@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/cli"
@@ -38,12 +40,32 @@ type RuntimeSet struct {
 
 type ReloadRuntime func(context.Context, domain.ModelSelection) (RuntimeSet, error)
 
+// String returns a diagnostic summary without exposing credential values.
+func (s RuntimeSet) String() string {
+	return fmt.Sprintf("RuntimeSet{Models:%v DefaultSelection:%+v CredentialEnvs:%v ConfigurationError:%t}", s.Models, s.DefaultSelection, s.CredentialEnvs, s.ConfigurationError != nil)
+}
+
+// MarshalJSON serializes only the non-sensitive runtime metadata.
+func (s RuntimeSet) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Models             []domain.ModelSelection `json:"models"`
+		DefaultSelection   domain.ModelSelection   `json:"defaultSelection"`
+		CredentialEnvs     map[string]string       `json:"credentialEnvs"`
+		ConfigurationError bool                    `json:"configurationError"`
+	}{
+		Models:             s.Models,
+		DefaultSelection:   s.DefaultSelection,
+		CredentialEnvs:     s.CredentialEnvs,
+		ConfigurationError: s.ConfigurationError != nil,
+	})
+}
+
 func (s RuntimeSet) Ready(selection domain.ModelSelection) error {
-	if s.unchecked {
-		return nil
-	}
 	if s.ConfigurationError != nil {
 		return s.ConfigurationError
+	}
+	if s.unchecked {
+		return nil
 	}
 	if !slices.Contains(s.Models, selection) {
 		return configurationError(s.configPath, fmt.Sprintf("model %q is not configured for provider %q; edit the file and run /reload", selection.Model, selection.Profile), nil)
@@ -167,6 +189,42 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 			runner.Approver = approver
 		},
 	}, nil
+}
+
+func profileKeyValues(keys map[string]string) []string {
+	values := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if key != "" {
+			values = append(values, key)
+		}
+	}
+	return values
+}
+
+func effectiveMaxToolCalls(cfg config.Config, options cli.Options) int {
+	if options.MaxToolsSet || (options.MaxToolCalls != 0 && options.MaxToolCalls != 32) {
+		return options.MaxToolCalls
+	}
+	return cfg.MaxToolCalls
+}
+
+func effectiveShellTimeout(cfg config.Config, options cli.Options) time.Duration {
+	if options.TimeoutSet || (options.ShellTimeout != 0 && options.ShellTimeout != 120*time.Second) {
+		return options.ShellTimeout
+	}
+	return time.Duration(cfg.ShellTimeoutSeconds) * time.Second
+}
+
+func compactSession(provider ports.ModelProvider, store ports.SessionStore) CompactSession {
+	return func(ctx context.Context, session domain.Session, replay domain.SessionReplay) error {
+		return agent.Compact(ctx, agent.CompactInput{
+			Provider:     provider,
+			Sessions:     store,
+			Session:      session,
+			Replay:       replay,
+			SystemPrompt: systemPrompt,
+		})
+	}
 }
 
 func configurationError(path, message string, cause error) error {

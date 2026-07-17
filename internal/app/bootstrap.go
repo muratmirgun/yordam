@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
-	"time"
 
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/cli"
@@ -244,16 +243,6 @@ func resolveDataDir(configured string) (string, error) {
 	return path, nil
 }
 
-func profileKeyValues(keys map[string]string) []string {
-	values := make([]string, 0, len(keys))
-	for _, key := range keys {
-		if key != "" {
-			values = append(values, key)
-		}
-	}
-	return values
-}
-
 func selectSession(
 	ctx context.Context,
 	store *jsonl.Store,
@@ -292,32 +281,6 @@ func selectSession(
 		return domain.Session{}, domain.SessionReplay{}, fmt.Errorf("select session: %w", err)
 	}
 	return session, replay, nil
-}
-
-func effectiveMaxToolCalls(cfg config.Config, options cli.Options) int {
-	if options.MaxToolsSet || (options.MaxToolCalls != 0 && options.MaxToolCalls != 32) {
-		return options.MaxToolCalls
-	}
-	return cfg.MaxToolCalls
-}
-
-func effectiveShellTimeout(cfg config.Config, options cli.Options) time.Duration {
-	if options.TimeoutSet || (options.ShellTimeout != 0 && options.ShellTimeout != 120*time.Second) {
-		return options.ShellTimeout
-	}
-	return time.Duration(cfg.ShellTimeoutSeconds) * time.Second
-}
-
-func compactSession(provider ports.ModelProvider, store ports.SessionStore) CompactSession {
-	return func(ctx context.Context, session domain.Session, replay domain.SessionReplay) error {
-		return agent.Compact(ctx, agent.CompactInput{
-			Provider:     provider,
-			Sessions:     store,
-			Session:      session,
-			Replay:       replay,
-			SystemPrompt: systemPrompt,
-		})
-	}
 }
 
 func openDebugLogger(path string, redactor secret.Redacting) (*logging.Logger, func() error, error) {

@@ -18,7 +18,9 @@ import (
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/permission"
+	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
+	"github.com/muratmirgun/yordam/internal/testsupport/agentfixture"
 )
 
 func TestRuntimeSetReadinessClassifiesModelsAndCredentials(t *testing.T) {
@@ -40,6 +42,15 @@ func TestRuntimeSetReadinessClassifiesModelsAndCredentials(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "/home/user/.config/yordam/config.jsonc") || !strings.Contains(err.Error(), "restart") && want == "SECONDARY_KEY" || !asTypedConfiguration(err, &typed) {
 			t.Fatalf("selection=%+v error=%v", selection, err)
 		}
+	}
+}
+
+func TestRuntimeSetReadyReturnsConfigurationErrorBeforeCompatibilityBypass(t *testing.T) {
+	configuration := configurationError("/home/user/.config/yordam/config.jsonc", "configuration is invalid; edit the file and run /reload", nil)
+	set := RuntimeSet{ConfigurationError: configuration, unchecked: true}
+
+	if got := set.Ready(domain.ModelSelection{}); !errors.Is(got, configuration) {
+		t.Fatalf("Ready() error = %v, want configuration error %v", got, configuration)
 	}
 }
 
@@ -67,6 +78,16 @@ func TestRuntimeBuilderBindsProvidersToolsLimitsAndCredentials(t *testing.T) {
 	}
 	if set.Credentials["primary"] != "primary-secret" || set.Credentials["secondary"] != "secondary-secret" {
 		t.Fatalf("credentials not bound by provider")
+	}
+	if summary := fmt.Sprintf("%+v", set); strings.Contains(summary, "primary-secret") || strings.Contains(summary, "secondary-secret") {
+		t.Fatalf("runtime set summary exposes credentials: %s", summary)
+	}
+	serialized, err := json.Marshal(set)
+	if err != nil {
+		t.Fatalf("serialize runtime set summary: %v", err)
+	}
+	if strings.Contains(string(serialized), "primary-secret") || strings.Contains(string(serialized), "secondary-secret") {
+		t.Fatalf("serialized runtime set summary exposes credentials: %s", serialized)
 	}
 	runner, ok := set.Runtime.(*agent.Runner)
 	if !ok || runner.MaxToolCalls != 7 {
@@ -137,6 +158,34 @@ func TestRuntimeGenerationsKeepImmutableRedactors(t *testing.T) {
 	if got := second.Redactor.String("generation-a generation-b"); got != "generation-a [REDACTED]" {
 		t.Fatalf("second redactor=%q", got)
 	}
+	firstRunner, ok := first.Runtime.(*agent.Runner)
+	if !ok {
+		t.Fatalf("first runtime=%T", first.Runtime)
+	}
+	if got := firstRunner.Redact("generation-a generation-b"); got != "[REDACTED] generation-b" {
+		t.Fatalf("first runner redactor=%q", got)
+	}
+	shellTool, ok := firstRunner.Tools.Lookup("shell")
+	if !ok {
+		t.Fatal("shell tool missing")
+	}
+	prepared, err := shellTool.Prepare(t.Context(), domain.ToolRequest{
+		CallID:    "immutable-redaction",
+		Name:      "shell",
+		Workspace: builder.workspace.CanonicalPath,
+		Input:     json.RawMessage(`{"command":"printf 'generation-a generation-b'","cwd":"."}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := prepared.Execute(t.Context()).Content; got != "[REDACTED] generation-b" {
+		t.Fatalf("first output redactor=%q", got)
+	}
+	binding := secret.NewBinding(first.Redactor)
+	binding.Replace(second.Redactor)
+	if got := binding.String("generation-a generation-b"); got != "generation-a [REDACTED]" {
+		t.Fatalf("long-lived redactor binding=%q", got)
+	}
 }
 
 func TestRuntimeBuilderRedactsConfiguredAndOverrideCredentials(t *testing.T) {
@@ -153,6 +202,23 @@ func TestRuntimeBuilderRedactsConfiguredAndOverrideCredentials(t *testing.T) {
 	}
 	if got := set.Redactor.String("configured-secret override-secret"); got != "[REDACTED] [REDACTED]" {
 		t.Fatalf("redacted=%q", got)
+	}
+}
+
+func TestRuntimeSetBindsApproverToItsRunner(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	set, err := newRuntimeBuilderForTest(t, nil).build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, ok := set.Runtime.(*agent.Runner)
+	if !ok {
+		t.Fatalf("runtime=%T", set.Runtime)
+	}
+	approver := &agentfixture.Approver{}
+	set.BindApprover(approver)
+	if runner.Approver != approver {
+		t.Fatalf("runner approver=%T, want %T", runner.Approver, approver)
 	}
 }
 
