@@ -102,7 +102,7 @@ func (c EventCorrelation) Validate() error {
 			return fmt.Errorf("invalid session correlation")
 		}
 	case JournalWorkspaceControl:
-		if c.SessionID != "" || c.TaskID != "" || c.TurnID != "" || c.ActivityID != "" {
+		if c.SessionID != "" {
 			return fmt.Errorf("invalid workspace-control correlation")
 		}
 	}
@@ -133,7 +133,20 @@ func (e ApplicationEvent) Validate() error {
 	if err := e.Correlation.Validate(); err != nil {
 		return err
 	}
+	if e.Correlation.JournalKind == JournalWorkspaceControl && isControlOperationEventKind(e.Kind) && e.Correlation.ControlOperationID == "" {
+		return fmt.Errorf("control-operation application event requires control-operation ID")
+	}
 	return ValidateRawJSON(e.Payload)
+}
+
+func isControlOperationEventKind(kind string) bool {
+	switch kind {
+	case EventControlOperationPlanned, EventControlOperationAuthorized, EventControlOperationStarted,
+		EventControlOperationCompleted, EventControlOperationFailed, EventControlOperationInterrupted:
+		return true
+	default:
+		return false
+	}
 }
 
 func CloneApplicationEvent(event ApplicationEvent) ApplicationEvent {

@@ -3,7 +3,13 @@ package protocol
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
+)
+
+const (
+	AuthorizationLifetimeOnce    = "once"
+	AuthorizationLifetimeSession = "session"
 )
 
 type AuthorizationConstraint struct {
@@ -52,6 +58,9 @@ type AuthorizationRequest struct {
 }
 
 func (r AuthorizationRequest) Validate() error {
+	if err := ValidateBounds(r); err != nil {
+		return fmt.Errorf("authorization request bounds: %w", err)
+	}
 	if (r.SessionID == "") == (r.ControlOperationID == "") {
 		return fmt.Errorf("authorization request requires exactly one session or control operation")
 	}
@@ -73,6 +82,14 @@ func (r AuthorizationRequest) Validate() error {
 	for _, digest := range []Digest{r.DescriptorDigest, r.PlanDigest, r.RequestDigest, r.DispatchDigest} {
 		if err := digest.Validate(); err != nil {
 			return err
+		}
+	}
+	if len(r.PolicyProvenance) == 0 {
+		return fmt.Errorf("authorization request requires policy provenance")
+	}
+	for _, provenance := range r.PolicyProvenance {
+		if provenance.Source == "" || provenance.Revision == "" || provenance.Generation == "" {
+			return fmt.Errorf("policy provenance is incomplete")
 		}
 	}
 	return validateSortedUniqueResources(r.Resources)
@@ -102,13 +119,19 @@ type AuthorizationDecision struct {
 }
 
 func (d AuthorizationDecision) Validate() error {
+	if err := ValidateBounds(d); err != nil {
+		return fmt.Errorf("authorization decision bounds: %w", err)
+	}
 	if err := d.Request.Validate(); err != nil {
 		return err
 	}
 	if d.Action != "allow" && d.Action != "deny" && d.Action != "ask" {
 		return fmt.Errorf("invalid authorization action %q", d.Action)
 	}
-	if d.Lifetime == "" || d.PolicySource == "" || d.PolicyGeneration == "" || d.Reason == "" || d.DecidedAt.IsZero() || d.DecisionNonce == "" {
+	if d.Lifetime != AuthorizationLifetimeOnce && d.Lifetime != AuthorizationLifetimeSession {
+		return fmt.Errorf("invalid authorization lifetime %q", d.Lifetime)
+	}
+	if d.PolicySource == "" || d.PolicyGeneration == "" || d.Reason == "" || d.DecidedAt.IsZero() || d.DecisionNonce == "" {
 		return fmt.Errorf("authorization decision is incomplete")
 	}
 	if d.ExpiresAt != nil && !d.ExpiresAt.After(d.DecidedAt) {
@@ -122,7 +145,37 @@ func (d AuthorizationDecision) Validate() error {
 	if err := d.PlanDigest.Validate(); err != nil {
 		return err
 	}
-	return validateSortedUniqueResources(d.Scope.Resources)
+	if d.PolicyGeneration != d.Request.PolicyGeneration {
+		return fmt.Errorf("authorization policy generation binding mismatch")
+	}
+	if d.PlanDigest != d.Request.PlanDigest {
+		return fmt.Errorf("authorization plan digest binding mismatch")
+	}
+	if d.Scope.Capability == "" || d.Scope.Capability != d.Request.Action {
+		return fmt.Errorf("authorization scope capability binding mismatch")
+	}
+	if err := d.Scope.Source.Validate(); err != nil {
+		return err
+	}
+	if d.Scope.Source != d.Request.Source {
+		return fmt.Errorf("authorization scope source binding mismatch")
+	}
+	if err := validateSortedUniqueResources(d.Scope.Resources); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(d.Scope.Resources, d.Request.Resources) {
+		return fmt.Errorf("authorization scope resource binding mismatch")
+	}
+	if err := validateAuthorizationConstraints(d.Scope.Constraints); err != nil {
+		return err
+	}
+	if err := validateAuthorizationConstraints(d.Constraints); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(d.Scope.Constraints, d.Constraints) {
+		return fmt.Errorf("authorization constraint binding mismatch")
+	}
+	return nil
 }
 
 type ApprovalResponse struct {
@@ -132,4 +185,22 @@ type ApprovalResponse struct {
 	ScopeDigest Digest   `json:"scope_digest"`
 	Actor       ActorRef `json:"actor"`
 	Reason      string   `json:"reason"`
+}
+
+func validateAuthorizationConstraints(constraints []AuthorizationConstraint) error {
+	previous := ""
+	for index, constraint := range constraints {
+		if constraint.Name == "" || constraint.Operator == "" {
+			return fmt.Errorf("authorization constraint is incomplete")
+		}
+		if err := ValidateRawJSON(constraint.Value); err != nil {
+			return fmt.Errorf("authorization constraint %q: %w", constraint.Name, err)
+		}
+		key := constraint.Name + "\x00" + constraint.Operator
+		if index > 0 && key <= previous {
+			return fmt.Errorf("authorization constraints must be sorted and unique")
+		}
+		previous = key
+	}
+	return nil
 }

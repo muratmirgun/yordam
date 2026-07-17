@@ -9,6 +9,48 @@ import (
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
+func protocolDigest(fill byte) protocol.Digest {
+	return protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat(string(fill), 64)}
+}
+
+func validModelDescriptor() protocol.ModelDescriptor {
+	return protocol.ModelDescriptor{
+		ProviderID: "provider", ModelID: "model", AdapterKind: "openai_compatible", DisplayName: "Model",
+		ContextWindow:   protocol.ValueInt64{State: protocol.ValueKnown, Value: 8192, Provenance: "catalog"},
+		MaximumOutput:   protocol.ValueInt64{State: protocol.ValueKnown, Value: 2048, Provenance: "catalog"},
+		Capabilities:    []protocol.CapabilityFact{{Capability: protocol.CapabilityTextInput, State: protocol.CapabilitySupported, Provenance: "adapter", RuntimeGenerationID: "generation"}},
+		UsageCategories: []string{"input"}, Pricing: []protocol.PricingFact{{Category: "input", PerMillionDecimal: "1.25", Currency: "USD", Provenance: "catalog"}},
+		CredentialBindingRef: "env:OPENAI_API_KEY", SourceRevision: "r1", RuntimeGenerationID: "generation",
+	}
+}
+
+func validToolDescriptorBody() protocol.ToolDescriptorBody {
+	return protocol.ToolDescriptorBody{
+		Identity: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "read"}, SourceRevision: "r1", DisplayName: "Read", Description: "Read a file",
+		InputSchema: json.RawMessage(`{"type":"object"}`), Effect: "observation", Mutation: "read_only", ExecutionLoci: []string{"builtin"},
+		ClassificationSource: "trusted_adapter", Idempotency: "idempotent", Retry: "safe_before_dispatch",
+	}
+}
+
+func validAuthorizationDecision() protocol.AuthorizationDecision {
+	digest := protocolDigest('a')
+	resource := protocol.ResourceTarget{Kind: "file", CanonicalID: "/workspace/a"}
+	source := protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "read"}
+	constraint := protocol.AuthorizationConstraint{Name: "path_prefix", Operator: "equals", Value: json.RawMessage(`"/workspace"`)}
+	request := protocol.AuthorizationRequest{
+		RequestID: "request", Principal: protocol.ActorRef{ID: "user", Kind: protocol.ActorUser}, Actor: protocol.ActorRef{ID: "agent", Kind: protocol.ActorAgent},
+		SessionID: "session", ActivityID: "activity", CallID: "call", QueueID: "queue", Source: source, SourceRevision: "r1", DescriptorDigest: digest,
+		Action: "read", Resources: []protocol.ResourceTarget{resource}, ExecutionLocus: "builtin", RequestedProfile: "restricted", EffectiveProfile: "restricted",
+		Effect: "observation", Boundary: "workspace", Reversibility: "not_applicable", VerificationCoverage: "full", RuntimeGenerationID: "generation", PolicyGeneration: "policy-r1",
+		PolicyProvenance: []protocol.PolicyProvenance{{Source: "platform", Revision: "r1", Generation: "policy-r1"}}, PlanDigest: digest, RequestDigest: digest, DispatchDigest: digest,
+	}
+	return protocol.AuthorizationDecision{
+		Request: request, Action: "allow", Scope: protocol.CanonicalAuthorizationScope{Capability: "read", Source: source, Resources: []protocol.ResourceTarget{resource}, Constraints: []protocol.AuthorizationConstraint{constraint}},
+		Constraints: []protocol.AuthorizationConstraint{constraint}, Lifetime: "once", PolicySource: "platform", PolicyGeneration: "policy-r1", Reason: "allowed",
+		DecidedAt: time.Unix(1, 0).UTC(), PlanDigest: digest, DecisionNonce: "nonce",
+	}
+}
+
 func validEnvelope() protocol.EventEnvelope {
 	return protocol.EventEnvelope{
 		SchemaVersion: 2, PayloadVersion: 1,
@@ -172,5 +214,139 @@ func TestModelEventRequiresOneMatchingPayload(t *testing.T) {
 	event.Error = &protocol.ProviderError{Code: "failed", Message: "failure"}
 	if err := event.Validate(); err == nil {
 		t.Fatal("ambiguous model event accepted")
+	}
+}
+
+func TestRecursiveModelAndToolValidatorsFailClosed(t *testing.T) {
+	t.Parallel()
+
+	descriptor := validModelDescriptor()
+	if err := descriptor.Validate(); err != nil {
+		t.Fatalf("valid model descriptor rejected: %v", err)
+	}
+	invalidDescriptor := descriptor
+	invalidDescriptor.Capabilities = append([]protocol.CapabilityFact(nil), descriptor.Capabilities...)
+	invalidDescriptor.Capabilities[0].Capability = "future_unregistered_capability"
+	if err := invalidDescriptor.Validate(); err == nil {
+		t.Fatal("unknown model capability accepted")
+	}
+	invalidDescriptor = descriptor
+	invalidDescriptor.ContextWindow.Provenance = ""
+	if err := invalidDescriptor.Validate(); err == nil {
+		t.Fatal("known context-window fact without provenance accepted")
+	}
+	invalidDescriptor = descriptor
+	invalidDescriptor.Pricing = append([]protocol.PricingFact(nil), descriptor.Pricing...)
+	invalidDescriptor.Pricing[0].PerMillionDecimal = "1e3"
+	if err := invalidDescriptor.Validate(); err == nil {
+		t.Fatal("non-canonical pricing decimal accepted")
+	}
+
+	body := validToolDescriptorBody()
+	if err := body.Validate(); err != nil {
+		t.Fatalf("valid tool descriptor rejected: %v", err)
+	}
+	invalidBodies := []protocol.ToolDescriptorBody{body, body, body, body}
+	invalidBodies[0].InputSchema = json.RawMessage(`[]`)
+	invalidBodies[1].ExecutionLoci = []string{"builtin", "builtin"}
+	invalidBodies[2].ClassificationSource = ""
+	invalidBodies[3].Retry = ""
+	for index, invalid := range invalidBodies {
+		if err := invalid.Validate(); err == nil {
+			t.Fatalf("invalid tool descriptor %d accepted", index)
+		}
+	}
+
+	exposure := protocol.ToolExposure{
+		CatalogRevision: "tools-r1",
+		Tools:           []protocol.ExposedTool{{Alias: "read", Identity: body.Identity, Description: body.Description, InputSchema: protocol.CloneRawMessage(body.InputSchema)}},
+		Aliases:         []protocol.ToolAliasBinding{{Alias: "read", Identity: body.Identity, SourceRevision: body.SourceRevision, DescriptorDigest: protocolDigest('a')}},
+	}
+	if err := exposure.Validate(); err != nil {
+		t.Fatalf("valid tool exposure rejected: %v", err)
+	}
+	exposure.Tools[0].InputSchema = json.RawMessage(`[]`)
+	if err := exposure.Validate(); err == nil {
+		t.Fatal("non-object exposed-tool schema accepted")
+	}
+	exposure.Tools[0].InputSchema = json.RawMessage(`{"type":"object"}`)
+	exposure.Aliases[0].Identity.Name = "other"
+	if err := exposure.Validate(); err == nil {
+		t.Fatal("tool exposure alias identity mismatch accepted")
+	}
+
+	source := protocol.ContentSource{ID: "instructions", Kind: "system", Scope: "workspace", Provenance: "file", Digest: protocolDigest('b'), Content: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "Be precise."}}}
+	if err := source.Validate(); err != nil {
+		t.Fatalf("valid content source rejected: %v", err)
+	}
+	source.Content[0] = protocol.ContentBlock{Kind: protocol.ContentText, JSON: json.RawMessage(`{}`)}
+	if err := source.Validate(); err == nil {
+		t.Fatal("invalid nested content block accepted")
+	}
+	if err := (protocol.ExcludedContentSource{ID: "large", Reason: "", Digest: protocolDigest('c')}).Validate(); err == nil {
+		t.Fatal("excluded content source without reason accepted")
+	}
+}
+
+func TestAuthorizationDecisionBindsLifetimePolicyPlanScopeAndConstraints(t *testing.T) {
+	t.Parallel()
+	decision := validAuthorizationDecision()
+	if err := decision.Validate(); err != nil {
+		t.Fatalf("valid authorization decision rejected: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*protocol.AuthorizationDecision)
+	}{
+		{"lifetime", func(d *protocol.AuthorizationDecision) { d.Lifetime = "forever" }},
+		{"policy generation", func(d *protocol.AuthorizationDecision) { d.PolicyGeneration = "policy-r2" }},
+		{"plan digest", func(d *protocol.AuthorizationDecision) { d.PlanDigest = protocolDigest('b') }},
+		{"scope capability", func(d *protocol.AuthorizationDecision) { d.Scope.Capability = "write" }},
+		{"scope source", func(d *protocol.AuthorizationDecision) { d.Scope.Source.Name = "edit" }},
+		{"scope resources", func(d *protocol.AuthorizationDecision) { d.Scope.Resources[0].CanonicalID = "/workspace/b" }},
+		{"constraint JSON", func(d *protocol.AuthorizationDecision) { d.Constraints[0].Value = json.RawMessage(`1e3`) }},
+		{"constraint repetition", func(d *protocol.AuthorizationDecision) { d.Scope.Constraints[0].Operator = "prefix" }},
+	}
+	for _, test := range cases {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			candidate := protocol.DeepCopy(decision)
+			test.mutate(&candidate)
+			if err := candidate.Validate(); err == nil {
+				t.Fatalf("invalid authorization %s accepted", test.name)
+			}
+		})
+	}
+}
+
+func TestApplicationEventUsesKindAwareWorkspaceControlCorrelation(t *testing.T) {
+	t.Parallel()
+	workspaceCorrelation := protocol.EventCorrelation{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", TaskID: "task", TurnID: "turn", ActivityID: "activity"}
+	if err := workspaceCorrelation.Validate(); err != nil {
+		t.Fatalf("workspace causation lineage rejected: %v", err)
+	}
+
+	event := protocol.ApplicationEvent{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, StreamEventID: "stream-event", Correlation: workspaceCorrelation,
+		Time: time.Unix(1, 0).UTC(), Kind: protocol.EventControlOperationStarted, Classification: "durable", PayloadVersion: 1, Payload: json.RawMessage(`{}`),
+	}
+	if err := event.Validate(); err == nil {
+		t.Fatal("control-operation application event without control-operation ID accepted")
+	}
+	event.Correlation.ControlOperationID = "control"
+	if err := event.Validate(); err != nil {
+		t.Fatalf("control-operation application event with optional causation rejected: %v", err)
+	}
+
+	event.Kind = protocol.EventRuntimeGenerationActivated
+	event.Correlation.ControlOperationID = ""
+	if err := event.Validate(); err != nil {
+		t.Fatalf("non-operation workspace event without control-operation ID rejected: %v", err)
+	}
+
+	event.Correlation = protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: "session", SessionID: "session", ControlOperationID: "control"}
+	if err := event.Validate(); err == nil {
+		t.Fatal("session application event with control-operation ID accepted")
 	}
 }

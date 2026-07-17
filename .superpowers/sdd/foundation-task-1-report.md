@@ -248,3 +248,118 @@ No config/runtime composition, schema, reload, or SDD progress-ledger file was m
 
 - No known Task 1 blocker remains.
 - Cross-record authorization binding necessarily requires the referenced committed decision and start payload; Task 1 exposes and tests `eventcodec.ValidateAuthorizationConsumption`. The journal/orchestrator tasks must call this helper when those records become available rather than relying on single-record `Registry.Validate` alone.
+
+## Independent Review Closure (2026-07-18)
+
+All eight Important findings and the typed-nil Minor from the independent Task 1 review were reproduced with focused negative regressions, fixed without changing the Task 1 wire DTO shapes, and reverified.
+
+### Finding-to-fix map
+
+1. Envelope/payload identity is now exact for every repeated session, task, turn, activity, parent-activity, runtime-generation, diagnostic-journal, and transaction identity. Coverage includes authorization requests/decisions/consumption, activity starts, evidence, checkpoint planned/ready, verification receipts, provider plans, action plans in every event family, control-operation starts, runtime activation, diagnostics, and transaction markers. Each repeated field has valid-positive plus omitted/mismatch coverage; the checkpoint SessionID case asserts the exact identity-validator error path.
+2. `authorization.grant_revoked@1` is session-journal only.
+3. Migration and recovery diagnostic `JournalRef` values must exactly match the envelope journal.
+4. `DeepCopy` now shallow-copies complete structs and recursively replaces exported fields, preserving immutable/unexported state while detaching exported mutable fields. A custom descriptor with an unexported `time.Time` and exported `json.RawMessage` proves the alias boundary.
+5. Recursive fail-closed validation now covers `ValueInt64`, capability names/states/requirements, pricing decimals and provenance, model descriptors, content blocks/sources/exclusions and source-content digests, tool descriptor object schemas/loci/classification/idempotency/retry, tool exposure aliases/schemas, negotiated provider plans, context plans, and runtime manifests. Nested validation runs before each outer body digest check.
+6. Authorization decisions accept only `once|session`, bind policy generation and plan digest to the request, bind canonical scope capability/source/resources, and validate bounded canonical-profile constraint JSON with exact repeated constraints.
+7. Cross-record consumption now requires a valid `authorization.decided@1` v2 envelope, strictly decodes and validates its committed payload and journal/correlation, proves the supplied decision is identical, derives all bindings and the decision digest from that committed payload, permits only `allow`, and then checks the start payload.
+8. Workspace-control application correlation permits optional task/turn/activity causation. `ApplicationEvent.Validate` requires `ControlOperationID` for the six control-operation event kinds; non-operation workspace events may omit it, and session events still forbid it.
+9. `Descriptor.New` rejects typed nil pointers. The v1 compatibility assertion now checks exact serialized bytes and the exact seven-field struct/key set.
+
+### Review RED evidence
+
+First identity/journal/deep-copy/typed-nil group:
+
+```text
+go test ./internal/eventcodec -run 'TestRegistryRejectsTypedNilDescriptorFactoryAndBreaksCustomAliases|TestFoundationRegistryRequiresExactEnvelopePayloadIdentity|TestFoundationRegistryKeepsGrantRevocationSessionOnly|TestFoundationRegistryBindsDiagnosticJournalToEnvelope' -count=1 -v
+
+descriptor factory returning a typed nil pointer accepted
+authorization.grant_revoked accepted in workspace-control journal
+diagnostic journal mismatch accepted
+task/turn/activity/parent/runtime omitted or mismatched identity accepted
+FAIL
+```
+
+Recursive DTO API group:
+
+```text
+go test ./internal/protocol -run TestRecursiveModelAndToolValidatorsFailClosed -count=1
+
+descriptor.Validate undefined
+body.Validate undefined
+exposure.Validate undefined
+source.Validate undefined
+FAIL [build failed]
+```
+
+Nested-before-outer-digest group:
+
+```text
+go test ./internal/eventcodec -run TestFoundationRegistryValidatesNestedBodiesBeforeOuterDigests -count=1 -v
+
+nested model descriptor was not rejected before plan digest: body digest mismatch
+content source digest was not rejected before context-plan digest: body digest mismatch
+nested tool descriptor was not rejected before manifest digest: body digest mismatch
+FAIL
+```
+
+Authorization binding group:
+
+```text
+go test ./internal/protocol -run TestAuthorizationDecisionBindsLifetimePolicyPlanScopeAndConstraints -count=1 -v
+
+invalid authorization lifetime/policy generation/plan digest/scope capability/scope source/scope resources/constraint JSON/constraint repetition accepted
+FAIL
+```
+
+Cross-record and application groups:
+
+```text
+go test ./internal/eventcodec -run TestValidateAuthorizationConsumptionMatchesDecisionAndStartBindings -count=1 -v
+non-authorization.decided envelope accepted as committed decision
+FAIL
+
+go test ./internal/protocol -run TestApplicationEventUsesKindAwareWorkspaceControlCorrelation -count=1 -v
+workspace causation lineage rejected: invalid workspace-control correlation
+FAIL
+```
+
+Exhaustive remaining repeated-identity group:
+
+```text
+go test ./internal/eventcodec -run TestFoundationRegistryBindsEveryNestedRepeatedIdentity -count=1 -v
+
+runtime identity omitted/mismatch accepted for file/activity/execution/control/provider plans
+task/turn/runtime identity omitted/mismatch accepted for checkpoints
+task/activity identity omitted/mismatch accepted for verification receipts
+runtime identity omitted/mismatch accepted for control-operation start
+FAIL
+```
+
+### Review GREEN and final verification
+
+Every focused RED command above was rerun and passed after its minimum implementation slice. The exact final focused gates were then rerun fresh:
+
+```text
+go test ./internal/canonicaljson ./internal/protocol ./internal/eventcodec ./internal/domain -count=1
+ok github.com/muratmirgun/yordam/internal/canonicaljson 0.322s
+ok github.com/muratmirgun/yordam/internal/protocol      0.320s
+ok github.com/muratmirgun/yordam/internal/eventcodec    0.405s
+ok github.com/muratmirgun/yordam/internal/domain        0.388s
+
+go test -race ./internal/canonicaljson ./internal/protocol ./internal/eventcodec ./internal/domain -count=1
+ok github.com/muratmirgun/yordam/internal/canonicaljson 1.353s
+ok github.com/muratmirgun/yordam/internal/protocol      1.283s
+ok github.com/muratmirgun/yordam/internal/eventcodec    1.471s
+ok github.com/muratmirgun/yordam/internal/domain        1.279s
+```
+
+Repository gates were also fresh and exited zero:
+
+```text
+go test ./...
+go test -race ./...
+go vet ./...
+git diff --check
+```
+
+The review fix changes only Task 1-owned protocol/codec/tests plus this ignored implementation report; config, schema, reload behavior, and the SDD ledger remain untouched.

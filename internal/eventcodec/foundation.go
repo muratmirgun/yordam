@@ -426,15 +426,35 @@ func validateActionPlan(plan protocol.ActionPlan) error {
 }
 
 func validateNegotiatedPlan(plan protocol.NegotiatedProviderPlan) error {
+	if err := protocol.ValidateBounds(plan.Body); err != nil {
+		return err
+	}
+	if err := plan.Body.Descriptor.Validate(); err != nil {
+		return err
+	}
+	if plan.Body.ToolExposureRevision == "" {
+		return fmt.Errorf("tool exposure revision is required")
+	}
+	previousRequirement := ""
 	for _, requirement := range plan.Body.Requirements {
 		if err := requirement.Validate(); err != nil {
 			return err
 		}
+		if previousRequirement != "" && requirement.Capability <= previousRequirement {
+			return fmt.Errorf("capability requirements must be sorted and unique")
+		}
+		previousRequirement = requirement.Capability
+	}
+	if err := sortedStrings(plan.Body.Warnings, "provider plan warnings"); err != nil {
+		return err
 	}
 	return requireDigest(plan.Body, plan.Digest)
 }
 
 func validateContextPlan(plan protocol.ContextPlan) error {
+	if err := protocol.ValidateBounds(plan.Body); err != nil {
+		return err
+	}
 	if plan.Body.OutputReserve < 0 || plan.Body.CompactionRevision == "" || plan.Body.ToolExposureRevision == "" {
 		return fmt.Errorf("context plan body is invalid")
 	}
@@ -443,6 +463,28 @@ func validateContextPlan(plan protocol.ContextPlan) error {
 	}
 	if err := plan.Body.ContextWindow.Validate(); err != nil {
 		return err
+	}
+	seenSources := make(map[string]struct{}, len(plan.Body.Sources)+len(plan.Body.Excluded))
+	for _, source := range plan.Body.Sources {
+		if err := source.Validate(); err != nil {
+			return fmt.Errorf("content source %q: %w", source.ID, err)
+		}
+		if _, duplicate := seenSources[source.ID]; duplicate {
+			return fmt.Errorf("duplicate content source %q", source.ID)
+		}
+		seenSources[source.ID] = struct{}{}
+		if err := requireDigest(source.Content, source.Digest); err != nil {
+			return fmt.Errorf("content source %q digest: %w", source.ID, err)
+		}
+	}
+	for _, source := range plan.Body.Excluded {
+		if err := source.Validate(); err != nil {
+			return err
+		}
+		if _, duplicate := seenSources[source.ID]; duplicate {
+			return fmt.Errorf("duplicate or conflicting excluded content source %q", source.ID)
+		}
+		seenSources[source.ID] = struct{}{}
 	}
 	return requireDigest(plan.Body, plan.Digest)
 }
@@ -484,16 +526,48 @@ func validateReceipt(receipt protocol.VerificationReceipt) error {
 }
 
 func validateManifest(manifest protocol.RuntimeGenerationManifest) error {
+	if err := protocol.ValidateBounds(manifest.Body); err != nil {
+		return err
+	}
 	if manifest.ID == "" || manifest.Body.ProviderCatalogRevision == "" || manifest.Body.ToolCatalogRevision == "" || manifest.Body.InstructionRevision == "" || manifest.Body.PolicyGeneration == "" || manifest.Body.Limits.MaxToolCalls <= 0 || manifest.Body.Limits.ShellTimeoutNanos <= 0 || manifest.Body.Limits.ApplicationQueueCapacity <= 0 {
 		return fmt.Errorf("runtime generation manifest is incomplete")
 	}
+	seenModels := make(map[string]struct{}, len(manifest.Body.Models))
+	for _, descriptor := range manifest.Body.Models {
+		if err := descriptor.Validate(); err != nil {
+			return fmt.Errorf("model descriptor: %w", err)
+		}
+		if descriptor.RuntimeGenerationID != manifest.ID {
+			return fmt.Errorf("model descriptor runtime generation mismatch")
+		}
+		key := string(descriptor.ProviderID) + "\x00" + string(descriptor.ModelID)
+		if _, duplicate := seenModels[key]; duplicate {
+			return fmt.Errorf("duplicate model descriptor")
+		}
+		seenModels[key] = struct{}{}
+	}
+	seenTools := make(map[protocol.ToolIdentity]struct{}, len(manifest.Body.Tools))
 	for _, descriptor := range manifest.Body.Tools {
-		if err := descriptor.Body.Identity.Validate(); err != nil {
-			return err
+		if err := descriptor.Body.Validate(); err != nil {
+			return fmt.Errorf("tool descriptor: %w", err)
 		}
 		if err := requireDigest(descriptor.Body, descriptor.DescriptorDigest); err != nil {
 			return err
 		}
+		if _, duplicate := seenTools[descriptor.Body.Identity]; duplicate {
+			return fmt.Errorf("duplicate tool descriptor")
+		}
+		seenTools[descriptor.Body.Identity] = struct{}{}
+	}
+	seenProfiles := make(map[string]struct{}, len(manifest.Body.ExecutionProfiles))
+	for _, profile := range manifest.Body.ExecutionProfiles {
+		if profile == "" {
+			return fmt.Errorf("execution profile is empty")
+		}
+		if _, duplicate := seenProfiles[profile]; duplicate {
+			return fmt.Errorf("duplicate execution profile %q", profile)
+		}
+		seenProfiles[profile] = struct{}{}
 	}
 	return requireDigest(manifest.Body, manifest.Digest)
 }
@@ -503,15 +577,38 @@ func requireDigest(body any, got protocol.Digest) error {
 }
 
 func ValidateAuthorizationConsumption(consumed protocol.AuthorizationDecisionConsumedV1, decisionEnvelope protocol.EventEnvelope, decision protocol.AuthorizationDecidedV1, started any) error {
+	if decisionEnvelope.Kind != protocol.EventAuthorizationDecided || decisionEnvelope.PayloadVersion != 1 {
+		return fmt.Errorf("committed decision must be authorization.decided@1")
+	}
+	committed := new(protocol.AuthorizationDecidedV1)
+	if err := decodeStrict(decisionEnvelope.Payload, committed); err != nil {
+		return fmt.Errorf("decode committed authorization decision: %w", err)
+	}
+	if err := requireFields(decisionEnvelope.Payload, reflect.TypeOf(*committed)); err != nil {
+		return fmt.Errorf("committed authorization decision structure: %w", err)
+	}
+	registry, err := New(FoundationDescriptors())
+	if err != nil {
+		return fmt.Errorf("construct foundation registry: %w", err)
+	}
+	if err := registry.Validate(protocol.EventRecord{Envelope: decisionEnvelope, Decoded: committed}); err != nil {
+		return fmt.Errorf("validate committed authorization decision: %w", err)
+	}
+	if !reflect.DeepEqual(*committed, decision) {
+		return fmt.Errorf("supplied authorization decision does not match committed payload")
+	}
+	if committed.Decision.Action != "allow" {
+		return fmt.Errorf("only an allow decision can be consumed")
+	}
 	if err := consumed.Validate(); err != nil {
 		return err
 	}
-	request := decision.Decision.Request
-	decisionDigest, err := canonicaljson.Digest(decision.Decision)
+	request := committed.Decision.Request
+	decisionDigest, err := canonicaljson.Digest(committed.Decision)
 	if err != nil {
 		return err
 	}
-	if consumed.DecisionEventID != decisionEnvelope.EventID || consumed.DecisionNonce != decision.Decision.DecisionNonce || consumed.DecisionDigest != decisionDigest || consumed.RequestID != request.RequestID || consumed.CallID != request.CallID || consumed.PlanDigest != request.PlanDigest || consumed.RequestDigest != request.RequestDigest || consumed.DispatchDigest != request.DispatchDigest || consumed.RuntimeGenerationID != request.RuntimeGenerationID {
+	if consumed.DecisionEventID != decisionEnvelope.EventID || consumed.DecisionNonce != committed.Decision.DecisionNonce || consumed.DecisionDigest != decisionDigest || consumed.RequestID != request.RequestID || consumed.CallID != request.CallID || consumed.PlanDigest != request.PlanDigest || consumed.RequestDigest != request.RequestDigest || consumed.DispatchDigest != request.DispatchDigest || consumed.RuntimeGenerationID != request.RuntimeGenerationID {
 		return fmt.Errorf("authorization consumption does not match committed decision bindings")
 	}
 	if consumed.ActivityID != request.ActivityID || consumed.ControlOperationID != request.ControlOperationID {
@@ -666,6 +763,7 @@ func sessionOnlyKind(kind string) bool {
 		protocol.EventActivitySucceeded, protocol.EventActivityFailed, protocol.EventActivityDenied, protocol.EventActivityCancelled,
 		protocol.EventActivityInterruptedNoEffect, protocol.EventActivityUncertain,
 		protocol.EventProviderCapabilityDecided, protocol.EventProviderAttemptTerminal, protocol.EventExecutionPlanDeclared,
+		protocol.EventAuthorizationGrantRevoked,
 		protocol.EventEvidenceRecorded, protocol.EventEvidenceLinked,
 		protocol.EventCheckpointPlanned, protocol.EventCheckpointReady, protocol.EventCheckpointFailed,
 		protocol.EventVerificationReceiptRecorded, protocol.EventContextPlanRecorded, protocol.EventContextUsageRecorded:
@@ -677,33 +775,105 @@ func sessionOnlyKind(kind string) bool {
 
 func validateEnvelopeIdentity(envelope protocol.EventEnvelope, payload any) error {
 	switch value := payload.(type) {
+	case *protocol.FileChangePlannedV1:
+		return requireRepeatedIdentity("file.change_planned runtime generation ID", string(envelope.RuntimeGenerationID), string(value.Plan.Body.RuntimeGenerationID))
+	case *protocol.ActivityPlannedV1:
+		if value.Plan != nil {
+			return requireRepeatedIdentity("activity.planned runtime generation ID", string(envelope.RuntimeGenerationID), string(value.Plan.Body.RuntimeGenerationID))
+		}
+	case *protocol.ExecutionPlanDeclaredV1:
+		return requireRepeatedIdentity("execution.plan_declared runtime generation ID", string(envelope.RuntimeGenerationID), string(value.Plan.Body.RuntimeGenerationID))
 	case *protocol.ActivityStartedV1:
-		if envelope.ActivityID != "" && value.ActivityID != envelope.ActivityID {
-			return fmt.Errorf("activity ID does not match envelope")
+		if err := requireRepeatedIdentity("activity.started activity ID", string(envelope.ActivityID), string(value.ActivityID)); err != nil {
+			return err
 		}
+		return requireRepeatedIdentity("activity.started runtime generation ID", string(envelope.RuntimeGenerationID), string(value.RuntimeGenerationID))
 	case *protocol.AuthorizationRequestedV1:
-		if value.Request.SessionID != "" && value.Request.SessionID != envelope.SessionID {
-			return fmt.Errorf("authorization session ID does not match envelope")
-		}
-		if envelope.ActivityID != "" && value.Request.ActivityID != envelope.ActivityID {
-			return fmt.Errorf("authorization activity ID does not match envelope")
-		}
+		return validateAuthorizationEnvelopeIdentities(envelope, value.Request)
 	case *protocol.AuthorizationDecidedV1:
-		if value.Decision.Request.SessionID != "" && value.Decision.Request.SessionID != envelope.SessionID {
-			return fmt.Errorf("authorization decision session ID does not match envelope")
+		return validateAuthorizationEnvelopeIdentities(envelope, value.Decision.Request)
+	case *protocol.AuthorizationDecisionConsumedV1:
+		if err := requireRepeatedIdentity("authorization.decision_consumed activity ID", string(envelope.ActivityID), string(value.ActivityID)); err != nil {
+			return err
 		}
+		return requireRepeatedIdentity("authorization.decision_consumed runtime generation ID", string(envelope.RuntimeGenerationID), string(value.RuntimeGenerationID))
 	case *protocol.EvidenceRecordedV1:
-		if value.Record.Body.SessionID != "" && value.Record.Body.SessionID != envelope.SessionID {
-			return fmt.Errorf("evidence session ID does not match envelope")
+		if err := requireRepeatedIdentity("evidence.recorded session ID", string(envelope.SessionID), string(value.Record.Body.SessionID)); err != nil {
+			return err
 		}
+		return requireRepeatedIdentity("evidence.recorded activity ID", string(envelope.ActivityID), string(value.Record.Body.ProducingActivityID))
+	case *protocol.CheckpointPlannedV1:
+		return validateCheckpointEnvelopeIdentities(envelope, value.Body)
+	case *protocol.CheckpointReadyV1:
+		return validateCheckpointEnvelopeIdentities(envelope, value.Body)
+	case *protocol.VerificationReceiptRecordedV1:
+		if err := requireRepeatedIdentity("verification receipt task ID", string(envelope.TaskID), string(value.Receipt.Body.TaskID)); err != nil {
+			return err
+		}
+		return requireRepeatedIdentity("verification receipt activity ID", string(envelope.ActivityID), string(value.Receipt.Body.ActivityID))
+	case *protocol.ProviderCapabilityDecidedV1:
+		return requireRepeatedIdentity("provider plan runtime generation ID", string(envelope.RuntimeGenerationID), string(value.Plan.Body.Descriptor.RuntimeGenerationID))
 	case *protocol.RuntimeGenerationActivatedV1:
-		if envelope.RuntimeGenerationID != "" && value.Manifest.ID != envelope.RuntimeGenerationID {
-			return fmt.Errorf("runtime generation ID does not match envelope")
+		return requireRepeatedIdentity("runtime_generation.activated runtime generation ID", string(envelope.RuntimeGenerationID), string(value.Manifest.ID))
+	case *protocol.ControlOperationPlannedV1:
+		return requireRepeatedIdentity("control_operation.planned runtime generation ID", string(envelope.RuntimeGenerationID), string(value.Plan.Body.RuntimeGenerationID))
+	case *protocol.ControlOperationStartedV1:
+		return requireRepeatedIdentity("control_operation.started runtime generation ID", string(envelope.RuntimeGenerationID), string(value.RuntimeGenerationID))
+	case *protocol.DiagnosticV1:
+		if value.Diagnostic.Journal.Kind != envelope.JournalKind || value.Diagnostic.Journal.ID != envelope.JournalID {
+			return fmt.Errorf("diagnostic journal does not match envelope")
 		}
 	case *protocol.TransactionCommittedV1:
 		if value.TransactionID != envelope.TransactionID {
 			return fmt.Errorf("transaction ID does not match envelope")
 		}
+	}
+	return nil
+}
+
+func validateCheckpointEnvelopeIdentities(envelope protocol.EventEnvelope, body protocol.CheckpointBody) error {
+	checks := []struct {
+		label    string
+		envelope string
+		payload  string
+	}{
+		{"session ID", string(envelope.SessionID), string(body.SessionID)},
+		{"task ID", string(envelope.TaskID), string(body.TaskID)},
+		{"turn ID", string(envelope.TurnID), string(body.TurnID)},
+		{"runtime generation ID", string(envelope.RuntimeGenerationID), string(body.RuntimeGenerationID)},
+	}
+	for _, check := range checks {
+		if err := requireRepeatedIdentity("checkpoint "+check.label, check.envelope, check.payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateAuthorizationEnvelopeIdentities(envelope protocol.EventEnvelope, request protocol.AuthorizationRequest) error {
+	checks := []struct {
+		label    string
+		envelope string
+		payload  string
+	}{
+		{"session ID", string(envelope.SessionID), string(request.SessionID)},
+		{"task ID", string(envelope.TaskID), string(request.TaskID)},
+		{"turn ID", string(envelope.TurnID), string(request.TurnID)},
+		{"activity ID", string(envelope.ActivityID), string(request.ActivityID)},
+		{"parent activity ID", string(envelope.ParentActivityID), string(request.ParentActivityID)},
+		{"runtime generation ID", string(envelope.RuntimeGenerationID), string(request.RuntimeGenerationID)},
+	}
+	for _, check := range checks {
+		if err := requireRepeatedIdentity("authorization request "+check.label, check.envelope, check.payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func requireRepeatedIdentity(label, envelope, payload string) error {
+	if envelope != payload {
+		return fmt.Errorf("%s does not match envelope", label)
 	}
 	return nil
 }

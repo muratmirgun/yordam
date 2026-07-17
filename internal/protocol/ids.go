@@ -333,9 +333,14 @@ func deepCopyValue(value reflect.Value) reflect.Value {
 		return result
 	case reflect.Struct:
 		result := reflect.New(value.Type()).Elem()
+		// Copy the complete value first so immutable and unexported fields (for
+		// example time.Time's representation) are preserved without reflecting
+		// through inaccessible state. Exported fields are then recursively
+		// replaced to detach every mutable wire value.
+		result.Set(value)
 		for i := 0; i < value.NumField(); i++ {
-			if !result.Field(i).CanSet() || value.Type().Field(i).PkgPath != "" {
-				return value
+			if value.Type().Field(i).PkgPath != "" {
+				continue
 			}
 			result.Field(i).Set(deepCopyValue(value.Field(i)))
 		}

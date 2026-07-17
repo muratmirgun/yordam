@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 type ValueInt64 struct {
@@ -18,6 +19,9 @@ func (v ValueInt64) Validate() error {
 	if v.State == ValueKnown && v.Value < 0 {
 		return fmt.Errorf("known int64 value must not be negative")
 	}
+	if (v.State == ValueKnown || v.State == ValueUnavailable) && strings.TrimSpace(v.Provenance) == "" {
+		return fmt.Errorf("int64 value state %q requires provenance", v.State)
+	}
 	return nil
 }
 
@@ -26,6 +30,13 @@ type PricingFact struct {
 	PerMillionDecimal string `json:"per_million_decimal"`
 	Currency          string `json:"currency"`
 	Provenance        string `json:"provenance"`
+}
+
+func (p PricingFact) Validate() error {
+	if p.Category == "" || !validDecimal(p.PerMillionDecimal) || p.Currency == "" || p.Provenance == "" {
+		return fmt.Errorf("pricing fact is invalid")
+	}
+	return nil
 }
 
 type ToolUseBlock struct {
@@ -80,6 +91,16 @@ type ExcludedContentSource struct {
 	ID     string `json:"id"`
 	Reason string `json:"reason"`
 	Digest Digest `json:"digest,omitempty"`
+}
+
+func (s ExcludedContentSource) Validate() error {
+	if s.ID == "" || strings.TrimSpace(s.Reason) == "" {
+		return fmt.Errorf("excluded content source is incomplete")
+	}
+	if !s.Digest.IsZero() {
+		return s.Digest.Validate()
+	}
+	return nil
 }
 
 type UsageState string
@@ -151,6 +172,24 @@ type ContentSource struct {
 	Provenance string         `json:"provenance"`
 	Digest     Digest         `json:"digest"`
 	Content    []ContentBlock `json:"content"`
+}
+
+func (s ContentSource) Validate() error {
+	if err := ValidateBounds(s); err != nil {
+		return err
+	}
+	if s.ID == "" || s.Kind == "" || s.Scope == "" || s.Provenance == "" || len(s.Content) == 0 {
+		return fmt.Errorf("content source is incomplete")
+	}
+	if err := s.Digest.Validate(); err != nil {
+		return err
+	}
+	for _, block := range s.Content {
+		if err := block.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type ContentBlock struct {
@@ -268,7 +307,10 @@ type CapabilityFact struct {
 }
 
 func (f CapabilityFact) Validate() error {
-	if f.Capability == "" || f.Provenance == "" || f.RuntimeGenerationID == "" {
+	if !validCapability(f.Capability) {
+		return fmt.Errorf("invalid capability %q", f.Capability)
+	}
+	if f.Provenance == "" || f.RuntimeGenerationID == "" {
 		return fmt.Errorf("capability fact is incomplete")
 	}
 	if f.State != CapabilitySupported && f.State != CapabilityUnsupported && f.State != CapabilityUnknown {
@@ -283,8 +325,8 @@ type CapabilityRequirement struct {
 }
 
 func (r CapabilityRequirement) Validate() error {
-	if r.Capability == "" {
-		return fmt.Errorf("capability is required")
+	if !validCapability(r.Capability) {
+		return fmt.Errorf("invalid capability %q", r.Capability)
 	}
 	if r.Level != CapabilityRequired && r.Level != CapabilityPreferred && r.Level != CapabilityUnused {
 		return fmt.Errorf("invalid capability requirement level %q", r.Level)
@@ -305,6 +347,48 @@ type ModelDescriptor struct {
 	CredentialBindingRef string              `json:"credential_binding_ref"`
 	SourceRevision       string              `json:"source_revision"`
 	RuntimeGenerationID  RuntimeGenerationID `json:"runtime_generation_id"`
+}
+
+func (d ModelDescriptor) Validate() error {
+	if err := ValidateBounds(d); err != nil {
+		return err
+	}
+	if d.ProviderID == "" || d.ModelID == "" || d.AdapterKind == "" || d.DisplayName == "" || d.CredentialBindingRef == "" || d.SourceRevision == "" || d.RuntimeGenerationID == "" {
+		return fmt.Errorf("model descriptor is incomplete")
+	}
+	if err := d.ContextWindow.Validate(); err != nil {
+		return fmt.Errorf("context window: %w", err)
+	}
+	if err := d.MaximumOutput.Validate(); err != nil {
+		return fmt.Errorf("maximum output: %w", err)
+	}
+	previousCapability := ""
+	for index, fact := range d.Capabilities {
+		if err := fact.Validate(); err != nil {
+			return err
+		}
+		if fact.RuntimeGenerationID != d.RuntimeGenerationID {
+			return fmt.Errorf("capability runtime generation mismatch")
+		}
+		if index > 0 && fact.Capability <= previousCapability {
+			return fmt.Errorf("capabilities must be sorted and unique")
+		}
+		previousCapability = fact.Capability
+	}
+	if err := validateSortedUniqueNonemptyStrings(d.UsageCategories, "usage categories"); err != nil {
+		return err
+	}
+	previousPricing := ""
+	for index, price := range d.Pricing {
+		if err := price.Validate(); err != nil {
+			return err
+		}
+		if index > 0 && price.Category <= previousPricing {
+			return fmt.Errorf("pricing categories must be sorted and unique")
+		}
+		previousPricing = price.Category
+	}
+	return nil
 }
 
 type NegotiatedProviderPlanBody struct {
@@ -446,4 +530,47 @@ func oneContentDeltaValue(delta ContentDelta) bool {
 		return delta.Text == "" && delta.JSONFragment != ""
 	}
 	return false
+}
+
+func validCapability(capability string) bool {
+	switch capability {
+	case CapabilityTextInput, CapabilityTextOutput, CapabilityStreaming, CapabilityToolUse,
+		CapabilityStructuredOutput, CapabilityImageInput, CapabilityFileInput,
+		CapabilityReasoningSummary, CapabilityUsageReporting:
+		return true
+	default:
+		return false
+	}
+}
+
+func validDecimal(value string) bool {
+	if value == "" {
+		return false
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) > 2 || parts[0] == "" || (len(parts) == 2 && parts[1] == "") {
+		return false
+	}
+	for partIndex, part := range parts {
+		for index := range part {
+			if part[index] < '0' || part[index] > '9' {
+				return false
+			}
+		}
+		if partIndex == 0 && len(part) > 1 && part[0] == '0' {
+			return false
+		}
+	}
+	return true
+}
+
+func validateSortedUniqueNonemptyStrings(values []string, label string) error {
+	previous := ""
+	for index, value := range values {
+		if value == "" || (index > 0 && value <= previous) {
+			return fmt.Errorf("%s must be nonempty, sorted, and unique", label)
+		}
+		previous = value
+	}
+	return nil
 }

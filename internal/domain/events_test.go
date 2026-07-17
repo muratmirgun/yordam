@@ -57,6 +57,14 @@ func TestDurableEventV1WireEnvelopeRemainsExact(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("v1 envelope keys=%v want=%v", got, want)
 	}
+	const wantWire = `{"schema_version":1,"event_id":"event","session_id":"session","seq":1,"time":"1970-01-01T00:00:01Z","kind":"session.created","payload":{"workspace":"/tmp/app"}}`
+	if string(raw) != wantWire {
+		t.Fatalf("v1 envelope wire=%s want=%s", raw, wantWire)
+	}
+	typeOf := reflect.TypeOf(event)
+	if typeOf.NumField() != len(want) {
+		t.Fatalf("v1 envelope field count=%d want=%d", typeOf.NumField(), len(want))
+	}
 }
 
 func slicesSort(values []string) {

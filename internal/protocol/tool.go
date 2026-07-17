@@ -79,6 +79,30 @@ type ToolDescriptorBody struct {
 	Retry                string          `json:"retry"`
 }
 
+func (b ToolDescriptorBody) Validate() error {
+	if err := ValidateBounds(b); err != nil {
+		return err
+	}
+	if err := b.Identity.Validate(); err != nil {
+		return err
+	}
+	if b.SourceRevision == "" || b.DisplayName == "" || b.Description == "" || b.Effect == "" || b.Mutation == "" || b.ClassificationSource == "" || b.Idempotency == "" || b.Retry == "" {
+		return fmt.Errorf("tool descriptor body is incomplete")
+	}
+	if err := validateJSONObject(b.InputSchema, "input schema"); err != nil {
+		return err
+	}
+	if b.OutputSchema != nil {
+		if err := validateJSONObject(b.OutputSchema, "output schema"); err != nil {
+			return err
+		}
+	}
+	if len(b.ExecutionLoci) == 0 {
+		return fmt.Errorf("tool descriptor requires at least one execution locus")
+	}
+	return validateSortedUniqueNonemptyStrings(b.ExecutionLoci, "execution loci")
+}
+
 type ToolDescriptor struct {
 	Body             ToolDescriptorBody `json:"body"`
 	DescriptorDigest Digest             `json:"descriptor_digest"`
@@ -102,6 +126,52 @@ type ToolExposure struct {
 	CatalogRevision string             `json:"catalog_revision"`
 	Tools           []ExposedTool      `json:"tools"`
 	Aliases         []ToolAliasBinding `json:"aliases"`
+}
+
+func (e ToolExposure) Validate() error {
+	if err := ValidateBounds(e); err != nil {
+		return err
+	}
+	if e.CatalogRevision == "" || len(e.Tools) != len(e.Aliases) {
+		return fmt.Errorf("tool exposure is incomplete")
+	}
+	tools := make(map[string]ToolIdentity, len(e.Tools))
+	for _, tool := range e.Tools {
+		if tool.Alias == "" || tool.Description == "" {
+			return fmt.Errorf("exposed tool is incomplete")
+		}
+		if err := tool.Identity.Validate(); err != nil {
+			return err
+		}
+		if err := validateJSONObject(tool.InputSchema, "exposed tool input schema"); err != nil {
+			return err
+		}
+		if _, duplicate := tools[tool.Alias]; duplicate {
+			return fmt.Errorf("duplicate exposed tool alias %q", tool.Alias)
+		}
+		tools[tool.Alias] = tool.Identity
+	}
+	aliases := make(map[string]struct{}, len(e.Aliases))
+	for _, alias := range e.Aliases {
+		if alias.Alias == "" || alias.SourceRevision == "" {
+			return fmt.Errorf("tool alias binding is incomplete")
+		}
+		if err := alias.Identity.Validate(); err != nil {
+			return err
+		}
+		if err := alias.DescriptorDigest.Validate(); err != nil {
+			return err
+		}
+		if _, duplicate := aliases[alias.Alias]; duplicate {
+			return fmt.Errorf("duplicate tool alias binding %q", alias.Alias)
+		}
+		aliases[alias.Alias] = struct{}{}
+		identity, exists := tools[alias.Alias]
+		if !exists || identity != alias.Identity {
+			return fmt.Errorf("tool alias %q does not match exposed identity", alias.Alias)
+		}
+	}
+	return nil
 }
 
 type ActionPlanBody struct {
@@ -144,4 +214,15 @@ type ExecutionResult struct {
 	Outcome    ActivityOutcomeV1   `json:"outcome"`
 	ToolResult ToolResultBlock     `json:"tool_result"`
 	Evidence   []EvidenceCandidate `json:"evidence"`
+}
+
+func validateJSONObject(raw json.RawMessage, label string) error {
+	if err := ValidateRawJSON(raw); err != nil {
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return fmt.Errorf("%s must be a JSON object", label)
+	}
+	return nil
 }

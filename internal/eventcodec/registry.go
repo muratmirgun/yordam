@@ -63,7 +63,7 @@ func New(descriptors []Descriptor) (*Registry, error) {
 			return nil, fmt.Errorf("invalid event descriptor")
 		}
 		created := descriptor.New()
-		if created == nil || reflect.TypeOf(created).Kind() != reflect.Pointer {
+		if created == nil || reflect.TypeOf(created).Kind() != reflect.Pointer || reflect.ValueOf(created).IsNil() {
 			return nil, fmt.Errorf("descriptor %s@%d New must return a nonnil pointer", descriptor.Kind, descriptor.Version)
 		}
 		key := registryKey{kind: descriptor.Kind, version: descriptor.Version}
