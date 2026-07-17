@@ -36,9 +36,9 @@ func TestAppRejectsDraftBeforeTurnWhenRuntimeIsNotReady(t *testing.T) {
 	defer cancel()
 	go application.Run(ctx)
 
-	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "keep this draft"}
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, DraftID: 11, Prompt: "keep this draft"}
 	event := receiveEvent(t, application.Events())
-	if event.Kind != app.EventError || event.Draft != "keep this draft" || runs != 0 {
+	if event.Kind != app.EventError || event.DraftID != 11 || event.Draft != "keep this draft" || runs != 0 {
 		t.Fatalf("event=%+v runs=%d", event, runs)
 	}
 	if got := store.appendKinds(); len(got) != 0 {
@@ -60,9 +60,9 @@ func TestAppRejectedTurnReturnsDraft(t *testing.T) {
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "active"}
 	<-started
 	requireTurnAccepted(t, application.Events(), "active")
-	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "retry this"}
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, DraftID: 12, Prompt: "retry this"}
 	event := receiveEvent(t, application.Events())
-	if event.Kind != app.EventRejected || event.Draft != "retry this" {
+	if event.Kind != app.EventRejected || event.DraftID != 12 || event.Draft != "retry this" {
 		t.Fatalf("rejection=%+v", event)
 	}
 	close(release)

@@ -582,8 +582,8 @@ func TestAppBlocksTurnsAfterReplayRefreshFailure(t *testing.T) {
 	if event := receiveEvent(t, application.Events()); event.Kind != app.EventError || !strings.Contains(event.Message, "reload failed") {
 		t.Fatalf("refresh event=%+v", event)
 	}
-	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "must not use stale replay"}
-	if event := receiveEvent(t, application.Events()); event.Kind != app.EventRejected || !strings.Contains(event.Message, "context is unavailable") {
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, DraftID: 13, Prompt: "must not use stale replay"}
+	if event := receiveEvent(t, application.Events()); event.Kind != app.EventRejected || event.DraftID != 13 || event.Draft != "must not use stale replay" || !strings.Contains(event.Message, "context is unavailable") {
 		t.Fatalf("blocked event=%+v", event)
 	}
 	if runs != 1 {

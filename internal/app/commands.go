@@ -20,6 +20,7 @@ const (
 
 type Command struct {
 	Kind      CommandKind
+	DraftID   uint64
 	Prompt    string
 	CallID    string
 	Decision  domain.PermissionDecision

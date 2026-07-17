@@ -218,16 +218,16 @@ func (a *App) Run(ctx context.Context) error {
 			switch command.Kind {
 			case CommandStartTurn:
 				if !a.replayValid {
-					a.publish(ctx, Event{Kind: EventRejected, Message: "session context is unavailable until replay reload succeeds", Draft: command.Prompt})
+					a.publish(ctx, Event{Kind: EventRejected, DraftID: command.DraftID, Message: "session context is unavailable until replay reload succeeds", Draft: command.Prompt})
 					continue
 				}
 				if activeOperation != "" {
-					a.publish(ctx, Event{Kind: EventRejected, Message: "a turn is already active", Draft: command.Prompt})
+					a.publish(ctx, Event{Kind: EventRejected, DraftID: command.DraftID, Message: "a turn is already active", Draft: command.Prompt})
 					continue
 				}
 				activeSet := a.runtimeSet
 				if err := activeSet.Ready(a.session.Selection); err != nil {
-					a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), Draft: command.Prompt})
+					a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 					continue
 				}
 				input := agent.RunInput{Session: a.session, Replay: a.replay, Prompt: command.Prompt}
@@ -235,16 +235,16 @@ func (a *App) Run(ctx context.Context) error {
 					var err error
 					input, err = a.input(command.Prompt)
 					if err != nil {
-						a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error()})
+						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 						continue
 					}
 				}
 				if activeSet.Runtime == nil {
 					err := errors.New("runtime is not configured")
-					a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), Draft: command.Prompt})
+					a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 					continue
 				}
-				a.publish(ctx, Event{Kind: EventTurnAccepted, Draft: command.Prompt})
+				a.publish(ctx, Event{Kind: EventTurnAccepted, DraftID: command.DraftID, Draft: command.Prompt})
 				turnCtx, cancel := context.WithCancel(ctx)
 				activeCancel = cancel
 				activeOperation = operationTurn

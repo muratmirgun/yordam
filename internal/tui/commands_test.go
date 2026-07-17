@@ -61,18 +61,20 @@ func TestDraftRendersOnlyAfterTurnAcceptanceAndRestoresOnConfigError(t *testing.
 	if len(got) != 1 || got[0].Kind != app.CommandStartTurn || len(model.ConversationBlocksForTest()) != 0 {
 		t.Fatalf("commands=%v blocks=%v", got, model.ConversationBlocksForTest())
 	}
-	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnAccepted, Draft: "draft prompt"})
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnAccepted, DraftID: got[0].DraftID, Draft: "draft prompt"})
 	blocks := model.ConversationBlocksForTest()
 	if len(blocks) != 1 || blocks[0].Content != "draft prompt" {
 		t.Fatalf("accepted blocks=%v", blocks)
 	}
 
-	failed, _ := tui.NavigationModelForTest()
+	failed, failedCommands := tui.NavigationModelForTest()
 	failed = tui.SubmitForTest(failed, "retry me")
+	failedCommand := tui.CommandsForTest(failedCommands)[0]
 	failed = tui.ApplyAppEventForTest(failed, app.Event{
-		Kind:  app.EventError,
-		Err:   &domain.TypedError{Kind: domain.ErrorConfigurationInvalid, Message: "edit config and run /reload"},
-		Draft: "retry me",
+		Kind:    app.EventError,
+		DraftID: failedCommand.DraftID,
+		Err:     &domain.TypedError{Kind: domain.ErrorConfigurationInvalid, Message: "edit config and run /reload"},
+		Draft:   "retry me",
 	})
 	failedBlocks := failed.ConversationBlocksForTest()
 	if failed.ComposerValueForTest() != "retry me" || failed.TurnActiveForTest() || len(failedBlocks) != 1 || failedBlocks[0].Kind != components.BlockError || !strings.Contains(failedBlocks[0].Content, "edit config and run /reload") {
@@ -84,9 +86,10 @@ func TestDraftRendersOnlyAfterTurnAcceptanceAndRestoresOnConfigError(t *testing.
 }
 
 func TestTurnAcceptanceAppendsPendingDraftExactlyOnce(t *testing.T) {
-	model, _ := tui.NavigationModelForTest()
+	model, commands := tui.NavigationModelForTest()
 	model = tui.SubmitForTest(model, "configured secret")
-	accepted := app.Event{Kind: app.EventTurnAccepted, Draft: "[REDACTED]"}
+	command := tui.CommandsForTest(commands)[0]
+	accepted := app.Event{Kind: app.EventTurnAccepted, DraftID: command.DraftID, Draft: "[REDACTED]"}
 	model = tui.ApplyAppEventForTest(model, accepted)
 	model = tui.ApplyAppEventForTest(model, accepted)
 
@@ -99,16 +102,108 @@ func TestTurnAcceptanceAppendsPendingDraftExactlyOnce(t *testing.T) {
 func TestRejectedTurnRestoresPendingDraftAndUnlocksComposer(t *testing.T) {
 	model, commands := tui.NavigationModelForTest()
 	model = tui.SubmitForTest(model, "retry this draft")
-	if got := tui.CommandsForTest(commands); len(got) != 1 || got[0].Kind != app.CommandStartTurn {
+	got := tui.CommandsForTest(commands)
+	if len(got) != 1 || got[0].Kind != app.CommandStartTurn {
 		t.Fatalf("commands=%v", got)
 	}
-	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventRejected, Message: "session context is unavailable", Draft: "retry this draft"})
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventRejected, DraftID: got[0].DraftID, Message: "session context is unavailable", Draft: "retry this draft"})
 	if model.TurnActiveForTest() || model.ComposerValueForTest() != "retry this draft" {
 		t.Fatalf("active=%t composer=%q", model.TurnActiveForTest(), model.ComposerValueForTest())
 	}
 	model = tui.SubmitForTest(model, model.ComposerValueForTest())
 	if got := tui.CommandsForTest(commands); len(got) != 1 || got[0].Prompt != "retry this draft" {
 		t.Fatalf("retry commands=%v", got)
+	}
+}
+
+func TestDraftCorrelationIgnoresDelayedAcceptanceFromPriorTurn(t *testing.T) {
+	model, commands := tui.NavigationModelForTest()
+	model = tui.SubmitForTest(model, "draft A")
+	commandA := tui.CommandsForTest(commands)[0]
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnAccepted, DraftID: commandA.DraftID, Draft: "draft A"})
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnCompleted})
+
+	model = tui.SubmitForTest(model, "draft B")
+	commandB := tui.CommandsForTest(commands)[0]
+	if commandA.DraftID == 0 || commandB.DraftID == 0 || commandA.DraftID == commandB.DraftID {
+		t.Fatalf("draft IDs A=%d B=%d", commandA.DraftID, commandB.DraftID)
+	}
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnAccepted, DraftID: commandA.DraftID, Draft: "draft A"})
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnAccepted, DraftID: commandB.DraftID, Draft: "draft B"})
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnAccepted, DraftID: commandB.DraftID, Draft: "draft B"})
+
+	blocks := model.ConversationBlocksForTest()
+	if len(blocks) != 2 || blocks[0].Content != "draft A" || blocks[1].Content != "draft B" {
+		t.Fatalf("blocks=%v", blocks)
+	}
+}
+
+func TestMatchingTerminalErrorRestoresLocalDraftAndClearsCorrelation(t *testing.T) {
+	model, commands := tui.NavigationModelForTest()
+	model = tui.SubmitForTest(model, "draft B")
+	command := tui.CommandsForTest(commands)[0]
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventError, DraftID: command.DraftID, Err: errors.New("prepare failed")})
+
+	if model.TurnActiveForTest() || model.ComposerValueForTest() != "draft B" {
+		t.Fatalf("active=%t composer=%q", model.TurnActiveForTest(), model.ComposerValueForTest())
+	}
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnAccepted, DraftID: command.DraftID, Draft: "draft B"})
+	for _, block := range model.ConversationBlocksForTest() {
+		if block.Kind == components.BlockUser {
+			t.Fatalf("stale acceptance rendered after terminal error: %v", model.ConversationBlocksForTest())
+		}
+	}
+}
+
+func TestStaleDraftFailuresDoNotConsumeCurrentDraft(t *testing.T) {
+	tests := []struct {
+		name  string
+		event app.Event
+	}{
+		{name: "error", event: app.Event{Kind: app.EventError, Err: errors.New("stale error")}},
+		{name: "rejection", event: app.Event{Kind: app.EventRejected, Message: "stale rejection"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			model, commands := tui.NavigationModelForTest()
+			model = tui.SubmitForTest(model, "draft B")
+			command := tui.CommandsForTest(commands)[0]
+			test.event.DraftID = command.DraftID + 1
+			test.event.Draft = "stale draft"
+			model = tui.ApplyAppEventForTest(model, test.event)
+			if !model.TurnActiveForTest() || model.ComposerValueForTest() != "" {
+				t.Fatalf("stale event consumed draft: active=%t composer=%q", model.TurnActiveForTest(), model.ComposerValueForTest())
+			}
+			model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnAccepted, DraftID: command.DraftID, Draft: "draft B"})
+			blocks := model.ConversationBlocksForTest()
+			if blocks[len(blocks)-1].Kind != components.BlockUser || blocks[len(blocks)-1].Content != "draft B" {
+				t.Fatalf("real acceptance not rendered: %v", blocks)
+			}
+		})
+	}
+}
+
+func TestDraftIDExhaustionFailsClosedWithoutReusingAnID(t *testing.T) {
+	model, commands := tui.NavigationModelForTest()
+	model = tui.SetNextDraftIDForTest(model, ^uint64(0))
+	model = tui.SubmitForTest(model, "preserve this draft")
+
+	if got := tui.CommandsForTest(commands); len(got) != 0 {
+		t.Fatalf("exhausted command=%v", got)
+	}
+	blocks := model.ConversationBlocksForTest()
+	if model.TurnActiveForTest() || model.ComposerValueForTest() != "preserve this draft" || len(blocks) != 1 || !strings.Contains(blocks[0].Content, "restart Yordam") {
+		t.Fatalf("active=%t composer=%q blocks=%v", model.TurnActiveForTest(), model.ComposerValueForTest(), blocks)
+	}
+}
+
+func TestDraftIDZeroValueStartsAtOne(t *testing.T) {
+	model, commands := tui.NavigationModelForTest()
+	model = tui.SetNextDraftIDForTest(model, 0)
+	model = tui.SubmitForTest(model, "draft")
+
+	if got := tui.CommandsForTest(commands); len(got) != 1 || got[0].DraftID != 1 {
+		t.Fatalf("commands=%v", got)
 	}
 }
 
@@ -145,6 +240,14 @@ func TestReloadCompletionRefreshesModelsAndUnlocksComposer(t *testing.T) {
 
 func TestReloadFailurePreservesModelsAndSelectionWhileUnlocking(t *testing.T) {
 	model, commands := tui.NavigationModelForTest()
+	preservedSelection := domain.ModelSelection{Profile: "primary", Model: "model-b"}
+	model = tui.SubmitForTest(model, "/model")
+	model = tui.PressForTest(model, "down")
+	model = tui.PressForTest(model, "enter")
+	if got := tui.CommandsForTest(commands); len(got) != 1 || got[0].Kind != app.CommandChangeModel || got[0].Selection != preservedSelection {
+		t.Fatalf("model change commands=%v", got)
+	}
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventState, Selection: preservedSelection})
 	model = tui.SubmitForTest(model, "/reload")
 	if got := tui.CommandsForTest(commands); len(got) != 1 || got[0].Kind != app.CommandReloadConfig {
 		t.Fatalf("reload commands=%v", got)
@@ -157,8 +260,7 @@ func TestReloadFailurePreservesModelsAndSelectionWhileUnlocking(t *testing.T) {
 		Err:       errors.New("invalid reload"),
 	})
 
-	wantSelection := domain.ModelSelection{Profile: "primary", Model: "model-a"}
-	if model.TurnActiveForTest() || model.ComposerActiveForTest() || model.StatusSelectionForTest() != wantSelection || model.ModelCountForTest() != 2 {
+	if model.TurnActiveForTest() || model.ComposerActiveForTest() || model.StatusSelectionForTest() != preservedSelection || model.ModelCountForTest() != 2 {
 		t.Fatalf("active=%t composerActive=%t selection=%+v modelCount=%d", model.TurnActiveForTest(), model.ComposerActiveForTest(), model.StatusSelectionForTest(), model.ModelCountForTest())
 	}
 	blocks := model.ConversationBlocksForTest()
@@ -167,7 +269,7 @@ func TestReloadFailurePreservesModelsAndSelectionWhileUnlocking(t *testing.T) {
 	}
 	model = tui.SubmitForTest(model, "/model")
 	model = tui.PressForTest(model, "enter")
-	if got := tui.CommandsForTest(commands); len(got) != 1 || got[0].Kind != app.CommandChangeModel || got[0].Selection != wantSelection {
+	if got := tui.CommandsForTest(commands); len(got) != 1 || got[0].Kind != app.CommandChangeModel || got[0].Selection != preservedSelection {
 		t.Fatalf("preserved picker commands=%v", got)
 	}
 }

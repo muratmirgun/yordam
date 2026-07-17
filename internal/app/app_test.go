@@ -29,6 +29,40 @@ func TestAppOwnsRuntimeLifecycleThroughRuntimeSet(t *testing.T) {
 	}
 }
 
+func TestAppInputPreparationErrorReturnsCorrelatedDraft(t *testing.T) {
+	const configuredSecret = "input-draft-secret"
+	application := app.New(app.Options{
+		RuntimeSet: testRuntimeSet(&fakeRuntime{}),
+		Redactors:  secret.NewBinding(secret.New(configuredSecret)),
+		Input: func(string) (agent.RunInput, error) {
+			return agent.RunInput{}, errors.New("prepare input")
+		},
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go application.Run(ctx)
+
+	command := app.Command{Kind: app.CommandStartTurn, DraftID: 42, Prompt: configuredSecret}
+	application.Commands() <- command
+	event := receiveEvent(t, application.Events())
+	if event.Kind != app.EventError || event.Draft != "[REDACTED]" || event.DraftID != 42 {
+		t.Fatalf("event=%+v", event)
+	}
+}
+
+func TestAppRuntimeMissingErrorReturnsCorrelatedDraft(t *testing.T) {
+	application := app.New(app.Options{RuntimeSet: testRuntimeSet(nil)})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go application.Run(ctx)
+
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, DraftID: 43, Prompt: "keep runtime draft"}
+	event := receiveEvent(t, application.Events())
+	if event.Kind != app.EventError || event.DraftID != 43 || event.Draft != "keep runtime draft" || event.Message != "runtime is not configured" {
+		t.Fatalf("event=%+v", event)
+	}
+}
+
 func TestAppRedactsConfiguredSecretFromEveryPublishedEventField(t *testing.T) {
 	const configuredSecret = "configured-event-secret-sentinel"
 	runtimeEvents := make(chan agent.RuntimeEvent, 4)
@@ -121,9 +155,13 @@ func TestAppSnapshotsInputAndAllowsNextTurnAfterTerminal(t *testing.T) {
 	defer cancel()
 	go application.Run(ctx)
 
-	for _, prompt := range []string{"one", "two"} {
-		application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: prompt}
-		requireTurnAccepted(t, application.Events(), prompt)
+	for index, prompt := range []string{"one", "two"} {
+		draftID := uint64(index + 1)
+		application.Commands() <- app.Command{Kind: app.CommandStartTurn, DraftID: draftID, Prompt: prompt}
+		accepted := receiveEvent(t, application.Events())
+		if accepted.Kind != app.EventTurnAccepted || accepted.Draft != prompt || accepted.DraftID != draftID {
+			t.Fatalf("accepted=%+v", accepted)
+		}
 		if input := <-inputs; input.Prompt != "snapshot:"+prompt {
 			t.Fatalf("input prompt=%q", input.Prompt)
 		}
@@ -131,6 +169,20 @@ func TestAppSnapshotsInputAndAllowsNextTurnAfterTerminal(t *testing.T) {
 			t.Fatalf("terminal event=%+v", event)
 		}
 	}
+}
+
+func TestAppPreservesZeroDraftIDForDirectCallers(t *testing.T) {
+	application := app.New(app.Options{RuntimeSet: testRuntimeSet(&fakeRuntime{run: func(context.Context, agent.RunInput) error { return nil }})})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go application.Run(ctx)
+
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "direct caller"}
+	accepted := receiveEvent(t, application.Events())
+	if accepted.Kind != app.EventTurnAccepted || accepted.DraftID != 0 || accepted.Draft != "direct caller" {
+		t.Fatalf("accepted=%+v", accepted)
+	}
+	_ = receiveEvent(t, application.Events())
 }
 
 func TestAppPublishesBufferedRuntimeEventsBeforeTerminal(t *testing.T) {

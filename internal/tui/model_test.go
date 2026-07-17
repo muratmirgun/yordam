@@ -215,7 +215,7 @@ func TestComposerSubmitStartsTurnAndAppendsUserBlock(t *testing.T) {
 	if blocks := model.ConversationBlocksForTest(); len(blocks) != 0 {
 		t.Fatalf("unaccepted blocks=%+v", blocks)
 	}
-	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnAccepted, Draft: command.Prompt})
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnAccepted, DraftID: command.DraftID, Draft: command.Prompt})
 	blocks := model.ConversationBlocksForTest()
 	if len(blocks) != 1 || blocks[0].Kind != components.BlockUser || blocks[0].Content != "  inspect this  " {
 		t.Fatalf("blocks=%+v", blocks)
@@ -266,6 +266,37 @@ func TestConfiguredSecretPromptIsRedactedBeforeConversationRendering(t *testing.
 	blocks := model.ConversationBlocksForTest()
 	if len(blocks) != 1 || blocks[0].Content != "[REDACTED]" {
 		t.Fatal("conversation did not contain the redacted prompt")
+	}
+}
+
+func TestInputPreparationFailureRestoresCorrelatedSanitizedDraft(t *testing.T) {
+	const configuredSecret = "input-failure-tui-secret"
+	application := app.New(app.Options{
+		RuntimeSet: app.RuntimeSet{
+			Runtime:        tuiRuntimeFunc(func(context.Context, agent.RunInput) error { return nil }),
+			Models:         []domain.ModelSelection{{}},
+			Credentials:    map[string]string{"": "configured"},
+			CredentialEnvs: map[string]string{"": "TEST_KEY"},
+		},
+		Redactors: secret.NewBinding(secret.New(configuredSecret)),
+		Input: func(string) (agent.RunInput, error) {
+			return agent.RunInput{}, fmt.Errorf("prepare input")
+		},
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go application.Run(ctx)
+
+	events := application.Events()
+	model := tui.NewModel(tui.Options{Commands: application.Commands(), Events: events})
+	model = tui.SubmitForTest(model, configuredSecret)
+	event := <-events
+	if event.Kind != app.EventError || event.DraftID == 0 || event.Draft != "[REDACTED]" {
+		t.Fatalf("event=%+v", event)
+	}
+	model = tui.ApplyAppEventForTest(model, event)
+	if model.TurnActiveForTest() || model.ComposerValueForTest() != "[REDACTED]" || strings.Contains(model.View().Content, configuredSecret) {
+		t.Fatalf("active=%t composer=%q view=%q", model.TurnActiveForTest(), model.ComposerValueForTest(), model.View().Content)
 	}
 }
 
