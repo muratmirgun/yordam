@@ -107,15 +107,30 @@ func TestLoggerUsesCurrentRedactorBinding(t *testing.T) {
 	var destination bytes.Buffer
 	binding := secret.NewBinding(secret.New("old-secret"))
 	logger := logging.New(&destination, binding)
-	if err := logger.Event("old", map[string]any{"message": "old-secret"}); err != nil {
+	if err := logger.Event("old-secret", map[string]any{"message": "old-secret new-secret"}); err != nil {
 		t.Fatal(err)
 	}
 	binding.Replace(secret.New("new-secret"))
-	if err := logger.Event("new", map[string]any{"message": "new-secret"}); err != nil {
+	if err := logger.Event("new-secret", map[string]any{"message": "old-secret new-secret"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := destination.String(); strings.Contains(got, "old-secret") || strings.Contains(got, "new-secret") || strings.Count(got, "[REDACTED]") != 2 {
-		t.Fatalf("unsafe dynamic log=%q", got)
+
+	lines := bytes.Split(bytes.TrimSpace(destination.Bytes()), []byte{'\n'})
+	if len(lines) != 2 {
+		t.Fatalf("lines=%d log=%q", len(lines), destination.String())
+	}
+	wantMessages := []string{"[REDACTED] new-secret", "old-secret [REDACTED]"}
+	for index, line := range lines {
+		var event struct {
+			Event   string `json:"event"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatalf("line %d: %v", index, err)
+		}
+		if event.Event != "[REDACTED]" || event.Message != wantMessages[index] {
+			t.Fatalf("line %d event=%+v want message=%q", index, event, wantMessages[index])
+		}
 	}
 }
 

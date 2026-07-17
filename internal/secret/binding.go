@@ -16,6 +16,9 @@ type Binding struct {
 	current Redactor
 }
 
+var _ Redacting = Redactor{}
+var _ Redacting = (*Binding)(nil)
+
 func NewBinding(initial Redactor) *Binding { return &Binding{current: initial} }
 
 func (b *Binding) Replace(next Redactor) {

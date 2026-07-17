@@ -151,6 +151,16 @@ func TestBufferSnapshotIsThreadSafeAndBounded(t *testing.T) {
 	wait.Wait()
 }
 
+func TestBufferUsesSafeDefaultWhenRedactorIsNil(t *testing.T) {
+	buffer := output.New(output.Options{Redact: nil})
+	if written, err := buffer.Write([]byte("unconfigured value")); err != nil || written != len("unconfigured value") {
+		t.Fatalf("write=(%d, %v)", written, err)
+	}
+	if got, truncated := buffer.Snapshot(); got != "unconfigured value" || truncated {
+		t.Fatalf("snapshot=(%q, %v)", got, truncated)
+	}
+}
+
 func TestBufferKeepsImmutableRedactorSnapshot(t *testing.T) {
 	binding := secret.NewBinding(secret.New("old-secret"))
 	oldBuffer := output.New(output.Options{Redact: binding.Snapshot()})

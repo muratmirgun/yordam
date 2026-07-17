@@ -1,7 +1,8 @@
 package secret_test
 
 import (
-	"bytes"
+	"encoding/json"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -11,38 +12,90 @@ import (
 func TestBindingReplacesCurrentRedactorAndPreservesSnapshots(t *testing.T) {
 	binding := secret.NewBinding(secret.New("old-secret"))
 	snapshot := binding.Snapshot()
-	if got := binding.String("old-secret"); got != "[REDACTED]" {
-		t.Fatalf("old binding=%q", got)
-	}
+	assertRedactionMethods(t, binding, "old-secret new-secret", "[REDACTED] new-secret")
+
 	binding.Replace(secret.New("new-secret"))
-	if got := binding.String("new-secret"); got != "[REDACTED]" {
-		t.Fatalf("new binding=%q", got)
-	}
-	if got := snapshot.String("old-secret new-secret"); got != "[REDACTED] new-secret" {
-		t.Fatalf("snapshot changed=%q", got)
-	}
+	assertRedactionMethods(t, binding, "old-secret new-secret", "old-secret [REDACTED]")
+	assertRedactionMethods(t, snapshot, "old-secret new-secret", "[REDACTED] new-secret")
 }
 
 func TestBindingRedactionMethodsAreSafeDuringReplacement(t *testing.T) {
 	binding := secret.NewBinding(secret.New("alpha"))
-	var wait sync.WaitGroup
-	for range 32 {
-		wait.Add(1)
+	redactors := []secret.Redactor{secret.New("alpha"), secret.New("beta")}
+	start := make(chan struct{})
+	done := make(chan struct{})
+
+	var readers sync.WaitGroup
+	for range 100 {
+		readers.Add(1)
 		go func() {
-			defer wait.Done()
+			defer readers.Done()
+			<-start
 			for range 100 {
-				_ = binding.String("alpha beta")
-				_ = binding.Bytes([]byte("alpha beta"))
-				raw, err := binding.JSON(map[string]string{"value": "alpha beta"})
-				if err != nil || !bytes.Contains(raw, []byte("[REDACTED]")) && !bytes.Contains(raw, []byte("alpha")) {
-					t.Errorf("JSON=%s err=%v", raw, err)
+				if got := binding.String("alpha beta"); !validConcurrentRedaction(got) {
+					t.Errorf("String=%q", got)
+				}
+				if got := string(binding.Bytes([]byte("alpha beta"))); !validConcurrentRedaction(got) {
+					t.Errorf("Bytes=%q", got)
+				}
+				raw, err := binding.JSON("alpha beta")
+				var got string
+				if err != nil {
+					t.Errorf("JSON error=%v", err)
+				} else if err := json.Unmarshal(raw, &got); err != nil {
+					t.Errorf("JSON=%s error=%v", raw, err)
+				} else if !validConcurrentRedaction(got) {
+					t.Errorf("JSON value=%q", got)
 				}
 			}
 		}()
 	}
-	for range 100 {
-		binding.Replace(secret.New("alpha"))
-		binding.Replace(secret.New("beta"))
+
+	var replacer sync.WaitGroup
+	replacer.Add(1)
+	go func() {
+		defer replacer.Done()
+		<-start
+		for {
+			for _, redactor := range redactors {
+				select {
+				case <-done:
+					return
+				default:
+					binding.Replace(redactor)
+				}
+			}
+			runtime.Gosched()
+		}
+	}()
+
+	close(start)
+	readers.Wait()
+	close(done)
+	replacer.Wait()
+}
+
+func assertRedactionMethods(t *testing.T, redactor secret.Redacting, value, want string) {
+	t.Helper()
+	if got := redactor.String(value); got != want {
+		t.Errorf("String=%q want=%q", got, want)
 	}
-	wait.Wait()
+	if got := string(redactor.Bytes([]byte(value))); got != want {
+		t.Errorf("Bytes=%q want=%q", got, want)
+	}
+	raw, err := redactor.JSON(value)
+	if err != nil {
+		t.Fatalf("JSON error=%v", err)
+	}
+	var got string
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("JSON=%s error=%v", raw, err)
+	}
+	if got != want {
+		t.Errorf("JSON value=%q want=%q", got, want)
+	}
+}
+
+func validConcurrentRedaction(value string) bool {
+	return value == "[REDACTED] beta" || value == "alpha [REDACTED]"
 }
