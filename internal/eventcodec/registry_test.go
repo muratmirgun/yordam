@@ -118,6 +118,25 @@ func registryAuthorizationDecision() protocol.AuthorizationDecidedV1 {
 	}}
 }
 
+func registryControlAuthorizationDecision() protocol.AuthorizationDecidedV1 {
+	digest := testDigest('a')
+	source := protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "reload"}
+	resource := protocol.ResourceTarget{Kind: "workspace", CanonicalID: "workspace"}
+	request := protocol.AuthorizationRequest{
+		RequestID: "control-request", Principal: protocol.ActorRef{ID: "user", Kind: protocol.ActorUser}, Actor: protocol.ActorRef{ID: "control-actor", Kind: protocol.ActorControl},
+		ControlOperationID: "control", TaskID: "task", TurnID: "turn", ActivityID: "causation-activity", CallID: "control-call", QueueID: "control-queue",
+		Source: source, SourceRevision: "r1", DescriptorDigest: digest, Action: "reload", Resources: []protocol.ResourceTarget{resource}, ExecutionLocus: "builtin",
+		RequestedProfile: "restricted", EffectiveProfile: "restricted", Effect: "observation", Boundary: "workspace", Reversibility: "not_applicable", VerificationCoverage: "full",
+		RuntimeGenerationID: "generation", PolicyGeneration: "policy-r1", PolicyProvenance: []protocol.PolicyProvenance{{Source: "platform", Revision: "r1", Generation: "policy-r1"}},
+		PlanDigest: digest, RequestDigest: digest, DispatchDigest: digest,
+	}
+	return protocol.AuthorizationDecidedV1{Decision: protocol.AuthorizationDecision{
+		Request: request, Action: "allow", Scope: protocol.CanonicalAuthorizationScope{Capability: "reload", Source: source, Resources: []protocol.ResourceTarget{resource}, Constraints: []protocol.AuthorizationConstraint{}},
+		Constraints: []protocol.AuthorizationConstraint{}, Lifetime: protocol.AuthorizationLifetimeOnce, PolicySource: "platform", PolicyGeneration: "policy-r1", Reason: "allowed",
+		DecidedAt: time.Unix(1, 0).UTC(), PlanDigest: digest, DecisionNonce: "control-nonce",
+	}}
+}
+
 func registryDecisionEnvelope(t *testing.T, decision protocol.AuthorizationDecidedV1) protocol.EventEnvelope {
 	t.Helper()
 	payload, err := json.Marshal(decision)
@@ -373,6 +392,59 @@ func TestValidateAuthorizationConsumptionMatchesDecisionAndStartBindings(t *test
 	wrongVersion.PayloadVersion = 2
 	if err := eventcodec.ValidateAuthorizationConsumption(consumed, wrongVersion, decision, started); err == nil {
 		t.Fatal("unsupported decision payload version accepted")
+	}
+}
+
+func TestControlAuthorizationConsumptionPreservesEnvelopeCausation(t *testing.T) {
+	t.Parallel()
+	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := testDigest('a')
+	decision := registryControlAuthorizationDecision()
+	decisionDigest, err := canonicaljson.Digest(decision.Decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumed := protocol.AuthorizationDecisionConsumedV1{
+		DecisionNonce: "control-nonce", DecisionEventID: "control-decision-event", DecisionDigest: decisionDigest, RequestID: "control-request",
+		ControlOperationID: "control", CallID: "control-call", PlanDigest: digest, RequestDigest: digest, DispatchDigest: digest, RuntimeGenerationID: "generation",
+	}
+	consumedRecord, err := registry.Decode(envelopeFor(t, protocol.EventEnvelope{
+		JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", Kind: protocol.EventAuthorizationDecisionConsumed,
+		TaskID: "task", TurnID: "turn", ActivityID: "causation-activity", RuntimeGenerationID: "generation",
+	}, consumed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Validate(consumedRecord); err != nil {
+		t.Fatalf("control consumption rejected independent envelope causation: %v", err)
+	}
+
+	decisionPayload, err := json.Marshal(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decisionEnvelope := protocol.EventEnvelope{
+		SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1, JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", EventID: "control-decision-event",
+		Seq: 1, Time: time.Unix(1, 0).UTC(), Kind: protocol.EventAuthorizationDecided, TaskID: "task", TurnID: "turn", ActivityID: "causation-activity",
+		RuntimeGenerationID: "generation", TransactionID: "transaction", Payload: decisionPayload,
+	}
+	started := protocol.ControlOperationStartedV1{ControlOperationID: "control", DecisionEventID: "control-decision-event", DecisionNonce: "control-nonce", PlanDigest: digest, RequestDigest: digest, DispatchDigest: digest, RuntimeGenerationID: "generation"}
+	if err := eventcodec.ValidateAuthorizationConsumption(consumed, decisionEnvelope, decision, started); err != nil {
+		t.Fatalf("valid control consumption rejected: %v", err)
+	}
+
+	omitted := consumed
+	omitted.ControlOperationID = ""
+	if err := eventcodec.ValidateAuthorizationConsumption(omitted, decisionEnvelope, decision, started); err == nil {
+		t.Fatal("control consumption without control-operation target accepted")
+	}
+	mismatched := consumed
+	mismatched.ControlOperationID = "other"
+	if err := eventcodec.ValidateAuthorizationConsumption(mismatched, decisionEnvelope, decision, started); err == nil {
+		t.Fatal("control consumption with mismatched control-operation target accepted")
 	}
 }
 

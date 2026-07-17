@@ -363,3 +363,70 @@ git diff --check
 ```
 
 The review fix changes only Task 1-owned protocol/codec/tests plus this ignored implementation report; config, schema, reload behavior, and the SDD ledger remain untouched.
+
+## Second Re-review Closure (2026-07-18)
+
+The second independent pass identified two remaining branch/kind union gaps. Both were reproduced before production changes and fixed without changing wire DTOs.
+
+### Control-consumption branch RED/GREEN
+
+RED:
+
+```text
+go test ./internal/eventcodec -run TestControlAuthorizationConsumptionPreservesEnvelopeCausation -count=1 -v
+control consumption rejected independent envelope causation: authorization.decision_consumed activity ID does not match envelope
+FAIL
+```
+
+The registry identity rule now compares `ActivityID` only for the session/activity target branch. The control target branch keeps `AuthorizationDecisionConsumedV1.ActivityID` empty, binds `ControlOperationID`, and permits independent optional task/turn/activity causation in the workspace-control envelope. Cross-record validation likewise compares activity only on the activity branch and control-operation ID only on the control branch. The positive fixture carries task/turn/activity causation in the committed control decision and envelope, consumes by `ControlOperationID`, and binds a `ControlOperationStartedV1`. Missing and mismatched control-operation targets are rejected.
+
+GREEN:
+
+```text
+go test ./internal/eventcodec -run TestControlAuthorizationConsumptionPreservesEnvelopeCausation -count=1 -v
+PASS
+ok github.com/muratmirgun/yordam/internal/eventcodec 0.267s
+```
+
+### Kind-centric application correlation RED/GREEN
+
+RED:
+
+```text
+go test ./internal/protocol -run TestApplicationEventUsesKindAwareWorkspaceControlCorrelation -count=1 -v
+session-labeled control-operation application event accepted
+FAIL
+```
+
+`ApplicationEvent.Validate` now treats every `control_operation.*` event kind as workspace-control-only and requires a nonempty `ControlOperationID`, independent of the correlation's claimed journal kind. Valid workspace events retain optional task/turn/activity causation; non-operation workspace events may still omit the operation ID.
+
+GREEN:
+
+```text
+go test ./internal/protocol -run TestApplicationEventUsesKindAwareWorkspaceControlCorrelation -count=1 -v
+PASS
+ok github.com/muratmirgun/yordam/internal/protocol 0.258s
+```
+
+Fresh second re-review gates:
+
+```text
+go test ./internal/canonicaljson ./internal/protocol ./internal/eventcodec ./internal/domain -count=1
+ok github.com/muratmirgun/yordam/internal/canonicaljson 0.268s
+ok github.com/muratmirgun/yordam/internal/protocol      0.197s
+ok github.com/muratmirgun/yordam/internal/eventcodec    0.209s
+ok github.com/muratmirgun/yordam/internal/domain        0.186s
+
+go test -race ./internal/canonicaljson ./internal/protocol ./internal/eventcodec ./internal/domain -count=1
+ok github.com/muratmirgun/yordam/internal/canonicaljson 1.382s
+ok github.com/muratmirgun/yordam/internal/protocol      1.306s
+ok github.com/muratmirgun/yordam/internal/eventcodec    1.480s
+ok github.com/muratmirgun/yordam/internal/domain        1.124s
+
+go test ./...
+go test -race ./...
+go vet ./...
+git diff --check
+```
+
+All repository gates exited zero.

@@ -345,6 +345,12 @@ func TestApplicationEventUsesKindAwareWorkspaceControlCorrelation(t *testing.T) 
 		t.Fatalf("non-operation workspace event without control-operation ID rejected: %v", err)
 	}
 
+	event.Kind = protocol.EventControlOperationStarted
+	event.Correlation = protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: "session", SessionID: "session"}
+	if err := event.Validate(); err == nil {
+		t.Fatal("session-labeled control-operation application event accepted")
+	}
+
 	event.Correlation = protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: "session", SessionID: "session", ControlOperationID: "control"}
 	if err := event.Validate(); err == nil {
 		t.Fatal("session application event with control-operation ID accepted")

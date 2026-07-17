@@ -611,8 +611,12 @@ func ValidateAuthorizationConsumption(consumed protocol.AuthorizationDecisionCon
 	if consumed.DecisionEventID != decisionEnvelope.EventID || consumed.DecisionNonce != committed.Decision.DecisionNonce || consumed.DecisionDigest != decisionDigest || consumed.RequestID != request.RequestID || consumed.CallID != request.CallID || consumed.PlanDigest != request.PlanDigest || consumed.RequestDigest != request.RequestDigest || consumed.DispatchDigest != request.DispatchDigest || consumed.RuntimeGenerationID != request.RuntimeGenerationID {
 		return fmt.Errorf("authorization consumption does not match committed decision bindings")
 	}
-	if consumed.ActivityID != request.ActivityID || consumed.ControlOperationID != request.ControlOperationID {
-		return fmt.Errorf("authorization consumption correlation does not match decision request")
+	if consumed.ControlOperationID != "" {
+		if request.ControlOperationID == "" || consumed.ControlOperationID != request.ControlOperationID {
+			return fmt.Errorf("authorization consumption control-operation target does not match decision request")
+		}
+	} else if request.ControlOperationID != "" || consumed.ActivityID != request.ActivityID {
+		return fmt.Errorf("authorization consumption activity target does not match decision request")
 	}
 	switch value := started.(type) {
 	case protocol.ActivityStartedV1:
@@ -793,8 +797,10 @@ func validateEnvelopeIdentity(envelope protocol.EventEnvelope, payload any) erro
 	case *protocol.AuthorizationDecidedV1:
 		return validateAuthorizationEnvelopeIdentities(envelope, value.Decision.Request)
 	case *protocol.AuthorizationDecisionConsumedV1:
-		if err := requireRepeatedIdentity("authorization.decision_consumed activity ID", string(envelope.ActivityID), string(value.ActivityID)); err != nil {
-			return err
+		if value.ActivityID != "" {
+			if err := requireRepeatedIdentity("authorization.decision_consumed activity ID", string(envelope.ActivityID), string(value.ActivityID)); err != nil {
+				return err
+			}
 		}
 		return requireRepeatedIdentity("authorization.decision_consumed runtime generation ID", string(envelope.RuntimeGenerationID), string(value.RuntimeGenerationID))
 	case *protocol.EvidenceRecordedV1:

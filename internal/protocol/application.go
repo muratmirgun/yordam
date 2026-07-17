@@ -133,8 +133,8 @@ func (e ApplicationEvent) Validate() error {
 	if err := e.Correlation.Validate(); err != nil {
 		return err
 	}
-	if e.Correlation.JournalKind == JournalWorkspaceControl && isControlOperationEventKind(e.Kind) && e.Correlation.ControlOperationID == "" {
-		return fmt.Errorf("control-operation application event requires control-operation ID")
+	if isControlOperationEventKind(e.Kind) && (e.Correlation.JournalKind != JournalWorkspaceControl || e.Correlation.ControlOperationID == "") {
+		return fmt.Errorf("control-operation application event requires workspace-control journal and control-operation ID")
 	}
 	return ValidateRawJSON(e.Payload)
 }
