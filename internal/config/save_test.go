@@ -118,6 +118,8 @@ func TestEnsureGlobalRemovesOnlyAbandonedTemporary(t *testing.T) {
 	abandoned := filepath.Join(directory, ".config-abandoned.tmp")
 	recent := filepath.Join(directory, ".config-recent.tmp")
 	nonmatching := filepath.Join(directory, ".config-keep.txt")
+	matchingDirectory := filepath.Join(directory, ".config-directory.tmp")
+	matchingSymlink := filepath.Join(directory, ".config-symlink.tmp")
 	if err := os.WriteFile(abandoned, []byte("stale"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -133,6 +135,12 @@ func TestEnsureGlobalRemovesOnlyAbandonedTemporary(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := os.Mkdir(matchingDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(nonmatching, matchingSymlink); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := config.EnsureGlobal(); err != nil {
 		t.Fatal(err)
 	}
@@ -145,6 +153,11 @@ func TestEnsureGlobalRemovesOnlyAbandonedTemporary(t *testing.T) {
 	} {
 		if raw, err := os.ReadFile(path); err != nil || string(raw) != want {
 			t.Fatalf("preserved file %q changed: raw=%q err=%v", path, raw, err)
+		}
+	}
+	for _, path := range []string{matchingDirectory, matchingSymlink} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("matching nonregular entry %q changed: %v", path, err)
 		}
 	}
 }

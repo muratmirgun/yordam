@@ -45,6 +45,14 @@ var defaultTemplate = []byte(`{
 `)
 
 func EnsureGlobal() (path string, created bool, err error) {
+	return ensureGlobal(os.Link, os.Remove, syncDirectory)
+}
+
+func ensureGlobal(
+	linkFile func(string, string) error,
+	removeFile func(string) error,
+	syncDir func(string) error,
+) (path string, created bool, err error) {
 	saveMu.Lock()
 	defer saveMu.Unlock()
 	path, err = DefaultConfigPath()
@@ -72,9 +80,12 @@ func EnsureGlobal() (path string, created bool, err error) {
 		return "", false, err
 	}
 	temporaryPath := temporary.Name()
+	temporaryClosed := false
 	defer func() {
-		_ = temporary.Close()
-		_ = os.Remove(temporaryPath)
+		if !temporaryClosed {
+			err = errors.Join(err, temporary.Close())
+		}
+		err = errors.Join(err, removeConfigTemporary(temporaryPath, directory, removeFile, syncDir))
 	}()
 	if err := temporary.Chmod(0o600); err != nil {
 		return "", false, err
@@ -85,19 +96,15 @@ func EnsureGlobal() (path string, created bool, err error) {
 	if err := temporary.Sync(); err != nil {
 		return "", false, err
 	}
-	if err := temporary.Close(); err != nil {
-		return "", false, err
+	closeErr := temporary.Close()
+	temporaryClosed = true
+	if closeErr != nil {
+		return "", false, closeErr
 	}
-	if err := os.Link(temporaryPath, path); err != nil {
+	if err := linkFile(temporaryPath, path); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return path, false, nil
 		}
-		return "", false, err
-	}
-	if err := os.Remove(temporaryPath); err != nil && !os.IsNotExist(err) {
-		return "", false, err
-	}
-	if err := syncDirectory(directory); err != nil {
 		return "", false, err
 	}
 	return path, true, nil
@@ -128,10 +135,14 @@ func SaveGlobal(path string, cfg Config) (err error) {
 		return err
 	}
 	temporaryPath := temporary.Name()
+	temporaryClosed := false
+	temporaryMoved := false
 	defer func() {
-		_ = temporary.Close()
-		if err != nil {
-			_ = os.Remove(temporaryPath)
+		if !temporaryClosed {
+			err = errors.Join(err, temporary.Close())
+		}
+		if !temporaryMoved {
+			err = errors.Join(err, removeConfigTemporary(temporaryPath, directory, os.Remove, syncDirectory))
 		}
 	}()
 	if err = temporary.Chmod(0o600); err != nil {
@@ -143,18 +154,16 @@ func SaveGlobal(path string, cfg Config) (err error) {
 	if err = temporary.Sync(); err != nil {
 		return err
 	}
-	if err = temporary.Close(); err != nil {
-		return err
+	closeErr := temporary.Close()
+	temporaryClosed = true
+	if closeErr != nil {
+		return closeErr
 	}
 	if err = os.Rename(temporaryPath, path); err != nil {
 		return err
 	}
-	directoryFile, err := os.Open(directory)
-	if err != nil {
-		return err
-	}
-	defer directoryFile.Close()
-	return directoryFile.Sync()
+	temporaryMoved = true
+	return syncDirectory(directory)
 }
 
 func marshalConfig(cfg Config) ([]byte, error) {
@@ -195,19 +204,20 @@ func cleanupConfigTemporaries(directory string) error {
 	removed := false
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.Type().IsRegular() && strings.HasPrefix(name, ".config-") && strings.HasSuffix(name, ".tmp") {
-			info, err := entry.Info()
-			if err != nil {
-				return err
-			}
-			if time.Since(info.ModTime()) < abandonedTemporaryAge {
-				continue
-			}
-			if err := os.Remove(filepath.Join(directory, name)); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-			removed = true
+		if !strings.HasPrefix(name, ".config-") || !strings.HasSuffix(name, ".tmp") {
+			continue
 		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || time.Since(info.ModTime()) < abandonedTemporaryAge {
+			continue
+		}
+		if err := os.Remove(filepath.Join(directory, name)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		removed = true
 	}
 	if !removed {
 		return nil
@@ -225,4 +235,17 @@ func syncDirectory(directory string) error {
 		return err
 	}
 	return errors.Join(directoryFile.Sync(), directoryFile.Close())
+}
+
+func removeConfigTemporary(
+	temporaryPath string,
+	directory string,
+	removeFile func(string) error,
+	syncDir func(string) error,
+) error {
+	removeErr := removeFile(temporaryPath)
+	if errors.Is(removeErr, os.ErrNotExist) {
+		removeErr = nil
+	}
+	return errors.Join(removeErr, syncDir(directory))
 }
