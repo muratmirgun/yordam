@@ -32,51 +32,44 @@ type EventLogger interface {
 }
 
 type Options struct {
-	RuntimeSet       RuntimeSet
-	ReloadRuntime    ReloadRuntime
-	Redactors        *secret.Binding
-	Runtime          Runtime
-	Input            TurnInput
-	Compact          func(context.Context) error
-	CompactSession   CompactSession
-	RuntimeEvents    <-chan agent.RuntimeEvent
-	Sessions         ports.SessionStore
-	Session          domain.Session
-	Replay           domain.SessionReplay
-	Workspace        domain.Workspace
-	Policy           MutablePolicy
-	RestorePolicy    RestorePolicy
-	ConfiguredModels []domain.ModelSelection
-	CommandBuffer    int
-	EventBuffer      int
-	Logger           EventLogger
-	Close            func() error
-	SessionChanged   func(string)
+	RuntimeSet     RuntimeSet
+	ReloadRuntime  ReloadRuntime
+	Redactors      *secret.Binding
+	Input          TurnInput
+	Compact        func(context.Context) error
+	RuntimeEvents  <-chan agent.RuntimeEvent
+	Sessions       ports.SessionStore
+	Session        domain.Session
+	Replay         domain.SessionReplay
+	Workspace      domain.Workspace
+	Policy         MutablePolicy
+	RestorePolicy  RestorePolicy
+	CommandBuffer  int
+	EventBuffer    int
+	Logger         EventLogger
+	Close          func() error
+	SessionChanged func(string)
 }
 
 type App struct {
-	runtimeSet       RuntimeSet
-	reloadRuntime    ReloadRuntime
-	redactors        *secret.Binding
-	runtime          Runtime
-	input            TurnInput
-	compact          func(context.Context) error
-	compactSession   CompactSession
-	runtimeEvents    <-chan agent.RuntimeEvent
-	sessions         ports.SessionStore
-	session          domain.Session
-	replay           domain.SessionReplay
-	replayValid      bool
-	workspace        domain.Workspace
-	policy           MutablePolicy
-	restorePolicy    RestorePolicy
-	configuredModels []domain.ModelSelection
-	commands         chan Command
-	events           chan Event
-	logger           EventLogger
-	close            func() error
-	sessionChanged   func(string)
-	emitTurnAccepted bool
+	runtimeSet     RuntimeSet
+	reloadRuntime  ReloadRuntime
+	redactors      *secret.Binding
+	input          TurnInput
+	compact        func(context.Context) error
+	runtimeEvents  <-chan agent.RuntimeEvent
+	sessions       ports.SessionStore
+	session        domain.Session
+	replay         domain.SessionReplay
+	replayValid    bool
+	workspace      domain.Workspace
+	policy         MutablePolicy
+	restorePolicy  RestorePolicy
+	commands       chan Command
+	events         chan Event
+	logger         EventLogger
+	close          func() error
+	sessionChanged func(string)
 
 	pendingMu  sync.Mutex
 	pending    map[string]chan domain.PermissionDecision
@@ -105,48 +98,31 @@ func New(options Options) *App {
 		workspace = options.Session.Workspace
 	}
 	runtimeSet := options.RuntimeSet
-	emitTurnAccepted := runtimeSet.Runtime != nil || runtimeSet.ConfigurationError != nil
-	if runtimeSet.Runtime == nil && (options.Runtime != nil || options.Compact != nil || options.CompactSession != nil || len(options.ConfiguredModels) > 0) {
-		runtimeSet = RuntimeSet{
-			Runtime:          options.Runtime,
-			CompactSession:   options.CompactSession,
-			Models:           append([]domain.ModelSelection(nil), options.ConfiguredModels...),
-			DefaultSelection: options.Session.Selection,
-			unchecked:        true,
-		}
-	}
-	if runtimeSet.CompactSession == nil && options.CompactSession != nil {
-		runtimeSet.CompactSession = options.CompactSession
-	}
 	redactors := options.Redactors
 	if redactors == nil {
-		redactors = secret.NewBinding(runtimeSet.Redactor)
+		redactors = secret.NewBinding(secret.New())
 	}
 	application := &App{
-		runtimeSet:       runtimeSet,
-		reloadRuntime:    options.ReloadRuntime,
-		redactors:        redactors,
-		runtime:          options.Runtime,
-		input:            options.Input,
-		compact:          options.Compact,
-		compactSession:   options.CompactSession,
-		runtimeEvents:    options.RuntimeEvents,
-		sessions:         options.Sessions,
-		session:          options.Session,
-		replay:           options.Replay,
-		replayValid:      true,
-		workspace:        workspace,
-		policy:           options.Policy,
-		restorePolicy:    options.RestorePolicy,
-		configuredModels: append([]domain.ModelSelection(nil), options.ConfiguredModels...),
-		commands:         make(chan Command, options.CommandBuffer),
-		events:           make(chan Event, options.EventBuffer),
-		logger:           options.Logger,
-		close:            options.Close,
-		sessionChanged:   options.SessionChanged,
-		emitTurnAccepted: emitTurnAccepted,
-		pending:          make(map[string]chan domain.PermissionDecision),
-		eventWake:        make(chan struct{}, 1),
+		runtimeSet:     runtimeSet,
+		reloadRuntime:  options.ReloadRuntime,
+		redactors:      redactors,
+		input:          options.Input,
+		compact:        options.Compact,
+		runtimeEvents:  options.RuntimeEvents,
+		sessions:       options.Sessions,
+		session:        options.Session,
+		replay:         options.Replay,
+		replayValid:    true,
+		workspace:      workspace,
+		policy:         options.Policy,
+		restorePolicy:  options.RestorePolicy,
+		commands:       make(chan Command, options.CommandBuffer),
+		events:         make(chan Event, options.EventBuffer),
+		logger:         options.Logger,
+		close:          options.Close,
+		sessionChanged: options.SessionChanged,
+		pending:        make(map[string]chan domain.PermissionDecision),
+		eventWake:      make(chan struct{}, 1),
 	}
 	runtimeSet.BindApprover(application)
 	return application
@@ -246,9 +222,7 @@ func (a *App) Run(ctx context.Context) error {
 					a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), Draft: command.Prompt})
 					continue
 				}
-				if a.emitTurnAccepted {
-					a.publish(ctx, Event{Kind: EventTurnAccepted, Draft: command.Prompt})
-				}
+				a.publish(ctx, Event{Kind: EventTurnAccepted, Draft: command.Prompt})
 				turnCtx, cancel := context.WithCancel(ctx)
 				activeCancel = cancel
 				activeOperation = operationTurn
@@ -478,6 +452,7 @@ func (a *App) completeReload(ctx context.Context, result operationResult) {
 	}
 	if readyErr := candidate.Ready(selection); readyErr != nil {
 		event.Err = readyErr
+		event.NonTerminal = true
 	}
 	a.publish(ctx, event)
 }
@@ -604,11 +579,11 @@ func (a *App) openSession(ctx context.Context, sessionID string) bool {
 }
 
 func (a *App) modelConfigured(selection domain.ModelSelection) bool {
-	return slices.Contains(a.runtimeSet.Models, selection) || slices.Contains(a.configuredModels, selection)
+	return slices.Contains(a.runtimeSet.Models, selection)
 }
 
 func (a *App) selectionConfigured(selection domain.ModelSelection) bool {
-	if a.runtimeSet.unchecked && len(a.runtimeSet.Models) == 0 && len(a.configuredModels) == 0 {
+	if a.runtimeSet.unchecked && len(a.runtimeSet.Models) == 0 {
 		return true
 	}
 	return a.modelConfigured(selection)

@@ -118,15 +118,16 @@ func acceptSecretHygiene(t *testing.T) {
 
 	debugLog := filepath.Join(root, "logs", "debug.jsonl")
 	t.Setenv("YORDAM_API_KEY", sentinel)
-	application, snapshot, err := app.Bootstrap(context.Background(), app.BootstrapOptions{
-		Config: config.Config{
-			ActiveProfile: "secret",
-			Profiles: map[string]config.Profile{
-				"secret": {BaseURL: server.URL + "/v1", APIKeyEnv: "ACCEPTANCE_SECRET_KEY", Models: []string{"secret-model"}, DefaultModel: "secret-model"},
-			},
-			MaxToolCalls:        32,
-			ShellTimeoutSeconds: 120,
+	cfg := config.Config{
+		ActiveProfile: "secret",
+		Profiles: map[string]config.Profile{
+			"secret": {BaseURL: server.URL + "/v1", APIKeyEnv: "ACCEPTANCE_SECRET_KEY", Models: []string{"secret-model"}, DefaultModel: "secret-model"},
 		},
+		MaxToolCalls:        32,
+		ShellTimeoutSeconds: 120,
+	}
+	application, snapshot, err := app.Bootstrap(context.Background(), app.BootstrapOptions{
+		ConfigPath: writeAcceptanceConfig(t, cfg),
 		CLI:        cli.Options{Mode: domain.ModeAsk, DataDir: dataDir, DebugLog: debugLog, MaxToolCalls: 32, ShellTimeout: 2 * time.Second},
 		CWD:        workspace,
 		HTTPClient: server.Client(),

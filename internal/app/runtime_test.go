@@ -19,9 +19,17 @@ import (
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/permission"
+	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
 	"github.com/muratmirgun/yordam/internal/testsupport/agentfixture"
 )
+
+func TestNewUsesEmptyRedactorBindingWhenNoneIsSupplied(t *testing.T) {
+	application := New(Options{RuntimeSet: RuntimeSet{Redactor: secret.New("candidate-secret")}})
+	if got := application.redactors.String("candidate-secret"); got != "candidate-secret" {
+		t.Fatalf("implicit binding inherited candidate secrets: %q", got)
+	}
+}
 
 func TestRuntimeSetReadinessClassifiesModelsAndCredentials(t *testing.T) {
 	set := RuntimeSet{

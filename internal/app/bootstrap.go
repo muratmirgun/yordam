@@ -24,7 +24,6 @@ const systemPrompt = "You are Yordam, a terminal agent working in the user's cur
 
 type BootstrapOptions struct {
 	ConfigPath string
-	Config     config.Config
 	CLI        cli.Options
 	CWD        string
 	HTTPClient *http.Client
@@ -192,17 +191,11 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 }
 
 func loadBootstrapConfig(options BootstrapOptions) (config.Config, string, error) {
-	if options.ConfigPath != "" {
-		cfg, err := config.Load(config.LoadOptions{ConfigPath: options.ConfigPath})
-		if err != nil {
-			return config.Config{}, options.ConfigPath, configurationError(options.ConfigPath, fmt.Sprintf("configuration is invalid (%v); edit the file and run /reload", err), err)
-		}
-		return cfg, options.ConfigPath, nil
+	cfg, err := config.Load(config.LoadOptions{ConfigPath: options.ConfigPath})
+	if err != nil {
+		return config.Config{}, options.ConfigPath, configurationError(options.ConfigPath, fmt.Sprintf("configuration is invalid (%v); edit the file and run /reload", err), err)
 	}
-	if err := options.Config.Validate(); err != nil {
-		return config.Config{}, "", configurationError("", fmt.Sprintf("configuration is invalid (%v)", err), err)
-	}
-	return options.Config, "", nil
+	return cfg, options.ConfigPath, nil
 }
 
 func appendBootstrapSelection(ctx context.Context, store ports.SessionStore, session *domain.Session, replay *domain.SessionReplay, selection domain.ModelSelection) error {

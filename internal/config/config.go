@@ -50,7 +50,6 @@ type ResolveOptions struct {
 	Profile        string
 	Model          string
 	BaseURL        string
-	ProcessAPIKey  string // removed with the setup stage in Task 5
 	DefaultProfile string
 	DefaultModel   string
 }
@@ -371,10 +370,7 @@ func (c Config) Resolve(opts ResolveOptions) (ResolvedProfile, error) {
 	if !slices.Contains(profile.Models, model) {
 		return ResolvedProfile{}, fmt.Errorf("model %q not configured for %q", model, profileName)
 	}
-	key := opts.ProcessAPIKey
-	if key == "" {
-		key, _ = lookup("YORDAM_API_KEY")
-	}
+	key, _ := lookup("YORDAM_API_KEY")
 	if key == "" {
 		key, _ = lookup(profile.APIKeyEnv)
 	}

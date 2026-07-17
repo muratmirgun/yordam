@@ -15,6 +15,18 @@ import (
 	"github.com/muratmirgun/yordam/internal/ports"
 )
 
+func TestAppOwnsRuntimeLifecycleThroughRuntimeSet(t *testing.T) {
+	optionsType := reflect.TypeOf(app.Options{})
+	for _, legacyField := range []string{"Runtime", "CompactSession", "ConfiguredModels"} {
+		if _, exists := optionsType.FieldByName(legacyField); exists {
+			t.Errorf("app.Options still exposes legacy generation field %q", legacyField)
+		}
+	}
+	if _, exists := reflect.TypeOf(app.BootstrapOptions{}).FieldByName("Config"); exists {
+		t.Error("app.BootstrapOptions still accepts an in-memory config")
+	}
+}
+
 func TestAppRejectsConcurrentTurnAndCancelsActive(t *testing.T) {
 	started := make(chan struct{})
 	runtime := &fakeRuntime{run: func(ctx context.Context, _ agent.RunInput) error {
@@ -22,13 +34,14 @@ func TestAppRejectsConcurrentTurnAndCancelsActive(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	}}
-	application := app.New(app.Options{Runtime: runtime})
+	application := app.New(app.Options{RuntimeSet: testRuntimeSet(runtime)})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go application.Run(ctx)
 
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "one"}
 	<-started
+	requireTurnAccepted(t, application.Events(), "one")
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "two"}
 	if event := <-application.Events(); event.Kind != app.EventRejected {
 		t.Fatalf("event=%s", event.Kind)
@@ -46,7 +59,7 @@ func TestAppSnapshotsInputAndAllowsNextTurnAfterTerminal(t *testing.T) {
 		return nil
 	}}
 	application := app.New(app.Options{
-		Runtime: runtime,
+		RuntimeSet: testRuntimeSet(runtime),
 		Input: func(prompt string) (agent.RunInput, error) {
 			return agent.RunInput{Prompt: "snapshot:" + prompt}, nil
 		},
@@ -57,6 +70,7 @@ func TestAppSnapshotsInputAndAllowsNextTurnAfterTerminal(t *testing.T) {
 
 	for _, prompt := range []string{"one", "two"} {
 		application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: prompt}
+		requireTurnAccepted(t, application.Events(), prompt)
 		if input := <-inputs; input.Prompt != "snapshot:"+prompt {
 			t.Fatalf("input prompt=%q", input.Prompt)
 		}
@@ -69,12 +83,14 @@ func TestAppSnapshotsInputAndAllowsNextTurnAfterTerminal(t *testing.T) {
 func TestAppPublishesBufferedRuntimeEventsBeforeTerminal(t *testing.T) {
 	for iteration := range 50 {
 		runtimeEvents := make(chan agent.RuntimeEvent, 2)
+		runs := 0
 		runtime := &fakeRuntime{run: func(context.Context, agent.RunInput) error {
+			runs++
 			runtimeEvents <- agent.RuntimeEvent{Kind: agent.RuntimeTextDelta, Text: "one"}
 			runtimeEvents <- agent.RuntimeEvent{Kind: agent.RuntimeTextDelta, Text: "two"}
 			return nil
 		}}
-		application := app.New(app.Options{Runtime: runtime, RuntimeEvents: runtimeEvents, EventBuffer: 3})
+		application := app.New(app.Options{RuntimeSet: testRuntimeSet(runtime), RuntimeEvents: runtimeEvents, EventBuffer: 4})
 		ctx, cancel := context.WithCancel(context.Background())
 		go application.Run(ctx)
 		application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "prompt"}
@@ -83,11 +99,15 @@ func TestAppPublishesBufferedRuntimeEventsBeforeTerminal(t *testing.T) {
 			receiveEvent(t, application.Events()).Kind,
 			receiveEvent(t, application.Events()).Kind,
 			receiveEvent(t, application.Events()).Kind,
+			receiveEvent(t, application.Events()).Kind,
 		}
 		cancel()
-		want := []app.EventKind{app.EventTextDelta, app.EventTextDelta, app.EventTurnCompleted}
+		want := []app.EventKind{app.EventTurnAccepted, app.EventTextDelta, app.EventTextDelta, app.EventTurnCompleted}
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("iteration %d events=%v want=%v", iteration, got, want)
+		}
+		if runs != 1 {
+			t.Fatalf("iteration %d runtime calls=%d want=1", iteration, runs)
 		}
 	}
 }
@@ -101,7 +121,7 @@ func TestAppShutdownWaitsForActiveRuntime(t *testing.T) {
 		<-release
 		return ctx.Err()
 	}}
-	application := app.New(app.Options{Runtime: runtime})
+	application := app.New(app.Options{RuntimeSet: testRuntimeSet(runtime)})
 	done := make(chan error, 1)
 	go func() { done <- application.Run(context.Background()) }()
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "prompt"}
@@ -135,7 +155,7 @@ func TestAppParentCancellationJoinsRuntimeWithoutEventConsumer(t *testing.T) {
 		<-release
 		return ctx.Err()
 	}}
-	application := app.New(app.Options{Runtime: runtime, RuntimeEvents: runtimeEvents})
+	application := app.New(app.Options{RuntimeSet: testRuntimeSet(runtime), RuntimeEvents: runtimeEvents})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- application.Run(ctx) }()
@@ -172,7 +192,7 @@ func TestAppShutdownCommandJoinsRuntimeWithoutEventConsumer(t *testing.T) {
 		<-release
 		return ctx.Err()
 	}}
-	application := app.New(app.Options{Runtime: runtime, RuntimeEvents: runtimeEvents})
+	application := app.New(app.Options{RuntimeSet: testRuntimeSet(runtime), RuntimeEvents: runtimeEvents})
 	done := make(chan error, 1)
 	go func() { done <- application.Run(context.Background()) }()
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "prompt"}
@@ -201,7 +221,7 @@ func TestAppInputAndRuntimeErrorsEmitErrorEvents(t *testing.T) {
 	runtime := &fakeRuntime{run: func(context.Context, agent.RunInput) error { return runtimeErr }}
 	inputCalls := 0
 	application := app.New(app.Options{
-		Runtime: runtime,
+		RuntimeSet: testRuntimeSet(runtime),
 		Input: func(prompt string) (agent.RunInput, error) {
 			inputCalls++
 			if inputCalls == 1 {
@@ -219,6 +239,7 @@ func TestAppInputAndRuntimeErrorsEmitErrorEvents(t *testing.T) {
 		t.Fatalf("input event=%+v", event)
 	}
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "two"}
+	requireTurnAccepted(t, application.Events(), "two")
 	if event := receiveEvent(t, application.Events()); event.Kind != app.EventError || !errors.Is(event.Err, runtimeErr) {
 		t.Fatalf("runtime event=%+v", event)
 	}
@@ -233,7 +254,7 @@ func TestAppRunsCompactionOnlyWhileIdle(t *testing.T) {
 	}}
 	compactCalls := make(chan struct{}, 1)
 	application := app.New(app.Options{
-		Runtime: runtime,
+		RuntimeSet: testRuntimeSet(runtime),
 		Compact: func(context.Context) error {
 			compactCalls <- struct{}{}
 			return nil
@@ -245,6 +266,7 @@ func TestAppRunsCompactionOnlyWhileIdle(t *testing.T) {
 
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "one"}
 	<-turnStarted
+	requireTurnAccepted(t, application.Events(), "one")
 	application.Commands() <- app.Command{Kind: app.CommandCompact}
 	if event := receiveEvent(t, application.Events()); event.Kind != app.EventRejected {
 		t.Fatalf("active compact event=%+v", event)
@@ -361,13 +383,14 @@ func TestAppCancelRemovesPendingPermissionsAndEmitsOneTerminalEvent(t *testing.T
 		_, err := application.Resolve(ctx, ports.PermissionPrompt{Call: domain.PreparedToolRequest{Request: domain.ToolRequest{CallID: "call-1"}}})
 		return err
 	}}
-	application = app.New(app.Options{Runtime: runtime, EventBuffer: 4})
+	application = app.New(app.Options{RuntimeSet: testRuntimeSet(runtime), EventBuffer: 4})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go application.Run(ctx)
 
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "one"}
 	<-permissionStarted
+	requireTurnAccepted(t, application.Events(), "one")
 	if event := <-application.Events(); event.Kind != app.EventPermissionRequested {
 		t.Fatalf("event=%+v", event)
 	}
@@ -414,6 +437,15 @@ type fakeRuntime struct {
 	run func(context.Context, agent.RunInput) error
 }
 
+func testRuntimeSet(runtime app.Runtime) app.RuntimeSet {
+	return app.RuntimeSet{
+		Runtime:        runtime,
+		Models:         []domain.ModelSelection{{}},
+		Credentials:    map[string]string{"": "configured"},
+		CredentialEnvs: map[string]string{"": "TEST_KEY"},
+	}
+}
+
 type permissionResult struct {
 	decision domain.PermissionDecision
 	err      error
@@ -427,6 +459,14 @@ func receiveEvent(t *testing.T, events <-chan app.Event) app.Event {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for app event")
 		return app.Event{}
+	}
+}
+
+func requireTurnAccepted(t *testing.T, events <-chan app.Event, draft string) {
+	t.Helper()
+	event := receiveEvent(t, events)
+	if event.Kind != app.EventTurnAccepted || event.Draft != draft {
+		t.Fatalf("turn accepted event=%+v want draft %q", event, draft)
 	}
 }
 

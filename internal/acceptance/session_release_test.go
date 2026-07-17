@@ -36,8 +36,9 @@ func acceptResume(t *testing.T) {
 	workspace := t.TempDir()
 	dataDir := t.TempDir()
 	cfg := acceptanceConfig(server.URL+"/v1", "ACCEPTANCE_RESUME_KEY", map[string][]string{"resume": {"model-a"}})
+	configPath := writeAcceptanceConfig(t, cfg)
 	options := acceptanceCLI(dataDir, domain.ModeSafe)
-	application, first, err := app.Bootstrap(context.Background(), app.BootstrapOptions{Config: cfg, CLI: options, CWD: workspace, HTTPClient: server.Client()})
+	application, first, err := app.Bootstrap(context.Background(), app.BootstrapOptions{ConfigPath: configPath, CLI: options, CWD: workspace, HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +52,7 @@ func acceptResume(t *testing.T) {
 
 	continuedOptions := options
 	continuedOptions.Continue = true
-	continuedApp, continued, err := app.Bootstrap(context.Background(), app.BootstrapOptions{Config: cfg, CLI: continuedOptions, CWD: workspace, HTTPClient: server.Client()})
+	continuedApp, continued, err := app.Bootstrap(context.Background(), app.BootstrapOptions{ConfigPath: configPath, CLI: continuedOptions, CWD: workspace, HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,14 +197,19 @@ func acceptModelChange(t *testing.T) {
 		}
 	}
 	application := app.New(app.Options{
-		Runtime:          fixture.runner,
-		Sessions:         fixture.store,
-		Session:          fixture.session,
-		Replay:           fixture.replay,
-		Policy:           fixture.policy,
-		ConfiguredModels: []domain.ModelSelection{oldSelection, newSelection},
-		CommandBuffer:    0,
-		EventBuffer:      8,
+		RuntimeSet: app.RuntimeSet{
+			Runtime:          fixture.runner,
+			Models:           []domain.ModelSelection{oldSelection, newSelection},
+			DefaultSelection: oldSelection,
+			CredentialEnvs:   map[string]string{"old": "ACCEPTANCE_KEY", "new": "ACCEPTANCE_KEY"},
+			Credentials:      map[string]string{"old": "configured", "new": "configured"},
+		},
+		Sessions:      fixture.store,
+		Session:       fixture.session,
+		Replay:        fixture.replay,
+		Policy:        fixture.policy,
+		CommandBuffer: 0,
+		EventBuffer:   8,
 	})
 	done := runAcceptanceApp(t, application)
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "first"}
@@ -321,6 +327,15 @@ func acceptanceConfig(baseURL, keyEnv string, profiles map[string][]string) conf
 		configured[name] = config.Profile{BaseURL: baseURL, APIKeyEnv: keyEnv, Models: models, DefaultModel: models[0]}
 	}
 	return config.Config{ActiveProfile: active, Profiles: configured, MaxToolCalls: 32, ShellTimeoutSeconds: 120}
+}
+
+func writeAcceptanceConfig(t *testing.T, cfg config.Config) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.jsonc")
+	if err := config.SaveGlobal(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func acceptanceCLI(dataDir string, mode domain.PermissionMode) cli.Options {

@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -11,6 +12,12 @@ import (
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
 )
+
+func TestResolveOptionsDoesNotAcceptProcessOnlyCredential(t *testing.T) {
+	if _, exists := reflect.TypeOf(config.ResolveOptions{}).FieldByName("ProcessAPIKey"); exists {
+		t.Fatal("ResolveOptions still accepts a process-only API key")
+	}
+}
 
 const validConfig = `{
   "$schema": "https://raw.githubusercontent.com/muratmirgun/yordam/main/schema/config.json",
@@ -152,15 +159,14 @@ func TestResolveOverridePrecedence(t *testing.T) {
 		t.Fatalf("environment resolved=%+v", resolved)
 	}
 	resolved, err = cfg.Resolve(config.ResolveOptions{
-		Profile:       "primary",
-		Model:         "model-b",
-		BaseURL:       "https://cli.example/v1/",
-		ProcessAPIKey: "process-key",
+		Profile: "primary",
+		Model:   "model-b",
+		BaseURL: "https://cli.example/v1/",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved.Name != "primary" || resolved.Model != "model-b" || resolved.BaseURL != "https://cli.example/v1" || resolved.APIKey != "process-key" {
+	if resolved.Name != "primary" || resolved.Model != "model-b" || resolved.BaseURL != "https://cli.example/v1" || resolved.APIKey != "override-key" {
 		t.Fatalf("CLI resolved=%+v", resolved)
 	}
 	if got := cfg.APIKeys(); got["primary"] != "primary-key" || got["secondary"] != "secondary-key" {

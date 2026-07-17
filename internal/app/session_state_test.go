@@ -41,15 +41,16 @@ func TestAppAppliesModeAndModelDurabilityFirst(t *testing.T) {
 	policy := &recordingPolicy{}
 	inputs := make(chan agent.RunInput, 1)
 	application := app.New(app.Options{
-		Runtime: &fakeRuntime{run: func(_ context.Context, input agent.RunInput) error {
+		RuntimeSet: stateRuntimeSet(&fakeRuntime{run: func(_ context.Context, input agent.RunInput) error {
 			inputs <- input
 			return nil
-		}},
-		Sessions:         store,
-		Session:          store.current.Session,
-		Replay:           store.current,
-		Policy:           policy,
-		ConfiguredModels: []domain.ModelSelection{{Profile: "primary", Model: "model-a"}, {Profile: "primary", Model: "model-b"}},
+		}}, nil,
+			domain.ModelSelection{Profile: "primary", Model: "model-a"},
+			domain.ModelSelection{Profile: "primary", Model: "model-b"}),
+		Sessions: store,
+		Session:  store.current.Session,
+		Replay:   store.current,
+		Policy:   policy,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -87,6 +88,7 @@ func TestAppAppliesModeAndModelDurabilityFirst(t *testing.T) {
 	}
 
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "snapshot"}
+	requireTurnAccepted(t, application.Events(), "snapshot")
 	input := <-inputs
 	if input.Session.Mode != domain.ModeAuto || input.Session.Selection.Model != "model-b" {
 		t.Fatalf("turn input state=%+v", input.Session)
@@ -101,20 +103,18 @@ func TestAppQueuesLastModeAndModelDuringTurnAndAppliesModeFirst(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	application := app.New(app.Options{
-		Runtime: &fakeRuntime{run: func(context.Context, agent.RunInput) error {
+		RuntimeSet: stateRuntimeSet(&fakeRuntime{run: func(context.Context, agent.RunInput) error {
 			close(started)
 			<-release
 			return nil
-		}},
+		}}, nil,
+			domain.ModelSelection{Profile: "primary", Model: "model-a"},
+			domain.ModelSelection{Profile: "primary", Model: "model-b"},
+			domain.ModelSelection{Profile: "other", Model: "model-c"}),
 		Sessions: store,
 		Session:  store.current.Session,
 		Replay:   store.current,
 		Policy:   &recordingPolicy{},
-		ConfiguredModels: []domain.ModelSelection{
-			{Profile: "primary", Model: "model-a"},
-			{Profile: "primary", Model: "model-b"},
-			{Profile: "other", Model: "model-c"},
-		},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -122,6 +122,7 @@ func TestAppQueuesLastModeAndModelDuringTurnAndAppliesModeFirst(t *testing.T) {
 
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "one"}
 	<-started
+	requireTurnAccepted(t, application.Events(), "one")
 	application.Commands() <- app.Command{Kind: app.CommandChangeMode, Mode: domain.ModeSafe}
 	application.Commands() <- app.Command{Kind: app.CommandChangeMode, Mode: domain.ModeAuto}
 	application.Commands() <- app.Command{Kind: app.CommandChangeModel, Selection: domain.ModelSelection{Profile: "primary", Model: "model-b"}}
@@ -148,10 +149,10 @@ func TestAppQueuesLastModeAndModelDuringTurnAndAppliesModeFirst(t *testing.T) {
 func TestAppRejectsUnconfiguredModelBeforeAppend(t *testing.T) {
 	store := newStateStore(testSession())
 	application := app.New(app.Options{
-		Sessions:         store,
-		Session:          store.current.Session,
-		Replay:           store.current,
-		ConfiguredModels: []domain.ModelSelection{{Profile: "primary", Model: "model-a"}},
+		RuntimeSet: stateRuntimeSet(nil, nil, domain.ModelSelection{Profile: "primary", Model: "model-a"}),
+		Sessions:   store,
+		Session:    store.current.Session,
+		Replay:     store.current,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -252,10 +253,12 @@ func TestAppOpensSessionOnlyAfterLoadAndWorkspaceVerification(t *testing.T) {
 	store.loads["resumed"] = resumed
 	inputs := make(chan agent.RunInput, 1)
 	application := app.New(app.Options{
-		Runtime: &fakeRuntime{run: func(_ context.Context, input agent.RunInput) error {
+		RuntimeSet: stateRuntimeSet(&fakeRuntime{run: func(_ context.Context, input agent.RunInput) error {
 			inputs <- input
 			return nil
-		}},
+		}}, nil,
+			domain.ModelSelection{Profile: "primary", Model: "model-a"},
+			domain.ModelSelection{Profile: "primary", Model: "model-b"}),
 		Sessions: store,
 		Session:  current.Session,
 		Replay:   current,
@@ -279,6 +282,7 @@ func TestAppOpensSessionOnlyAfterLoadAndWorkspaceVerification(t *testing.T) {
 	}
 
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "resumed turn"}
+	requireTurnAccepted(t, application.Events(), "resumed turn")
 	if input := <-inputs; input.Session.ID != "resumed" || input.Session.Mode != domain.ModeSafe || input.Session.Selection.Model != "model-b" {
 		t.Fatalf("resumed input=%+v", input)
 	}
@@ -411,10 +415,10 @@ func TestAppDoesNotReplaceSessionWithoutPolicyRestoration(t *testing.T) {
 	store.loads["other"] = other
 	inputs := make(chan agent.RunInput, 1)
 	application := app.New(app.Options{
-		Runtime: &fakeRuntime{run: func(_ context.Context, input agent.RunInput) error {
+		RuntimeSet: stateRuntimeSet(&fakeRuntime{run: func(_ context.Context, input agent.RunInput) error {
 			inputs <- input
 			return nil
-		}},
+		}}, nil, current.Session.Selection),
 		Sessions: store,
 		Session:  current.Session,
 		Replay:   current,
@@ -429,6 +433,7 @@ func TestAppDoesNotReplaceSessionWithoutPolicyRestoration(t *testing.T) {
 		t.Fatalf("open event=%+v", event)
 	}
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "still current"}
+	requireTurnAccepted(t, application.Events(), "still current")
 	if input := <-inputs; input.Session.ID != current.Session.ID {
 		t.Fatalf("session replaced after restore failure: %+v", input.Session)
 	}
@@ -445,11 +450,11 @@ func TestAppRejectsSessionChangesDuringActiveOperations(t *testing.T) {
 	compactStarted := make(chan struct{})
 	compactRelease := make(chan struct{})
 	application := app.New(app.Options{
-		Runtime: &fakeRuntime{run: func(context.Context, agent.RunInput) error {
+		RuntimeSet: stateRuntimeSet(&fakeRuntime{run: func(context.Context, agent.RunInput) error {
 			close(turnStarted)
 			<-turnRelease
 			return nil
-		}},
+		}}, nil, current.Session.Selection),
 		Compact: func(context.Context) error {
 			close(compactStarted)
 			<-compactRelease
@@ -466,6 +471,7 @@ func TestAppRejectsSessionChangesDuringActiveOperations(t *testing.T) {
 
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "one"}
 	<-turnStarted
+	requireTurnAccepted(t, application.Events(), "one")
 	application.Commands() <- app.Command{Kind: app.CommandNewSession}
 	if event := receiveEvent(t, application.Events()); event.Kind != app.EventRejected {
 		t.Fatalf("new during turn=%+v", event)
@@ -499,10 +505,10 @@ func TestAppRefreshesReplayOnlyAfterSuccessfulCompaction(t *testing.T) {
 	}
 	inputs := make(chan agent.RunInput, 1)
 	application := app.New(app.Options{
-		Runtime: &fakeRuntime{run: func(_ context.Context, input agent.RunInput) error {
+		RuntimeSet: stateRuntimeSet(&fakeRuntime{run: func(_ context.Context, input agent.RunInput) error {
 			inputs <- input
 			return nil
-		}},
+		}}, nil, current.Session.Selection),
 		Compact:  compact,
 		Sessions: store,
 		Session:  current.Session,
@@ -517,6 +523,7 @@ func TestAppRefreshesReplayOnlyAfterSuccessfulCompaction(t *testing.T) {
 		t.Fatalf("compact event=%+v", event)
 	}
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "after compact"}
+	requireTurnAccepted(t, application.Events(), "after compact")
 	if input := <-inputs; len(input.Replay.Events) != 2 || input.Replay.Events[1].Kind != domain.EventContextCompacted {
 		t.Fatalf("refreshed input replay=%+v", input.Replay)
 	}
@@ -532,17 +539,19 @@ func TestAppRefreshesReplayAfterCompletedTurn(t *testing.T) {
 		_, err := store.Append(context.Background(), current.Session.ID, domain.EventTurnCompleted, domain.TurnTerminalPayload{Reason: "complete"})
 		return err
 	}}
-	application := app.New(app.Options{Runtime: runtime, Sessions: store, Session: current.Session, Replay: current})
+	application := app.New(app.Options{RuntimeSet: stateRuntimeSet(runtime, nil, current.Session.Selection), Sessions: store, Session: current.Session, Replay: current})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go application.Run(ctx)
 
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "turn"}
+	requireTurnAccepted(t, application.Events(), "turn")
 	event := receiveEvent(t, application.Events())
 	if event.Kind != app.EventTurnCompleted || len(event.Replay.Events) != len(current.Events)+1 {
 		t.Fatalf("terminal event=%+v", event)
 	}
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "next"}
+	requireTurnAccepted(t, application.Events(), "next")
 	// The fake runtime appends again; the input snapshot is covered by the replay on the terminal event.
 	_ = receiveEvent(t, application.Events())
 }
@@ -552,13 +561,13 @@ func TestAppBlocksTurnsAfterReplayRefreshFailure(t *testing.T) {
 	store := newStateStore(current)
 	var runs int
 	application := app.New(app.Options{
-		Runtime: &fakeRuntime{run: func(context.Context, agent.RunInput) error {
+		RuntimeSet: stateRuntimeSet(&fakeRuntime{run: func(context.Context, agent.RunInput) error {
 			runs++
 			store.mu.Lock()
 			store.loadErr = errors.New("reload failed")
 			store.mu.Unlock()
 			return nil
-		}},
+		}}, nil, current.Session.Selection),
 		Sessions: store,
 		Session:  current.Session,
 		Replay:   current,
@@ -568,6 +577,7 @@ func TestAppBlocksTurnsAfterReplayRefreshFailure(t *testing.T) {
 	go func() { _ = application.Run(ctx) }()
 
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "first"}
+	requireTurnAccepted(t, application.Events(), "first")
 	if event := receiveEvent(t, application.Events()); event.Kind != app.EventError || !strings.Contains(event.Message, "reload failed") {
 		t.Fatalf("refresh event=%+v", event)
 	}
@@ -585,19 +595,18 @@ func TestAppPassesCurrentProjectedStateToCompaction(t *testing.T) {
 	store := newStateStore(current)
 	compacted := make(chan agent.RunInput, 1)
 	compactErr := errors.New("stop after snapshot")
+	compactSession := func(_ context.Context, session domain.Session, replay domain.SessionReplay) error {
+		compacted <- agent.RunInput{Session: session, Replay: replay}
+		return compactErr
+	}
 	application := app.New(app.Options{
+		RuntimeSet: stateRuntimeSet(nil, compactSession,
+			domain.ModelSelection{Profile: "primary", Model: "model-a"},
+			domain.ModelSelection{Profile: "primary", Model: "model-b"}),
 		Sessions: store,
 		Session:  current.Session,
 		Replay:   current,
 		Policy:   &recordingPolicy{},
-		ConfiguredModels: []domain.ModelSelection{
-			{Profile: "primary", Model: "model-a"},
-			{Profile: "primary", Model: "model-b"},
-		},
-		CompactSession: func(_ context.Context, session domain.Session, replay domain.SessionReplay) error {
-			compacted <- agent.RunInput{Session: session, Replay: replay}
-			return compactErr
-		},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -615,6 +624,27 @@ func TestAppPassesCurrentProjectedStateToCompaction(t *testing.T) {
 	}
 	if event := receiveEvent(t, application.Events()); event.Kind != app.EventError || !errors.Is(event.Err, compactErr) {
 		t.Fatalf("compact terminal=%+v", event)
+	}
+}
+
+func stateRuntimeSet(runtime app.Runtime, compact app.CompactSession, models ...domain.ModelSelection) app.RuntimeSet {
+	credentials := make(map[string]string, len(models))
+	credentialEnvs := make(map[string]string, len(models))
+	for _, selection := range models {
+		credentials[selection.Profile] = "configured"
+		credentialEnvs[selection.Profile] = "TEST_KEY"
+	}
+	var defaultSelection domain.ModelSelection
+	if len(models) > 0 {
+		defaultSelection = models[0]
+	}
+	return app.RuntimeSet{
+		Runtime:          runtime,
+		CompactSession:   compact,
+		Models:           append([]domain.ModelSelection(nil), models...),
+		DefaultSelection: defaultSelection,
+		CredentialEnvs:   credentialEnvs,
+		Credentials:      credentials,
 	}
 }
 
