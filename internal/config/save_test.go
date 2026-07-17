@@ -108,10 +108,16 @@ func TestSaveGlobalDoesNotReplaceExistingFileWhenConfigIsInvalid(t *testing.T) {
 	}
 }
 
-func TestSaveGlobalRemovesAbandonedTemporary(t *testing.T) {
-	directory := t.TempDir()
+func TestEnsureGlobalRemovesOnlyAbandonedTemporary(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	directory := filepath.Join(home, ".config", "yordam")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	abandoned := filepath.Join(directory, ".config-abandoned.tmp")
-	live := filepath.Join(directory, ".config-live.tmp")
+	recent := filepath.Join(directory, ".config-recent.tmp")
+	nonmatching := filepath.Join(directory, ".config-keep.txt")
 	if err := os.WriteFile(abandoned, []byte("stale"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -119,26 +125,39 @@ func TestSaveGlobalRemovesAbandonedTemporary(t *testing.T) {
 	if err := os.Chtimes(abandoned, old, old); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(live, []byte("in progress"), 0o600); err != nil {
-		t.Fatal(err)
+	for path, contents := range map[string]string{
+		recent:      "in progress",
+		nonmatching: "keep",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := config.SaveGlobal(filepath.Join(directory, "config.jsonc"), savedConfig()); err != nil {
+	if _, _, err := config.EnsureGlobal(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(abandoned); !os.IsNotExist(err) {
 		t.Fatalf("abandoned temporary remains: %v", err)
 	}
-	if raw, err := os.ReadFile(live); err != nil || string(raw) != "in progress" {
-		t.Fatalf("live temporary changed: raw=%q err=%v", raw, err)
+	for path, want := range map[string]string{
+		recent:      "in progress",
+		nonmatching: "keep",
+	} {
+		if raw, err := os.ReadFile(path); err != nil || string(raw) != want {
+			t.Fatalf("preserved file %q changed: raw=%q err=%v", path, raw, err)
+		}
 	}
 }
 
 func TestEnsureGlobalNeverOverwritesExistingFile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	path := filepath.Join(home, ".config", "yordam", "config.jsonc")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	path, created, err := config.EnsureGlobal()
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("first EnsureGlobal() did not create config")
 	}
 	if err := os.WriteFile(path, []byte("unchanged"), 0o600); err != nil {
 		t.Fatal(err)
