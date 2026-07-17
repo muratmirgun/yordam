@@ -35,22 +35,22 @@ func acceptSecretHygiene(t *testing.T) {
 		}
 	}
 	sentinel := sentinels[0]
+	redactor := secret.New(sentinels...)
 	root := t.TempDir()
 	workspace := filepath.Join(root, "workspace")
 	dataDir := filepath.Join(root, "data")
 	outputDir := filepath.Join(root, "output")
 	if err := os.MkdirAll(workspace, 0o700); err != nil {
-		t.Fatal(err)
+		t.Fatal(redactor.String(err.Error()))
 	}
 	if err := os.MkdirAll(outputDir, 0o700); err != nil {
-		t.Fatal(err)
+		t.Fatal(redactor.String(err.Error()))
 	}
 
-	redactor := secret.New(sentinels...)
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if authorization := request.Header.Get("Authorization"); authorization != "Bearer "+sentinel {
-			t.Errorf("provider authorization=%q", authorization)
+			t.Error("provider authorization did not use the configured credential")
 		}
 		if requests.Add(1) == 1 {
 			response.WriteHeader(http.StatusBadRequest)
@@ -72,29 +72,29 @@ func acceptSecretHygiene(t *testing.T) {
 	})
 	_, providerErr := client.Stream(context.Background(), domain.ModelRequest{})
 	if providerErr == nil || strings.Contains(providerErr.Error(), sentinel) || !strings.Contains(providerErr.Error(), "[REDACTED]") {
-		t.Fatalf("provider error=%v", providerErr)
+		t.Fatal("provider error was not safely redacted")
 	}
 	writeAcceptanceFile(t, filepath.Join(outputDir, "provider-error.txt"), []byte(providerErr.Error()))
 
 	store := jsonl.New(dataDir, jsonl.Options{Sanitize: redactor.JSON})
 	canonical, err := jsonl.WorkspaceFromPath(workspace)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal(redactor.String(err.Error()))
 	}
 	session, err := store.Create(context.Background(), canonical, domain.ModeAsk, domain.ModelSelection{Profile: "secret", Model: "secret-model"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal(redactor.String(err.Error()))
 	}
 	if _, err := store.Append(context.Background(), session.ID, domain.EventUserMessage, domain.MessagePayload{Content: "session " + sentinel}); err != nil {
-		t.Fatal(err)
+		t.Fatal(redactor.String(err.Error()))
 	}
 	buffer := output.New(output.Options{SessionID: session.ID, Artifacts: store, Redact: redactor})
 	if _, err := fmt.Fprint(buffer, strings.Repeat("artifact-data-", 3000)+sentinel); err != nil {
-		t.Fatal(err)
+		t.Fatal(redactor.String(err.Error()))
 	}
 	artifactResult, err := buffer.Result(context.Background())
 	if err != nil || len(artifactResult.ArtifactIDs) != 1 || strings.Contains(artifactResult.Content, sentinel) {
-		t.Fatalf("artifact result=%+v err=%v", artifactResult, err)
+		t.Fatal("artifact result did not satisfy secret redaction")
 	}
 
 	t.Setenv("ACCEPTANCE_SECRET_KEY", sentinel)
@@ -108,11 +108,11 @@ func acceptSecretHygiene(t *testing.T) {
 	})
 	prepared, err := shell.Prepare(context.Background(), domain.ToolRequest{CallID: "env", Name: "shell", Workspace: workspace, Input: json.RawMessage(`{"command":"env","cwd":"."}`)})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal(redactor.String(err.Error()))
 	}
 	shellResult := prepared.Execute(context.Background())
 	if shellResult.Status != domain.ToolSucceeded || strings.Contains(shellResult.Content, sentinel) || strings.Contains(shellResult.Content, "ACCEPTANCE_SECRET_KEY=") || !strings.Contains(shellResult.Content, "ACCEPTANCE_ORDINARY=preserved") {
-		t.Fatalf("shell env result=%+v", shellResult)
+		t.Fatal("shell result did not satisfy secret redaction")
 	}
 	writeAcceptanceFile(t, filepath.Join(outputDir, "shell.txt"), []byte(shellResult.Content))
 
@@ -133,7 +133,7 @@ func acceptSecretHygiene(t *testing.T) {
 		HTTPClient: server.Client(),
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal(redactor.String(err.Error()))
 	}
 	if snapshot.Session.ID == session.ID {
 		t.Fatal("bootstrap unexpectedly reused the fixture session")
@@ -143,31 +143,40 @@ func acceptSecretHygiene(t *testing.T) {
 	var visible strings.Builder
 	for {
 		event := <-application.Events()
-		visible.WriteString(event.Message)
-		visible.WriteString(event.Runtime.Text)
+		serialized, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal("marshal application event")
+		}
+		visible.Write(serialized)
+		if event.Err != nil {
+			visible.WriteString(event.Err.Error())
+		}
+		if event.Permission != nil {
+			visible.WriteString(event.Permission.Call.ApprovalScope)
+		}
 		if event.Kind == app.EventError {
 			break
 		}
 	}
 	if strings.Contains(visible.String(), sentinel) || !strings.Contains(visible.String(), "[REDACTED]") || !strings.Contains(visible.String(), "provider stream interrupted") {
-		t.Fatalf("streamed error output=%q", visible.String())
+		t.Fatal("application event output did not satisfy secret redaction")
 	}
 	writeAcceptanceFile(t, filepath.Join(outputDir, "app-visible.txt"), []byte(visible.String()))
 	application.Commands() <- app.Command{Kind: app.CommandShutdown}
 	if err := <-appDone; err != nil {
-		t.Fatal(err)
+		t.Fatal(redactor.String(err.Error()))
 	}
 
 	ptyRoot := filepath.Join(root, "pty")
 	if err := os.MkdirAll(ptyRoot, 0o700); err != nil {
-		t.Fatal(err)
+		t.Fatal(redactor.String(err.Error()))
 	}
 	ptyServer := newSSEServer(t, "data: [DONE]\n\n")
 	defer ptyServer.Close()
 	ptyHome := t.TempDir()
 	ptyConfig := filepath.Join(ptyHome, ".config", "yordam", "config.jsonc")
 	if err := config.SaveGlobal(ptyConfig, acceptanceConfig(ptyServer.URL+"/v1", "ACCEPTANCE_SECRET_KEY", map[string][]string{"default": {"secret-model"}})); err != nil {
-		t.Fatal(err)
+		t.Fatal(redactor.String(err.Error()))
 	}
 	ptySession := ptyfixture.Start(t, ptyfixture.CachedYordam(t), ptyRoot, cleanPTYEnvironment(ptyHome, []string{"ACCEPTANCE_SECRET_KEY=" + sentinel}),
 		"--data-dir", filepath.Join(ptyRoot, "data"),
@@ -177,7 +186,7 @@ func acceptSecretHygiene(t *testing.T) {
 	ptySession.WaitForExit(t, 3*time.Second)
 	ptySession.AssertRestored(t)
 	if strings.Contains(ptySession.Output(), sentinel) {
-		t.Fatalf("PTY output contains sentinel: %q", ptySession.Output())
+		t.Fatal("PTY output contains the configured secret")
 	}
 	writeAcceptanceFile(t, filepath.Join(outputDir, "pty.txt"), []byte(ptySession.Output()))
 

@@ -14,6 +14,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/tui"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 	"github.com/muratmirgun/yordam/internal/workspace"
@@ -228,6 +229,49 @@ func TestComposerSubmitStartsTurnAndAppendsUserBlock(t *testing.T) {
 	if got := model.ComposerValueForTest(); got != "blocked" {
 		t.Fatalf("active composer value=%q", got)
 	}
+}
+
+func TestConfiguredSecretPromptIsRedactedBeforeConversationRendering(t *testing.T) {
+	const configuredSecret = "configured-tui-secret-sentinel"
+	runtime := tuiRuntimeFunc(func(context.Context, agent.RunInput) error { return nil })
+	selection := domain.ModelSelection{Profile: "profile", Model: "model"}
+	application := app.New(app.Options{
+		RuntimeSet: app.RuntimeSet{
+			Runtime:          runtime,
+			Models:           []domain.ModelSelection{selection},
+			DefaultSelection: selection,
+			Credentials:      map[string]string{selection.Profile: configuredSecret},
+			CredentialEnvs:   map[string]string{selection.Profile: "TEST_KEY"},
+		},
+		Redactors: secret.NewBinding(secret.New(configuredSecret)),
+		Session:   domain.Session{Selection: selection},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: configuredSecret}
+	model := tui.NewModel(tui.OptionsForTest())
+	for {
+		event := <-application.Events()
+		model = tui.ApplyAppEventForTest(model, event)
+		if event.Kind == app.EventTurnCompleted {
+			break
+		}
+	}
+	if strings.Contains(model.View().Content, configuredSecret) {
+		t.Fatal("rendered TUI contains configured secret")
+	}
+	blocks := model.ConversationBlocksForTest()
+	if len(blocks) != 1 || blocks[0].Content != "[REDACTED]" {
+		t.Fatal("conversation did not contain the redacted prompt")
+	}
+}
+
+type tuiRuntimeFunc func(context.Context, agent.RunInput) error
+
+func (run tuiRuntimeFunc) RunTurn(ctx context.Context, input agent.RunInput) error {
+	return run(ctx, input)
 }
 
 func TestRootDelegatesPasteToComposer(t *testing.T) {

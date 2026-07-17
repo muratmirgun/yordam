@@ -663,6 +663,9 @@ func (a *App) clearPending() {
 }
 
 func (a *App) publish(ctx context.Context, event Event) bool {
+	if a.redactors != nil {
+		event = sanitizePublishedEvent(a.redactors.Snapshot(), event)
+	}
 	if a.logger != nil {
 		_ = a.logger.Event("app_event", map[string]any{
 			"kind":    event.Kind,

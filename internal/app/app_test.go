@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 func TestAppOwnsRuntimeLifecycleThroughRuntimeSet(t *testing.T) {
@@ -24,6 +26,57 @@ func TestAppOwnsRuntimeLifecycleThroughRuntimeSet(t *testing.T) {
 	}
 	if _, exists := reflect.TypeOf(app.BootstrapOptions{}).FieldByName("Config"); exists {
 		t.Error("app.BootstrapOptions still accepts an in-memory config")
+	}
+}
+
+func TestAppRedactsConfiguredSecretFromEveryPublishedEventField(t *testing.T) {
+	const configuredSecret = "configured-event-secret-sentinel"
+	runtimeEvents := make(chan agent.RuntimeEvent, 4)
+	runtime := &fakeRuntime{run: func(context.Context, agent.RunInput) error {
+		runtimeEvents <- agent.RuntimeEvent{Kind: agent.RuntimeStateChanged, State: configuredSecret}
+		runtimeEvents <- agent.RuntimeEvent{Kind: agent.RuntimeTextDelta, Text: configuredSecret}
+		runtimeEvents <- agent.RuntimeEvent{Kind: agent.RuntimeToolOutput, Progress: &domain.ToolProgress{CallID: configuredSecret, Text: configuredSecret}}
+		runtimeEvents <- agent.RuntimeEvent{Kind: agent.RuntimeToolCompleted, Result: &domain.ToolResult{
+			CallID:  configuredSecret,
+			Content: configuredSecret,
+			FileChange: &domain.FileChange{
+				Path: configuredSecret,
+				Diff: configuredSecret,
+			},
+			WorkspaceChanges: &domain.WorkspaceChanges{
+				Status: configuredSecret,
+				Diff:   configuredSecret,
+				Notice: configuredSecret,
+			},
+		}}
+		return errors.New(configuredSecret)
+	}}
+	redactors := secret.NewBinding(secret.New(configuredSecret))
+	application := app.New(app.Options{
+		RuntimeSet:    testRuntimeSet(runtime),
+		RuntimeEvents: runtimeEvents,
+		Redactors:     redactors,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: configuredSecret}
+	for {
+		event := receiveEvent(t, application.Events())
+		raw, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal("marshal app event")
+		}
+		if strings.Contains(string(raw), configuredSecret) {
+			t.Fatal("published app event contains configured secret")
+		}
+		if event.Err != nil && strings.Contains(event.Err.Error(), configuredSecret) {
+			t.Fatal("published app event error contains configured secret")
+		}
+		if event.Kind == app.EventError {
+			break
+		}
 	}
 }
 
