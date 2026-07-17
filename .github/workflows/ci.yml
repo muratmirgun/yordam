@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: ./scripts/check.sh
+
+  cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - GOOS: darwin
+            GOARCH: amd64
+          - GOOS: darwin
+            GOARCH: arm64
+          - GOOS: linux
+            GOARCH: amd64
+          - GOOS: linux
+            GOARCH: arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: mkdir -p dist
+      - run: CGO_ENABLED=0 GOOS=${{ matrix.GOOS }} GOARCH=${{ matrix.GOARCH }} go build -trimpath -o dist/yordam-${{ matrix.GOOS }}-${{ matrix.GOARCH }} ./cmd/yordam
+
+  secret-hygiene:
+    runs-on: ubuntu-latest
+    env:
+      YORDAM_API_KEY: synthetic-ci-secret
+      PROFILE_KEY: synthetic-profile-secret
+      TEST_OUTPUT_ROOT: ${{ runner.temp }}/yordam-secret-scan
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: rm -rf "$TEST_OUTPUT_ROOT" && mkdir -p "$TEST_OUTPUT_ROOT/tmp" "$TEST_OUTPUT_ROOT/evidence"
+      - run: go test -tags acceptance ./internal/acceptance -run 'TestV010Acceptance/secret_hygiene' -count=1 -v | tee "$TEST_OUTPUT_ROOT/evidence/test.log"
+        env:
+          TMPDIR: ${{ env.TEST_OUTPUT_ROOT }}/tmp
+      - name: Scan generated test output for secrets
+        run: |
+          test -s "$TEST_OUTPUT_ROOT/evidence/test.log"
+          set +e
+          rg -uuu 'synthetic-(ci|profile)-secret' "$TEST_OUTPUT_ROOT"
+          status=$?
+          set -e
+          [[ $status -eq 1 ]]

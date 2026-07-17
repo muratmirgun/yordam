@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.tag.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run release gates
+        run: ./scripts/check.sh
+      - name: Verify signed release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_MAINTAINER_ALLOWLIST: ${{ vars.RELEASE_MAINTAINER_ALLOWLIST }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$GITHUB_REF_TYPE" != "tag" || ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release requires an exact vMAJOR.MINOR.PATCH tag" >&2
+            exit 1
+          fi
+
+          tag_type=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.type')
+          tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.sha')
+          if [[ "$tag_type" != "tag" ]]; then
+            echo "release tag must be annotated and signed" >&2
+            exit 1
+          fi
+
+          tag_name=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.tag')
+          verified=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.verification.verified')
+          if [[ "$tag_name" != "$GITHUB_REF_NAME" || "$verified" != "true" ]]; then
+            echo "release tag verification failed" >&2
+            exit 1
+          fi
+          if [[ -z "$RELEASE_MAINTAINER_ALLOWLIST" ]]; then
+            echo "RELEASE_MAINTAINER_ALLOWLIST repository variable is required for tag publication" >&2
+            exit 1
+          fi
+          IFS=',' read -ra allowed_maintainers <<< "$RELEASE_MAINTAINER_ALLOWLIST"
+          authorized=false
+          for allowed in "${allowed_maintainers[@]}"; do
+            [[ "$GITHUB_ACTOR" == "${allowed//[[:space:]]/}" ]] && authorized=true
+          done
+          if [[ "$authorized" != "true" ]]; then
+            echo "release actor is not an authorized maintainer" >&2
+            exit 1
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install pinned release tools
+        run: |
+          go install github.com/goreleaser/goreleaser/v2@v2.17.0
+          go install github.com/anchore/syft/cmd/syft@v1.46.0
+      - name: Package release candidate
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            goreleaser release --snapshot --clean --skip=publish
+          else
+            goreleaser release --clean --skip=publish
+          fi
+      - name: Run release-candidate acceptance
+        run: go test -tags acceptance ./internal/acceptance -run TestV010Acceptance -count=1 -v
+      - name: Verify packaged files
+        run: |
+          shopt -s nullglob
+          archives=(dist/*.tar.gz)
+          sboms=(dist/*.spdx.json)
+          [[ ${#archives[@]} -eq 4 ]]
+          [[ ${#sboms[@]} -eq 4 ]]
+          [[ -f dist/checksums.txt ]]
+          for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+            matches=(dist/yordam_*_${target}.tar.gz)
+            [[ ${#matches[@]} -eq 1 ]]
+            [[ -f "${matches[0]}.spdx.json" ]]
+            awk -v name="$(basename "${matches[0]}")" '$2 == name {found=1} END {exit !found}' dist/checksums.txt
+          done
+          (
+            cd dist
+            shasum -a 256 ./*.tar.gz ./*.spdx.json checksums.txt > artifact-manifest.sha256
+          )
+      - name: Upload verified release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  smoke:
+    needs: package
+    strategy:
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, os: linux, arch: amd64}
+          - {runner: ubuntu-24.04-arm, os: linux, arch: arm64}
+          - {runner: macos-15-intel, os: darwin, arch: amd64}
+          - {runner: macos-15, os: darwin, arch: arm64}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate
+          path: dist
+      - name: Verify and smoke native archive
+        run: |
+          [[ "$(go env GOOS)" == "${{ matrix.os }}" ]]
+          [[ "$(go env GOARCH)" == "${{ matrix.arch }}" ]]
+          (
+            cd dist
+            shasum -a 256 -c artifact-manifest.sha256
+          )
+          shopt -s nullglob
+          archives=(dist/yordam_*_${{ matrix.os }}_${{ matrix.arch }}.tar.gz)
+          [[ ${#archives[@]} -eq 1 ]]
+          archive=${archives[0]}
+          [[ -f "${archive}.spdx.json" ]]
+          expected=$(awk -v name="$(basename "$archive")" '$2 == name {print $1}' dist/checksums.txt)
+          actual=$(shasum -a 256 "$archive" | cut -d ' ' -f 1)
+          [[ -n "$expected" && "$actual" == "$expected" ]]
+          ./scripts/smoke-release.sh "$archive"
+
+  publish:
+    needs: [verify, package, smoke]
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate
+          path: dist
+      - name: Verify unchanged release candidate
+        run: |
+          (
+            cd dist
+            shasum -a 256 -c artifact-manifest.sha256
+          )
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.spdx.json dist/checksums.txt --verify-tag --title "$GITHUB_REF_NAME" --generate-notes

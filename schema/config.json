@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/muratmirgun/yordam/main/schema/config.json",
+  "title": "Yordam configuration",
+  "type": "object",
+  "required": ["model", "provider"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {"type": "string"},
+    "model": {
+      "type": "string",
+      "pattern": "^[^/]+/[^/]+$",
+      "not": {"pattern": "/your-model-id$"},
+      "description": "Default model in provider/model format."
+    },
+    "provider": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"minLength": 1},
+      "additionalProperties": {"$ref": "#/$defs/provider"}
+    },
+    "limits": {"$ref": "#/$defs/limits"}
+  },
+  "$defs": {
+    "provider": {
+      "type": "object",
+      "required": ["options", "models"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string"},
+        "options": {"$ref": "#/$defs/providerOptions"},
+        "models": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "allOf": [
+              {"minLength": 1},
+              {"not": {"const": "your-model-id"}}
+            ]
+          },
+          "additionalProperties": {"$ref": "#/$defs/model"}
+        }
+      }
+    },
+    "providerOptions": {
+      "type": "object",
+      "required": ["baseURL"],
+      "oneOf": [
+        {"required": ["apiKey"]},
+        {"required": ["apiKeyEnv"]}
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "baseURL": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://",
+          "not": {"pattern": "^https?://[^/]*@"}
+        },
+        "apiKey": {"type": "string", "minLength": 1},
+        "apiKeyEnv": {"type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$"}
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"name": {"type": "string"}}
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxToolCalls": {"type": "integer", "minimum": 1, "maximum": 128, "default": 32},
+        "shellTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 1800, "default": 120}
+      }
+    }
+  }
+}

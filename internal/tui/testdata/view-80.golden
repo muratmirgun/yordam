@@ -1,0 +1,8 @@
+Command bridge | /Users/murat/oss/t~ommand-bridge-demo | mode: ask | local/gpt-5
+--------------------------------------------------------------------------------
+[diff] | tool | error
+DIFF internal/app/app.go
+@@ -1,3 +1,3 @@
+-old bridge
++typed command bridge
+Enter: collapse | Esc: close

@@ -1,0 +1,435 @@
+package app_test
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/muratmirgun/yordam/internal/agent"
+	"github.com/muratmirgun/yordam/internal/app"
+	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/ports"
+)
+
+func TestAppRejectsConcurrentTurnAndCancelsActive(t *testing.T) {
+	started := make(chan struct{})
+	runtime := &fakeRuntime{run: func(ctx context.Context, _ agent.RunInput) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	application := app.New(app.Options{Runtime: runtime})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "one"}
+	<-started
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "two"}
+	if event := <-application.Events(); event.Kind != app.EventRejected {
+		t.Fatalf("event=%s", event.Kind)
+	}
+	application.Commands() <- app.Command{Kind: app.CommandCancelTurn}
+	if event := <-application.Events(); event.Kind != app.EventTurnInterrupted {
+		t.Fatalf("event=%s", event.Kind)
+	}
+}
+
+func TestAppSnapshotsInputAndAllowsNextTurnAfterTerminal(t *testing.T) {
+	inputs := make(chan agent.RunInput, 2)
+	runtime := &fakeRuntime{run: func(_ context.Context, input agent.RunInput) error {
+		inputs <- input
+		return nil
+	}}
+	application := app.New(app.Options{
+		Runtime: runtime,
+		Input: func(prompt string) (agent.RunInput, error) {
+			return agent.RunInput{Prompt: "snapshot:" + prompt}, nil
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	for _, prompt := range []string{"one", "two"} {
+		application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: prompt}
+		if input := <-inputs; input.Prompt != "snapshot:"+prompt {
+			t.Fatalf("input prompt=%q", input.Prompt)
+		}
+		if event := receiveEvent(t, application.Events()); event.Kind != app.EventTurnCompleted {
+			t.Fatalf("terminal event=%+v", event)
+		}
+	}
+}
+
+func TestAppPublishesBufferedRuntimeEventsBeforeTerminal(t *testing.T) {
+	for iteration := range 50 {
+		runtimeEvents := make(chan agent.RuntimeEvent, 2)
+		runtime := &fakeRuntime{run: func(context.Context, agent.RunInput) error {
+			runtimeEvents <- agent.RuntimeEvent{Kind: agent.RuntimeTextDelta, Text: "one"}
+			runtimeEvents <- agent.RuntimeEvent{Kind: agent.RuntimeTextDelta, Text: "two"}
+			return nil
+		}}
+		application := app.New(app.Options{Runtime: runtime, RuntimeEvents: runtimeEvents, EventBuffer: 3})
+		ctx, cancel := context.WithCancel(context.Background())
+		go application.Run(ctx)
+		application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "prompt"}
+
+		got := []app.EventKind{
+			receiveEvent(t, application.Events()).Kind,
+			receiveEvent(t, application.Events()).Kind,
+			receiveEvent(t, application.Events()).Kind,
+		}
+		cancel()
+		want := []app.EventKind{app.EventTextDelta, app.EventTextDelta, app.EventTurnCompleted}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("iteration %d events=%v want=%v", iteration, got, want)
+		}
+	}
+}
+
+func TestAppShutdownWaitsForActiveRuntime(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	runtime := &fakeRuntime{run: func(ctx context.Context, _ agent.RunInput) error {
+		close(started)
+		<-ctx.Done()
+		<-release
+		return ctx.Err()
+	}}
+	application := app.New(app.Options{Runtime: runtime})
+	done := make(chan error, 1)
+	go func() { done <- application.Run(context.Background()) }()
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "prompt"}
+	<-started
+	application.Commands() <- app.Command{Kind: app.CommandShutdown}
+
+	select {
+	case err := <-done:
+		t.Fatalf("app returned before runtime stopped: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("app did not finish after runtime stopped")
+	}
+}
+
+func TestAppParentCancellationJoinsRuntimeWithoutEventConsumer(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	runtimeEvents := make(chan agent.RuntimeEvent, 1)
+	runtime := &fakeRuntime{run: func(ctx context.Context, _ agent.RunInput) error {
+		close(started)
+		runtimeEvents <- agent.RuntimeEvent{Kind: agent.RuntimeTextDelta, Text: "buffered"}
+		<-ctx.Done()
+		<-release
+		return ctx.Err()
+	}}
+	application := app.New(app.Options{Runtime: runtime, RuntimeEvents: runtimeEvents})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- application.Run(ctx) }()
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "prompt"}
+	<-started
+	cancel()
+
+	select {
+	case err := <-done:
+		t.Fatalf("app returned before runtime joined: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error=%v want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("app blocked publishing during shutdown without a UI consumer")
+	}
+}
+
+func TestAppShutdownCommandJoinsRuntimeWithoutEventConsumer(t *testing.T) {
+	started := make(chan struct{})
+	eventAccepted := make(chan struct{})
+	release := make(chan struct{})
+	runtimeEvents := make(chan agent.RuntimeEvent)
+	runtime := &fakeRuntime{run: func(ctx context.Context, _ agent.RunInput) error {
+		close(started)
+		runtimeEvents <- agent.RuntimeEvent{Kind: agent.RuntimeTextDelta, Text: "unconsumed"}
+		close(eventAccepted)
+		<-ctx.Done()
+		<-release
+		return ctx.Err()
+	}}
+	application := app.New(app.Options{Runtime: runtime, RuntimeEvents: runtimeEvents})
+	done := make(chan error, 1)
+	go func() { done <- application.Run(context.Background()) }()
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "prompt"}
+	<-started
+	<-eventAccepted
+	application.Commands() <- app.Command{Kind: app.CommandShutdown}
+
+	select {
+	case err := <-done:
+		t.Fatalf("app returned before runtime joined: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown command blocked behind unconsumed event publication")
+	}
+}
+
+func TestAppInputAndRuntimeErrorsEmitErrorEvents(t *testing.T) {
+	runtimeErr := errors.New("runtime failed")
+	runtime := &fakeRuntime{run: func(context.Context, agent.RunInput) error { return runtimeErr }}
+	inputCalls := 0
+	application := app.New(app.Options{
+		Runtime: runtime,
+		Input: func(prompt string) (agent.RunInput, error) {
+			inputCalls++
+			if inputCalls == 1 {
+				return agent.RunInput{}, errors.New("snapshot failed")
+			}
+			return agent.RunInput{Prompt: prompt}, nil
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "one"}
+	if event := receiveEvent(t, application.Events()); event.Kind != app.EventError || event.Message != "snapshot failed" {
+		t.Fatalf("input event=%+v", event)
+	}
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "two"}
+	if event := receiveEvent(t, application.Events()); event.Kind != app.EventError || !errors.Is(event.Err, runtimeErr) {
+		t.Fatalf("runtime event=%+v", event)
+	}
+}
+
+func TestAppRunsCompactionOnlyWhileIdle(t *testing.T) {
+	turnStarted := make(chan struct{})
+	runtime := &fakeRuntime{run: func(ctx context.Context, _ agent.RunInput) error {
+		close(turnStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	compactCalls := make(chan struct{}, 1)
+	application := app.New(app.Options{
+		Runtime: runtime,
+		Compact: func(context.Context) error {
+			compactCalls <- struct{}{}
+			return nil
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "one"}
+	<-turnStarted
+	application.Commands() <- app.Command{Kind: app.CommandCompact}
+	if event := receiveEvent(t, application.Events()); event.Kind != app.EventRejected {
+		t.Fatalf("active compact event=%+v", event)
+	}
+	application.Commands() <- app.Command{Kind: app.CommandCancelTurn}
+	if event := receiveEvent(t, application.Events()); event.Kind != app.EventTurnInterrupted {
+		t.Fatalf("turn terminal=%+v", event)
+	}
+
+	application.Commands() <- app.Command{Kind: app.CommandCompact}
+	select {
+	case <-compactCalls:
+	case <-time.After(time.Second):
+		t.Fatal("compaction did not start")
+	}
+	if event := receiveEvent(t, application.Events()); event.Kind != app.EventTurnCompleted {
+		t.Fatalf("compact terminal=%+v", event)
+	}
+}
+
+func TestAppTranslatesRuntimeEvents(t *testing.T) {
+	runtimeEvents := make(chan agent.RuntimeEvent)
+	application := app.New(app.Options{RuntimeEvents: runtimeEvents})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	progress := domain.ToolProgress{CallID: "call-1", Text: "working"}
+	result := domain.ToolResult{CallID: "call-1", Content: "done"}
+	tests := []struct {
+		runtime agent.RuntimeEvent
+		want    app.EventKind
+	}{
+		{runtime: agent.RuntimeEvent{Kind: agent.RuntimeStateChanged, State: "streaming_model"}, want: app.EventState},
+		{runtime: agent.RuntimeEvent{Kind: agent.RuntimeTextDelta, Text: "hello"}, want: app.EventTextDelta},
+		{runtime: agent.RuntimeEvent{Kind: agent.RuntimeToolStarted}, want: app.EventToolStarted},
+		{runtime: agent.RuntimeEvent{Kind: agent.RuntimeToolOutput, Progress: &progress}, want: app.EventToolOutput},
+		{runtime: agent.RuntimeEvent{Kind: agent.RuntimeToolCompleted, Result: &result}, want: app.EventToolCompleted},
+	}
+	for _, test := range tests {
+		runtimeEvents <- test.runtime
+		event := receiveEvent(t, application.Events())
+		if event.Kind != test.want || event.Runtime != test.runtime {
+			t.Fatalf("event=%+v want kind=%q runtime=%+v", event, test.want, test.runtime)
+		}
+	}
+}
+
+func TestAppPermissionBrokerResolvesRegisteredCall(t *testing.T) {
+	application := app.New(app.Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	prompt := ports.PermissionPrompt{SessionID: "session-1", Call: domain.PreparedToolRequest{
+		Request:         domain.ToolRequest{CallID: "call-1", Name: "shell"},
+		CanonicalScope:  "/workspace",
+		InsideWorkspace: true,
+		ProposedDiff:    "diff",
+		Summary:         "run command",
+	}}
+	decision := domain.PermissionDecision{Action: domain.PermissionAllow, Lifetime: domain.PermissionOnce}
+	resolved := make(chan permissionResult, 1)
+	go func() {
+		got, err := application.Resolve(ctx, prompt)
+		resolved <- permissionResult{decision: got, err: err}
+	}()
+
+	event := receiveEvent(t, application.Events())
+	if event.Kind != app.EventPermissionRequested || event.Permission == nil || !reflect.DeepEqual(*event.Permission, prompt) {
+		t.Fatalf("event=%+v", event)
+	}
+	application.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: prompt.Call.Request.CallID, Decision: decision}
+	if got := <-resolved; got.err != nil || got.decision != decision {
+		t.Fatalf("resolved=%+v", got)
+	}
+
+	application.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: prompt.Call.Request.CallID, Decision: decision}
+	if event := <-application.Events(); event.Kind != app.EventRejected || !strings.Contains(event.Message, prompt.Call.Request.CallID) {
+		t.Fatalf("stale event=%+v", event)
+	}
+}
+
+func TestAppPermissionBrokerRejectsDuplicateCallID(t *testing.T) {
+	application := app.New(app.Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+	prompt := ports.PermissionPrompt{Call: domain.PreparedToolRequest{Request: domain.ToolRequest{CallID: "duplicate"}}}
+
+	first := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, prompt)
+		first <- permissionResult{decision: decision, err: err}
+	}()
+	if event := <-application.Events(); event.Kind != app.EventPermissionRequested {
+		t.Fatalf("event=%+v", event)
+	}
+	if _, err := application.Resolve(ctx, prompt); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("duplicate error=%v", err)
+	}
+
+	cancel()
+	if got := <-first; !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("first error=%v", got.err)
+	}
+}
+
+func TestAppCancelRemovesPendingPermissionsAndEmitsOneTerminalEvent(t *testing.T) {
+	permissionStarted := make(chan struct{})
+	var application *app.App
+	runtime := &fakeRuntime{run: func(ctx context.Context, _ agent.RunInput) error {
+		close(permissionStarted)
+		_, err := application.Resolve(ctx, ports.PermissionPrompt{Call: domain.PreparedToolRequest{Request: domain.ToolRequest{CallID: "call-1"}}})
+		return err
+	}}
+	application = app.New(app.Options{Runtime: runtime, EventBuffer: 4})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "one"}
+	<-permissionStarted
+	if event := <-application.Events(); event.Kind != app.EventPermissionRequested {
+		t.Fatalf("event=%+v", event)
+	}
+	application.Commands() <- app.Command{Kind: app.CommandCancelTurn}
+	if event := <-application.Events(); event.Kind != app.EventTurnInterrupted {
+		t.Fatalf("terminal event=%+v", event)
+	}
+	application.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: "call-1"}
+	if event := <-application.Events(); event.Kind != app.EventRejected {
+		t.Fatalf("stale event=%+v", event)
+	}
+	select {
+	case event := <-application.Events():
+		t.Fatalf("duplicate terminal event=%+v", event)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestAppPermissionBrokerAllowsConcurrentDistinctCalls(t *testing.T) {
+	application := app.New(app.Options{EventBuffer: 2})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for _, callID := range []string{"one", "two"} {
+		callID := callID
+		go func() {
+			defer wg.Done()
+			_, _ = application.Resolve(ctx, ports.PermissionPrompt{Call: domain.PreparedToolRequest{Request: domain.ToolRequest{CallID: callID}}})
+		}()
+	}
+	for range 2 {
+		if event := <-application.Events(); event.Kind != app.EventPermissionRequested {
+			t.Fatalf("event=%+v", event)
+		}
+	}
+	cancel()
+	wg.Wait()
+}
+
+type fakeRuntime struct {
+	run func(context.Context, agent.RunInput) error
+}
+
+type permissionResult struct {
+	decision domain.PermissionDecision
+	err      error
+}
+
+func receiveEvent(t *testing.T, events <-chan app.Event) app.Event {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for app event")
+		return app.Event{}
+	}
+}
+
+func (r *fakeRuntime) RunTurn(ctx context.Context, input agent.RunInput) error {
+	return r.run(ctx, input)
+}

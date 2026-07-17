@@ -1,0 +1,34 @@
+version: 2
+project_name: yordam
+
+builds:
+  - id: yordam
+    main: ./cmd/yordam
+    binary: yordam
+    env: [CGO_ENABLED=0]
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X github.com/muratmirgun/yordam/internal/buildinfo.Version={{.Version}} -X github.com/muratmirgun/yordam/internal/buildinfo.Commit={{.Commit}} -X github.com/muratmirgun/yordam/internal/buildinfo.Date={{.Date}}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+sboms:
+  - id: archives
+    artifacts: archive
+    documents: ["{{ .ArtifactName }}.spdx.json"]
+    cmd: syft
+    args: ["$artifact", "--output", "spdx-json=$document"]
+
+changelog:
+  use: git
+
+release:
+  draft: false

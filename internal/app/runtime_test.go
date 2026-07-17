@@ -1,0 +1,224 @@
+package app
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/muratmirgun/yordam/internal/agent"
+	"github.com/muratmirgun/yordam/internal/cli"
+	"github.com/muratmirgun/yordam/internal/config"
+	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/permission"
+	"github.com/muratmirgun/yordam/internal/session/jsonl"
+)
+
+func TestRuntimeSetReadinessClassifiesModelsAndCredentials(t *testing.T) {
+	set := RuntimeSet{
+		Models:         []domain.ModelSelection{{Profile: "primary", Model: "a"}, {Profile: "secondary", Model: "b"}},
+		CredentialEnvs: map[string]string{"primary": "PRIMARY_KEY", "secondary": "SECONDARY_KEY"},
+		Credentials:    map[string]string{"primary": "secret", "secondary": ""},
+		configPath:     "/home/user/.config/yordam/config.jsonc",
+	}
+	if err := set.Ready(domain.ModelSelection{Profile: "primary", Model: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	for selection, want := range map[domain.ModelSelection]string{
+		{Profile: "secondary", Model: "b"}: "SECONDARY_KEY",
+		{Profile: "missing", Model: "x"}:   "not configured",
+	} {
+		err := set.Ready(selection)
+		var typed *domain.TypedError
+		if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "/home/user/.config/yordam/config.jsonc") || !strings.Contains(err.Error(), "restart") && want == "SECONDARY_KEY" || !asTypedConfiguration(err, &typed) {
+			t.Fatalf("selection=%+v error=%v", selection, err)
+		}
+	}
+}
+
+func TestRuntimeBuilderBindsProvidersToolsLimitsAndCredentials(t *testing.T) {
+	requests := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		requests <- request.Header.Get("Authorization")
+		response.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(response, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	t.Setenv("SECONDARY_KEY", "secondary-secret")
+	t.Setenv("ORDINARY_VALUE", "preserved")
+	cfg := loadRuntimeConfig(t, server.URL+"/v1", 1)
+	builder := newRuntimeBuilderForTest(t, server.Client())
+	set, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantModels := []domain.ModelSelection{{Profile: "primary", Model: "a"}, {Profile: "primary", Model: "b"}, {Profile: "secondary", Model: "c"}}
+	if !slices.Equal(set.Models, wantModels) || set.DefaultSelection != wantModels[0] {
+		t.Fatalf("models=%+v default=%+v", set.Models, set.DefaultSelection)
+	}
+	if set.Credentials["primary"] != "primary-secret" || set.Credentials["secondary"] != "secondary-secret" {
+		t.Fatalf("credentials not bound by provider")
+	}
+	runner, ok := set.Runtime.(*agent.Runner)
+	if !ok || runner.MaxToolCalls != 7 {
+		t.Fatalf("runtime=%T max=%d", set.Runtime, runner.MaxToolCalls)
+	}
+	for _, selection := range []domain.ModelSelection{{Profile: "primary", Model: "a"}, {Profile: "secondary", Model: "c"}} {
+		stream, err := runner.Provider.Stream(t.Context(), domain.ModelRequest{Selection: selection})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range stream {
+		}
+	}
+	if got := []string{<-requests, <-requests}; !slices.Equal(got, []string{"Bearer primary-secret", "Bearer secondary-secret"}) {
+		t.Fatalf("authorizations=%q", got)
+	}
+
+	shellTool, ok := runner.Tools.Lookup("shell")
+	if !ok {
+		t.Fatal("shell tool missing")
+	}
+	prepared, err := shellTool.Prepare(t.Context(), domain.ToolRequest{
+		CallID:    "env",
+		Name:      "shell",
+		Workspace: builder.workspace.CanonicalPath,
+		Input:     json.RawMessage(`{"command":"env","cwd":"."}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := prepared.Execute(t.Context())
+	if result.Status != domain.ToolSucceeded || strings.Contains(result.Content, "PRIMARY_KEY=") || strings.Contains(result.Content, "SECONDARY_KEY=") || !strings.Contains(result.Content, "ORDINARY_VALUE=preserved") {
+		t.Fatalf("shell environment result=%+v", result)
+	}
+
+	prepared, err = shellTool.Prepare(t.Context(), domain.ToolRequest{
+		CallID:    "timeout",
+		Name:      "shell",
+		Workspace: builder.workspace.CanonicalPath,
+		Input:     json.RawMessage(`{"command":"sleep 5","cwd":"."}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	result = prepared.Execute(t.Context())
+	if result.ErrorKind != domain.ErrorToolTimeout || time.Since(started) > 3*time.Second {
+		t.Fatalf("timeout result=%+v elapsed=%s", result, time.Since(started))
+	}
+}
+
+func TestRuntimeGenerationsKeepImmutableRedactors(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "generation-a")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	builder := newRuntimeBuilderForTest(t, nil)
+	first, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PRIMARY_KEY", "generation-b")
+	second, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := first.Redactor.String("generation-a generation-b"); got != "[REDACTED] generation-b" {
+		t.Fatalf("first redactor=%q", got)
+	}
+	if got := second.Redactor.String("generation-a generation-b"); got != "generation-a [REDACTED]" {
+		t.Fatalf("second redactor=%q", got)
+	}
+}
+
+func TestRuntimeBuilderRedactsConfiguredAndOverrideCredentials(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "configured-secret")
+	t.Setenv("YORDAM_API_KEY", "override-secret")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.Credentials["primary"] != "override-secret" {
+		t.Fatalf("effective credential=%q", set.Credentials["primary"])
+	}
+	if got := set.Redactor.String("configured-secret override-secret"); got != "[REDACTED] [REDACTED]" {
+		t.Fatalf("redacted=%q", got)
+	}
+}
+
+func TestRuntimeBuilderFallsBackToRootWhenCurrentModelWasRemoved(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(cfg, domain.ModelSelection{Profile: "removed", Model: "gone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.DefaultSelection != (domain.ModelSelection{Profile: "primary", Model: "a"}) {
+		t.Fatalf("default selection=%+v", set.DefaultSelection)
+	}
+}
+
+func asTypedConfiguration(err error, target **domain.TypedError) bool {
+	return errors.As(err, target) && (*target).Kind == domain.ErrorConfigurationInvalid
+}
+
+func loadRuntimeConfig(t *testing.T, baseURL string, timeout int) config.Config {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.jsonc")
+	body := fmt.Sprintf(`{
+  "model": "primary/a",
+  "provider": {
+    "primary": {
+      "options": {"baseURL": %q, "apiKeyEnv": "PRIMARY_KEY"},
+      "models": {"b": {}, "a": {}}
+    },
+    "secondary": {
+      "options": {"baseURL": %q, "apiKeyEnv": "SECONDARY_KEY"},
+      "models": {"c": {}}
+    }
+  },
+  "limits": {"maxToolCalls": 7, "shellTimeoutSeconds": %d}
+}`, baseURL, baseURL, timeout)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.LoadOptions{ConfigPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func newRuntimeBuilderForTest(t *testing.T, client *http.Client) runtimeBuilder {
+	t.Helper()
+	workspace, err := jsonl.WorkspaceFromPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := jsonl.New(t.TempDir(), jsonl.Options{})
+	session, err := store.Create(t.Context(), workspace, domain.ModeAsk, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtimeBuilder{
+		configPath:    "/home/user/.config/yordam/config.jsonc",
+		cli:           cli.Options{MaxToolCalls: 32, ShellTimeout: 120 * time.Second},
+		workspace:     workspace,
+		store:         store,
+		policy:        newPolicyBinding(permission.NewSession(domain.ModeAsk)),
+		activeSession: &sessionBinding{id: session.ID},
+		runtimeEvents: make(chan agent.RuntimeEvent, 64),
+		httpClient:    client,
+	}
+}
