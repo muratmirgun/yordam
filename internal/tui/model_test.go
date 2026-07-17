@@ -604,6 +604,57 @@ func TestPermissionEscapeResolvesAppBroker(t *testing.T) {
 	}
 }
 
+func TestPermissionEscapeRoundTripsOpaqueCallIDThroughAppBroker(t *testing.T) {
+	const configuredSecret = "tui-permission-call-id-secret"
+	rawCallID := "provider-" + configuredSecret
+	application := app.New(app.Options{Redactors: secret.NewBinding(secret.New(configuredSecret))})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = application.Run(ctx) }()
+
+	prompt := tui.PermissionPromptForTest("edit", "/workspace/file.go", true)
+	prompt.Call.Request.CallID = rawCallID
+	resolved := make(chan domain.PermissionDecision, 1)
+	errors := make(chan error, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, prompt)
+		if err != nil {
+			errors <- err
+			return
+		}
+		resolved <- decision
+	}()
+
+	var event app.Event
+	select {
+	case event = <-application.Events():
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for permission event")
+	}
+	if event.Permission == nil {
+		t.Fatal("permission request was not published")
+	}
+	displayedCallID := event.Permission.Call.Request.CallID
+	if displayedCallID == rawCallID || displayedCallID == "provider-[REDACTED]" || strings.Contains(displayedCallID, configuredSecret) {
+		t.Fatal("TUI received a raw or derived permission call ID")
+	}
+	model := tui.NewModel(tui.Options{Commands: application.Commands(), Events: application.Events()})
+	model = tui.SetTurnActiveForTest(model, true)
+	model = tui.ApplyAppEventForTest(model, event)
+	model = tui.PressForTest(model, "esc")
+
+	select {
+	case decision := <-resolved:
+		if decision.Action != domain.PermissionDeny || prompt.Call.Request.CallID != rawCallID {
+			t.Fatal("TUI response did not preserve the runner-owned internal call ID")
+		}
+	case err := <-errors:
+		t.Fatalf("resolve error=%v", err)
+	case <-time.After(time.Second):
+		t.Fatal("opaque TUI call ID left app permission request unresolved")
+	}
+}
+
 func TestAutoShellAcceptAcknowledgesBeforeResolution(t *testing.T) {
 	model, commands := tui.ModelAndCommandsForTest()
 	model = tui.SetModeForTest(model, domain.ModeAuto)

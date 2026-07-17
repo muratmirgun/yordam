@@ -215,11 +215,12 @@ func TestAppAutoShellApprovalStaysPendingWhenAcknowledgementAppendFails(t *testi
 		decision, err := application.Resolve(ctx, prompt)
 		resolved <- permissionResult{decision: decision, err: err}
 	}()
-	if event := receiveEvent(t, application.Events()); event.Kind != app.EventPermissionRequested {
-		t.Fatalf("permission event=%+v", event)
+	permissionEvent := receiveEvent(t, application.Events())
+	if permissionEvent.Kind != app.EventPermissionRequested || permissionEvent.Permission == nil {
+		t.Fatalf("permission event=%+v", permissionEvent)
 	}
 	decision := domain.PermissionDecision{Action: domain.PermissionAllow, Lifetime: domain.PermissionOnce, Scope: prompt.Call.CanonicalScope}
-	application.Commands() <- app.Command{Kind: app.CommandAcknowledgeAutoShell, CallID: "shell-1", Decision: decision}
+	application.Commands() <- app.Command{Kind: app.CommandAcknowledgeAutoShell, CallID: permissionEvent.Permission.Call.Request.CallID, Decision: decision}
 	if event := receiveEvent(t, application.Events()); event.Kind != app.EventError || !strings.Contains(event.Message, "disk full") {
 		t.Fatalf("ack event=%+v", event)
 	}

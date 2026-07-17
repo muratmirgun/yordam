@@ -389,16 +389,22 @@ func TestAppPermissionBrokerResolvesRegisteredCall(t *testing.T) {
 	}()
 
 	event := receiveEvent(t, application.Events())
-	if event.Kind != app.EventPermissionRequested || event.Permission == nil || !reflect.DeepEqual(*event.Permission, prompt) {
+	if event.Kind != app.EventPermissionRequested || event.Permission == nil {
 		t.Fatalf("event=%+v", event)
 	}
-	application.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: prompt.Call.Request.CallID, Decision: decision}
+	displayedCallID := event.Permission.Call.Request.CallID
+	wantPrompt := prompt
+	wantPrompt.Call.Request.CallID = displayedCallID
+	if displayedCallID == prompt.Call.Request.CallID || !reflect.DeepEqual(*event.Permission, wantPrompt) {
+		t.Fatalf("event=%+v", event)
+	}
+	application.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: displayedCallID, Decision: decision}
 	if got := <-resolved; got.err != nil || got.decision != decision {
 		t.Fatalf("resolved=%+v", got)
 	}
 
-	application.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: prompt.Call.Request.CallID, Decision: decision}
-	if event := <-application.Events(); event.Kind != app.EventRejected || !strings.Contains(event.Message, prompt.Call.Request.CallID) {
+	application.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: displayedCallID, Decision: decision}
+	if event := <-application.Events(); event.Kind != app.EventRejected || !strings.Contains(event.Message, displayedCallID) {
 		t.Fatalf("stale event=%+v", event)
 	}
 }
@@ -432,7 +438,7 @@ func TestAppPermissionBrokerRestoresInternalScopeAfterDisplayedScopeValidation(t
 	}
 	application.Commands() <- app.Command{
 		Kind:   app.CommandResolvePermission,
-		CallID: prompt.Call.Request.CallID,
+		CallID: event.Permission.Call.Request.CallID,
 		Decision: domain.PermissionDecision{
 			Action:   domain.PermissionAllow,
 			Lifetime: domain.PermissionOnce,
@@ -442,6 +448,212 @@ func TestAppPermissionBrokerRestoresInternalScopeAfterDisplayedScopeValidation(t
 	result := <-resolved
 	if result.err != nil || result.decision.Scope != rawScope {
 		t.Fatal("valid displayed-scope approval did not restore the internal scope")
+	}
+}
+
+func TestAppPermissionBrokerUsesOpaqueDisplayedCallID(t *testing.T) {
+	const configuredSecret = "permission-call-id-secret"
+	rawCallID := "provider-" + configuredSecret
+	application := app.New(app.Options{Redactors: secret.NewBinding(secret.New(configuredSecret))})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go application.Run(ctx)
+
+	prompt := ports.PermissionPrompt{Call: domain.PreparedToolRequest{
+		Request:        domain.ToolRequest{CallID: rawCallID, Name: "shell"},
+		CanonicalScope: "/workspace/safe",
+	}}
+	resolved := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, prompt)
+		resolved <- permissionResult{decision: decision, err: err}
+	}()
+
+	event := receiveEvent(t, application.Events())
+	if event.Kind != app.EventPermissionRequested || event.Permission == nil {
+		t.Fatal("permission request was not published")
+	}
+	displayedCallID := event.Permission.Call.Request.CallID
+	if displayedCallID == "" || displayedCallID == rawCallID || displayedCallID == "provider-[REDACTED]" || strings.Contains(displayedCallID, configuredSecret) {
+		t.Fatal("published permission did not use a safe opaque call ID")
+	}
+	if prompt.Call.Request.CallID != rawCallID {
+		t.Fatal("app mutated the runner-owned internal call ID")
+	}
+	application.Commands() <- app.Command{
+		Kind:   app.CommandResolvePermission,
+		CallID: displayedCallID,
+		Decision: domain.PermissionDecision{
+			Action:   domain.PermissionDeny,
+			Lifetime: domain.PermissionOnce,
+			Scope:    prompt.Call.CanonicalScope,
+		},
+	}
+	select {
+	case result := <-resolved:
+		if result.err != nil || result.decision.Action != domain.PermissionDeny {
+			t.Fatal("displayed call ID did not resolve the internal pending call")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("displayed call ID stranded Resolve")
+	}
+}
+
+func TestAppPermissionBrokerRejectsTamperedRawAndStaleCallIDs(t *testing.T) {
+	const configuredSecret = "permission-call-id-tamper-secret"
+	rawCallID := "provider-" + configuredSecret
+	application := app.New(app.Options{Redactors: secret.NewBinding(secret.New(configuredSecret))})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go application.Run(ctx)
+
+	prompt := ports.PermissionPrompt{Call: domain.PreparedToolRequest{
+		Request:        domain.ToolRequest{CallID: rawCallID, Name: "shell"},
+		CanonicalScope: "/workspace/safe",
+	}}
+	resolved := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, prompt)
+		resolved <- permissionResult{decision: decision, err: err}
+	}()
+	event := receiveEvent(t, application.Events())
+	if event.Permission == nil {
+		t.Fatal("permission request was not published")
+	}
+	displayedCallID := event.Permission.Call.Request.CallID
+
+	for _, rejectedCallID := range []string{displayedCallID + "-tampered", rawCallID} {
+		application.Commands() <- app.Command{
+			Kind:   app.CommandResolvePermission,
+			CallID: rejectedCallID,
+			Decision: domain.PermissionDecision{
+				Action:   domain.PermissionAllow,
+				Lifetime: domain.PermissionOnce,
+				Scope:    prompt.Call.CanonicalScope,
+			},
+		}
+		rejected := receiveEvent(t, application.Events())
+		if rejected.Kind != app.EventRejected || strings.Contains(rejected.Message, configuredSecret) {
+			t.Fatal("invalid call ID was not rejected safely")
+		}
+		select {
+		case <-resolved:
+			t.Fatal("invalid call ID resolved the pending permission")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	application.Commands() <- app.Command{
+		Kind:   app.CommandResolvePermission,
+		CallID: displayedCallID,
+		Decision: domain.PermissionDecision{
+			Action:   domain.PermissionDeny,
+			Lifetime: domain.PermissionOnce,
+			Scope:    prompt.Call.CanonicalScope,
+		},
+	}
+	select {
+	case result := <-resolved:
+		if result.err != nil {
+			t.Fatal("valid displayed call ID could not resolve after rejected IDs")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("valid displayed call ID stranded Resolve")
+	}
+
+	replacement := prompt
+	replacement.Call.Request.CallID = rawCallID + "-replacement"
+	replacementResolved := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, replacement)
+		replacementResolved <- permissionResult{decision: decision, err: err}
+	}()
+	replacementEvent := receiveEvent(t, application.Events())
+	if replacementEvent.Permission == nil {
+		t.Fatal("replacement permission request was not published")
+	}
+	replacementCallID := replacementEvent.Permission.Call.Request.CallID
+	if replacementCallID == displayedCallID {
+		t.Fatal("replacement permission reused a stale displayed call ID")
+	}
+	application.Commands() <- app.Command{
+		Kind:     app.CommandResolvePermission,
+		CallID:   displayedCallID,
+		Decision: domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: replacement.Call.CanonicalScope},
+	}
+	if rejected := receiveEvent(t, application.Events()); rejected.Kind != app.EventRejected {
+		t.Fatal("stale displayed call ID was not rejected")
+	}
+	select {
+	case <-replacementResolved:
+		t.Fatal("stale displayed call ID resolved a later permission")
+	case <-time.After(20 * time.Millisecond):
+	}
+	application.Commands() <- app.Command{
+		Kind:     app.CommandResolvePermission,
+		CallID:   replacementCallID,
+		Decision: domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: replacement.Call.CanonicalScope},
+	}
+	select {
+	case result := <-replacementResolved:
+		if result.err != nil {
+			t.Fatal("replacement permission did not resolve with its displayed call ID")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement displayed call ID stranded Resolve")
+	}
+}
+
+func TestAppPermissionBrokerSeparatesConcurrentCallIDsWithSameRedactedValue(t *testing.T) {
+	application := app.New(app.Options{Redactors: secret.NewBinding(secret.New("first-secret", "second-secret")), EventBuffer: 2})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go application.Run(ctx)
+
+	prompts := []ports.PermissionPrompt{
+		{Call: domain.PreparedToolRequest{Request: domain.ToolRequest{CallID: "provider-first-secret", Name: "shell"}, CanonicalScope: "/workspace/safe"}},
+		{Call: domain.PreparedToolRequest{Request: domain.ToolRequest{CallID: "provider-second-secret", Name: "shell"}, CanonicalScope: "/workspace/safe"}},
+	}
+	results := []chan permissionResult{make(chan permissionResult, 1), make(chan permissionResult, 1)}
+	for index := range prompts {
+		index := index
+		go func() {
+			decision, err := application.Resolve(ctx, prompts[index])
+			results[index] <- permissionResult{decision: decision, err: err}
+		}()
+	}
+
+	displayedCallIDs := make([]string, 0, len(prompts))
+	for range prompts {
+		event := receiveEvent(t, application.Events())
+		if event.Kind != app.EventPermissionRequested || event.Permission == nil {
+			t.Fatal("concurrent permission request was not published")
+		}
+		displayedCallIDs = append(displayedCallIDs, event.Permission.Call.Request.CallID)
+	}
+	if displayedCallIDs[0] == displayedCallIDs[1] || displayedCallIDs[0] == "provider-[REDACTED]" || displayedCallIDs[1] == "provider-[REDACTED]" {
+		t.Fatal("concurrent permissions did not receive distinct opaque call IDs")
+	}
+	for _, displayedCallID := range displayedCallIDs {
+		application.Commands() <- app.Command{
+			Kind:   app.CommandResolvePermission,
+			CallID: displayedCallID,
+			Decision: domain.PermissionDecision{
+				Action:   domain.PermissionDeny,
+				Lifetime: domain.PermissionOnce,
+				Scope:    "/workspace/safe",
+			},
+		}
+	}
+	for _, resultChannel := range results {
+		select {
+		case result := <-resultChannel:
+			if result.err != nil {
+				t.Fatal("concurrent displayed call ID did not resolve")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("redacted call ID collision stranded Resolve")
+		}
 	}
 }
 
@@ -471,7 +683,7 @@ func TestAppPermissionBrokerRejectsTamperedDisplayedScope(t *testing.T) {
 
 	application.Commands() <- app.Command{
 		Kind:   app.CommandResolvePermission,
-		CallID: prompt.Call.Request.CallID,
+		CallID: event.Permission.Call.Request.CallID,
 		Decision: domain.PermissionDecision{
 			Action:   domain.PermissionAllow,
 			Lifetime: domain.PermissionOnce,
@@ -489,7 +701,7 @@ func TestAppPermissionBrokerRejectsTamperedDisplayedScope(t *testing.T) {
 
 	application.Commands() <- app.Command{
 		Kind:   app.CommandResolvePermission,
-		CallID: prompt.Call.Request.CallID,
+		CallID: event.Permission.Call.Request.CallID,
 		Decision: domain.PermissionDecision{
 			Action:   domain.PermissionDeny,
 			Lifetime: domain.PermissionOnce,
@@ -554,7 +766,7 @@ func TestAppPermissionSanitizationFailureReturnsErrorWithoutPendingLeak(t *testi
 	}
 	application.Commands() <- app.Command{
 		Kind:   app.CommandResolvePermission,
-		CallID: valid.Call.Request.CallID,
+		CallID: requestEvent.Permission.Call.Request.CallID,
 		Decision: domain.PermissionDecision{
 			Action:   domain.PermissionDeny,
 			Lifetime: domain.PermissionOnce,

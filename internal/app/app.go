@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"slices"
@@ -71,17 +72,21 @@ type App struct {
 	close          func() error
 	sessionChanged func(string)
 
-	pendingMu  sync.Mutex
-	pending    map[string]*pendingPermission
-	eventMu    sync.Mutex
-	eventQueue []Event
-	eventWake  chan struct{}
+	pendingMu              sync.Mutex
+	pending                map[string]*pendingPermission
+	pendingInternal        map[string]*pendingPermission
+	permissionCallSequence uint64
+	eventMu                sync.Mutex
+	eventQueue             []Event
+	eventWake              chan struct{}
 }
 
 type pendingPermission struct {
-	decision       chan domain.PermissionDecision
-	internalScope  string
-	displayedScope string
+	internalCallID  string
+	displayedCallID string
+	decision        chan domain.PermissionDecision
+	internalScope   string
+	displayedScope  string
 }
 
 type permissionResolution uint8
@@ -91,6 +96,8 @@ const (
 	permissionStale
 	permissionInvalidScope
 )
+
+var errPermissionCorrelationUnavailable = errors.New("permission correlation unavailable")
 
 type operationResult struct {
 	kind       operationKind
@@ -117,26 +124,27 @@ func New(options Options) *App {
 		redactors = secret.NewBinding(secret.New())
 	}
 	application := &App{
-		runtimeSet:     runtimeSet,
-		reloadRuntime:  options.ReloadRuntime,
-		redactors:      redactors,
-		input:          options.Input,
-		compact:        options.Compact,
-		runtimeEvents:  options.RuntimeEvents,
-		sessions:       options.Sessions,
-		session:        options.Session,
-		replay:         options.Replay,
-		replayValid:    true,
-		workspace:      workspace,
-		policy:         options.Policy,
-		restorePolicy:  options.RestorePolicy,
-		commands:       make(chan Command, options.CommandBuffer),
-		events:         make(chan Event, options.EventBuffer),
-		logger:         options.Logger,
-		close:          options.Close,
-		sessionChanged: options.SessionChanged,
-		pending:        make(map[string]*pendingPermission),
-		eventWake:      make(chan struct{}, 1),
+		runtimeSet:      runtimeSet,
+		reloadRuntime:   options.ReloadRuntime,
+		redactors:       redactors,
+		input:           options.Input,
+		compact:         options.Compact,
+		runtimeEvents:   options.RuntimeEvents,
+		sessions:        options.Sessions,
+		session:         options.Session,
+		replay:          options.Replay,
+		replayValid:     true,
+		workspace:       workspace,
+		policy:          options.Policy,
+		restorePolicy:   options.RestorePolicy,
+		commands:        make(chan Command, options.CommandBuffer),
+		events:          make(chan Event, options.EventBuffer),
+		logger:          options.Logger,
+		close:           options.Close,
+		sessionChanged:  options.SessionChanged,
+		pending:         make(map[string]*pendingPermission),
+		pendingInternal: make(map[string]*pendingPermission),
+		eventWake:       make(chan struct{}, 1),
 	}
 	runtimeSet.BindApprover(application)
 	return application
@@ -638,8 +646,12 @@ func (a *App) settingEvent() Event {
 }
 
 func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domain.PermissionDecision, error) {
-	callID := prompt.Call.Request.CallID
-	published, sanitizeErr := a.preparePublishedEvent(Event{Kind: EventPermissionRequested, Permission: &prompt})
+	internalCallID := prompt.Call.Request.CallID
+	redactor := secret.New()
+	if a.redactors != nil {
+		redactor = a.redactors.Snapshot()
+	}
+	published, sanitizeErr := sanitizePublishedEvent(redactor, Event{Kind: EventPermissionRequested, Permission: &prompt})
 	if sanitizeErr != nil {
 		a.enqueuePublishedEvent(ctx, published)
 		if err := ctx.Err(); err != nil {
@@ -647,20 +659,33 @@ func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domai
 		}
 		return domain.PermissionDecision{}, sanitizeErr
 	}
-	pending := &pendingPermission{
-		decision:       make(chan domain.PermissionDecision, 1),
-		internalScope:  permissionApprovalScope(prompt.Call),
-		displayedScope: permissionApprovalScope(published.Permission.Call),
-	}
-
 	a.pendingMu.Lock()
-	if _, exists := a.pending[callID]; exists {
+	if _, exists := a.pendingInternal[internalCallID]; exists {
 		a.pendingMu.Unlock()
-		return domain.PermissionDecision{}, fmt.Errorf("permission call %q is already pending", callID)
+		return domain.PermissionDecision{}, errors.New("duplicate permission call is already pending")
 	}
-	a.pending[callID] = pending
+	displayedCallID, err := a.newDisplayedPermissionCallID(redactor)
+	if err != nil {
+		a.pendingMu.Unlock()
+		failure := Event{Kind: EventError, Message: err.Error(), Err: err}
+		a.enqueuePublishedEvent(ctx, failure)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return domain.PermissionDecision{}, ctxErr
+		}
+		return domain.PermissionDecision{}, err
+	}
+	published = permissionEventWithCallID(published, displayedCallID)
+	pending := &pendingPermission{
+		internalCallID:  internalCallID,
+		displayedCallID: displayedCallID,
+		decision:        make(chan domain.PermissionDecision, 1),
+		internalScope:   permissionApprovalScope(prompt.Call),
+		displayedScope:  permissionApprovalScope(published.Permission.Call),
+	}
+	a.pending[displayedCallID] = pending
+	a.pendingInternal[internalCallID] = pending
 	a.pendingMu.Unlock()
-	defer a.removePending(callID, pending)
+	defer a.removePending(pending)
 
 	if !a.enqueuePublishedEvent(ctx, published) {
 		return domain.PermissionDecision{}, ctx.Err()
@@ -671,6 +696,32 @@ func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domai
 	case <-ctx.Done():
 		return domain.PermissionDecision{}, ctx.Err()
 	}
+}
+
+func (a *App) newDisplayedPermissionCallID(redactor secret.Redactor) (string, error) {
+	for range 32 {
+		if a.permissionCallSequence == ^uint64(0) {
+			return "", errPermissionCorrelationUnavailable
+		}
+		a.permissionCallSequence++
+		callID := fmt.Sprintf("permission-%d-%s", a.permissionCallSequence, rand.Text())
+		if redactor.String(callID) != callID {
+			continue
+		}
+		return callID, nil
+	}
+	return "", errPermissionCorrelationUnavailable
+}
+
+func permissionEventWithCallID(event Event, callID string) Event {
+	prompt := *event.Permission
+	call := prompt.Call
+	request := call.Request
+	request.CallID = callID
+	call.Request = request
+	prompt.Call = call
+	event.Permission = &prompt
+	return event
 }
 
 func permissionApprovalScope(request domain.PreparedToolRequest) string {
@@ -709,17 +760,21 @@ func (a *App) resolvePermission(callID string, decision domain.PermissionDecisio
 	select {
 	case pending.decision <- decision:
 		delete(a.pending, callID)
+		delete(a.pendingInternal, pending.internalCallID)
 		return permissionResolved
 	default:
 		return permissionStale
 	}
 }
 
-func (a *App) removePending(callID string, pending *pendingPermission) {
+func (a *App) removePending(pending *pendingPermission) {
 	a.pendingMu.Lock()
 	defer a.pendingMu.Unlock()
-	if a.pending[callID] == pending {
-		delete(a.pending, callID)
+	if a.pending[pending.displayedCallID] == pending {
+		delete(a.pending, pending.displayedCallID)
+	}
+	if a.pendingInternal[pending.internalCallID] == pending {
+		delete(a.pendingInternal, pending.internalCallID)
 	}
 }
 
@@ -727,6 +782,7 @@ func (a *App) clearPending() {
 	a.pendingMu.Lock()
 	defer a.pendingMu.Unlock()
 	clear(a.pending)
+	clear(a.pendingInternal)
 }
 
 func (a *App) publish(ctx context.Context, event Event) bool {
