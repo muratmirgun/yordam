@@ -546,7 +546,7 @@ func (s *Store) openSessionAtWorkspace(
 	if err != nil {
 		return fail(err)
 	}
-	if err := cleanupRootTemporaries(transaction.sessionRoot, validMetadataTemporaryName); err != nil {
+	if err := cleanupRootTemporaries(transaction.sessionRoot, validSessionTemporaryName); err != nil {
 		return fail(err)
 	}
 	transaction.metadata, transaction.metadataInfo, err = openRootedRegularFile(ctx, transaction.sessionRoot, "metadata.json", os.O_RDONLY, 0)
@@ -757,6 +757,68 @@ func writeJSONAtomicRooted(ctx context.Context, transaction *sessionTransaction,
 	)
 }
 
+func writeReplaceJSONAtomicRooted(
+	ctx context.Context,
+	transaction *sessionTransaction,
+	final string,
+	prefix string,
+	value any,
+	limit int64,
+) error {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if int64(len(raw)) > limit {
+		return fmt.Errorf("persistent JSON exceeds %d bytes", limit)
+	}
+	if err := transaction.verifyEvents(); err != nil {
+		return err
+	}
+	temporary, file, fileInfo, err := createRootedTemporary(ctx, transaction.sessionRoot, prefix, ".tmp")
+	if err != nil {
+		return err
+	}
+	cleanup := func(operationErr error) error {
+		return errors.Join(operationErr, cleanupRootEntryIfSame(transaction.sessionRoot, fileInfo, temporary))
+	}
+	writeErr := error(nil)
+	if _, writeErr = file.Write(raw); writeErr == nil {
+		writeErr = file.Sync()
+	}
+	if writeErr == nil {
+		writeErr = errors.Join(transaction.verifyEvents(), verifyRootedRegularFile(transaction.sessionRoot, temporary, fileInfo))
+	}
+	writeErr = errors.Join(writeErr, file.Close())
+	if writeErr != nil {
+		return cleanup(writeErr)
+	}
+	if err := ctx.Err(); err != nil {
+		return cleanup(err)
+	}
+	if existing, err := transaction.sessionRoot.Lstat(final); err == nil {
+		if !existing.Mode().IsRegular() || existing.Mode()&os.ModeSymlink != 0 {
+			return cleanup(fmt.Errorf("%q is not a regular disposable index", final))
+		}
+	} else if !os.IsNotExist(err) {
+		return cleanup(err)
+	}
+	if err := errors.Join(transaction.verifyEvents(), verifyRootedRegularFile(transaction.sessionRoot, temporary, fileInfo)); err != nil {
+		return cleanup(err)
+	}
+	if err := transaction.sessionRoot.Rename(temporary, final); err != nil {
+		return cleanup(err)
+	}
+	if err := syncRootDir(transaction.sessionRoot, "."); err != nil {
+		return err
+	}
+	index, indexInfo, err := openRootedRegularFile(ctx, transaction.sessionRoot, final, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	return errors.Join(index.Close(), transaction.verifyEvents(), verifyRootedRegularFile(transaction.sessionRoot, final, indexInfo))
+}
+
 func createRootedTemporary(
 	ctx context.Context,
 	root *os.Root,
@@ -784,6 +846,14 @@ func validWorkspaceTemporaryName(name string) bool {
 
 func validMetadataTemporaryName(name string) bool {
 	return validRandomTemporaryName(name, ".metadata-", ".tmp")
+}
+
+func validJournalIndexTemporaryName(name string) bool {
+	return validRandomTemporaryName(name, ".journal-index-", ".tmp")
+}
+
+func validSessionTemporaryName(name string) bool {
+	return validMetadataTemporaryName(name) || validJournalIndexTemporaryName(name)
 }
 
 func validRandomTemporaryName(name, prefix, suffix string) bool {

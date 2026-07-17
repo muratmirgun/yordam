@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/eventcodec"
+	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -22,6 +24,9 @@ type Options struct {
 	Clock    func() time.Time
 	Entropy  io.Reader
 	Sanitize func(any) (json.RawMessage, error)
+	Encoder  journal.Encoder
+	Registry *eventcodec.Registry
+	Fault    FaultInjector
 }
 
 type Store struct {
@@ -29,13 +34,18 @@ type Store struct {
 	clock    func() time.Time
 	entropy  io.Reader
 	sanitize func(any) (json.RawMessage, error)
+	encoder  journal.Encoder
+	registry *eventcodec.Registry
+	fault    FaultInjector
 	state    *rootState
 }
 
 type rootState struct {
-	lock    chan struct{}
-	lastID  ulid.ULID
-	hasLast bool
+	lock         chan struct{}
+	idMu         sync.Mutex
+	lastID       ulid.ULID
+	hasLast      bool
+	journalLocks sync.Map
 }
 
 var rootStates sync.Map
@@ -43,6 +53,10 @@ var rootStates sync.Map
 const maxEventSize = 2 << 20
 
 func New(root string, opts Options) *Store {
+	encoder := opts.Encoder
+	if encoder == nil && opts.Sanitize != nil {
+		encoder = sanitizeEncoder{sanitize: opts.Sanitize}
+	}
 	if opts.Clock == nil {
 		opts.Clock = time.Now
 	}
@@ -54,9 +68,16 @@ func New(root string, opts Options) *Store {
 			return json.Marshal(value)
 		}
 	}
+	registry := opts.Registry
+	if registry == nil {
+		registry, _ = eventcodec.New(eventcodec.FoundationDescriptors())
+	}
 	root = normalizeRoot(root)
 	state, _ := rootStates.LoadOrStore(root, newRootState())
-	return &Store{root: root, clock: opts.Clock, entropy: opts.Entropy, sanitize: opts.Sanitize, state: state.(*rootState)}
+	return &Store{
+		root: root, clock: opts.Clock, entropy: opts.Entropy, sanitize: opts.Sanitize,
+		encoder: encoder, registry: registry, fault: opts.Fault, state: state.(*rootState),
+	}
 }
 
 func newRootState() *rootState {
@@ -109,6 +130,8 @@ func normalizeRoot(root string) string {
 }
 
 func (s *Store) nextID() (string, error) {
+	s.state.idMu.Lock()
+	defer s.state.idMu.Unlock()
 	id, err := ulid.New(ulid.Timestamp(s.clock()), s.entropy)
 	if err != nil {
 		return "", err
