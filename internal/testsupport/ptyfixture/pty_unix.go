@@ -104,6 +104,71 @@ func (s *Session) Output() string {
 	return s.output.String()
 }
 
+func (s *Session) OutputOffset() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.output.Len()
+}
+
+func (s *Session) WaitForAfter(t testing.TB, offset int, value string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		output, valid := s.outputAfter(offset)
+		if !valid {
+			t.Fatal(s.formatDiagnostic("invalid PTY output offset %d", offset))
+		}
+		if strings.Contains(output, value) {
+			return
+		}
+		select {
+		case err := <-s.done:
+			t.Fatal(s.formatDiagnostic("process exited before post-offset marker %q: err=%v output=%q", value, err, output))
+		case <-deadline.C:
+			t.Fatal(s.formatDiagnostic("timed out waiting for post-offset marker %q; output=%q", value, output))
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Session) WaitForQuiet(t testing.TB, quiet, timeout time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	lastLength := -1
+	quietSince := time.Now()
+	for {
+		length := s.OutputOffset()
+		if length != lastLength {
+			lastLength = length
+			quietSince = time.Now()
+		} else if time.Since(quietSince) >= quiet {
+			return
+		}
+		select {
+		case err := <-s.done:
+			t.Fatal(s.formatDiagnostic("process exited before PTY became quiet: err=%v output=%q", err, s.Output()))
+		case <-deadline.C:
+			t.Fatal(s.formatDiagnostic("timed out waiting for quiet PTY output=%q", s.Output()))
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Session) outputAfter(offset int) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if offset < 0 || offset > s.output.Len() {
+		return "", false
+	}
+	return s.output.String()[offset:], true
+}
+
 func (s *Session) ResetOutput() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

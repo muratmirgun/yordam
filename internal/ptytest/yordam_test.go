@@ -13,13 +13,18 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/muratmirgun/yordam/internal/config"
+	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/testsupport/ptyfixture"
 )
+
+const ptyCredential = "pty-key-value"
 
 func TestVersionAndInteractiveTerminalRestoration(t *testing.T) {
 	binary := buildYordam(t)
@@ -42,13 +47,16 @@ func TestVersionAndInteractiveTerminalRestoration(t *testing.T) {
 }
 
 func TestFirstRunCreatesTemplateAndRestoresTerminal(t *testing.T) {
+	const environmentSecret = "first-run-template-secret"
 	workspace := t.TempDir()
 	home := t.TempDir()
 	dataDir := t.TempDir()
 
-	session := startYordam(t, workspace, home, "--data-dir", dataDir)
+	session := startYordamWithEnvironment(t, workspace, home, []string{"YORDAM_API_KEY=" + environmentSecret}, []string{environmentSecret}, "--data-dir", dataDir)
+	resizePTY(t, session, 220)
 	session.waitFor(t, "Ask Yordam", 3*time.Second)
-	session.waitFor(t, "Created", 3*time.Second)
+	session.waitFor(t, ".config/yordam/config.jsonc", 3*time.Second)
+	session.waitFor(t, "/reload", 3*time.Second)
 	session.write(t, string([]byte{3}))
 	session.waitForExit(t, 3*time.Second)
 	session.assertRestored(t)
@@ -58,11 +66,140 @@ func TestFirstRunCreatesTemplateAndRestoresTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), `"$schema"`) || !strings.Contains(string(raw), `"model": "openai/your-model-id"`) || !strings.Contains(string(raw), `"apiKeyEnv": "OPENAI_API_KEY"`) {
+	for _, expected := range []string{
+		`"$schema": "` + config.SchemaURL + `"`,
+		`"model": "openai/your-model-id"`,
+		`"baseURL": "https://api.openai.com/v1"`,
+		`"apiKeyEnv": "OPENAI_API_KEY"`,
+	} {
+		if !strings.Contains(string(raw), expected) {
+			t.Fatal("generated config is missing a required template field")
+		}
+	}
+	if strings.Contains(string(raw), environmentSecret) {
+		t.Fatal("generated config contains an environment secret")
+	}
+	if strings.Contains(session.outputString(), environmentSecret) {
+		t.Fatal("PTY output contains an environment secret")
+	}
+	if strings.Contains(string(raw), `"apiKey"`) {
 		t.Fatalf("generated config=%s", raw)
 	}
 	assertFileMode(t, filepath.Dir(configPath), 0o700)
 	assertFileMode(t, configPath, 0o600)
+}
+
+func TestEditAndReloadPreservesSessionAndSecretBoundaries(t *testing.T) {
+	const reloadSecret = "reload-secret"
+	const responseText = "assistant response after reload"
+	fixture := fmt.Sprintf("data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\ndata: [DONE]\n\n", responseText)
+	server, requests := newRecordingSSEServer(t, fixture, reloadSecret)
+	defer server.Close()
+	workspace := t.TempDir()
+	home := t.TempDir()
+	dataDir := t.TempDir()
+	debugLog := filepath.Join(t.TempDir(), "debug.jsonl")
+	configPath := filepath.Join(home, ".config", "yordam", "config.jsonc")
+
+	session := startYordamWithEnvironment(t, workspace, home, []string{"YORDAM_API_KEY=" + reloadSecret}, []string{reloadSecret},
+		"--data-dir", dataDir,
+		"--debug-log", debugLog,
+	)
+	resizePTY(t, session, 220)
+	session.waitFor(t, "Ask Yordam", 3*time.Second)
+	session.waitFor(t, "/reload", 3*time.Second)
+	identityBefore := singleSessionIdentity(t, dataDir)
+	replaceConfigAtomically(t, configPath, jsoncConfig(server.URL+"/v1", "YORDAM_API_KEY", "openai", "test-model"))
+	reloadOffset := session.OutputOffset()
+	session.write(t, "/reload\r")
+	session.WaitForAfter(t, reloadOffset, "openai/test-model", 3*time.Second)
+	session.WaitForAfter(t, reloadOffset, "configuration reloaded", 3*time.Second)
+	session.write(t, "hello after reload\r")
+	session.waitFor(t, responseText, 3*time.Second)
+	session.WaitForQuiet(t, 300*time.Millisecond, 3*time.Second)
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("provider requests=%d want=1", got)
+	}
+	if identityAfter := singleSessionIdentity(t, dataDir); identityAfter != identityBefore {
+		t.Fatalf("session identity changed across reload")
+	}
+	session.write(t, string([]byte{3}))
+	session.waitForExit(t, 3*time.Second)
+	session.assertRestored(t)
+
+	if strings.Contains(session.outputString(), reloadSecret) {
+		t.Fatal("PTY output contains the reload credential")
+	}
+	assertTreeOmits(t, home, reloadSecret)
+	assertTreeOmits(t, dataDir, reloadSecret)
+	assertTreeOmits(t, filepath.Dir(debugLog), reloadSecret)
+	assertTreeContains(t, dataDir, "hello after reload")
+	assertTreeContains(t, dataDir, responseText)
+}
+
+func TestFailedReloadKeepsOldRuntimeAndMissingKeyAppliesStateWithoutRequest(t *testing.T) {
+	const oldSecret = "old-runtime-secret"
+	const oldResponse = "old runtime still answers"
+	fixture := fmt.Sprintf("data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\ndata: [DONE]\n\n", oldResponse)
+	server, requests := newRecordingSSEServer(t, fixture, oldSecret)
+	defer server.Close()
+	workspace := t.TempDir()
+	home := t.TempDir()
+	dataDir := t.TempDir()
+	configPath := filepath.Join(home, ".config", "yordam", "config.jsonc")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	replaceConfigAtomically(t, configPath, jsoncConfig(server.URL+"/v1", "OLD_RELOAD_KEY", "old", "stable-model"))
+
+	session := startYordamWithEnvironment(t, workspace, home, []string{"OLD_RELOAD_KEY=" + oldSecret}, []string{oldSecret}, "--data-dir", dataDir)
+	resizePTY(t, session, 220)
+	session.waitFor(t, "old/stable-model", 3*time.Second)
+	identityBefore := singleSessionIdentity(t, dataDir)
+
+	replaceConfigAtomically(t, configPath, "{\n  \"model\":,\n}\n")
+	invalidOffset := session.OutputOffset()
+	session.write(t, "/reload\r")
+	session.WaitForAfter(t, invalidOffset, "invalid JSONC", 3*time.Second)
+	statusOffset := session.OutputOffset()
+	resizePTY(t, session, 219)
+	session.WaitForAfter(t, statusOffset, "old/stable-model", 3*time.Second)
+	session.write(t, "prompt after invalid reload\r")
+	session.waitFor(t, oldResponse, 3*time.Second)
+	session.WaitForQuiet(t, 300*time.Millisecond, 3*time.Second)
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("old runtime provider requests=%d want=1", got)
+	}
+
+	resizePTY(t, session, 360)
+	replaceConfigAtomically(t, configPath, jsoncConfig(server.URL+"/v1", "MISSING_RELOAD_KEY", "missing", "new-model"))
+	missingOffset := session.OutputOffset()
+	session.write(t, "/reload\r")
+	session.WaitForAfter(t, missingOffset, "missing/new-model", 3*time.Second)
+	session.WaitForAfter(t, missingOffset, "configuration reloaded", 3*time.Second)
+	session.WaitForAfter(t, missingOffset, "restart Yordam", 3*time.Second)
+
+	const restoredDraft = "draft restored after missing key"
+	draftOffset := session.OutputOffset()
+	session.write(t, restoredDraft+"\r")
+	session.WaitForAfter(t, draftOffset, "restart Yordam", 3*time.Second)
+	redrawOffset := session.OutputOffset()
+	resizePTY(t, session, 121)
+	session.WaitForAfter(t, redrawOffset, restoredDraft, 3*time.Second)
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("missing-key runtime made a provider request: requests=%d", got)
+	}
+	if identityAfter := singleSessionIdentity(t, dataDir); identityAfter != identityBefore {
+		t.Fatal("session identity changed across failed or missing-key reload")
+	}
+	session.write(t, string([]byte{3}))
+	session.waitForExit(t, 3*time.Second)
+	session.assertRestored(t)
+	if strings.Contains(session.outputString(), oldSecret) {
+		t.Fatal("PTY output contains the old runtime credential")
+	}
+	assertTreeOmits(t, home, oldSecret)
+	assertTreeOmits(t, dataDir, oldSecret)
 }
 
 func TestScriptedConversationResizeAndCleanExit(t *testing.T) {
@@ -152,7 +289,14 @@ type ptySession struct{ *ptyfixture.Session }
 
 func startYordam(t *testing.T, workspace, home string, arguments ...string) *ptySession {
 	t.Helper()
-	return &ptySession{Session: ptyfixture.Start(t, buildYordam(t), workspace, cleanEnvironment(os.Environ(), home), arguments...)}
+	return startYordamWithEnvironment(t, workspace, home, nil, []string{ptyCredential}, arguments...)
+}
+
+func startYordamWithEnvironment(t *testing.T, workspace, home string, extraEnvironment, secrets []string, arguments ...string) *ptySession {
+	t.Helper()
+	environment := append(cleanEnvironment(os.Environ(), home), extraEnvironment...)
+	redactor := secret.New(secrets...)
+	return &ptySession{Session: ptyfixture.StartRedacted(t, redactor.String, buildYordam(t), workspace, environment, arguments...)}
 }
 
 func (s *ptySession) write(t *testing.T, value string) {
@@ -209,33 +353,131 @@ func newSSEServer(t *testing.T, fixture string) *httptest.Server {
 	}))
 }
 
+func newRecordingSSEServer(t *testing.T, fixture, expectedCredential string) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	requests := &atomic.Int32{}
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/chat/completions" {
+			t.Errorf("request path=%q", request.URL.Path)
+			http.NotFound(response, request)
+			return
+		}
+		if request.Header.Get("Authorization") != "Bearer "+expectedCredential {
+			t.Error("provider request did not use the configured credential")
+		}
+		requests.Add(1)
+		response.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(response, fixture)
+	}))
+	return server, requests
+}
+
 func writeConfig(t *testing.T, home, baseURL, keyEnvironment string) {
 	t.Helper()
 	path := filepath.Join(home, ".config", "yordam", "config.jsonc")
-	body := fmt.Sprintf(`{
-  "model": "default/test-model",
-  "provider": {
-    "default": {
-      "options": {
-        "baseURL": %q,
-        "apiKeyEnv": %q
-      },
-      "models": {"test-model": {}}
-    }
-  },
-  "limits": {
-    "maxToolCalls": 32,
-    "shellTimeoutSeconds": 120
-  }
-}
-`, baseURL+"/v1", keyEnvironment)
+	body := jsoncConfig(baseURL+"/v1", keyEnvironment, "default", "test-model")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(keyEnvironment, "pty-key-value")
+	t.Setenv(keyEnvironment, ptyCredential)
+}
+
+func jsoncConfig(baseURL, keyEnvironment, provider, model string) string {
+	return fmt.Sprintf(`{
+  "$schema": %q,
+  // PTY fixture exercises comments and trailing commas.
+  "model": %q,
+  "provider": {
+    %q: {
+      "options": {
+        "baseURL": %q,
+        "apiKeyEnv": %q,
+      },
+      "models": {%q: {}},
+    },
+  },
+  "limits": {
+    "maxToolCalls": 32,
+    "shellTimeoutSeconds": 120,
+  },
+}
+`, config.SchemaURL, provider+"/"+model, provider, baseURL, keyEnvironment, model)
+}
+
+func replaceConfigAtomically(t *testing.T, path, body string) {
+	t.Helper()
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	temporary, err := os.CreateTemp(directory, ".pty-config-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		t.Fatal(err)
+	}
+	if _, err := temporary.WriteString(body); err != nil {
+		_ = temporary.Close()
+		t.Fatal(err)
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		t.Fatal(err)
+	}
+	if err := temporary.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func singleSessionIdentity(t *testing.T, dataDir string) string {
+	t.Helper()
+	workspaces, err := os.ReadDir(filepath.Join(dataDir, "workspaces"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces = onlyDirectories(workspaces)
+	if len(workspaces) != 1 {
+		t.Fatalf("workspace data directories=%d want=1", len(workspaces))
+	}
+	sessions, err := os.ReadDir(filepath.Join(dataDir, "workspaces", workspaces[0].Name(), "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions = onlyDirectories(sessions)
+	if len(sessions) != 1 {
+		t.Fatalf("session data directories=%d want=1", len(sessions))
+	}
+	return workspaces[0].Name() + "/" + sessions[0].Name()
+}
+
+func onlyDirectories(entries []os.DirEntry) []os.DirEntry {
+	directories := entries[:0]
+	for _, entry := range entries {
+		if entry.IsDir() {
+			directories = append(directories, entry)
+		}
+	}
+	return directories
+}
+
+func resizePTY(t *testing.T, session *ptySession, columns uint16) {
+	t.Helper()
+	if err := pty.Setsize(session.Terminal(), &pty.Winsize{Rows: 32, Cols: columns}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Command().Process.Signal(syscall.SIGWINCH); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func cleanEnvironment(environment []string, home string) []string {
