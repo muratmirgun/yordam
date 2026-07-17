@@ -91,6 +91,110 @@ type documentLimits struct {
 	ShellTimeoutSeconds *int `json:"shellTimeoutSeconds,omitempty"`
 }
 
+func (d *document) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "$schema", "model", "provider", "limits")
+	if err != nil {
+		return err
+	}
+	*d = document{}
+	if err := decodeField(fields, "$schema", &d.Schema); err != nil {
+		return err
+	}
+	if err := decodeField(fields, "model", &d.Model); err != nil {
+		return err
+	}
+	if err := decodeField(fields, "provider", &d.Provider); err != nil {
+		return err
+	}
+	return decodeField(fields, "limits", &d.Limits)
+}
+
+func (d *documentProvider) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "name", "options", "models")
+	if err != nil {
+		return err
+	}
+	*d = documentProvider{}
+	if err := decodeField(fields, "name", &d.Name); err != nil {
+		return err
+	}
+	if err := decodeField(fields, "options", &d.Options); err != nil {
+		return err
+	}
+	return decodeField(fields, "models", &d.Models)
+}
+
+func (d *documentProviderOptions) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "baseURL", "apiKeyEnv")
+	if err != nil {
+		return err
+	}
+	*d = documentProviderOptions{}
+	if err := decodeField(fields, "baseURL", &d.BaseURL); err != nil {
+		return err
+	}
+	return decodeField(fields, "apiKeyEnv", &d.APIKeyEnv)
+}
+
+func (d *documentModel) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "name")
+	if err != nil {
+		return err
+	}
+	*d = documentModel{}
+	return decodeField(fields, "name", &d.Name)
+}
+
+func (d *documentLimits) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "maxToolCalls", "shellTimeoutSeconds")
+	if err != nil {
+		return err
+	}
+	*d = documentLimits{}
+	if _, ok := fields["maxToolCalls"]; ok {
+		var value int
+		if err := decodeField(fields, "maxToolCalls", &value); err != nil {
+			return err
+		}
+		d.MaxToolCalls = &value
+	}
+	if _, ok := fields["shellTimeoutSeconds"]; ok {
+		var value int
+		if err := decodeField(fields, "shellTimeoutSeconds", &value); err != nil {
+			return err
+		}
+		d.ShellTimeoutSeconds = &value
+	}
+	return nil
+}
+
+func decodeExactObject(data []byte, allowed ...string) (map[string]json.RawMessage, error) {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil, fmt.Errorf("object must not be null")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	for key := range fields {
+		if !slices.Contains(allowed, key) {
+			return nil, fmt.Errorf("json: unknown field %q", key)
+		}
+	}
+	return fields, nil
+}
+
+func decodeField(fields map[string]json.RawMessage, name string, destination any) error {
+	raw, ok := fields[name]
+	if !ok {
+		return nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return fmt.Errorf("%s must not be null", name)
+	}
+	return json.Unmarshal(raw, destination)
+}
+
 var envName = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
 var hujsonErrorLocation = regexp.MustCompile(`^hujson: line ([0-9]+), column ([0-9]+):`)
 

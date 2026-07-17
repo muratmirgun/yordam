@@ -32,6 +32,16 @@ const validConfig = `{
   "limits": {"maxToolCalls": 32, "shellTimeoutSeconds": 120},
 }`
 
+const (
+	exactModelObject    = `{"name":"Model A"}`
+	exactModelsObject   = `{"model-a":` + exactModelObject + `}`
+	exactOptionsObject  = `{"baseURL":"https://llm.example/v1","apiKeyEnv":"PRIMARY_KEY"}`
+	exactProviderObject = `{"name":"Primary","options":` + exactOptionsObject + `,"models":` + exactModelsObject + `}`
+	exactProviderMap    = `{"primary":` + exactProviderObject + `}`
+	exactLimitsObject   = `{"maxToolCalls":32,"shellTimeoutSeconds":120}`
+	exactConfig         = `{"$schema":"` + config.SchemaURL + `","model":"primary/model-a","provider":` + exactProviderMap + `,"limits":` + exactLimitsObject + `}`
+)
+
 func TestLoadJSONCAndResolveProvider(t *testing.T) {
 	path := writeConfig(t, validConfig)
 	t.Setenv("PRIMARY_KEY", "secret-value")
@@ -71,6 +81,13 @@ func TestLoadReportsJSONCLineAndColumn(t *testing.T) {
 	_, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, "{\n  \"model\":,\n}")})
 	if err == nil || !strings.Contains(err.Error(), "line 2") || !strings.Contains(err.Error(), "column") {
 		t.Fatalf("syntax error=%v", err)
+	}
+}
+
+func TestLoadAcceptsBlockComments(t *testing.T) {
+	body := strings.Replace(validConfig, "// comments and trailing commas are accepted", "/* block comments are accepted */", 1)
+	if _, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, body)}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -197,6 +214,67 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 			_, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, test.body)})
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("Load() error=%v want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsNullAtSchemaConstrainedLocations(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "schema", body: strings.Replace(exactConfig, `"$schema":"`+config.SchemaURL+`"`, `"$schema":null`, 1)},
+		{name: "root model", body: strings.Replace(exactConfig, `"model":"primary/model-a"`, `"model":null`, 1)},
+		{name: "provider map", body: strings.Replace(exactConfig, `"provider":`+exactProviderMap, `"provider":null`, 1)},
+		{name: "provider object", body: strings.Replace(exactConfig, exactProviderObject, `null`, 1)},
+		{name: "provider name", body: strings.Replace(exactConfig, `"name":"Primary"`, `"name":null`, 1)},
+		{name: "options object", body: strings.Replace(exactConfig, exactOptionsObject, `null`, 1)},
+		{name: "base URL", body: strings.Replace(exactConfig, `"baseURL":"https://llm.example/v1"`, `"baseURL":null`, 1)},
+		{name: "API key environment", body: strings.Replace(exactConfig, `"apiKeyEnv":"PRIMARY_KEY"`, `"apiKeyEnv":null`, 1)},
+		{name: "models object", body: strings.Replace(exactConfig, exactModelsObject, `null`, 1)},
+		{name: "model object", body: strings.Replace(exactConfig, exactModelObject, `null`, 1)},
+		{name: "model name", body: strings.Replace(exactConfig, `"name":"Model A"`, `"name":null`, 1)},
+		{name: "limits object", body: strings.Replace(exactConfig, exactLimitsObject, `null`, 1)},
+		{name: "max tool calls", body: strings.Replace(exactConfig, `"maxToolCalls":32`, `"maxToolCalls":null`, 1)},
+		{name: "shell timeout", body: strings.Replace(exactConfig, `"shellTimeoutSeconds":120`, `"shellTimeoutSeconds":null`, 1)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, test.body)})
+			if err == nil || !strings.Contains(err.Error(), "must not be null") {
+				t.Fatalf("Load() error=%v", err)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsCaseVariantKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		body string
+	}{
+		{name: "schema", key: "$SCHEMA", body: strings.Replace(exactConfig, `"$schema":`, `"$SCHEMA":`, 1)},
+		{name: "model", key: "MODEL", body: strings.Replace(exactConfig, `"model":`, `"MODEL":`, 1)},
+		{name: "provider", key: "PROVIDER", body: strings.Replace(exactConfig, `"provider":`, `"PROVIDER":`, 1)},
+		{name: "limits", key: "LIMITS", body: strings.Replace(exactConfig, `"limits":`, `"LIMITS":`, 1)},
+		{name: "provider name", key: "NAME", body: strings.Replace(exactConfig, `"name":"Primary"`, `"NAME":"Primary"`, 1)},
+		{name: "options", key: "OPTIONS", body: strings.Replace(exactConfig, `"options":`, `"OPTIONS":`, 1)},
+		{name: "models", key: "MODELS", body: strings.Replace(exactConfig, `"models":`, `"MODELS":`, 1)},
+		{name: "base URL", key: "BASEURL", body: strings.Replace(exactConfig, `"baseURL":`, `"BASEURL":`, 1)},
+		{name: "API key environment", key: "APIKEYENV", body: strings.Replace(exactConfig, `"apiKeyEnv":`, `"APIKEYENV":`, 1)},
+		{name: "model name", key: "NAME", body: strings.Replace(exactConfig, `"name":"Model A"`, `"NAME":"Model A"`, 1)},
+		{name: "max tool calls", key: "MAXTOOLCALLS", body: strings.Replace(exactConfig, `"maxToolCalls":`, `"MAXTOOLCALLS":`, 1)},
+		{name: "shell timeout", key: "SHELLTIMEOUTSECONDS", body: strings.Replace(exactConfig, `"shellTimeoutSeconds":`, `"SHELLTIMEOUTSECONDS":`, 1)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, test.body)})
+			if err == nil || !strings.Contains(err.Error(), `unknown field "`+test.key+`"`) {
+				t.Fatalf("Load() error=%v", err)
 			}
 		})
 	}
