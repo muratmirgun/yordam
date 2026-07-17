@@ -201,7 +201,21 @@ func cleanupConfigTemporaries(directory string) error {
 	if err != nil {
 		return err
 	}
+	return cleanupConfigTemporaryEntries(directory, entries, os.Remove, syncDirectory)
+}
+
+func cleanupConfigTemporaryEntries(
+	directory string,
+	entries []os.DirEntry,
+	removeFile func(string) error,
+	syncDir func(string) error,
+) (err error) {
 	removed := false
+	defer func() {
+		if removed {
+			err = errors.Join(err, syncDir(directory))
+		}
+	}()
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasPrefix(name, ".config-") || !strings.HasSuffix(name, ".tmp") {
@@ -209,24 +223,24 @@ func cleanupConfigTemporaries(directory string) error {
 		}
 		info, err := entry.Info()
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			return err
 		}
 		if !info.Mode().IsRegular() || time.Since(info.ModTime()) < abandonedTemporaryAge {
 			continue
 		}
-		if err := os.Remove(filepath.Join(directory, name)); err != nil && !os.IsNotExist(err) {
-			return err
+		removeErr := removeFile(filepath.Join(directory, name))
+		if errors.Is(removeErr, os.ErrNotExist) {
+			continue
+		}
+		if removeErr != nil {
+			return removeErr
 		}
 		removed = true
 	}
-	if !removed {
-		return nil
-	}
-	directoryFile, err := os.Open(directory)
-	if err != nil {
-		return err
-	}
-	return errors.Join(directoryFile.Sync(), directoryFile.Close())
+	return nil
 }
 
 func syncDirectory(directory string) error {

@@ -138,6 +138,9 @@ func TestEnsureGlobalRemovesOnlyAbandonedTemporary(t *testing.T) {
 	if err := os.Mkdir(matchingDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chtimes(matchingDirectory, old, old); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Symlink(nonmatching, matchingSymlink); err != nil {
 		t.Fatal(err)
 	}
