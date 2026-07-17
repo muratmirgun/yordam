@@ -27,7 +27,7 @@ var defaultTemplate = []byte(`{
       "name": "OpenAI",
       "options": {
         "baseURL": "https://api.openai.com/v1",
-        "apiKey": "your-api-key"
+        "apiKeyEnv": "OPENAI_API_KEY"
       },
       "models": {
         "your-model-id": {
@@ -178,7 +178,6 @@ func marshalConfig(cfg Config) ([]byte, error) {
 			Name: profile.Name,
 			Options: documentProviderOptions{
 				BaseURL:   profile.BaseURL,
-				APIKey:    profile.APIKey,
 				APIKeyEnv: profile.APIKeyEnv,
 			},
 			Models: models,

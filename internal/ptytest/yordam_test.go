@@ -58,7 +58,7 @@ func TestFirstRunCreatesTemplateAndRestoresTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), `"$schema"`) || !strings.Contains(string(raw), `"model": "openai/your-model-id"`) || !strings.Contains(string(raw), `"apiKey": "your-api-key"`) {
+	if !strings.Contains(string(raw), `"$schema"`) || !strings.Contains(string(raw), `"model": "openai/your-model-id"`) || !strings.Contains(string(raw), `"apiKeyEnv": "OPENAI_API_KEY"`) {
 		t.Fatalf("generated config=%s", raw)
 	}
 	assertFileMode(t, filepath.Dir(configPath), 0o700)

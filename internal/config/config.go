@@ -27,7 +27,6 @@ const (
 type Profile struct {
 	Name         string
 	BaseURL      string
-	APIKey       string
 	APIKeyEnv    string
 	Models       []string
 	DefaultModel string
@@ -51,6 +50,7 @@ type ResolveOptions struct {
 	Profile        string
 	Model          string
 	BaseURL        string
+	ProcessAPIKey  string // removed with the setup stage in Task 5
 	DefaultProfile string
 	DefaultModel   string
 }
@@ -79,8 +79,7 @@ type documentProvider struct {
 
 type documentProviderOptions struct {
 	BaseURL   string `json:"baseURL"`
-	APIKey    string `json:"apiKey,omitempty"`
-	APIKeyEnv string `json:"apiKeyEnv,omitempty"`
+	APIKeyEnv string `json:"apiKeyEnv"`
 }
 
 type documentModel struct {
@@ -112,13 +111,6 @@ func Load(opts LoadOptions) (Config, error) {
 	}
 	value.Standardize()
 	standardized := value.Pack()
-	var shape any
-	if err := json.Unmarshal(standardized, &shape); err != nil {
-		return Config{}, fmt.Errorf("decode standardized JSONC: %w", err)
-	}
-	if containsJSONNull(shape) {
-		return Config{}, fmt.Errorf("null values are not allowed")
-	}
 	var decoded document
 	decoder := json.NewDecoder(bytes.NewReader(standardized))
 	decoder.DisallowUnknownFields()
@@ -135,26 +127,6 @@ func Load(opts LoadOptions) (Config, error) {
 	cfg.raw = append([]byte(nil), raw...)
 	cfg.lookupEnv = opts.LookupEnv
 	return cfg, nil
-}
-
-func containsJSONNull(value any) bool {
-	switch value := value.(type) {
-	case nil:
-		return true
-	case []any:
-		for _, item := range value {
-			if containsJSONNull(item) {
-				return true
-			}
-		}
-	case map[string]any:
-		for _, item := range value {
-			if containsJSONNull(item) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func requireJSONEOF(decoder *json.Decoder) error {
@@ -213,7 +185,6 @@ func normalizeDocument(decoded document) (Config, error) {
 		cfg.Profiles[id] = Profile{
 			Name:         provider.Name,
 			BaseURL:      provider.Options.BaseURL,
-			APIKey:       provider.Options.APIKey,
 			APIKeyEnv:    provider.Options.APIKeyEnv,
 			Models:       models,
 			DefaultModel: defaultModel,
@@ -246,10 +217,7 @@ func (c Config) Validate() error {
 		if !validBaseURL(configured.BaseURL) {
 			return fmt.Errorf("provider %q has invalid baseURL", name)
 		}
-		if configured.APIKey != "" && configured.APIKeyEnv != "" {
-			return fmt.Errorf("provider %q must configure only one of apiKey or apiKeyEnv", name)
-		}
-		if configured.APIKey == "" && !envName.MatchString(configured.APIKeyEnv) {
+		if !envName.MatchString(configured.APIKeyEnv) {
 			return fmt.Errorf("provider %q has invalid apiKeyEnv", name)
 		}
 		if len(configured.Models) == 0 {
@@ -299,11 +267,11 @@ func (c Config) Resolve(opts ResolveOptions) (ResolvedProfile, error) {
 	if !slices.Contains(profile.Models, model) {
 		return ResolvedProfile{}, fmt.Errorf("model %q not configured for %q", model, profileName)
 	}
-	key, _ := lookup("YORDAM_API_KEY")
+	key := opts.ProcessAPIKey
 	if key == "" {
-		key = profile.APIKey
+		key, _ = lookup("YORDAM_API_KEY")
 	}
-	if key == "" && profile.APIKeyEnv != "" {
+	if key == "" {
 		key, _ = lookup(profile.APIKeyEnv)
 	}
 	baseURL := opts.BaseURL
@@ -350,13 +318,15 @@ func (c Config) Models() []domain.ModelSelection {
 }
 
 func (c Config) ProviderKeyEnvironmentNames() []string {
-	names := make([]string, 0, len(c.Profiles))
-	for _, profile := range c.Profiles {
-		if profile.APIKeyEnv != "" {
-			names = append(names, profile.APIKeyEnv)
-		}
+	providers := make([]string, 0, len(c.Profiles))
+	for provider := range c.Profiles {
+		providers = append(providers, provider)
 	}
-	sort.Strings(names)
+	sort.Strings(providers)
+	names := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		names = append(names, c.Profiles[provider].APIKeyEnv)
+	}
 	return names
 }
 
@@ -367,10 +337,7 @@ func (c Config) APIKeys() map[string]string {
 	}
 	keys := make(map[string]string, len(c.Profiles))
 	for name, profile := range c.Profiles {
-		keys[name] = profile.APIKey
-		if keys[name] == "" && profile.APIKeyEnv != "" {
-			keys[name], _ = lookup(profile.APIKeyEnv)
-		}
+		keys[name], _ = lookup(profile.APIKeyEnv)
 	}
 	return keys
 }
