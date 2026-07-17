@@ -250,10 +250,11 @@ func TestConfiguredSecretPromptIsRedactedBeforeConversationRendering(t *testing.
 	defer cancel()
 	go application.Run(ctx)
 
-	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: configuredSecret}
-	model := tui.NewModel(tui.OptionsForTest())
+	events := application.Events()
+	model := tui.NewModel(tui.Options{Commands: application.Commands(), Events: events})
+	model = tui.SubmitForTest(model, configuredSecret)
 	for {
-		event := <-application.Events()
+		event := <-events
 		model = tui.ApplyAppEventForTest(model, event)
 		if event.Kind == app.EventTurnCompleted {
 			break

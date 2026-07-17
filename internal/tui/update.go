@@ -61,11 +61,11 @@ func (model Model) handleAppEvent(event app.Event) Model {
 			model = model.replaceModels(event.Models, event.Selection)
 		}
 	case app.EventTurnAccepted:
-		draft := event.Draft
-		if draft == "" {
-			draft = model.pendingDraft
-		}
-		if draft != "" {
+		if model.pendingDraft != "" {
+			draft := event.Draft
+			if draft == "" {
+				draft = model.pendingDraft
+			}
 			model.conversation.Append(components.BlockUser, draft)
 		}
 		model.pendingDraft = ""

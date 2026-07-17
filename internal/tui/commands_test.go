@@ -2,6 +2,7 @@ package tui_test
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/tui"
+	"github.com/muratmirgun/yordam/internal/tui/components"
 )
 
 func TestSlashCommandTable(t *testing.T) {
@@ -72,8 +74,25 @@ func TestDraftRendersOnlyAfterTurnAcceptanceAndRestoresOnConfigError(t *testing.
 		Err:   &domain.TypedError{Kind: domain.ErrorConfigurationInvalid, Message: "edit config and run /reload"},
 		Draft: "retry me",
 	})
-	if failed.ComposerValueForTest() != "retry me" || failed.TurnActiveForTest() || len(failed.ConversationBlocksForTest()) != 1 {
+	failedBlocks := failed.ConversationBlocksForTest()
+	if failed.ComposerValueForTest() != "retry me" || failed.TurnActiveForTest() || len(failedBlocks) != 1 || failedBlocks[0].Kind != components.BlockError || !strings.Contains(failedBlocks[0].Content, "edit config and run /reload") {
 		t.Fatalf("composer=%q active=%t blocks=%v", failed.ComposerValueForTest(), failed.TurnActiveForTest(), failed.ConversationBlocksForTest())
+	}
+	if failed.ContextOpenForTest() {
+		t.Fatal("configuration error moved focus away from the restored draft")
+	}
+}
+
+func TestTurnAcceptanceAppendsPendingDraftExactlyOnce(t *testing.T) {
+	model, _ := tui.NavigationModelForTest()
+	model = tui.SubmitForTest(model, "configured secret")
+	accepted := app.Event{Kind: app.EventTurnAccepted, Draft: "[REDACTED]"}
+	model = tui.ApplyAppEventForTest(model, accepted)
+	model = tui.ApplyAppEventForTest(model, accepted)
+
+	blocks := model.ConversationBlocksForTest()
+	if len(blocks) != 1 || blocks[0].Kind != components.BlockUser || blocks[0].Content != "[REDACTED]" {
+		t.Fatalf("accepted blocks=%v", blocks)
 	}
 }
 
@@ -114,10 +133,47 @@ func TestReloadCompletionRefreshesModelsAndUnlocksComposer(t *testing.T) {
 	if got := model.ModelCountForTest(); got != 2 {
 		t.Fatalf("model count=%d", got)
 	}
+	model = tui.PressForTest(model, "enter")
+	if got := tui.CommandsForTest(commands); len(got) != 1 || got[0].Kind != app.CommandChangeModel || got[0].Selection != selection {
+		t.Fatalf("refreshed picker commands=%v", got)
+	}
+	blocks := model.ConversationBlocksForTest()
+	if len(blocks) != 1 || blocks[0].Kind != components.BlockNotice || blocks[0].Content != "configuration reloaded" {
+		t.Fatalf("reload blocks=%v", blocks)
+	}
+}
+
+func TestReloadFailurePreservesModelsAndSelectionWhileUnlocking(t *testing.T) {
+	model, commands := tui.NavigationModelForTest()
+	model = tui.SubmitForTest(model, "/reload")
+	if got := tui.CommandsForTest(commands); len(got) != 1 || got[0].Kind != app.CommandReloadConfig {
+		t.Fatalf("reload commands=%v", got)
+	}
+	model = tui.ApplyAppEventForTest(model, app.Event{
+		Kind:      app.EventReloadCompleted,
+		Applied:   false,
+		Models:    []domain.ModelSelection{{Profile: "discarded", Model: "model"}},
+		Selection: domain.ModelSelection{Profile: "discarded", Model: "model"},
+		Err:       errors.New("invalid reload"),
+	})
+
+	wantSelection := domain.ModelSelection{Profile: "primary", Model: "model-a"}
+	if model.TurnActiveForTest() || model.ComposerActiveForTest() || model.StatusSelectionForTest() != wantSelection || model.ModelCountForTest() != 2 {
+		t.Fatalf("active=%t composerActive=%t selection=%+v modelCount=%d", model.TurnActiveForTest(), model.ComposerActiveForTest(), model.StatusSelectionForTest(), model.ModelCountForTest())
+	}
+	blocks := model.ConversationBlocksForTest()
+	if len(blocks) != 1 || blocks[0].Kind != components.BlockError || blocks[0].Content != "invalid reload" {
+		t.Fatalf("reload failure blocks=%v", blocks)
+	}
+	model = tui.SubmitForTest(model, "/model")
+	model = tui.PressForTest(model, "enter")
+	if got := tui.CommandsForTest(commands); len(got) != 1 || got[0].Kind != app.CommandChangeModel || got[0].Selection != wantSelection {
+		t.Fatalf("preserved picker commands=%v", got)
+	}
 }
 
 func TestReloadWithMissingCredentialShowsLoadedAndRestartNotices(t *testing.T) {
-	model, _ := tui.NavigationModelForTest()
+	model, commands := tui.NavigationModelForTest()
 	selection := domain.ModelSelection{Profile: "new", Model: "b"}
 	model = tui.ApplyAppEventForTest(model, app.Event{
 		Kind:      app.EventReloadCompleted,
@@ -134,14 +190,62 @@ func TestReloadWithMissingCredentialShowsLoadedAndRestartNotices(t *testing.T) {
 	if len(blocks) != 2 || blocks[0].Content != "configuration reloaded" || !strings.Contains(blocks[1].Content, "restart Yordam") {
 		t.Fatalf("blocks=%+v", blocks)
 	}
+	if model.StatusSelectionForTest() != selection || model.ModelCountForTest() != 1 {
+		t.Fatalf("selection=%+v modelCount=%d", model.StatusSelectionForTest(), model.ModelCountForTest())
+	}
+	model = tui.SubmitForTest(model, "/model")
+	model = tui.PressForTest(model, "enter")
+	if got := tui.CommandsForTest(commands); len(got) != 1 || got[0].Selection != selection {
+		t.Fatalf("applied picker commands=%v", got)
+	}
 }
 
 func TestNoticeAppendsWithoutChangingTurnState(t *testing.T) {
-	model, _ := tui.NavigationModelForTest()
-	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventNotice, Message: "Created config.jsonc"})
+	for _, active := range []bool{false, true} {
+		t.Run(map[bool]string{false: "idle", true: "active"}[active], func(t *testing.T) {
+			model, _ := tui.NavigationModelForTest()
+			model = tui.SetTurnActiveForTest(model, active)
+			model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventNotice, Message: "Created config.jsonc"})
+			blocks := model.ConversationBlocksForTest()
+			if len(blocks) != 1 || blocks[0].Content != "Created config.jsonc" || model.TurnActiveForTest() != active {
+				t.Fatalf("blocks=%v active=%t wantActive=%t", blocks, model.TurnActiveForTest(), active)
+			}
+		})
+	}
+}
+
+func TestReloadDuringActiveOperationIsRejectedLocally(t *testing.T) {
+	model, commands := tui.NavigationModelForTest()
+	model = tui.SetTurnActiveForTest(model, true)
+	model = tui.SubmitForTest(model, "/reload")
+
+	if got := tui.CommandsForTest(commands); len(got) != 0 {
+		t.Fatalf("commands=%v", got)
+	}
 	blocks := model.ConversationBlocksForTest()
-	if len(blocks) != 1 || blocks[0].Content != "Created config.jsonc" || model.TurnActiveForTest() {
-		t.Fatalf("blocks=%v active=%t", blocks, model.TurnActiveForTest())
+	if !model.TurnActiveForTest() || len(blocks) != 1 || blocks[0].Kind != components.BlockNotice || blocks[0].Content != "an operation is already active" {
+		t.Fatalf("active=%t blocks=%v", model.TurnActiveForTest(), blocks)
+	}
+}
+
+func TestStateModelsDistinguishesNilFromEmpty(t *testing.T) {
+	model, _ := tui.NavigationModelForTest()
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventState, Models: nil})
+	if got := model.ModelCountForTest(); got != 2 {
+		t.Fatalf("nil models changed picker count=%d", got)
+	}
+
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventState, Models: []domain.ModelSelection{}})
+	if got := model.ModelCountForTest(); got != 0 {
+		t.Fatalf("empty models did not clear picker count=%d", got)
+	}
+}
+
+func TestHelpListsReloadCommand(t *testing.T) {
+	model, _ := tui.NavigationModelForTest()
+	model = tui.SubmitForTest(model, "/help")
+	if view := model.View().Content; !strings.Contains(view, "/new /sessions /mode /model /reload /compact /help /quit") {
+		t.Fatalf("help missing reload command:\n%s", view)
 	}
 }
 
