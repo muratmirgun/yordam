@@ -20,6 +20,19 @@ import (
 	"github.com/muratmirgun/yordam/internal/testsupport/ptyfixture"
 )
 
+func TestCleanPTYEnvironmentScrubsTemplateCredentialAndKeepsArbitraryFixtureKey(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "inherited-template-credential")
+	t.Setenv("ACCEPTANCE_ARBITRARY_KEY", "preserved")
+	cleaned := cleanPTYEnvironment("/isolated-home", nil)
+	joined := strings.Join(cleaned, "\n")
+	if strings.Contains(joined, "OPENAI_API_KEY=") {
+		t.Fatal("clean acceptance environment retained the template credential")
+	}
+	if !strings.Contains(joined, "ACCEPTANCE_ARBITRARY_KEY=preserved") || !strings.Contains(joined, "HOME=/isolated-home") {
+		t.Fatal("clean acceptance environment discarded an arbitrary fixture key or isolated HOME")
+	}
+}
+
 func acceptSingleBinaryStartup(t *testing.T) {
 	const startupSecret = "v010-startup-template-secret"
 	binary := ptyfixture.BuildYordam(t, t.TempDir())
@@ -35,7 +48,7 @@ func acceptSingleBinaryStartup(t *testing.T) {
 	fresh := t.TempDir()
 	home := t.TempDir()
 	dataDir := filepath.Join(fresh, "data")
-	session := ptyfixture.StartRedacted(t, secret.New(startupSecret).String, binary, fresh, cleanPTYEnvironment(home, []string{"YORDAM_API_KEY=" + startupSecret}),
+	session := ptyfixture.StartRedacted(t, secret.New(startupSecret).String, binary, fresh, cleanPTYEnvironment(home, []string{"OPENAI_API_KEY=" + startupSecret}),
 		"--data-dir", dataDir,
 	)
 	session.WaitFor(t, "Ask Yordam", 3*time.Second)
@@ -61,6 +74,8 @@ func acceptSingleBinaryStartup(t *testing.T) {
 	if strings.Contains(string(raw), `"apiKey"`) || strings.Contains(string(raw), startupSecret) || strings.Contains(session.Output(), startupSecret) {
 		t.Fatal("first-run output persisted a credential value or raw-key field")
 	}
+	assertTreeOmits(t, home, startupSecret)
+	assertTreeOmits(t, dataDir, startupSecret)
 	assertAcceptanceMode(t, filepath.Dir(configPath), 0o700)
 	assertAcceptanceMode(t, configPath, 0o600)
 	if identity := singleAcceptanceSessionIdentity(t, dataDir); identity == "" {
@@ -132,7 +147,7 @@ func newAcceptanceSSEServer(t *testing.T, fixture, expectedCredential string) (*
 	requests := &atomic.Int32{}
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/v1/chat/completions" {
-			t.Errorf("request path=%q", request.URL.Path)
+			t.Error("provider request used an unexpected path")
 			http.NotFound(response, request)
 			return
 		}
@@ -150,7 +165,7 @@ func newSSEServer(t *testing.T, fixture string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/v1/chat/completions" {
-			t.Errorf("request path=%q", request.URL.Path)
+			t.Error("provider request used an unexpected path")
 			http.NotFound(response, request)
 			return
 		}
@@ -161,6 +176,7 @@ func newSSEServer(t *testing.T, fixture string) *httptest.Server {
 
 func cleanPTYEnvironment(home string, extra []string) []string {
 	blocked := map[string]bool{
+		"OPENAI_API_KEY":  true,
 		"YORDAM_API_KEY":  true,
 		"YORDAM_BASE_URL": true,
 		"YORDAM_MODEL":    true,
@@ -181,21 +197,32 @@ func cleanPTYEnvironment(home string, extra []string) []string {
 
 func assertTreeOmits(t *testing.T, root, forbidden string) {
 	t.Helper()
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+	scanFailed := false
+	found := false
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil || entry.IsDir() {
-			return walkErr
+			if walkErr != nil {
+				scanFailed = true
+				return filepath.SkipAll
+			}
+			return nil
 		}
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			return err
+			scanFailed = true
+			return filepath.SkipAll
 		}
 		if strings.Contains(string(raw), forbidden) {
-			return fmt.Errorf("%s contains sentinel", path)
+			found = true
+			return filepath.SkipAll
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
+	if scanFailed {
+		t.Fatal("secret tree scan failed")
+	}
+	if found {
+		t.Fatal("secret tree scan found a forbidden value")
 	}
 }
 
@@ -237,6 +264,6 @@ func assertAcceptanceMode(t *testing.T, path string, want os.FileMode) {
 		t.Fatal(err)
 	}
 	if got := info.Mode().Perm(); got != want {
-		t.Fatalf("%s mode=%o want=%o", path, got, want)
+		t.Fatalf("filesystem mode=%o want=%o", got, want)
 	}
 }

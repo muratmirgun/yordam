@@ -3,6 +3,8 @@
 package ptytest
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +27,22 @@ import (
 )
 
 const ptyCredential = "pty-key-value"
+
+func TestCleanEnvironmentScrubsTemplateCredentialAndKeepsArbitraryFixtureKey(t *testing.T) {
+	cleaned := cleanEnvironment([]string{
+		"HOME=/inherited",
+		"TERM=unsafe",
+		"OPENAI_API_KEY=inherited-template-credential",
+		"PTY_ARBITRARY_KEY=preserved",
+	}, "/isolated-home")
+	joined := strings.Join(cleaned, "\n")
+	if strings.Contains(joined, "OPENAI_API_KEY=") {
+		t.Fatal("clean PTY environment retained the template credential")
+	}
+	if !strings.Contains(joined, "PTY_ARBITRARY_KEY=preserved") || !strings.Contains(joined, "HOME=/isolated-home") {
+		t.Fatal("clean PTY environment discarded an arbitrary fixture key or isolated HOME")
+	}
+}
 
 func TestVersionAndInteractiveTerminalRestoration(t *testing.T) {
 	binary := buildYordam(t)
@@ -52,7 +70,7 @@ func TestFirstRunCreatesTemplateAndRestoresTerminal(t *testing.T) {
 	home := t.TempDir()
 	dataDir := t.TempDir()
 
-	session := startYordamWithEnvironment(t, workspace, home, []string{"YORDAM_API_KEY=" + environmentSecret}, []string{environmentSecret}, "--data-dir", dataDir)
+	session := startYordamWithEnvironment(t, workspace, home, []string{"OPENAI_API_KEY=" + environmentSecret}, []string{environmentSecret}, "--data-dir", dataDir)
 	resizePTY(t, session, 220)
 	session.waitFor(t, "Ask Yordam", 3*time.Second)
 	session.waitFor(t, ".config/yordam/config.jsonc", 3*time.Second)
@@ -82,8 +100,10 @@ func TestFirstRunCreatesTemplateAndRestoresTerminal(t *testing.T) {
 	if strings.Contains(session.outputString(), environmentSecret) {
 		t.Fatal("PTY output contains an environment secret")
 	}
+	assertTreeOmits(t, home, environmentSecret)
+	assertTreeOmits(t, dataDir, environmentSecret)
 	if strings.Contains(string(raw), `"apiKey"`) {
-		t.Fatalf("generated config=%s", raw)
+		t.Fatal("generated config contains an unsupported raw credential field")
 	}
 	assertFileMode(t, filepath.Dir(configPath), 0o700)
 	assertFileMode(t, configPath, 0o600)
@@ -146,13 +166,17 @@ func TestFailedReloadKeepsOldRuntimeAndMissingKeyAppliesStateWithoutRequest(t *t
 	workspace := t.TempDir()
 	home := t.TempDir()
 	dataDir := t.TempDir()
+	debugLog := filepath.Join(t.TempDir(), "debug.jsonl")
 	configPath := filepath.Join(home, ".config", "yordam", "config.jsonc")
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	replaceConfigAtomically(t, configPath, jsoncConfig(server.URL+"/v1", "OLD_RELOAD_KEY", "old", "stable-model"))
 
-	session := startYordamWithEnvironment(t, workspace, home, []string{"OLD_RELOAD_KEY=" + oldSecret}, []string{oldSecret}, "--data-dir", dataDir)
+	session := startYordamWithEnvironment(t, workspace, home, []string{"OLD_RELOAD_KEY=" + oldSecret}, []string{oldSecret},
+		"--data-dir", dataDir,
+		"--debug-log", debugLog,
+	)
 	resizePTY(t, session, 220)
 	session.waitFor(t, "old/stable-model", 3*time.Second)
 	identityBefore := singleSessionIdentity(t, dataDir)
@@ -180,9 +204,9 @@ func TestFailedReloadKeepsOldRuntimeAndMissingKeyAppliesStateWithoutRequest(t *t
 	session.WaitForAfter(t, missingOffset, "restart Yordam", 3*time.Second)
 
 	const restoredDraft = "draft restored after missing key"
-	draftOffset := session.OutputOffset()
+	debugOffset := debugLogSize(t, debugLog)
 	session.write(t, restoredDraft+"\r")
-	session.WaitForAfter(t, draftOffset, "restart Yordam", 3*time.Second)
+	waitForDebugAppErrorAfter(t, debugLog, debugOffset, 3*time.Second)
 	redrawOffset := session.OutputOffset()
 	resizePTY(t, session, 121)
 	session.WaitForAfter(t, redrawOffset, restoredDraft, 3*time.Second)
@@ -200,6 +224,8 @@ func TestFailedReloadKeepsOldRuntimeAndMissingKeyAppliesStateWithoutRequest(t *t
 	}
 	assertTreeOmits(t, home, oldSecret)
 	assertTreeOmits(t, dataDir, oldSecret)
+	assertTreeOmits(t, filepath.Dir(debugLog), oldSecret)
+	assertTreeOmits(t, dataDir, restoredDraft)
 }
 
 func TestScriptedConversationResizeAndCleanExit(t *testing.T) {
@@ -344,7 +370,7 @@ func newSSEServer(t *testing.T, fixture string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/v1/chat/completions" {
-			t.Errorf("request path=%q", request.URL.Path)
+			t.Error("provider request used an unexpected path")
 			http.NotFound(response, request)
 			return
 		}
@@ -358,7 +384,7 @@ func newRecordingSSEServer(t *testing.T, fixture, expectedCredential string) (*h
 	requests := &atomic.Int32{}
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/v1/chat/completions" {
-			t.Errorf("request path=%q", request.URL.Path)
+			t.Error("provider request used an unexpected path")
 			http.NotFound(response, request)
 			return
 		}
@@ -439,6 +465,47 @@ func replaceConfigAtomically(t *testing.T, path, body string) {
 	}
 }
 
+func debugLogSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal("cannot inspect debug log")
+	}
+	return info.Size()
+}
+
+func waitForDebugAppErrorAfter(t *testing.T, path string, offset int64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			if int64(len(raw)) < offset {
+				t.Fatal("debug log was replaced while waiting for an app error")
+			}
+			for _, line := range bytes.Split(raw[offset:], []byte{'\n'}) {
+				var event struct {
+					Event string `json:"event"`
+					Kind  string `json:"kind"`
+				}
+				if json.Unmarshal(line, &event) == nil && event.Event == "app_event" && event.Kind == "error" {
+					return
+				}
+			}
+		} else if !os.IsNotExist(err) {
+			t.Fatal("cannot read debug log while waiting for an app error")
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("timed out waiting for a new debug app error event")
+		case <-ticker.C:
+		}
+	}
+}
+
 func singleSessionIdentity(t *testing.T, dataDir string) string {
 	t.Helper()
 	workspaces, err := os.ReadDir(filepath.Join(dataDir, "workspaces"))
@@ -482,6 +549,7 @@ func resizePTY(t *testing.T, session *ptySession, columns uint16) {
 
 func cleanEnvironment(environment []string, home string) []string {
 	blocked := map[string]bool{
+		"OPENAI_API_KEY":  true,
 		"YORDAM_API_KEY":  true,
 		"YORDAM_BASE_URL": true,
 		"YORDAM_MODEL":    true,
@@ -559,20 +627,31 @@ func assertTreeContains(t *testing.T, root, value string) {
 
 func assertTreeOmits(t *testing.T, root, value string) {
 	t.Helper()
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+	scanFailed := false
+	forbidden := false
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {
-			return err
+			if err != nil {
+				scanFailed = true
+				return filepath.SkipAll
+			}
+			return nil
 		}
 		raw, readErr := os.ReadFile(path)
 		if readErr != nil {
-			return readErr
+			scanFailed = true
+			return filepath.SkipAll
 		}
 		if strings.Contains(string(raw), value) {
-			return fmt.Errorf("%s contains secret", path)
+			forbidden = true
+			return filepath.SkipAll
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
+	if scanFailed {
+		t.Fatal("secret tree scan failed")
+	}
+	if forbidden {
+		t.Fatal("secret tree scan found a forbidden value")
 	}
 }
