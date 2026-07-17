@@ -3,12 +3,15 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/secret"
 )
+
+var errPublishedEventContentUnavailable = errors.New("app event content unavailable")
 
 type EventKind string
 
@@ -44,42 +47,47 @@ type Event struct {
 	Applied     bool
 }
 
-func sanitizePublishedEvent(redactor secret.Redactor, event Event) Event {
+func sanitizePublishedEvent(redactor secret.Redactor, event Event) (Event, error) {
 	originalErr := event.Err
 	event.Err = nil
+	var sanitizedApprovalScope string
+	approvalScopeChanged := false
+	if event.Permission != nil {
+		sanitizedApprovalScope = redactor.String(event.Permission.Call.ApprovalScope)
+		approvalScopeChanged = sanitizedApprovalScope != event.Permission.Call.ApprovalScope
+	}
 	raw, err := redactor.JSON(event)
 	if err != nil {
-		return eventSanitizationFailure(redactor, event)
+		return eventSanitizationFailure(), errPublishedEventContentUnavailable
 	}
 	baseline, err := secret.New().JSON(event)
 	if err != nil {
-		return eventSanitizationFailure(redactor, event)
+		return eventSanitizationFailure(), errPublishedEventContentUnavailable
 	}
 	sanitizedErr, errChanged := sanitizePublishedError(redactor, originalErr)
-	if bytes.Equal(raw, baseline) {
+	if bytes.Equal(raw, baseline) && !approvalScopeChanged {
 		event.Err = originalErr
 		if errChanged {
 			event.Err = sanitizedErr
 		}
-		return event
+		return event, nil
 	}
 	var sanitized Event
 	if err := json.Unmarshal(raw, &sanitized); err != nil {
-		return eventSanitizationFailure(redactor, event)
+		return eventSanitizationFailure(), errPublishedEventContentUnavailable
 	}
 	if sanitized.Permission != nil && event.Permission != nil {
-		sanitized.Permission.Call.ApprovalScope = redactor.String(event.Permission.Call.ApprovalScope)
+		sanitized.Permission.Call.ApprovalScope = sanitizedApprovalScope
 	}
 	sanitized.Err = sanitizedErr
-	return sanitized
+	return sanitized, nil
 }
 
-func eventSanitizationFailure(redactor secret.Redactor, event Event) Event {
+func eventSanitizationFailure() Event {
 	return Event{
-		Kind:        EventKind(redactor.String(string(event.Kind))),
-		Message:     "app event content unavailable",
-		NonTerminal: event.NonTerminal,
-		Applied:     event.Applied,
+		Kind:    EventError,
+		Message: errPublishedEventContentUnavailable.Error(),
+		Err:     errPublishedEventContentUnavailable,
 	}
 }
 

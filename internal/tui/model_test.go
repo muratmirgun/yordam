@@ -554,12 +554,16 @@ func TestPermissionEscapeSendsExactDenyWithoutCancellingTurn(t *testing.T) {
 }
 
 func TestPermissionEscapeResolvesAppBroker(t *testing.T) {
-	application := app.New(app.Options{})
+	const configuredSecret = "tui-permission-internal-scope-secret"
+	rawScope := "/workspace/" + configuredSecret + "/file.go"
+	displayedScope := "/workspace/[REDACTED]/file.go"
+	application := app.New(app.Options{Redactors: secret.NewBinding(secret.New(configuredSecret))})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = application.Run(ctx) }()
 
-	prompt := tui.PermissionPromptForTest("edit", "/workspace/file.go", true)
+	prompt := tui.PermissionPromptForTest("edit", displayedScope, true)
+	prompt.Call.ApprovalScope = rawScope
 	resolved := make(chan domain.PermissionDecision, 1)
 	errors := make(chan error, 1)
 	go func() {
@@ -577,6 +581,9 @@ func TestPermissionEscapeResolvesAppBroker(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for permission event")
 	}
+	if event.Permission == nil || event.Permission.Call.ApprovalScope != displayedScope || strings.Contains(event.Permission.Call.ApprovalScope, configuredSecret) {
+		t.Fatal("app did not publish only the displayed approval scope")
+	}
 	model := tui.NewModel(tui.Options{Commands: application.Commands(), Events: application.Events()})
 	model = tui.SetTurnActiveForTest(model, true)
 	model = tui.ApplyAppEventForTest(model, event)
@@ -584,7 +591,7 @@ func TestPermissionEscapeResolvesAppBroker(t *testing.T) {
 
 	select {
 	case decision := <-resolved:
-		if decision.Action != domain.PermissionDeny || decision.Scope != prompt.Call.CanonicalScope {
+		if decision.Action != domain.PermissionDeny || decision.Scope != rawScope {
 			t.Fatalf("decision=%+v", decision)
 		}
 	case err := <-errors:

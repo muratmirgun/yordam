@@ -72,11 +72,25 @@ type App struct {
 	sessionChanged func(string)
 
 	pendingMu  sync.Mutex
-	pending    map[string]chan domain.PermissionDecision
+	pending    map[string]*pendingPermission
 	eventMu    sync.Mutex
 	eventQueue []Event
 	eventWake  chan struct{}
 }
+
+type pendingPermission struct {
+	decision       chan domain.PermissionDecision
+	internalScope  string
+	displayedScope string
+}
+
+type permissionResolution uint8
+
+const (
+	permissionResolved permissionResolution = iota
+	permissionStale
+	permissionInvalidScope
+)
 
 type operationResult struct {
 	kind       operationKind
@@ -121,7 +135,7 @@ func New(options Options) *App {
 		logger:         options.Logger,
 		close:          options.Close,
 		sessionChanged: options.SessionChanged,
-		pending:        make(map[string]chan domain.PermissionDecision),
+		pending:        make(map[string]*pendingPermission),
 		eventWake:      make(chan struct{}, 1),
 	}
 	runtimeSet.BindApprover(application)
@@ -235,8 +249,11 @@ func (a *App) Run(ctx context.Context) error {
 					a.clearPending()
 				}
 			case CommandResolvePermission:
-				if !a.resolvePermission(command.CallID, command.Decision) {
+				switch a.resolvePermission(command.CallID, command.Decision) {
+				case permissionStale:
 					a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q is stale", command.CallID)})
+				case permissionInvalidScope:
+					a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q response is invalid", command.CallID)})
 				}
 			case CommandCompact:
 				if !a.replayValid {
@@ -501,6 +518,14 @@ func (a *App) acknowledgeAutoShell(ctx context.Context, callID string, decision 
 	if a.sessions == nil || a.session.ID == "" {
 		return a.publish(ctx, Event{Kind: EventError, Message: "session store is not configured", NonTerminal: true})
 	}
+	if callID != "" {
+		switch a.validatePermissionResponse(callID, decision) {
+		case permissionStale:
+			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q is stale", callID)})
+		case permissionInvalidScope:
+			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q response is invalid", callID)})
+		}
+	}
 	event, err := a.sessions.Append(ctx, a.session.ID, domain.EventTrustedExecutionAcknowledged, domain.TrustedExecutionPayload{Enabled: true})
 	if err != nil {
 		return a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), NonTerminal: true})
@@ -511,8 +536,13 @@ func (a *App) acknowledgeAutoShell(ctx context.Context, callID string, decision 
 	if a.policy != nil {
 		a.policy.AcknowledgeAutoShell()
 	}
-	if callID != "" && !a.resolvePermission(callID, decision) {
-		return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q is stale", callID)})
+	if callID != "" {
+		switch a.resolvePermission(callID, decision) {
+		case permissionStale:
+			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q is stale", callID)})
+		case permissionInvalidScope:
+			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q response is invalid", callID)})
+		}
 	}
 	return a.publish(ctx, a.settingEvent())
 }
@@ -609,49 +639,86 @@ func (a *App) settingEvent() Event {
 
 func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domain.PermissionDecision, error) {
 	callID := prompt.Call.Request.CallID
-	decision := make(chan domain.PermissionDecision, 1)
+	published, sanitizeErr := a.preparePublishedEvent(Event{Kind: EventPermissionRequested, Permission: &prompt})
+	if sanitizeErr != nil {
+		a.enqueuePublishedEvent(ctx, published)
+		if err := ctx.Err(); err != nil {
+			return domain.PermissionDecision{}, err
+		}
+		return domain.PermissionDecision{}, sanitizeErr
+	}
+	pending := &pendingPermission{
+		decision:       make(chan domain.PermissionDecision, 1),
+		internalScope:  permissionApprovalScope(prompt.Call),
+		displayedScope: permissionApprovalScope(published.Permission.Call),
+	}
 
 	a.pendingMu.Lock()
 	if _, exists := a.pending[callID]; exists {
 		a.pendingMu.Unlock()
 		return domain.PermissionDecision{}, fmt.Errorf("permission call %q is already pending", callID)
 	}
-	a.pending[callID] = decision
+	a.pending[callID] = pending
 	a.pendingMu.Unlock()
-	defer a.removePending(callID, decision)
+	defer a.removePending(callID, pending)
 
-	if !a.publish(ctx, Event{Kind: EventPermissionRequested, Permission: &prompt}) {
+	if !a.enqueuePublishedEvent(ctx, published) {
 		return domain.PermissionDecision{}, ctx.Err()
 	}
 	select {
-	case resolved := <-decision:
+	case resolved := <-pending.decision:
 		return resolved, nil
 	case <-ctx.Done():
 		return domain.PermissionDecision{}, ctx.Err()
 	}
 }
 
-func (a *App) resolvePermission(callID string, decision domain.PermissionDecision) bool {
+func permissionApprovalScope(request domain.PreparedToolRequest) string {
+	if request.ApprovalScope != "" {
+		return request.ApprovalScope
+	}
+	return request.CanonicalScope
+}
+
+func (a *App) validatePermissionResponse(callID string, decision domain.PermissionDecision) permissionResolution {
 	a.pendingMu.Lock()
 	defer a.pendingMu.Unlock()
 
 	pending, exists := a.pending[callID]
 	if !exists {
-		return false
+		return permissionStale
 	}
+	if decision.Scope != pending.displayedScope {
+		return permissionInvalidScope
+	}
+	return permissionResolved
+}
+
+func (a *App) resolvePermission(callID string, decision domain.PermissionDecision) permissionResolution {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+
+	pending, exists := a.pending[callID]
+	if !exists {
+		return permissionStale
+	}
+	if decision.Scope != pending.displayedScope {
+		return permissionInvalidScope
+	}
+	decision.Scope = pending.internalScope
 	select {
-	case pending <- decision:
+	case pending.decision <- decision:
 		delete(a.pending, callID)
-		return true
+		return permissionResolved
 	default:
-		return false
+		return permissionStale
 	}
 }
 
-func (a *App) removePending(callID string, decision chan domain.PermissionDecision) {
+func (a *App) removePending(callID string, pending *pendingPermission) {
 	a.pendingMu.Lock()
 	defer a.pendingMu.Unlock()
-	if a.pending[callID] == decision {
+	if a.pending[callID] == pending {
 		delete(a.pending, callID)
 	}
 }
@@ -663,9 +730,18 @@ func (a *App) clearPending() {
 }
 
 func (a *App) publish(ctx context.Context, event Event) bool {
+	event, _ = a.preparePublishedEvent(event)
+	return a.enqueuePublishedEvent(ctx, event)
+}
+
+func (a *App) preparePublishedEvent(event Event) (Event, error) {
 	if a.redactors != nil {
-		event = sanitizePublishedEvent(a.redactors.Snapshot(), event)
+		return sanitizePublishedEvent(a.redactors.Snapshot(), event)
 	}
+	return event, nil
+}
+
+func (a *App) enqueuePublishedEvent(ctx context.Context, event Event) bool {
 	if a.logger != nil {
 		_ = a.logger.Event("app_event", map[string]any{
 			"kind":    event.Kind,

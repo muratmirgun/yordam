@@ -106,6 +106,34 @@ func TestPublishRedactsEquivalentTextFieldsWithActiveBinding(t *testing.T) {
 	}
 }
 
+func TestPublishRedactsSecretFoundOnlyInApprovalScope(t *testing.T) {
+	const configuredSecret = "approval-scope-only-secret-sentinel"
+	application := New(Options{Redactors: secret.NewBinding(secret.New(configuredSecret))})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.publishEvents(ctx)
+
+	prompt := ports.PermissionPrompt{Call: domain.PreparedToolRequest{
+		Request:        domain.ToolRequest{CallID: "scope-only", Name: "shell"},
+		CanonicalScope: "/workspace/[REDACTED]",
+		Summary:        "ordinary summary",
+		ApprovalScope:  "/workspace/" + configuredSecret,
+	}}
+	if !application.publish(ctx, Event{Kind: EventPermissionRequested, Permission: &prompt}) {
+		t.Fatal("publish rejected event")
+	}
+	published := <-application.Events()
+	if published.Permission == nil {
+		t.Fatal("published permission is nil")
+	}
+	if strings.Contains(published.Permission.Call.ApprovalScope, configuredSecret) {
+		t.Fatal("published in-memory permission contains the raw approval scope")
+	}
+	if published.Permission.Call.ApprovalScope != "/workspace/[REDACTED]" {
+		t.Fatal("published permission does not contain the displayed approval scope")
+	}
+}
+
 func assertErrorTreeOmits(t *testing.T, err error, forbidden string) {
 	t.Helper()
 	if err == nil {

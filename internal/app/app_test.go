@@ -381,7 +381,7 @@ func TestAppPermissionBrokerResolvesRegisteredCall(t *testing.T) {
 		ProposedDiff:    "diff",
 		Summary:         "run command",
 	}}
-	decision := domain.PermissionDecision{Action: domain.PermissionAllow, Lifetime: domain.PermissionOnce}
+	decision := domain.PermissionDecision{Action: domain.PermissionAllow, Lifetime: domain.PermissionOnce, Scope: prompt.Call.CanonicalScope}
 	resolved := make(chan permissionResult, 1)
 	go func() {
 		got, err := application.Resolve(ctx, prompt)
@@ -400,6 +400,169 @@ func TestAppPermissionBrokerResolvesRegisteredCall(t *testing.T) {
 	application.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: prompt.Call.Request.CallID, Decision: decision}
 	if event := <-application.Events(); event.Kind != app.EventRejected || !strings.Contains(event.Message, prompt.Call.Request.CallID) {
 		t.Fatalf("stale event=%+v", event)
+	}
+}
+
+func TestAppPermissionBrokerRestoresInternalScopeAfterDisplayedScopeValidation(t *testing.T) {
+	const configuredSecret = "permission-internal-scope-secret"
+	rawScope := "/workspace/" + configuredSecret
+	displayedScope := "/workspace/[REDACTED]"
+	application := app.New(app.Options{Redactors: secret.NewBinding(secret.New(configuredSecret))})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	prompt := ports.PermissionPrompt{Call: domain.PreparedToolRequest{
+		Request:        domain.ToolRequest{CallID: "scope-restore", Name: "shell"},
+		CanonicalScope: displayedScope,
+		ApprovalScope:  rawScope,
+	}}
+	resolved := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, prompt)
+		resolved <- permissionResult{decision: decision, err: err}
+	}()
+
+	event := receiveEvent(t, application.Events())
+	if event.Kind != app.EventPermissionRequested || event.Permission == nil {
+		t.Fatal("permission request was not published")
+	}
+	if strings.Contains(event.Permission.Call.ApprovalScope, configuredSecret) || event.Permission.Call.ApprovalScope != displayedScope {
+		t.Fatal("published permission did not contain only the displayed scope")
+	}
+	application.Commands() <- app.Command{
+		Kind:   app.CommandResolvePermission,
+		CallID: prompt.Call.Request.CallID,
+		Decision: domain.PermissionDecision{
+			Action:   domain.PermissionAllow,
+			Lifetime: domain.PermissionOnce,
+			Scope:    displayedScope,
+		},
+	}
+	result := <-resolved
+	if result.err != nil || result.decision.Scope != rawScope {
+		t.Fatal("valid displayed-scope approval did not restore the internal scope")
+	}
+}
+
+func TestAppPermissionBrokerRejectsTamperedDisplayedScope(t *testing.T) {
+	const configuredSecret = "permission-tamper-secret"
+	rawScope := "/workspace/" + configuredSecret
+	displayedScope := "/workspace/[REDACTED]"
+	application := app.New(app.Options{Redactors: secret.NewBinding(secret.New(configuredSecret))})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	prompt := ports.PermissionPrompt{Call: domain.PreparedToolRequest{
+		Request:        domain.ToolRequest{CallID: "scope-tamper", Name: "shell"},
+		CanonicalScope: displayedScope,
+		ApprovalScope:  rawScope,
+	}}
+	resolved := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, prompt)
+		resolved <- permissionResult{decision: decision, err: err}
+	}()
+	event := receiveEvent(t, application.Events())
+	if event.Permission == nil || event.Permission.Call.ApprovalScope != displayedScope {
+		t.Fatal("permission request did not expose the expected displayed scope")
+	}
+
+	application.Commands() <- app.Command{
+		Kind:   app.CommandResolvePermission,
+		CallID: prompt.Call.Request.CallID,
+		Decision: domain.PermissionDecision{
+			Action:   domain.PermissionAllow,
+			Lifetime: domain.PermissionOnce,
+			Scope:    displayedScope + "/tampered",
+		},
+	}
+	if rejected := receiveEvent(t, application.Events()); rejected.Kind != app.EventRejected {
+		t.Fatal("tampered displayed scope was not rejected")
+	}
+	select {
+	case <-resolved:
+		t.Fatal("tampered displayed scope resolved the pending permission")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	application.Commands() <- app.Command{
+		Kind:   app.CommandResolvePermission,
+		CallID: prompt.Call.Request.CallID,
+		Decision: domain.PermissionDecision{
+			Action:   domain.PermissionDeny,
+			Lifetime: domain.PermissionOnce,
+			Scope:    displayedScope,
+		},
+	}
+	result := <-resolved
+	if result.err != nil || result.decision.Scope != rawScope || result.decision.Action != domain.PermissionDeny {
+		t.Fatal("validated follow-up response did not resolve with the internal scope")
+	}
+}
+
+func TestAppPermissionSanitizationFailureReturnsErrorWithoutPendingLeak(t *testing.T) {
+	const configuredSecret = "permission-sanitize-failure-secret"
+	application := app.New(app.Options{Redactors: secret.NewBinding(secret.New(configuredSecret))})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	malformed := ports.PermissionPrompt{Call: domain.PreparedToolRequest{
+		Request: domain.ToolRequest{
+			CallID: "sanitize-failure",
+			Name:   "shell",
+			Input:  json.RawMessage(`{"value":"permission-sanitize-failure-secret"`),
+		},
+		ApprovalScope: "/workspace/" + configuredSecret,
+	}}
+	failed := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, malformed)
+		failed <- permissionResult{decision: decision, err: err}
+	}()
+
+	failureEvent := receiveEvent(t, application.Events())
+	if failureEvent.Kind != app.EventError || failureEvent.Permission != nil {
+		t.Fatal("sanitization failure published an unresolvable permission event")
+	}
+	if strings.Contains(failureEvent.Message, configuredSecret) || failureEvent.Err != nil && strings.Contains(failureEvent.Err.Error(), configuredSecret) {
+		t.Fatal("sanitization failure event exposed raw content")
+	}
+	select {
+	case result := <-failed:
+		if result.err == nil || strings.Contains(result.err.Error(), configuredSecret) {
+			t.Fatal("sanitization failure did not return a safe non-nil error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sanitization failure stranded Resolve")
+	}
+
+	valid := ports.PermissionPrompt{Call: domain.PreparedToolRequest{
+		Request:        domain.ToolRequest{CallID: "sanitize-failure", Name: "shell"},
+		CanonicalScope: "/workspace/safe",
+	}}
+	resolved := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, valid)
+		resolved <- permissionResult{decision: decision, err: err}
+	}()
+	requestEvent := receiveEvent(t, application.Events())
+	if requestEvent.Kind != app.EventPermissionRequested || requestEvent.Permission == nil {
+		t.Fatal("sanitization failure left a pending-call leak")
+	}
+	application.Commands() <- app.Command{
+		Kind:   app.CommandResolvePermission,
+		CallID: valid.Call.Request.CallID,
+		Decision: domain.PermissionDecision{
+			Action:   domain.PermissionDeny,
+			Lifetime: domain.PermissionOnce,
+			Scope:    valid.Call.CanonicalScope,
+		},
+	}
+	if result := <-resolved; result.err != nil {
+		t.Fatal("replacement permission could not resolve after sanitization failure")
 	}
 }
 

@@ -178,7 +178,7 @@ func acceptSecretHygiene(t *testing.T) {
 	if err := config.SaveGlobal(ptyConfig, acceptanceConfig(ptyServer.URL+"/v1", "ACCEPTANCE_SECRET_KEY", map[string][]string{"default": {"secret-model"}})); err != nil {
 		t.Fatal(redactor.String(err.Error()))
 	}
-	ptySession := ptyfixture.Start(t, ptyfixture.CachedYordam(t), ptyRoot, cleanPTYEnvironment(ptyHome, []string{"ACCEPTANCE_SECRET_KEY=" + sentinel}),
+	ptySession := ptyfixture.StartRedacted(t, redactor.String, ptyfixture.CachedYordam(t), ptyRoot, cleanPTYEnvironment(ptyHome, []string{"ACCEPTANCE_SECRET_KEY=" + sentinel}),
 		"--data-dir", filepath.Join(ptyRoot, "data"),
 	)
 	ptySession.WaitFor(t, "default/secret-model", 3*time.Second)
