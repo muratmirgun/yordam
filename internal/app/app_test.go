@@ -499,6 +499,160 @@ func TestAppPermissionBrokerUsesOpaqueDisplayedCallID(t *testing.T) {
 	}
 }
 
+func TestAppPermissionBrokerUsesOpaqueDisplayedCallIDForFilePlan(t *testing.T) {
+	const configuredSecret = "permission-edit-call-id-secret"
+	rawCallID := "provider-" + configuredSecret
+	redactedDerivedCallID := "provider-[REDACTED]"
+	application := app.New(app.Options{Redactors: secret.NewBinding(secret.New(configuredSecret))})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go application.Run(ctx)
+
+	originalPlan := &domain.FileChangePlan{CallID: rawCallID, Path: "/workspace/file.go", ArtifactIDs: []string{"artifact-safe"}}
+	prompt := ports.PermissionPrompt{Call: domain.PreparedToolRequest{
+		Request:        domain.ToolRequest{CallID: rawCallID, Name: "edit"},
+		CanonicalScope: "/workspace/file.go",
+		FilePlan:       originalPlan,
+	}}
+	resolved := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, prompt)
+		resolved <- permissionResult{decision: decision, err: err}
+	}()
+
+	event := receiveEvent(t, application.Events())
+	if event.Kind != app.EventPermissionRequested || event.Permission == nil || event.Permission.Call.FilePlan == nil {
+		t.Fatal("edit permission request was not published with its file plan")
+	}
+	displayedCallID := event.Permission.Call.Request.CallID
+	publishedPlan := event.Permission.Call.FilePlan
+	if displayedCallID == "" || displayedCallID != publishedPlan.CallID || displayedCallID == rawCallID || displayedCallID == redactedDerivedCallID || strings.Contains(displayedCallID, configuredSecret) {
+		t.Fatal("edit permission request IDs did not use the same safe opaque correlation")
+	}
+	if prompt.Call.Request.CallID != rawCallID || prompt.Call.FilePlan != originalPlan || originalPlan.CallID != rawCallID || publishedPlan == originalPlan {
+		t.Fatal("publishing the edit permission mutated or aliased the runner-owned prompt")
+	}
+	application.Commands() <- app.Command{
+		Kind:     app.CommandResolvePermission,
+		CallID:   displayedCallID,
+		Decision: domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: prompt.Call.CanonicalScope},
+	}
+	select {
+	case result := <-resolved:
+		if result.err != nil || result.decision.Action != domain.PermissionDeny {
+			t.Fatal("opaque edit permission call ID did not resolve")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("opaque edit permission call ID stranded Resolve")
+	}
+}
+
+func TestAppPermissionEventClonesFilePlanWithoutMutatingRunnerPrompt(t *testing.T) {
+	application := app.New(app.Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go application.Run(ctx)
+
+	originalPlan := &domain.FileChangePlan{CallID: "raw-edit-call", Path: "/workspace/file.go", ArtifactIDs: []string{"runner-artifact"}}
+	prompt := ports.PermissionPrompt{Call: domain.PreparedToolRequest{
+		Request:        domain.ToolRequest{CallID: originalPlan.CallID, Name: "edit"},
+		CanonicalScope: originalPlan.Path,
+		FilePlan:       originalPlan,
+	}}
+	resolved := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, prompt)
+		resolved <- permissionResult{decision: decision, err: err}
+	}()
+	event := receiveEvent(t, application.Events())
+	if event.Permission == nil || event.Permission.Call.FilePlan == nil {
+		t.Fatal("edit permission request was not published with its file plan")
+	}
+	displayedCallID := event.Permission.Call.Request.CallID
+	publishedPlan := event.Permission.Call.FilePlan
+	if publishedPlan == originalPlan || publishedPlan.CallID != displayedCallID {
+		t.Fatal("published edit file plan was not independently correlated")
+	}
+	publishedPlan.CallID = "subscriber-mutation"
+	publishedPlan.ArtifactIDs[0] = "subscriber-artifact"
+	if originalPlan.CallID != "raw-edit-call" || originalPlan.ArtifactIDs[0] != "runner-artifact" || prompt.Call.Request.CallID != "raw-edit-call" {
+		t.Fatal("published file plan mutation changed the runner-owned prompt")
+	}
+	application.Commands() <- app.Command{
+		Kind:     app.CommandResolvePermission,
+		CallID:   displayedCallID,
+		Decision: domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: prompt.Call.CanonicalScope},
+	}
+	select {
+	case result := <-resolved:
+		if result.err != nil {
+			t.Fatal("cloned edit permission did not resolve")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cloned edit permission stranded Resolve")
+	}
+}
+
+func TestAppPermissionCorrelationExhaustionFailsWithoutPendingLeak(t *testing.T) {
+	const generatedPrefixSecret = "permission-"
+	rawCallID := "provider-edit-call"
+	binding := secret.NewBinding(secret.New(generatedPrefixSecret))
+	application := app.New(app.Options{Redactors: binding})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go application.Run(ctx)
+
+	prompt := ports.PermissionPrompt{Call: domain.PreparedToolRequest{
+		Request:        domain.ToolRequest{CallID: rawCallID, Name: "edit"},
+		CanonicalScope: "/workspace/file.go",
+		FilePlan:       &domain.FileChangePlan{CallID: rawCallID, Path: "/workspace/file.go"},
+	}}
+	failed := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, prompt)
+		failed <- permissionResult{decision: decision, err: err}
+	}()
+	failureEvent := receiveEvent(t, application.Events())
+	if failureEvent.Kind != app.EventError || failureEvent.Permission != nil || failureEvent.Err == nil {
+		t.Fatal("correlation exhaustion did not publish a terminal safe error")
+	}
+	if strings.Contains(failureEvent.Message, generatedPrefixSecret) || strings.Contains(failureEvent.Message, rawCallID) || strings.Contains(failureEvent.Err.Error(), generatedPrefixSecret) || strings.Contains(failureEvent.Err.Error(), rawCallID) {
+		t.Fatal("correlation exhaustion event exposed secret or raw content")
+	}
+	select {
+	case result := <-failed:
+		if result.err == nil || strings.Contains(result.err.Error(), generatedPrefixSecret) || strings.Contains(result.err.Error(), rawCallID) {
+			t.Fatal("correlation exhaustion did not return a safe non-nil error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("correlation exhaustion stranded Resolve")
+	}
+
+	binding.Replace(secret.New())
+	resolved := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, prompt)
+		resolved <- permissionResult{decision: decision, err: err}
+	}()
+	requestEvent := receiveEvent(t, application.Events())
+	if requestEvent.Kind != app.EventPermissionRequested || requestEvent.Permission == nil {
+		t.Fatal("correlation exhaustion leaked a pending call")
+	}
+	application.Commands() <- app.Command{
+		Kind:     app.CommandResolvePermission,
+		CallID:   requestEvent.Permission.Call.Request.CallID,
+		Decision: domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: prompt.Call.CanonicalScope},
+	}
+	select {
+	case result := <-resolved:
+		if result.err != nil {
+			t.Fatal("call ID was not reusable after correlation exhaustion")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("normal permission after correlation exhaustion stranded Resolve")
+	}
+}
+
 func TestAppPermissionBrokerRejectsTamperedRawAndStaleCallIDs(t *testing.T) {
 	const configuredSecret = "permission-call-id-tamper-secret"
 	rawCallID := "provider-" + configuredSecret

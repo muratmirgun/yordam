@@ -719,6 +719,12 @@ func permissionEventWithCallID(event Event, callID string) Event {
 	request := call.Request
 	request.CallID = callID
 	call.Request = request
+	if call.FilePlan != nil {
+		plan := *call.FilePlan
+		plan.CallID = callID
+		plan.ArtifactIDs = append([]string(nil), plan.ArtifactIDs...)
+		call.FilePlan = &plan
+	}
 	prompt.Call = call
 	event.Permission = &prompt
 	return event
