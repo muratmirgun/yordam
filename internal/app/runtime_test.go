@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +19,6 @@ import (
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/permission"
-	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
 	"github.com/muratmirgun/yordam/internal/testsupport/agentfixture"
 )
@@ -181,10 +181,95 @@ func TestRuntimeGenerationsKeepImmutableRedactors(t *testing.T) {
 	if got := prepared.Execute(t.Context()).Content; got != "[REDACTED] generation-b" {
 		t.Fatalf("first output redactor=%q", got)
 	}
-	binding := secret.NewBinding(first.Redactor)
-	binding.Replace(second.Redactor)
-	if got := binding.String("generation-a generation-b"); got != "generation-a [REDACTED]" {
-		t.Fatalf("long-lived redactor binding=%q", got)
+}
+
+func TestRuntimeGenerationBootstrapBindingAdvancesStoreWhileOldOutputIsImmutable(t *testing.T) {
+	const generationA = "generation-a"
+	const generationB = "generation-b"
+	t.Setenv("PRIMARY_KEY", generationA)
+
+	configPath := filepath.Join(t.TempDir(), "config.jsonc")
+	if err := os.WriteFile(configPath, []byte(`{
+  "model": "primary/a",
+  "provider": {
+    "primary": {
+      "options": {"baseURL": "https://example.invalid/v1", "apiKeyEnv": "PRIMARY_KEY"},
+      "models": {"a": {}}
+    }
+  }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	application, snapshot, err := Bootstrap(t.Context(), BootstrapOptions{
+		ConfigPath: configPath,
+		CLI: cli.Options{
+			Mode:         domain.ModeAsk,
+			DataDir:      t.TempDir(),
+			MaxToolCalls: 32,
+			ShellTimeout: 120 * time.Second,
+		},
+		CWD: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRunner, ok := application.runtimeSet.Runtime.(*agent.Runner)
+	if !ok {
+		t.Fatalf("first runtime=%T", application.runtimeSet.Runtime)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- application.Run(ctx) }()
+	t.Setenv("PRIMARY_KEY", generationB)
+	application.Commands() <- Command{Kind: CommandReloadConfig}
+	select {
+	case event := <-application.Events():
+		if event.Kind != EventReloadCompleted || !event.Applied || event.Err != nil {
+			t.Fatalf("reload event=%+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for reload")
+	}
+
+	if _, err := application.sessions.Append(t.Context(), snapshot.Session.ID, domain.EventToolResult, domain.ToolResultPayload{
+		Result: domain.ToolResult{CallID: "store-generation-b", Status: domain.ToolSucceeded, Content: generationA + " " + generationB},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := application.sessions.Load(t.Context(), snapshot.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted domain.ToolResultPayload
+	if err := json.Unmarshal(replay.Events[len(replay.Events)-1].Payload, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if got := persisted.Result.Content; got != generationA+" [REDACTED]" {
+		t.Fatalf("production store redactor=%q", got)
+	}
+
+	shellTool, ok := firstRunner.Tools.Lookup("shell")
+	if !ok {
+		t.Fatal("shell tool missing")
+	}
+	prepared, err := shellTool.Prepare(t.Context(), domain.ToolRequest{
+		CallID:    "generation-a-output",
+		Name:      "shell",
+		Workspace: snapshot.Workspace.CanonicalPath,
+		Input:     json.RawMessage(`{"command":"printf 'generation-a generation-b'","cwd":"."}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := prepared.Execute(t.Context()).Content; got != "[REDACTED] generation-b" {
+		t.Fatalf("generation-a output redactor=%q", got)
+	}
+
+	application.Commands() <- Command{Kind: CommandShutdown}
+	if err := <-done; err != nil {
+		t.Fatalf("app shutdown: %v", err)
 	}
 }
 
