@@ -128,21 +128,43 @@ type TransactionCommittedV1 struct {
 type TaskState string
 
 const (
-	TaskPending   TaskState = "pending"
-	TaskRunning   TaskState = "running"
-	TaskCompleted TaskState = "completed"
-	TaskFailed    TaskState = "failed"
-	TaskCancelled TaskState = "cancelled"
+	TaskPending              TaskState = "pending"
+	TaskDraft                TaskState = "draft"
+	TaskContractDrafting     TaskState = "contract_drafting"
+	TaskContractProposed     TaskState = "contract_proposed"
+	TaskContractFrozen       TaskState = "contract_frozen"
+	TaskRunning              TaskState = "running"
+	TaskVerifying            TaskState = "verifying"
+	TaskVerified             TaskState = "verified"
+	TaskCompletedWithWaivers TaskState = "completed_with_waivers"
+	TaskPartial              TaskState = "partial"
+	TaskCompleted            TaskState = "completed"
+	TaskFailed               TaskState = "failed"
+	TaskUnknown              TaskState = "unknown"
+	TaskCancelled            TaskState = "cancelled"
+	TaskReopened             TaskState = "reopened"
 )
 
 type TurnState string
 
 const (
-	TurnAccepted    TurnState = "accepted"
-	TurnRunning     TurnState = "running"
-	TurnCompleted   TurnState = "completed"
-	TurnFailed      TurnState = "failed"
-	TurnInterrupted TurnState = "interrupted"
+	TurnAccepted           TurnState = "accepted"
+	TurnContractDrafting   TurnState = "contract_drafting"
+	TurnFreezingContract   TurnState = "freezing_contract"
+	TurnPlanningContext    TurnState = "planning_context"
+	TurnWaitingProvider    TurnState = "waiting_provider"
+	TurnReceivingProvider  TurnState = "receiving_provider"
+	TurnPlanningAction     TurnState = "planning_action"
+	TurnCheckpointing      TurnState = "checkpointing"
+	TurnAwaitingPermission TurnState = "awaiting_permission"
+	TurnExecuting          TurnState = "executing"
+	TurnRecordingEvidence  TurnState = "recording_evidence"
+	TurnReturningResult    TurnState = "returning_result"
+	TurnVerifying          TurnState = "verifying"
+	TurnRunning            TurnState = "running"
+	TurnCompleted          TurnState = "completed"
+	TurnFailed             TurnState = "failed"
+	TurnInterrupted        TurnState = "interrupted"
 )
 
 type ActivityState string
@@ -161,7 +183,9 @@ const (
 
 func validTaskState(state TaskState) bool {
 	switch state {
-	case TaskPending, TaskRunning, TaskCompleted, TaskFailed, TaskCancelled:
+	case TaskPending, TaskDraft, TaskContractDrafting, TaskContractProposed, TaskContractFrozen, TaskRunning,
+		TaskVerifying, TaskVerified, TaskCompletedWithWaivers, TaskPartial, TaskCompleted, TaskFailed,
+		TaskUnknown, TaskCancelled, TaskReopened:
 		return true
 	default:
 		return false
@@ -170,7 +194,9 @@ func validTaskState(state TaskState) bool {
 
 func validTurnState(state TurnState) bool {
 	switch state {
-	case TurnAccepted, TurnRunning, TurnCompleted, TurnFailed, TurnInterrupted:
+	case TurnAccepted, TurnContractDrafting, TurnFreezingContract, TurnPlanningContext, TurnWaitingProvider,
+		TurnReceivingProvider, TurnPlanningAction, TurnCheckpointing, TurnAwaitingPermission, TurnExecuting,
+		TurnRecordingEvidence, TurnReturningResult, TurnVerifying, TurnRunning, TurnCompleted, TurnFailed, TurnInterrupted:
 		return true
 	default:
 		return false
@@ -187,7 +213,12 @@ func validActivityState(state ActivityState) bool {
 }
 
 func terminalTaskState(state TaskState) bool {
-	return state == TaskCompleted || state == TaskFailed || state == TaskCancelled
+	switch state {
+	case TaskVerified, TaskCompletedWithWaivers, TaskPartial, TaskCompleted, TaskFailed, TaskUnknown, TaskCancelled:
+		return true
+	default:
+		return false
+	}
 }
 
 func terminalTurnState(state TurnState) bool {

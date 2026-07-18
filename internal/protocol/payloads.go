@@ -98,11 +98,18 @@ type StateChangedV1 struct {
 
 func (s StateChangedV1) ValidateTask() error {
 	from, to := TaskState(s.From), TaskState(s.To)
-	if !validTaskState(from) || !validTaskState(to) || from == to || terminalTaskState(from) {
+	if !validTaskState(from) || !validTaskState(to) || from == to {
 		return fmt.Errorf("invalid task transition %q -> %q", s.From, s.To)
 	}
 	valid := (from == TaskPending && (to == TaskRunning || to == TaskCancelled)) ||
-		(from == TaskRunning && (to == TaskCompleted || to == TaskFailed || to == TaskCancelled))
+		(from == TaskDraft && to == TaskContractDrafting) ||
+		(from == TaskContractDrafting && to == TaskContractProposed) ||
+		(from == TaskContractProposed && to == TaskContractFrozen) ||
+		(from == TaskContractFrozen && to == TaskRunning) ||
+		(from == TaskRunning && (to == TaskCompleted || to == TaskFailed || to == TaskCancelled || to == TaskVerifying)) ||
+		(from == TaskVerifying && (to == TaskVerified || to == TaskCompletedWithWaivers || to == TaskPartial || to == TaskFailed || to == TaskUnknown || to == TaskCancelled)) ||
+		((from == TaskPartial || from == TaskFailed || from == TaskUnknown || from == TaskCompletedWithWaivers) && to == TaskReopened) ||
+		(from == TaskReopened && to == TaskRunning)
 	if !valid {
 		return fmt.Errorf("invalid task transition %q -> %q", s.From, s.To)
 	}
@@ -114,7 +121,19 @@ func (s StateChangedV1) ValidateTurn() error {
 	if !validTurnState(from) || !validTurnState(to) || from == to || terminalTurnState(from) {
 		return fmt.Errorf("invalid turn transition %q -> %q", s.From, s.To)
 	}
-	valid := (from == TurnAccepted && (to == TurnRunning || to == TurnFailed || to == TurnInterrupted)) ||
+	valid := (from == TurnAccepted && (to == TurnRunning || to == TurnContractDrafting)) ||
+		(from == TurnContractDrafting && to == TurnFreezingContract) ||
+		(from == TurnFreezingContract && to == TurnPlanningContext) ||
+		(from == TurnPlanningContext && to == TurnWaitingProvider) ||
+		(from == TurnWaitingProvider && to == TurnReceivingProvider) ||
+		(from == TurnReceivingProvider && to == TurnPlanningAction) ||
+		(from == TurnPlanningAction && to == TurnCheckpointing) ||
+		(from == TurnCheckpointing && to == TurnAwaitingPermission) ||
+		(from == TurnAwaitingPermission && to == TurnExecuting) ||
+		(from == TurnExecuting && to == TurnRecordingEvidence) ||
+		(from == TurnRecordingEvidence && to == TurnReturningResult) ||
+		(from == TurnReturningResult && to == TurnVerifying) ||
+		(from == TurnVerifying && (to == TurnCompleted || to == TurnFailed || to == TurnInterrupted)) ||
 		(from == TurnRunning && (to == TurnCompleted || to == TurnFailed || to == TurnInterrupted))
 	if !valid {
 		return fmt.Errorf("invalid turn transition %q -> %q", s.From, s.To)

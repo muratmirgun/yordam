@@ -1,11 +1,19 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sort"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/journal"
+	"github.com/muratmirgun/yordam/internal/projection"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
+
+var ErrSessionStateReadOnly = errors.New("session state source is a read-only validated prefix")
 
 type SessionState struct {
 	Mode      domain.PermissionMode
@@ -33,4 +41,134 @@ func ProjectSessionState(replay domain.SessionReplay) SessionState {
 		}
 	}
 	return state
+}
+
+type SessionStateJournal interface {
+	Inspect(context.Context, protocol.JournalRef) (journal.Inspection, error)
+	ReadRange(context.Context, journal.ReadRangeRequest) (journal.EventPage, error)
+}
+
+type IncrementalSessionState struct {
+	SessionState
+	Journal     protocol.JournalRef      `json:"journal"`
+	Head        protocol.CommittedCursor `json:"head"`
+	Writable    bool                     `json:"writable"`
+	Diagnostics []protocol.Diagnostic    `json:"diagnostics,omitempty"`
+}
+
+type IncrementalSessionStateProjector struct {
+	journal SessionStateJournal
+}
+
+func NewIncrementalSessionStateProjector(reader SessionStateJournal) *IncrementalSessionStateProjector {
+	return &IncrementalSessionStateProjector{journal: reader}
+}
+
+func (p *IncrementalSessionStateProjector) Open(
+	ctx context.Context,
+	ref protocol.JournalRef,
+	initial SessionState,
+) (IncrementalSessionState, error) {
+	state := IncrementalSessionState{SessionState: initial, Journal: ref}
+	if p == nil || p.journal == nil {
+		return state, fmt.Errorf("session state journal is not configured")
+	}
+	if err := ref.Validate(); err != nil {
+		return state, err
+	}
+	inspection, err := p.journal.Inspect(ctx, ref)
+	if err != nil {
+		return state, err
+	}
+	if inspection.Journal != ref {
+		return state, fmt.Errorf("session state inspection journal mismatch")
+	}
+	candidate := state.SessionState
+	for _, record := range inspection.Events {
+		candidate, err = applyCommittedSessionEvent(candidate, record)
+		if err != nil {
+			return state, err
+		}
+	}
+	state.SessionState, state.Head, state.Writable = candidate, inspection.Head, inspection.Writable
+	state.Diagnostics = protocol.DeepCopy(inspection.Diagnostics)
+	if !inspection.Writable {
+		return state, ErrSessionStateReadOnly
+	}
+	return state, nil
+}
+
+func (p *IncrementalSessionStateProjector) ProjectSessionState(
+	ctx context.Context,
+	current IncrementalSessionState,
+) (IncrementalSessionState, error) {
+	if p == nil || p.journal == nil {
+		return current, fmt.Errorf("session state journal is not configured")
+	}
+	if !current.Writable {
+		return current, ErrSessionStateReadOnly
+	}
+	if err := current.Journal.Validate(); err != nil {
+		return current, err
+	}
+	if err := current.Head.Validate(); err != nil {
+		return current, err
+	}
+	updated := protocol.DeepCopy(current)
+	for {
+		page, err := p.journal.ReadRange(ctx, journal.ReadRangeRequest{Journal: updated.Journal, After: updated.Head, Limit: 1000})
+		if err != nil {
+			return current, err
+		}
+		candidate := updated.SessionState
+		for _, record := range page.Events {
+			candidate, err = applyCommittedSessionEvent(candidate, record)
+			if err != nil {
+				return current, err
+			}
+		}
+		if len(page.Events) > 0 {
+			if err := page.Cursor.Validate(); err != nil {
+				return current, err
+			}
+			if page.Cursor.JournalKind != updated.Journal.Kind || page.Cursor.JournalID != updated.Journal.ID || page.Cursor.CommitSeq <= updated.Head.CommitSeq {
+				return current, fmt.Errorf("session state cursor did not advance")
+			}
+			updated.SessionState, updated.Head = candidate, page.Cursor
+		}
+		if !page.More {
+			if page.Head != updated.Head {
+				return current, fmt.Errorf("session state final range did not reach reported head")
+			}
+			return updated, nil
+		}
+		if len(page.Events) == 0 {
+			return current, fmt.Errorf("session state range reported more without advancing")
+		}
+	}
+}
+
+func applyCommittedSessionEvent(state SessionState, record protocol.EventRecord) (SessionState, error) {
+	if err := projection.ValidateFoundationEvent(record); err != nil {
+		return state, err
+	}
+	switch record.Envelope.Kind {
+	case protocol.EventModeChanged:
+		payload, ok := record.Decoded.(*protocol.ModeChangedV1)
+		if !ok {
+			return state, fmt.Errorf("invalid mode projection payload")
+		}
+		mode := domain.PermissionMode(payload.Mode)
+		if err := mode.Validate(); err != nil {
+			return state, err
+		}
+		state.Mode = mode
+	case protocol.EventModelChanged:
+		payload, ok := record.Decoded.(*protocol.ModelChangedV1)
+		if !ok || payload.ProviderID == "" || payload.ModelID == "" {
+			return state, fmt.Errorf("invalid model projection payload")
+		}
+		state.Selection = domain.ModelSelection{Profile: string(payload.ProviderID), Model: string(payload.ModelID)}
+	}
+	return state, nil
 }

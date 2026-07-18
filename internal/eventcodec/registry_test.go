@@ -211,6 +211,73 @@ func TestFoundationRegistryRejectsDuplicateDescriptorsAndInvalidSemantics(t *tes
 	}
 }
 
+func TestFoundationRegistryValidatesTaskSixLifecycleTransitions(t *testing.T) {
+	t.Parallel()
+	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	validate := func(kind string, payload any, taskID protocol.TaskID, turnID protocol.TurnID) error {
+		record, decodeErr := registry.Decode(envelopeFor(t, protocol.EventEnvelope{
+			JournalKind: protocol.JournalSession, JournalID: "session", SessionID: "session", Kind: kind,
+			TaskID: taskID, TurnID: turnID,
+		}, payload))
+		if decodeErr != nil {
+			return decodeErr
+		}
+		return registry.Validate(record)
+	}
+
+	taskPath := [][2]string{
+		{"draft", "contract_drafting"}, {"contract_drafting", "contract_proposed"}, {"contract_proposed", "contract_frozen"},
+		{"contract_frozen", "running"}, {"running", "verifying"}, {"verifying", "partial"},
+		{"partial", "reopened"}, {"reopened", "running"},
+	}
+	for _, transition := range taskPath {
+		if err := validate(protocol.EventTaskStatusChanged, protocol.TaskStatusChangedV1{From: transition[0], To: transition[1]}, "task", ""); err != nil {
+			t.Fatalf("task transition %q -> %q: %v", transition[0], transition[1], err)
+		}
+	}
+	for _, terminal := range []string{"verified", "completed_with_waivers", "partial", "failed", "unknown", "cancelled"} {
+		if err := validate(protocol.EventTaskStatusChanged, protocol.TaskStatusChangedV1{From: "verifying", To: terminal}, "task", ""); err != nil {
+			t.Fatalf("task terminal %q: %v", terminal, err)
+		}
+	}
+	for _, legacy := range [][2]string{{"pending", "running"}, {"pending", "cancelled"}, {"running", "completed"}, {"running", "failed"}, {"running", "cancelled"}} {
+		if err := validate(protocol.EventTaskStatusChanged, protocol.TaskStatusChangedV1{From: legacy[0], To: legacy[1]}, "task", ""); err != nil {
+			t.Fatalf("legacy task transition %q -> %q: %v", legacy[0], legacy[1], err)
+		}
+	}
+	for _, invalid := range [][2]string{{"draft", "verified"}, {"verified", "running"}, {"cancelled", "reopened"}, {"partial", "running"}} {
+		if err := validate(protocol.EventTaskStatusChanged, protocol.TaskStatusChangedV1{From: invalid[0], To: invalid[1]}, "task", ""); err == nil {
+			t.Fatalf("invalid task transition %q -> %q accepted", invalid[0], invalid[1])
+		}
+	}
+
+	turnPath := [][2]string{
+		{"accepted", "contract_drafting"}, {"contract_drafting", "freezing_contract"}, {"freezing_contract", "planning_context"},
+		{"planning_context", "waiting_provider"}, {"waiting_provider", "receiving_provider"}, {"receiving_provider", "planning_action"},
+		{"planning_action", "checkpointing"}, {"checkpointing", "awaiting_permission"}, {"awaiting_permission", "executing"},
+		{"executing", "recording_evidence"}, {"recording_evidence", "returning_result"}, {"returning_result", "verifying"},
+		{"verifying", "completed"}, {"verifying", "failed"}, {"verifying", "interrupted"},
+	}
+	for _, transition := range turnPath {
+		if err := validate(protocol.EventTurnStateChanged, protocol.TurnStateChangedV1{From: transition[0], To: transition[1]}, "task", "turn"); err != nil {
+			t.Fatalf("turn transition %q -> %q: %v", transition[0], transition[1], err)
+		}
+	}
+	for _, legacy := range [][2]string{{"accepted", "running"}, {"running", "completed"}, {"running", "failed"}, {"running", "interrupted"}} {
+		if err := validate(protocol.EventTurnStateChanged, protocol.TurnStateChangedV1{From: legacy[0], To: legacy[1]}, "task", "turn"); err != nil {
+			t.Fatalf("legacy turn transition %q -> %q: %v", legacy[0], legacy[1], err)
+		}
+	}
+	for _, invalid := range [][2]string{{"accepted", "completed"}, {"contract_drafting", "failed"}, {"completed", "running"}} {
+		if err := validate(protocol.EventTurnStateChanged, protocol.TurnStateChangedV1{From: invalid[0], To: invalid[1]}, "task", "turn"); err == nil {
+			t.Fatalf("invalid turn transition %q -> %q accepted", invalid[0], invalid[1])
+		}
+	}
+}
+
 func TestFoundationRegistryRecomputesBodyDigestsAndEnforcesJournalFamilies(t *testing.T) {
 	t.Parallel()
 	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
