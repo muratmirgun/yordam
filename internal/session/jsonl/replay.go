@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/safefile"
 )
 
@@ -58,6 +59,18 @@ func (s *Store) Load(ctx context.Context, sessionID string) (domain.SessionRepla
 		return domain.SessionReplay{}, err
 	}
 	defer s.state.unlock()
+	if err := validateSessionID(sessionID); err != nil {
+		return domain.SessionReplay{}, err
+	}
+	// Legacy Load mutation order matches Append: root-wide v0.1 lock, then
+	// the session-keyed journal lock. Its helpers operate on the open
+	// transaction directly and never reacquire either lock.
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(sessionID)}
+	lock := s.journalLock(ref)
+	if err := lock.lock(ctx); err != nil {
+		return domain.SessionReplay{}, err
+	}
+	defer lock.unlock()
 	transaction, session, err := s.openSessionTransaction(ctx, sessionID, os.O_RDWR, 0)
 	var missingLog *missingEventLogError
 	if errors.As(err, &missingLog) {

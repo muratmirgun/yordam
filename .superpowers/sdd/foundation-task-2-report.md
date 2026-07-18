@@ -252,8 +252,8 @@ Four new regressions were added first and failed for the intended reasons:
 | Finding | Correction | Permanent regression |
 | --- | --- | --- |
 | Append-method durability boundary | Marker uncertainty remains registered through metadata/index/directory work and transaction close. It is cleared by `AppendBatch` only when the complete method returns `committed` without an operation or close error. | `TestPostSyncFailureRetainsMarkerInodeUntilLookupResolution` covers `marker_sync`, `metadata_write`, `metadata_rename`, and `directory_sync` substitution. |
-| Restart-safe committed views | Every complete committed view performs an actual events-file `Sync` followed by rooted identity verification. The deterministic `FaultCommittedViewSync` hook proves that a restarted store cannot use marker shape alone as durability evidence. | `TestRestartedCommittedViewsRequireSyncAndRootedVerification` |
-| Shared read-surface policy | `LookupTransaction`, `Inspect`, `Head`, `ReadRange`, and `ReadCommittedTransaction` use the same sync-and-root-verify policy before returning a complete committed view. A same-process uncertainty is cleared only when every recorded uncertain marker exists in the scan on the original opened inode. | `TestInspectAndHeadDoNotExposeMarkerWhenDurabilityResolutionFails`, existing range and independent-read suites, and the restart regression above |
+| Restart-safe committed views | Every committed prefix performs an actual events-file `Sync` followed by rooted identity verification before exposure, including when a later physical tail is incomplete. The deterministic `FaultCommittedViewSync` hook proves that a restarted store cannot use marker shape alone as durability evidence. | `TestRestartedCommittedViewsRequireSyncAndRootedVerification`, `TestRestartedCommittedPrefixBeforeIncompleteTailStillRequiresProof` |
+| Shared read-surface policy | `LookupTransaction`, `Inspect`, `Head`, `ReadRange`, and `ReadCommittedTransaction` use the same sync-and-root-verify policy before returning a committed prefix, whether or not a later tail is incomplete. A same-process uncertainty is cleared only when every recorded uncertain marker exists in the scan on the original opened inode. | `TestInspectAndHeadDoNotExposeMarkerWhenDurabilityResolutionFails`, `TestRestartedCommittedPrefixBeforeIncompleteTailStillRequiresProof`, and existing range and independent-read suites |
 | Legacy/v2 mutation exclusion | Legacy `Append` now takes the same session-keyed journal lock as v2 while holding its pre-existing root-wide lock. The only nested order is root-wide v0.1 lock then keyed journal lock; no path acquires the pair in reverse. | `TestLegacyAndV2MutatorsShareJournalLockBeforeTemporaryCleanup` blocks a legacy sanitizer with a live metadata temporary and proves v2 times out without entering cleanup. |
 
 A post-write verified prefix may be staged while the append retains its
@@ -284,3 +284,58 @@ were silent, and `gofmt -l` returned no Task 2-owned path.
 
 The re-review changed no Task 3 recovery/upcasting behavior, Task 4 `flock`,
 config/schema/reload semantics, or `.superpowers/sdd/progress.md` content.
+
+## Second Re-review Closure (2026-07-18)
+
+The second re-review started from clean signed commit
+`241ae8b70d28b260db3cecdc3feebea01b43af67` (`fix: close journal
+durability re-review`). `git verify-commit` reported a good signature from
+Murat Mirgün Ercan before editing.
+
+Two focused regressions were added before production changes:
+
+- a restarted journal containing complete unproven transaction A followed by
+  incomplete transaction B exposed A through all five committed-view surfaces;
+  both the deterministic sync fault and a same-bytes events-inode substitution
+  were skipped by `LookupTransaction`, `Inspect`, `Head`, `ReadRange`, and
+  `ReadCommittedTransaction`; and
+- a blocked `Load` interruption sanitizer held the root mutation lock but not
+  the keyed journal lock, allowing `AppendBatch` to enter rooted writer cleanup,
+  delete a live metadata temporary, and reach the legacy-transition error
+  instead of timing out.
+
+### Second re-review finding-to-fix evidence
+
+| Finding | Correction | Permanent regression |
+| --- | --- | --- |
+| Committed prefix before incomplete tail | `syncCommittedView` no longer rejects incomplete scans, and every committed-view caller invokes it after a successful authoritative scan. The committed prefix is synced and its originally opened rooted identity is re-verified before exposure; an uncertainty belonging to an uncommitted tail still fails closed. | `TestRestartedCommittedPrefixBeforeIncompleteTailStillRequiresProof` covers all five surfaces under both `FaultCommittedViewSync` and inode substitution. |
+| `Load`/v2 mutation exclusion | `Store.Load` validates the session and acquires its keyed journal lock after the existing root-wide lock, matching the root-to-journal order used by legacy `Append`. Recovery, metadata, and interruption helpers operate on the already-open transaction and do not reacquire either lock. | `TestLoadAndV2MutatorsShareJournalLockBeforeTemporaryCleanup` proves v2 times out before cleanup, preserves the live temporary, and that `Load` completes after the sanitizer is released. |
+
+The new context checks from the journal lock exposed a call-count assumption in
+the pre-existing rooted-substitution regression. Its trigger now waits for the
+events descriptor to be open instead of relying only on the number of context
+checks, preserving and strengthening the intended substitution boundary.
+
+The complete second re-review matrix then passed from the unstaged diff:
+
+```text
+TASK_GO_FILES=<the thirteen Task 2 Go paths, including replay and its rooted-substitution test> <mandatory gofmt/full-test/diff/status checkpoint>
+go test ./internal/session/jsonl -run 'Test(RestartedCommittedPrefixBeforeIncompleteTailStillRequiresProof|LoadAndV2MutatorsShareJournalLockBeforeTemporaryCleanup|LoadKeepsRecoveryTransactionOnOpenedSessionRoot|LookupTransactionDistinguishesCleanAbsentCommittedAndIncompleteUnknown|RestartedCommittedViewsRequireSyncAndRootedVerification)$' -count=10
+go test -race ./internal/session/jsonl -run 'Test(RestartedCommittedPrefixBeforeIncompleteTailStillRequiresProof|LoadAndV2MutatorsShareJournalLockBeforeTemporaryCleanup|LoadKeepsRecoveryTransactionOnOpenedSessionRoot)$' -count=10
+go test -race ./internal/session/jsonl -run 'Test(AppendBatch|ExpectedHead|ReadRange)' -count=10
+go test ./internal/session/jsonl -run 'Test.*(Substitut|Symlink|Durable|Metadata|IncompleteTail|Incomplete)' -count=1
+go test ./internal/journal ./internal/session/jsonl -count=1
+go test ./...
+go test -race ./...
+go vet ./...
+git diff --check
+```
+
+The focused and both race repetition suites exited 0 with no race report. The
+repository-wide normal and race runs covered every package, the fresh journal
+package run passed, `go vet` and `git diff --check` were silent, and `gofmt -l`
+returned no Task 2 path.
+
+No Task 3 compatibility/recovery behavior, Task 4 cross-process `flock`,
+config/schema/reload semantics, or `.superpowers/sdd/progress.md` content was
+changed.

@@ -1163,6 +1163,84 @@ func TestLegacyAndV2MutatorsShareJournalLockBeforeTemporaryCleanup(t *testing.T)
 	}
 }
 
+func TestLoadAndV2MutatorsShareJournalLockBeforeTemporaryCleanup(t *testing.T) {
+	root := t.TempDir()
+	setup := jsonl.New(root, jsonl.Options{
+		Clock:   func() time.Time { return time.Date(2026, 7, 18, 11, 0, 0, 0, time.UTC) },
+		Entropy: strings.NewReader(strings.Repeat("l", 4096)),
+	})
+	workspace, err := jsonl.WorkspaceFromPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := setup.Create(context.Background(), workspace, domain.ModeAsk, domain.ModelSelection{Profile: "p", Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	openCall, err := setup.Append(context.Background(), session.ID, domain.EventToolStarted, map[string]string{"call_id": "call-load-lock"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(session.ID)}
+	legacyHead := protocol.CommittedCursor{
+		JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: openCall.Seq,
+		TransactionID: protocol.TransactionID("legacy:" + openCall.EventID),
+	}
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	loading := jsonl.New(root, jsonl.Options{
+		Clock:   func() time.Time { return time.Date(2026, 7, 18, 11, 1, 0, 0, time.UTC) },
+		Entropy: strings.NewReader(strings.Repeat("m", 4096)),
+		Sanitize: func(value any) (json.RawMessage, error) {
+			entered <- struct{}{}
+			<-release
+			return json.Marshal(value)
+		},
+	})
+	loadCtx, cancelLoad := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelLoad()
+	loadDone := make(chan error, 1)
+	go func() {
+		_, err := loading.Load(loadCtx, session.ID)
+		loadDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-loadCtx.Done():
+		t.Fatalf("Load never reached the blocked sanitizer: %v", loadCtx.Err())
+	}
+
+	sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
+	temporary := filepath.Join(sessionDir, ".metadata-"+strings.Repeat("3", 32)+".tmp")
+	if err := os.WriteFile(temporary, []byte("live load writer"), 0o600); err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	v2 := jsonl.New(root, jsonl.Options{Encoder: passthroughEncoder{}})
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	event := proposed("evt-load-lock-domain", protocol.EventTaskCreated)
+	event.SessionID = protocol.SessionID(session.ID)
+	result, appendErr := v2.AppendBatch(ctx, journal.AppendRequest{
+		Journal: ref, ExpectedHead: legacyHead,
+		TransactionID: "txn-load-lock-domain", Events: []protocol.ProposedEvent{event},
+	})
+	cancel()
+	raw, temporaryErr := os.ReadFile(temporary)
+	close(release)
+	loadErr := <-loadDone
+
+	if !errors.Is(appendErr, context.DeadlineExceeded) || result.Status != "" {
+		t.Errorf("AppendBatch bypassed active Load mutator: result=%+v err=%v", result, appendErr)
+	}
+	if temporaryErr != nil || string(raw) != "live load writer" {
+		t.Errorf("AppendBatch deleted Load's live temporary: contents=%q err=%v", raw, temporaryErr)
+	}
+	if loadErr != nil {
+		t.Errorf("Load self-deadlocked or failed after releasing sanitizer: %v", loadErr)
+	}
+}
+
 func readJournalLines(t *testing.T, path string) [][]byte {
 	t.Helper()
 	file, err := os.Open(path)

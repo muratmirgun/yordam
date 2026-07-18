@@ -423,7 +423,7 @@ func (s *Store) ReadRange(ctx context.Context, request journal.ReadRangeRequest)
 		return journal.EventPage{}, err
 	}
 	scan, rebuildIndex, scanErr := s.loadJournalScan(ctx, transaction, request.Journal)
-	if scanErr == nil && !scan.incompleteTail {
+	if scanErr == nil {
 		scanErr = s.syncCommittedView(ctx, transaction, request.Journal, scan)
 	}
 	if scanErr == nil && rebuildIndex {
@@ -512,14 +512,12 @@ func (s *Store) LookupTransaction(
 	if scanErr != nil {
 		return journal.TransactionLookup{}, errors.Join(scanErr, transaction.close())
 	}
-	if !scan.incompleteTail {
-		if verifyErr := s.syncCommittedView(ctx, transaction, ref, scan); verifyErr != nil {
-			closeErr := transaction.close()
-			if errors.Is(verifyErr, errUnresolvedMarkerDurability) {
-				return journal.TransactionLookup{State: journal.TransactionUnknown}, closeErr
-			}
-			return journal.TransactionLookup{}, errors.Join(verifyErr, closeErr)
+	if verifyErr := s.syncCommittedView(ctx, transaction, ref, scan); verifyErr != nil {
+		closeErr := transaction.close()
+		if errors.Is(verifyErr, errUnresolvedMarkerDurability) {
+			return journal.TransactionLookup{State: journal.TransactionUnknown}, closeErr
 		}
+		return journal.TransactionLookup{}, errors.Join(verifyErr, closeErr)
 	}
 	if commit, ok := scan.transactions[transactionID]; ok {
 		s.rememberVerifiedJournalScan(transaction, ref, scan)
@@ -564,7 +562,7 @@ func (s *Store) ReadCommittedTransaction(
 		return journal.CommittedTransaction{}, err
 	}
 	scan, scanErr := s.scanJournal(ctx, transaction, ref)
-	if scanErr == nil && !scan.incompleteTail {
+	if scanErr == nil {
 		scanErr = s.syncCommittedView(ctx, transaction, ref, scan)
 	}
 	closeErr := transaction.close()

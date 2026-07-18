@@ -412,7 +412,7 @@ func (s *Store) Inspect(ctx context.Context, ref protocol.JournalRef) (journal.I
 		return journal.Inspection{}, err
 	}
 	scan, scanErr := s.scanJournal(ctx, transaction, ref)
-	if scanErr == nil && !scan.incompleteTail {
+	if scanErr == nil {
 		scanErr = s.syncCommittedView(ctx, transaction, ref, scan)
 	}
 	closeErr := transaction.close()

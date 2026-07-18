@@ -87,9 +87,6 @@ func (s *Store) syncCommittedView(
 	ref protocol.JournalRef,
 	scan journalScan,
 ) error {
-	if scan.incompleteTail {
-		return errUnresolvedMarkerDurability
-	}
 	prefix := journalLockKey(ref) + "\x00"
 	var uncertaintyKeys []string
 	var uncertaintyErr error

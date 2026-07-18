@@ -249,7 +249,9 @@ func TestLoadKeepsRecoveryTransactionOnOpenedSessionRoot(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-			condition: func(string) bool { return true },
+			condition: func(sessionDir string) bool {
+				return descriptorForPathIsOpen(filepath.Join(sessionDir, "events.jsonl"))
+			},
 			minChecks: 4,
 		},
 	}

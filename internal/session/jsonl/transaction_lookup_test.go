@@ -516,3 +516,128 @@ func TestRestartedCommittedViewsRequireSyncAndRootedVerification(t *testing.T) {
 		t.Fatalf("restart Head exposed unverified marker: head=%+v err=%v", head, err)
 	}
 }
+
+func TestRestartedCommittedPrefixBeforeIncompleteTailStillRequiresProof(t *testing.T) {
+	appendFault := errors.New("marker write unknown")
+	fixture := newV2JournalWithFault(t, func(point jsonl.FaultPoint) error {
+		if point == jsonl.FaultMarkerWrite {
+			return appendFault
+		}
+		return nil
+	})
+	event := proposed("evt-restart-prefix-a", protocol.EventTaskCreated)
+	event.SessionID = protocol.SessionID(fixture.ref.ID)
+	result, err := fixture.repo.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: fixture.ref, ExpectedHead: fixture.head,
+		TransactionID: "txn-restart-prefix-a", Events: []protocol.ProposedEvent{event},
+	})
+	if !errors.Is(err, appendFault) || result.Status != journal.AppendCommitUnknown {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+
+	viewFault := errors.New("committed prefix sync unknown")
+	proofFailures := []struct {
+		name   string
+		fault  func(string) jsonl.FaultInjector
+		assert func(error) bool
+	}{
+		{
+			name: "sync",
+			fault: func(string) jsonl.FaultInjector {
+				return func(point jsonl.FaultPoint) error {
+					if point == jsonl.FaultCommittedViewSync {
+						return viewFault
+					}
+					return nil
+				}
+			},
+			assert: func(err error) bool { return errors.Is(err, viewFault) },
+		},
+		{
+			name: "rooted_identity",
+			fault: func(eventsPath string) jsonl.FaultInjector {
+				substituted := false
+				return func(point jsonl.FaultPoint) error {
+					if point != jsonl.FaultCommittedViewSync || substituted {
+						return nil
+					}
+					substituted = true
+					raw, err := os.ReadFile(eventsPath)
+					if err != nil {
+						return err
+					}
+					if err := os.Rename(eventsPath, eventsPath+".detached"); err != nil {
+						return err
+					}
+					return os.WriteFile(eventsPath, raw, 0o600)
+				}
+			},
+			assert: func(err error) bool {
+				return err != nil && strings.Contains(err.Error(), `"events.jsonl" no longer identifies the opened regular file`)
+			},
+		},
+	}
+	surfaces := []struct {
+		name string
+		read func(*jsonl.Store) (any, error)
+	}{
+		{
+			name: "lookup",
+			read: func(store *jsonl.Store) (any, error) {
+				return store.LookupTransaction(context.Background(), fixture.ref, "txn-restart-prefix-a")
+			},
+		},
+		{
+			name: "inspect",
+			read: func(store *jsonl.Store) (any, error) {
+				return store.Inspect(context.Background(), fixture.ref)
+			},
+		},
+		{
+			name: "head",
+			read: func(store *jsonl.Store) (any, error) {
+				return store.Head(context.Background(), fixture.ref)
+			},
+		},
+		{
+			name: "range",
+			read: func(store *jsonl.Store) (any, error) {
+				return store.ReadRange(context.Background(), journal.ReadRangeRequest{Journal: fixture.ref, Limit: 10})
+			},
+		},
+		{
+			name: "committed_transaction",
+			read: func(store *jsonl.Store) (any, error) {
+				return store.ReadCommittedTransaction(context.Background(), fixture.ref, "txn-restart-prefix-a")
+			},
+		},
+	}
+	for _, proofFailure := range proofFailures {
+		for _, surface := range surfaces {
+			t.Run(proofFailure.name+"/"+surface.name, func(t *testing.T) {
+				restartRoot := filepath.Join(t.TempDir(), "restarted-store")
+				copyJournalRootForRestart(t, fixture.root, restartRoot)
+				relativeEvents, err := filepath.Rel(fixture.root, fixture.eventsPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				restartEvents := filepath.Join(restartRoot, relativeEvents)
+				file, err := os.OpenFile(restartEvents, os.O_WRONLY|os.O_APPEND, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, writeErr := file.Write([]byte(`{"schema_version":2,"transaction_id":"txn-restart-prefix-b"`))
+				if err := errors.Join(writeErr, file.Close()); err != nil {
+					t.Fatal(err)
+				}
+				restarted := jsonl.New(restartRoot, jsonl.Options{
+					Encoder: passthroughEncoder{}, Fault: proofFailure.fault(restartEvents),
+				})
+				got, err := surface.read(restarted)
+				if !proofFailure.assert(err) {
+					t.Fatalf("%s exposed committed prefix without %s proof: result=%+v err=%v", surface.name, proofFailure.name, got, err)
+				}
+			})
+		}
+	}
+}
