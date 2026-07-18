@@ -88,7 +88,22 @@ func BuildLegacyContextSources(replay domain.SessionReplay, systemPrompt string,
 	sources := make([]protocol.ContentSource, 0, len(messages))
 	for index, message := range messages {
 		blocks := make([]protocol.ContentBlock, 0, len(message.ToolCalls)+1)
-		if message.Content != "" {
+		if message.Role == domain.RoleTool {
+			var result struct {
+				CallID string `json:"call_id"`
+				Status string `json:"status"`
+			}
+			if json.Unmarshal([]byte(message.Content), &result) != nil || result.Status == "" {
+				return nil, fmt.Errorf("legacy tool context message %d is invalid", index)
+			}
+			callID := message.ToolCallID
+			if callID == "" {
+				callID = result.CallID
+			}
+			blocks = append(blocks, protocol.ContentBlock{Kind: protocol.ContentToolResult, ToolResult: &protocol.ToolResultBlock{
+				CallID: callID, Status: result.Status, JSON: json.RawMessage(message.Content),
+			}})
+		} else if message.Content != "" {
 			blocks = append(blocks, protocol.ContentBlock{Kind: protocol.ContentText, Text: message.Content})
 		}
 		for _, call := range message.ToolCalls {

@@ -90,17 +90,13 @@ func TestAdapterNormalizesStreamEventsWithOrderingUsageAndTerminalMetadata(t *te
 	}
 }
 
-func TestAdapterEmitsRefusalStructuredJSONAndTypedErrors(t *testing.T) {
-	refusal := normalizeLegacyEvents(false, []domain.ModelEvent{{Kind: domain.ModelRefusalDelta, Refusal: "cannot comply"}, {Kind: domain.ModelDone, RequestID: "req", FinishReason: "content_filter"}})
+func TestAdapterEmitsRefusalAndTypedErrors(t *testing.T) {
+	refusal := normalizeLegacyEvents([]domain.ModelEvent{{Kind: domain.ModelRefusalDelta, Refusal: "cannot comply"}, {Kind: domain.ModelDone, RequestID: "req", FinishReason: "content_filter"}})
 	if len(refusal) != 2 || refusal[0].Kind != protocol.ModelEventContentBlock || refusal[0].Block.Kind != protocol.ContentRefusal || refusal[1].Terminal.Reason != "refusal" {
 		t.Fatalf("refusal=%#v", refusal)
 	}
-	structured := normalizeLegacyEvents(true, []domain.ModelEvent{{Kind: domain.ModelTextDelta, Text: `{"ok":true}`}, {Kind: domain.ModelDone, RequestID: "req", FinishReason: "stop"}})
-	if len(structured) != 3 || structured[0].Delta.Kind != protocol.ContentJSON || structured[1].Block.Kind != protocol.ContentJSON || string(structured[1].Block.JSON) != `{"ok":true}` {
-		t.Fatalf("structured=%#v", structured)
-	}
 	typed := &domain.TypedError{Kind: domain.ErrorProviderRetryable, Message: "overloaded"}
-	errors := normalizeLegacyEvents(false, []domain.ModelEvent{{Kind: domain.ModelStreamError, Err: typed}})
+	errors := normalizeLegacyEvents([]domain.ModelEvent{{Kind: domain.ModelStreamError, Err: typed}})
 	if len(errors) != 1 || errors[0].Kind != protocol.ModelEventError || errors[0].Error.Code != string(domain.ErrorProviderRetryable) || !errors[0].Error.Retryable {
 		t.Fatalf("errors=%#v", errors)
 	}
@@ -111,8 +107,9 @@ func TestAdapterDoesNotEmulateUnsupportedPreferredStructuredOutput(t *testing.T)
 		Requirements: []protocol.CapabilityRequirement{{Capability: protocol.CapabilityStructuredOutput, Level: protocol.CapabilityPreferred}},
 		Plan:         protocol.NegotiatedProviderPlan{Body: protocol.NegotiatedProviderPlanBody{Descriptor: protocol.ModelDescriptor{Capabilities: []protocol.CapabilityFact{{Capability: protocol.CapabilityStructuredOutput, State: protocol.CapabilityUnsupported}}}}},
 	}
-	if requiresStructuredOutput(request) {
-		t.Fatal("unsupported preferred structured output was emulated")
+	_, err := NewAdapter(nil).Normalize(context.Background(), request)
+	if !errors.Is(err, provider.ErrCapabilityUnavailable) {
+		t.Fatalf("error=%v", err)
 	}
 }
 
@@ -126,7 +123,7 @@ func TestMissingUsageCategoriesRemainUnknown(t *testing.T) {
 func TestInvalidProviderUsageBecomesTypedModelError(t *testing.T) {
 	unknown := protocol.UsageValue{State: protocol.UsageUnknown}
 	usage := protocol.ModelUsage{Input: protocol.UsageValue{State: protocol.UsageProviderReported, Value: -1}, Output: unknown, Cached: unknown, CacheWrite: unknown, Reasoning: unknown}
-	events := normalizeLegacyEvents(false, []domain.ModelEvent{{Kind: domain.ModelUsageUpdate, Usage: &usage}})
+	events := normalizeLegacyEvents([]domain.ModelEvent{{Kind: domain.ModelUsageUpdate, Usage: &usage}})
 	if len(events) != 1 || events[0].Kind != protocol.ModelEventError || events[0].Error.Code != "invalid_usage" {
 		t.Fatalf("events=%#v", events)
 	}
@@ -137,6 +134,22 @@ func TestAdapterRejectsUnsupportedSemanticBlocks(t *testing.T) {
 	_, err := adapter.normalize(context.Background(), protocol.ModelRequest{ModelID: "model-a", Messages: []protocol.ModelMessage{{Role: "user", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentReferenceKind, Reference: &protocol.ContentReference{URI: "file:///a", MediaType: "text/plain", Digest: adapterDigest('b')}}}}}})
 	if !errors.Is(err, provider.ErrCapabilityUnavailable) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestAdapterRejectsStructuredOutputBeforeTransport(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	defer server.Close()
+	adapter := NewAdapter(New(ClientOptions{HTTPClient: server.Client(), BaseURL: server.URL}))
+	request := protocol.ModelRequest{
+		ProviderID: "openai", ModelID: "model-a",
+		Messages:     []protocol.ModelMessage{{Role: "user", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "return JSON"}}}},
+		Requirements: []protocol.CapabilityRequirement{{Capability: protocol.CapabilityStructuredOutput, Level: protocol.CapabilityRequired}},
+	}
+	_, err := adapter.stream(context.Background(), request)
+	if !errors.Is(err, provider.ErrCapabilityUnavailable) || requests != 0 {
+		t.Fatalf("error=%v requests=%d", err, requests)
 	}
 }
 

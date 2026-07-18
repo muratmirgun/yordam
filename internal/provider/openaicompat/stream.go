@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/protocol"
@@ -26,43 +25,7 @@ const (
 )
 
 func (c *Client) Stream(ctx context.Context, input domain.ModelRequest) (<-chan domain.ModelEvent, error) {
-	resp, retriesUsed, err := c.openWithRetries(ctx, input)
-	if err != nil {
-		return nil, err
-	}
-	out := make(chan domain.ModelEvent)
-	go func() {
-		defer close(out)
-		for {
-			observed, err := c.consumeAttempt(ctx, resp, out)
-			if err == nil || ctx.Err() != nil {
-				return
-			}
-			if observed || !IsRetryable(err) || retriesUsed >= len(c.retryDelays) {
-				sendEvent(ctx, out, domain.ModelEvent{Kind: domain.ModelStreamError, Err: err})
-				return
-			}
-			if err := c.waitForRetry(ctx, c.retryDelays[retriesUsed]); err != nil {
-				return
-			}
-			retriesUsed++
-			for {
-				resp, err = c.openAttempt(ctx, input)
-				if err == nil {
-					break
-				}
-				if !IsRetryable(err) || retriesUsed >= len(c.retryDelays) {
-					sendEvent(ctx, out, domain.ModelEvent{Kind: domain.ModelStreamError, Err: err})
-					return
-				}
-				if err := c.waitForRetry(ctx, c.retryDelays[retriesUsed]); err != nil {
-					return
-				}
-				retriesUsed++
-			}
-		}
-	}()
-	return out, nil
+	return c.streamOnce(ctx, input)
 }
 
 func (c *Client) streamOnce(ctx context.Context, input domain.ModelRequest) (<-chan domain.ModelEvent, error) {
@@ -79,34 +42,6 @@ func (c *Client) streamOnce(ctx context.Context, input domain.ModelRequest) (<-c
 		}
 	}()
 	return out, nil
-}
-
-func (c *Client) openWithRetries(ctx context.Context, input domain.ModelRequest) (*http.Response, int, error) {
-	retriesUsed := 0
-	for {
-		resp, err := c.openAttempt(ctx, input)
-		if err == nil {
-			return resp, retriesUsed, nil
-		}
-		if !IsRetryable(err) || retriesUsed >= len(c.retryDelays) {
-			return nil, retriesUsed, err
-		}
-		if err := c.waitForRetry(ctx, c.retryDelays[retriesUsed]); err != nil {
-			return nil, retriesUsed, err
-		}
-		retriesUsed++
-	}
-}
-
-func (c *Client) waitForRetry(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(c.jitter(delay))
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 type callParts struct {

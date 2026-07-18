@@ -133,23 +133,23 @@ func adaptEvents(events []protocol.EventRecord) ([]protocol.ContentSource, []pro
 		if event.Envelope.Kind != protocol.EventContextCompacted {
 			continue
 		}
-		compactionIndex, through, summary = -1, 0, ""
-		if decoded, ok := contextCompaction(event); ok && decoded.Revision != "" {
-			compactionRevision = decoded.Revision
-		}
 		if event.Legacy == nil {
+			if decoded, ok := contextCompaction(event); ok && decoded.Revision != "" {
+				compactionIndex, through, summary = -1, 0, ""
+				compactionRevision = decoded.Revision
+			}
 			continue
 		}
 		var payload legacyCompactionPayload
 		if json.Unmarshal(event.Legacy.Payload, &payload) != nil || payload.Summary == "" || payload.FromSeq > payload.ThroughSeq || payload.ThroughSeq >= event.Envelope.Seq {
 			continue
 		}
-		compactionIndex, through, summary = index, payload.ThroughSeq, payload.Summary
+		candidateRevision := fmt.Sprintf("legacy-v%d", event.Legacy.SchemaVersion)
 		if decoded, ok := contextCompaction(event); ok && decoded.Revision != "" {
-			compactionRevision = decoded.Revision
-		} else {
-			compactionRevision = fmt.Sprintf("legacy-v%d", event.Legacy.SchemaVersion)
+			candidateRevision = decoded.Revision
 		}
+		compactionIndex, through, summary = index, payload.ThroughSeq, payload.Summary
+		compactionRevision = candidateRevision
 	}
 	sources := make([]protocol.ContentSource, 0, len(events)+1)
 	excluded := make([]protocol.ExcludedContentSource, 0)

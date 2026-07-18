@@ -99,6 +99,34 @@ func TestContextPlanRecordsNativeCompactionRevisionWithoutDroppingUnavailableSum
 	}
 }
 
+func TestContextPlanIgnoresMalformedLaterLegacyCompaction(t *testing.T) {
+	events := []protocol.EventRecord{
+		contextEvent("event-old", 1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old"}),
+		{
+			Envelope: protocol.EventEnvelope{EventID: "event-valid-compact", Seq: 2, Kind: protocol.EventContextCompacted},
+			Decoded:  &protocol.ContextCompactedV1{Revision: "valid-r1"},
+			Legacy:   &protocol.LegacySource{SchemaVersion: 1, EventID: "event-valid-compact", Seq: 2, Kind: protocol.EventContextCompacted, Payload: json.RawMessage(`{"from_seq":0,"through_seq":1,"summary":"valid summary"}`)},
+		},
+		contextEvent("event-new", 3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "new"}),
+		{
+			Envelope: protocol.EventEnvelope{EventID: "event-invalid-compact", Seq: 4, Kind: protocol.EventContextCompacted},
+			Decoded:  &protocol.ContextCompactedV1{Revision: "invalid-r2"},
+			Legacy:   &protocol.LegacySource{SchemaVersion: 1, EventID: "event-invalid-compact", Seq: 4, Kind: protocol.EventContextCompacted, Payload: json.RawMessage(`{"from_seq":5,"through_seq":3,"summary":"invalid summary"}`)},
+		},
+		contextEvent("event-latest", 5, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "latest"}),
+	}
+	plan, err := contextplanner.NewPlanner("tools-r1").Plan(stdcontext.Background(), contextplanner.Request{
+		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
+		Events: events, Model: contextModel(1024), OutputReserve: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Body.CompactionRevision != "valid-r1" || len(plan.Body.Sources) != 3 || plan.Body.Sources[0].Content[0].Text != "valid summary" || plan.Body.Sources[1].Content[0].Text != "new" || plan.Body.Sources[2].Content[0].Text != "latest" {
+		t.Fatalf("plan=%#v", plan)
+	}
+}
+
 func contextEvent(id string, sequence uint64, kind string, decoded any) protocol.EventRecord {
 	return protocol.EventRecord{Envelope: protocol.EventEnvelope{EventID: protocol.EventID(id), Seq: sequence, Kind: kind}, Decoded: decoded}
 }

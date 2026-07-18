@@ -39,6 +39,11 @@ func (*Adapter) normalize(ctx context.Context, request protocol.ModelRequest) (c
 	if err := ctx.Err(); err != nil {
 		return chatRequest{}, err
 	}
+	for _, requirement := range request.Requirements {
+		if requirement.Capability == protocol.CapabilityStructuredOutput && requirement.Level != protocol.CapabilityUnused {
+			return chatRequest{}, capabilityError(protocol.ContentJSON)
+		}
+	}
 	if request.ModelID == "" {
 		return chatRequest{}, fmt.Errorf("model ID is required")
 	}
@@ -128,11 +133,10 @@ func (a *Adapter) stream(ctx context.Context, request protocol.ModelRequest) (<-
 	if err != nil {
 		return nil, err
 	}
-	structured := requiresStructuredOutput(request)
 	out := make(chan protocol.ModelEvent)
 	go func() {
 		defer close(out)
-		normalizer := eventNormalizer{structured: structured}
+		normalizer := eventNormalizer{}
 		for event := range legacy {
 			for _, normalizedEvent := range normalizer.feed(event) {
 				select {
@@ -161,30 +165,10 @@ func legacyRequest(request chatRequest) domain.ModelRequest {
 	return legacy
 }
 
-func requiresStructuredOutput(request protocol.ModelRequest) bool {
-	supported := false
-	for _, fact := range request.Plan.Body.Descriptor.Capabilities {
-		if fact.Capability == protocol.CapabilityStructuredOutput {
-			supported = fact.State == protocol.CapabilitySupported
-			break
-		}
-	}
-	if !supported {
-		return false
-	}
-	for _, requirement := range request.Requirements {
-		if requirement.Capability == protocol.CapabilityStructuredOutput && requirement.Level != protocol.CapabilityUnused {
-			return true
-		}
-	}
-	return false
-}
-
 type eventNormalizer struct {
-	structured bool
-	sequence   uint64
-	text       strings.Builder
-	refusal    strings.Builder
+	sequence uint64
+	text     strings.Builder
+	refusal  strings.Builder
 }
 
 func (n *eventNormalizer) next(event protocol.ModelEvent) protocol.ModelEvent {
@@ -201,9 +185,6 @@ func (n *eventNormalizer) feed(event domain.ModelEvent) []protocol.ModelEvent {
 		}
 		n.text.WriteString(event.Text)
 		delta := protocol.ContentDelta{BlockID: "content-1", Kind: protocol.ContentText, Text: event.Text}
-		if n.structured {
-			delta.Kind, delta.Text, delta.JSONFragment = protocol.ContentJSON, "", event.Text
-		}
 		return []protocol.ModelEvent{n.next(protocol.ModelEvent{Kind: protocol.ModelEventContentDelta, Delta: &delta})}
 	case domain.ModelRefusalDelta:
 		n.refusal.WriteString(event.Refusal)
@@ -253,13 +234,6 @@ func (n *eventNormalizer) complete(event domain.ModelEvent) []protocol.ModelEven
 	result := make([]protocol.ModelEvent, 0, 3)
 	if n.text.Len() != 0 {
 		block := protocol.ContentBlock{Kind: protocol.ContentText, Text: n.text.String()}
-		if n.structured {
-			raw := json.RawMessage(n.text.String())
-			if protocol.ValidateRawJSON(raw) != nil {
-				return []protocol.ModelEvent{n.providerError("invalid_structured_output", "provider returned invalid structured JSON", false)}
-			}
-			block = protocol.ContentBlock{Kind: protocol.ContentJSON, JSON: raw}
-		}
 		result = append(result, n.next(protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Block: &block}))
 	}
 	if n.refusal.Len() != 0 {
@@ -292,8 +266,8 @@ func normalizeFinishReason(native string, refused bool) string {
 	}
 }
 
-func normalizeLegacyEvents(structured bool, events []domain.ModelEvent) []protocol.ModelEvent {
-	normalizer := eventNormalizer{structured: structured}
+func normalizeLegacyEvents(events []domain.ModelEvent) []protocol.ModelEvent {
+	normalizer := eventNormalizer{}
 	result := make([]protocol.ModelEvent, 0, len(events)+1)
 	for _, event := range events {
 		result = append(result, normalizer.feed(event)...)

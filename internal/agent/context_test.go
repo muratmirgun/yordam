@@ -9,6 +9,7 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 )
 
@@ -45,6 +46,27 @@ func TestBuildLegacyContextSourcesPreservesCurrentCompactionTranscript(t *testin
 		if source.Validate() != nil || source.Digest.Validate() != nil || source.Provenance != "legacy_context_adapter_v1" {
 			t.Fatalf("source=%#v validation=%v", source, source.Validate())
 		}
+	}
+}
+
+func TestBuildLegacyContextSourcesPreservesStructuredToolResultAssociation(t *testing.T) {
+	call := domain.ToolCall{ID: "call-1", Name: "read", Arguments: json.RawMessage(`{"path":"a.go"}`)}
+	result := domain.ToolResult{CallID: call.ID, Status: domain.ToolDenied, ErrorKind: domain.ErrorPermissionDenied, Content: "denied detail"}
+	replay := domain.SessionReplay{Events: []domain.DurableEvent{
+		{Seq: 1, Kind: domain.EventAssistantMessage, Payload: payload(t, domain.MessagePayload{Content: "checking", ToolCalls: []domain.ToolCall{call}})},
+		{Seq: 2, Kind: domain.EventToolResult, Payload: payload(t, domain.ToolResultPayload{Result: result})},
+	}}
+	sources, err := agent.BuildLegacyContextSources(replay, "system", contextLease(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolSource := sources[len(sources)-1]
+	if len(toolSource.Content) != 1 || toolSource.Content[0].Kind != protocol.ContentToolResult || toolSource.Content[0].ToolResult == nil {
+		t.Fatalf("tool source=%#v", toolSource)
+	}
+	block := toolSource.Content[0].ToolResult
+	if block.CallID != call.ID || block.Status != string(domain.ToolDenied) || !strings.Contains(string(block.JSON), `"content":"denied detail"`) {
+		t.Fatalf("tool result=%#v", block)
 	}
 }
 
