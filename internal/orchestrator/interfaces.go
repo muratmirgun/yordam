@@ -9,7 +9,6 @@ import (
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/provider"
-	"github.com/muratmirgun/yordam/internal/recovery"
 	"github.com/muratmirgun/yordam/internal/tooling"
 	"github.com/muratmirgun/yordam/internal/verification"
 )
@@ -91,6 +90,24 @@ type ApplicationEventPublisher interface {
 	PublishCommitted(context.Context, protocol.JournalRef, protocol.CommittedCursor, []protocol.EventEnvelope) error
 }
 
+type StreamingSanitizer interface {
+	Write(string) (string, error)
+	Close() (string, error)
+}
+
+// AdmissionService pins sanitization to the request's runtime generation.
+// It is applied before any model-visible or durable output leaves the
+// orchestrator, including provider streams split across chunk boundaries.
+type AdmissionService interface {
+	SanitizeText(context.Context, protocol.RuntimeGenerationID, string) (string, error)
+	SanitizeJSON(context.Context, protocol.RuntimeGenerationID, json.RawMessage) (json.RawMessage, error)
+	OpenTextStream(context.Context, protocol.RuntimeGenerationID) (StreamingSanitizer, error)
+}
+
+type InstructionService interface {
+	SystemInstructions(context.Context, protocol.RuntimeGenerationID, string, protocol.SessionID) ([]protocol.ContentSource, error)
+}
+
 type ContextPlanner interface {
 	Plan(context.Context, contextplanner.Request) (protocol.ContextPlan, error)
 }
@@ -105,6 +122,15 @@ type ProviderService interface {
 	Stream(context.Context, provider.ProviderHandle, authorization.CommittedToken) (<-chan protocol.ModelEvent, error)
 }
 
+// ProvenZeroByteProviderError is the only provider failure eligible for an
+// automatic retry. Both predicates must be true; every other start/stream
+// failure is treated as ambiguous and terminalized.
+type ProvenZeroByteProviderError interface {
+	error
+	Retryable() bool
+	ZeroBytesSent() bool
+}
+
 type ToolService interface {
 	Plan(context.Context, tooling.PlanRequest) (tooling.ActionHandle, protocol.ActionPlan, error)
 	PlanPreviewInspection(context.Context, tooling.PlanRequest) (tooling.ActionHandle, protocol.ActionPlan, error)
@@ -112,7 +138,6 @@ type ToolService interface {
 	PlanMutation(context.Context, tooling.PreviewResult, tooling.PlanRequest) (tooling.ActionHandle, protocol.ActionPlan, error)
 	Revalidate(context.Context, tooling.ActionHandle) (protocol.ActionPlan, bool, error)
 	Execute(context.Context, tooling.ActionHandle, authorization.CommittedToken) (protocol.ExecutionResult, error)
-	RecoveryCandidate(context.Context, tooling.PreviewResult, protocol.CheckpointBody, protocol.ActionPlan) (recovery.Candidate, error)
 }
 
 type AuthorizationService interface {
@@ -131,7 +156,7 @@ type EvidenceRecorder interface {
 }
 
 type RecoveryRecorder interface {
-	Put(context.Context, recovery.Candidate) (protocol.RecoveryMaterialRecord, error)
+	PrepareAndPut(context.Context, tooling.PreviewResult, protocol.ActivityID, protocol.CheckpointBody, protocol.ActionPlan) (protocol.RecoveryMaterialRecord, error)
 }
 
 type VerificationService interface {
@@ -172,4 +197,6 @@ type Dependencies struct {
 	EffectProbe   EffectStartProbe
 	Publisher     ApplicationEventPublisher
 	BarrierProbe  BarrierProbe
+	Admission     AdmissionService
+	Instructions  InstructionService
 }

@@ -13,9 +13,20 @@ import (
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
-func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlRequest) (RecoveryControlResult, error) {
+func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlRequest) (result RecoveryControlResult, runErr error) {
 	if err := validateRecoveryControlRequest(request); err != nil {
 		return RecoveryControlResult{}, err
+	}
+	if s.deps.Admission == nil {
+		return RecoveryControlResult{}, fmt.Errorf("generation admission service is required")
+	}
+	admitted, err := s.deps.Admission.SanitizeJSON(ctx, request.Control.Runtime.ID, request.Control.Event.Payload)
+	if err != nil {
+		return RecoveryControlResult{}, err
+	}
+	request.Control.Event.Payload = admitted
+	if err := validateRecoveryControlRequest(request); err != nil {
+		return RecoveryControlResult{}, fmt.Errorf("admitted recovery control event: %w", err)
 	}
 	sessionID := protocol.SessionID(request.Storage.Journal.ID)
 	laneLease, err := s.lane.Acquire(ctx, OperationClaim{Kind: OperationRecovery, SessionID: sessionID, ControlOperationID: request.Control.OperationID})
@@ -48,14 +59,27 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 			return RecoveryControlResult{}, err
 		}
 	}
-	released := false
+	releaseHead := request.Storage.ExpectedHead
 	defer func() {
-		if turnLease != nil && !released {
-			_ = turnLease.Release(context.WithoutCancel(ctx), request.Storage.ExpectedHead)
+		if turnLease != nil {
+			if releaseErr := turnLease.Release(context.WithoutCancel(ctx), releaseHead); releaseErr != nil {
+				runErr = errors.Join(runErr, releaseErr)
+			}
 		}
 	}()
 
 	controlState := controlState{ref: request.Control.Journal, head: request.Control.ExpectedHead, command: request.Control.Command, operationID: request.Control.OperationID}
+	defer func() {
+		if runErr == nil || !controlState.accepted || controlState.terminal {
+			return
+		}
+		terminalResult, terminalErr := s.terminalizeControlFailure(context.WithoutCancel(ctx), request.Control, &controlState, runErr)
+		if terminalErr != nil {
+			runErr = errors.Join(runErr, terminalErr)
+			return
+		}
+		result = RecoveryControlResult{CommandResult: terminalResult.CommandResult}
+	}()
 	authorizationRequest, err := controlAuthorizationRequest(request.Control)
 	if err != nil {
 		return RecoveryControlResult{}, err
@@ -72,9 +96,12 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 	if err != nil {
 		return RecoveryControlResult{}, err
 	}
+	plannedHead := controlState.head
 	if err := s.appendControl(ctx, &controlState, "recovery-planned", events, ""); err != nil {
+		controlState.accepted = controlState.head != plannedHead
 		return RecoveryControlResult{}, err
 	}
+	controlState.accepted = true
 	token, err := s.authorizeControl(ctx, request.Control, &controlState, authorizationRequest)
 	if err != nil {
 		return RecoveryControlResult{}, err
@@ -85,6 +112,13 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 		DispatchDigest: authorizationRequest.DispatchDigest, RuntimeGenerationID: request.Control.Runtime.ID,
 	}
 	var recoveryResult journal.RecoveryResult
+	barrierState := BarrierState{Journal: controlState.ref, Cursor: controlState.head, CommandID: request.Control.Command.CommandID, ControlOperationID: request.Control.OperationID, PlanDigest: request.Control.Plan.Digest}
+	if err := s.cross(ctx, BarrierAuthorizationCommitted, barrierState); err != nil {
+		return RecoveryControlResult{}, err
+	}
+	if err := s.probe.Before(ctx, BarrierEffectDispatch, barrierState); err != nil {
+		return RecoveryControlResult{}, err
+	}
 	dispatchErr := s.deps.Authorization.Dispatch(ctx, token, binding, func(runContext context.Context) error {
 		var recoverErr error
 		recoveryResult, recoverErr = s.repository.Recover(runContext, request.Storage)
@@ -92,6 +126,10 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 	})
 	if dispatchErr != nil {
 		return RecoveryControlResult{}, dispatchErr
+	}
+	postDispatchBarrierErr := s.probe.After(ctx, BarrierEffectDispatch, barrierState)
+	if recoveryResult.Status != "recovered" {
+		return RecoveryControlResult{}, fmt.Errorf("repository recovery status %q", recoveryResult.Status)
 	}
 	if recoveryResult.Cursor.Validate() != nil || recoveryResult.Cursor.JournalKind != request.Storage.Journal.Kind || recoveryResult.Cursor.JournalID != request.Storage.Journal.ID {
 		return RecoveryControlResult{}, fmt.Errorf("repository returned invalid recovery cursor")
@@ -102,6 +140,13 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 		return RecoveryControlResult{}, err
 	}
 	sessionHead := recoveryResult.Cursor
+	releaseHead = sessionHead
+	if turnLease == nil && projected.ActiveTurnID != "" {
+		turnLease, err = s.turnLeases.AcquireTurnRecoveryLease(ctx, sessionID, projected.ActiveTurnID, recoveryResult.Cursor)
+		if err != nil {
+			return RecoveryControlResult{}, err
+		}
+	}
 	if projected.ActiveTurnID != "" {
 		if projection.ActiveTurnID != "" && projected.ActiveTurnID != projection.ActiveTurnID {
 			return RecoveryControlResult{}, fmt.Errorf("active turn changed during recovery")
@@ -114,12 +159,10 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 		if err := s.cross(ctx, BarrierRecoveryTurnTerminalCommitted, barrierState); err != nil {
 			return RecoveryControlResult{}, err
 		}
+		releaseHead = sessionHead
 	}
-	if turnLease != nil {
-		if err := turnLease.Release(context.WithoutCancel(ctx), sessionHead); err != nil {
-			return RecoveryControlResult{}, err
-		}
-		released = true
+	if postDispatchBarrierErr != nil {
+		return RecoveryControlResult{}, postDispatchBarrierErr
 	}
 
 	finalCursor := protocol.CommittedCursor{
@@ -148,12 +191,15 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 	if err != nil {
 		return RecoveryControlResult{}, err
 	}
+	terminalHead := controlState.head
 	if err := s.appendControl(ctx, &controlState, "recovery-terminal", events, request.Control.TransactionID); err != nil {
+		controlState.terminal = controlState.head != terminalHead
 		return RecoveryControlResult{}, err
 	}
 	if controlState.head != finalCursor {
 		return RecoveryControlResult{}, fmt.Errorf("recovery control cursor prediction mismatch")
 	}
+	controlState.terminal = true
 	return RecoveryControlResult{Recovery: recoveryResult, CommandResult: commandResult}, nil
 }
 
@@ -219,6 +265,9 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 			Actor: &actor, RuntimeGenerationID: request.Control.Runtime.ID,
 			Payload: mustCanonical(protocol.CommandCompletedV1{CommandID: projection.OriginalCommandID, RequestDigest: projection.OriginalRequestDigest, Status: "interrupted", Result: rawResult, Error: publicError}),
 		})
+	}
+	if err := validateProposedEvents(events, request.Storage.Journal); err != nil {
+		return protocol.CommittedCursor{}, err
 	}
 	appendResult, err := s.repository.AppendBatch(ctx, journal.AppendRequest{Journal: request.Storage.Journal, ExpectedHead: expected, TransactionID: transactionID, Events: events})
 	if err != nil {

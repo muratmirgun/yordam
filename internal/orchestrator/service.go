@@ -14,6 +14,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	contextplanner "github.com/muratmirgun/yordam/internal/context"
+	"github.com/muratmirgun/yordam/internal/eventcodec"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/recovery"
@@ -49,10 +50,18 @@ func NewService(dependencies Dependencies) (*Service, error) {
 	}, nil
 }
 
-func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (RunResult, error) {
+func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result RunResult, runErr error) {
 	if err := validateStartTurnRequest(request); err != nil {
 		return RunResult{}, err
 	}
+	if s.deps.Admission == nil || s.deps.Instructions == nil {
+		return RunResult{}, fmt.Errorf("generation admission and instruction services are required")
+	}
+	admittedPrompt, err := s.deps.Admission.SanitizeText(ctx, request.Runtime.ID, request.Prompt)
+	if err != nil {
+		return RunResult{}, err
+	}
+	request.Prompt = admittedPrompt
 	lease, err := s.lane.Acquire(ctx, OperationClaim{Kind: OperationTurn, SessionID: request.SessionID})
 	if err != nil {
 		return RunResult{}, err
@@ -77,14 +86,28 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (RunRes
 		return RunResult{}, err
 	}
 	defer func() { _ = turnLease.Release(context.WithoutCancel(ctx), state.head) }()
+	defer func() {
+		if runErr == nil || !state.accepted || state.terminal {
+			return
+		}
+		terminalResult, terminalErr := s.terminalizeTurnFailure(context.WithoutCancel(ctx), request, &state, runErr)
+		if terminalErr != nil {
+			runErr = errors.Join(runErr, terminalErr)
+			return
+		}
+		result = terminalResult
+	}()
 
 	initial, err := s.initialTurnEvents(request, state)
 	if err != nil {
 		return RunResult{}, err
 	}
+	acceptedHead := state.head
 	if err := s.append(ctx, &state, "turn-accepted", initial); err != nil {
+		state.accepted = state.head != acceptedHead
 		return RunResult{}, err
 	}
+	state.accepted = true
 	if err := s.cross(ctx, BarrierCommandAccepted, state.barrierState()); err != nil {
 		return RunResult{}, err
 	}
@@ -96,9 +119,12 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (RunRes
 	if err != nil {
 		return RunResult{}, err
 	}
+	freezeHead := state.head
 	if err := s.append(ctx, &state, "contract-frozen", freeze); err != nil {
+		state.taskRunning = state.head != freezeHead
 		return RunResult{}, err
 	}
+	state.taskRunning = true
 	if err := s.cross(ctx, BarrierContractFrozen, state.barrierState()); err != nil {
 		return RunResult{}, err
 	}
@@ -108,9 +134,19 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (RunRes
 
 	extraMessages := make([]protocol.ModelMessage, 0)
 	completedTools := 0
+	zeroByteRetries := 0
 	for attempt := 0; ; attempt++ {
 		assistant, terminal, err := s.runProviderActivity(ctx, request, &state, attempt, extraMessages)
 		if err != nil {
+			var proved ProvenZeroByteProviderError
+			if errors.As(err, &proved) && proved.Retryable() && proved.ZeroBytesSent() && zeroByteRetries == 0 && state.activeActivityID != "" {
+				activityID := state.activeActivityID
+				if terminalErr := s.appendActivityEvidence(context.WithoutCancel(ctx), request, &state, activityID, fmt.Sprintf("provider-%d-zero-byte-terminal", attempt), "interrupted_no_effect", nil); terminalErr != nil {
+					return RunResult{}, errors.Join(err, terminalErr)
+				}
+				zeroByteRetries++
+				continue
+			}
 			return RunResult{}, err
 		}
 		if len(assistant.ToolIntents) == 0 {
@@ -146,13 +182,34 @@ func commandResultCursor(result protocol.CommandResult) protocol.CommittedCursor
 func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequest, state *turnState, attempt int, extra []protocol.ModelMessage) (protocol.AssistantMessageV1, protocol.ProviderAttemptTerminalV1, error) {
 	model := request.Runtime.Body.Models[0]
 	requirements := []protocol.CapabilityRequirement{}
-	page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: state.ref, After: request.ExpectedHead, Limit: protocol.MaxCollectionMembers})
+	history, err := s.readFullHistory(ctx, state.ref)
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
+	instructions, err := s.deps.Instructions.SystemInstructions(ctx, request.Runtime.ID, request.Runtime.Body.InstructionRevision, request.SessionID)
+	if err != nil {
+		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+	}
+	for index, source := range instructions {
+		for blockIndex, block := range source.Content {
+			admitted, admitErr := s.sanitizeContentBlock(ctx, request.Runtime.ID, block)
+			if admitErr != nil {
+				return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, admitErr
+			}
+			source.Content[blockIndex] = admitted
+		}
+		source.Digest, err = canonicaljson.Digest(source.Content)
+		if err != nil {
+			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+		}
+		instructions[index] = source
+		if err := source.Validate(); err != nil {
+			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("system instruction source: %w", err)
+		}
+	}
 	contextPlan, err := s.deps.Context.Plan(ctx, contextplanner.Request{
 		Session: request.SessionID, TaskID: state.taskID, OutcomeContractID: state.contractID, OutcomeContractVersion: 2,
-		Events: page.Events, Model: model,
+		Events: history, SystemInstructions: instructions, Model: model,
 	})
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
@@ -193,9 +250,14 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
+	plannedHead := state.head
 	if err := s.append(ctx, state, label+"-planned", events); err != nil {
+		if state.head != plannedHead {
+			state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
+		}
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
+	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
 	token, err := s.authorizeActivity(ctx, request, state, activityID, callID, label, authorizationRequest)
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
@@ -213,6 +275,7 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 	if err := s.probe.Before(ctx, BarrierEffectDispatch, barrierState); err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
+	state.activeDispatched = true
 	stream, err := s.deps.Provider.Stream(ctx, handle, token)
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
@@ -220,7 +283,7 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 	if err := s.probe.After(ctx, BarrierEffectDispatch, barrierState); err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
-	message, terminal, err := collectProviderStream(ctx, stream)
+	message, terminal, err := s.collectProviderStream(ctx, request.Runtime.ID, stream)
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
@@ -236,15 +299,51 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
+	terminalHead := state.head
 	if err := s.append(ctx, state, label+"-terminal", events); err != nil {
+		if state.head != terminalHead {
+			state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+		}
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
+	state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
 	return message, terminal, nil
+}
+
+func (s *Service) readFullHistory(ctx context.Context, ref protocol.JournalRef) ([]protocol.EventRecord, error) {
+	if err := ref.Validate(); err != nil {
+		return nil, err
+	}
+	after := protocol.CommittedCursor{}
+	var projectionHead protocol.CommittedCursor
+	events := make([]protocol.EventRecord, 0)
+	for {
+		page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: ref, After: after, Limit: protocol.MaxCollectionMembers})
+		if err != nil {
+			return nil, err
+		}
+		if projectionHead == (protocol.CommittedCursor{}) {
+			projectionHead = page.Head
+		} else if page.Head != projectionHead {
+			return nil, fmt.Errorf("context projection head changed during read")
+		}
+		events = append(events, protocol.DeepCopy(page.Events)...)
+		if !page.More {
+			return events, nil
+		}
+		if page.Cursor == after || page.Cursor == (protocol.CommittedCursor{}) {
+			return nil, fmt.Errorf("context history pagination did not advance")
+		}
+		after = page.Cursor
+	}
 }
 
 func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock) (protocol.ToolResultBlock, error) {
 	descriptor, ok := toolDescriptor(request.Runtime, intent.Alias)
 	if !ok {
+		if err := s.appendSyntheticToolFailure(ctx, request, state, intent, nil, "unknown tool"); err != nil {
+			return protocol.ToolResultBlock{}, err
+		}
 		return protocol.ToolResultBlock{CallID: intent.CallID, Status: "failed", Text: "unknown tool"}, nil
 	}
 	mutating := descriptor.Body.Effect != "observation"
@@ -278,9 +377,14 @@ func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, s
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
+		plannedHead := state.head
 		if err := s.append(ctx, state, previewLabel+"-planned", events); err != nil {
+			if state.head != plannedHead {
+				state.activeActivityID, state.activeStarted, state.activeDispatched = previewActivityID, false, false
+			}
 			return protocol.ToolResultBlock{}, err
 		}
+		state.activeActivityID, state.activeStarted, state.activeDispatched = previewActivityID, false, false
 		barrierState := state.barrierState()
 		barrierState.ActivityID, barrierState.PlanDigest = previewActivityID, previewPlan.Digest
 		if err := s.cross(ctx, BarrierActionPlanCommitted, barrierState); err != nil {
@@ -290,9 +394,13 @@ func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, s
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
+		if err := s.cross(ctx, BarrierAuthorizationCommitted, barrierState); err != nil {
+			return protocol.ToolResultBlock{}, err
+		}
 		if err := s.probe.Before(ctx, BarrierEffectDispatch, barrierState); err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
+		state.activeDispatched = true
 		preview, _, candidates, err := s.deps.Tools.PreparePreview(ctx, previewHandle, previewToken)
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
@@ -327,9 +435,14 @@ func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, s
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
+		plannedHead = state.head
 		if err := s.append(ctx, state, mutationLabel+"-planned", events); err != nil {
+			if state.head != plannedHead {
+				state.activeActivityID, state.activeStarted, state.activeDispatched = mutationActivityID, false, false
+			}
 			return protocol.ToolResultBlock{}, err
 		}
+		state.activeActivityID, state.activeStarted, state.activeDispatched = mutationActivityID, false, false
 		checkpoint, err := s.prepareCheckpoint(ctx, request, state, mutationActivityID, mutationLabel, preview, mutationPlan, previewRecords)
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
@@ -348,6 +461,16 @@ func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, s
 			return protocol.ToolResultBlock{}, err
 		}
 		if changed {
+			status := "cancelled"
+			if round == 2 {
+				status = "failed"
+			}
+			if err := s.abandonDriftRound(ctx, request, state, mutationActivityID, mutationLabel, mutationPlan.Digest, status); err != nil {
+				return protocol.ToolResultBlock{}, err
+			}
+			if round == 2 {
+				return protocol.ToolResultBlock{CallID: intent.CallID, Status: "failed", Text: "resource drift did not stabilize"}, nil
+			}
 			continue
 		}
 		mutationAuthorization, err := toolAuthorizationRequest(request, state, mutationRequest, mutationPlan, evidenceDigests(previewRecords))
@@ -365,16 +488,17 @@ func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, s
 		if err := s.append(ctx, state, mutationLabel+"-authorization", events); err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
-		if err := s.cross(ctx, BarrierAuthorizationCommitted, barrierState); err != nil {
-			return protocol.ToolResultBlock{}, err
-		}
 		token, err := s.authorizeActivity(ctx, request, state, mutationActivityID, intent.CallID, mutationLabel, mutationAuthorization)
 		if err != nil {
+			return protocol.ToolResultBlock{}, err
+		}
+		if err := s.cross(ctx, BarrierAuthorizationCommitted, barrierState); err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
 		if err := s.probe.Before(ctx, BarrierEffectDispatch, barrierState); err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
+		state.activeDispatched = true
 		execution, executeErr := s.deps.Tools.Execute(ctx, mutationHandle, token)
 		if executeErr != nil {
 			status := "uncertain"
@@ -386,7 +510,11 @@ func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, s
 			if appendErr := s.appendActivityEvidence(context.WithoutCancel(ctx), request, state, mutationActivityID, mutationLabel+"-terminal", status, nil); appendErr != nil {
 				return protocol.ToolResultBlock{}, errors.Join(executeErr, appendErr)
 			}
-			return protocol.ToolResultBlock{CallID: intent.CallID, Status: status, Text: executeErr.Error()}, nil
+			message, sanitizeErr := s.deps.Admission.SanitizeText(context.WithoutCancel(ctx), request.Runtime.ID, executeErr.Error())
+			if sanitizeErr != nil {
+				return protocol.ToolResultBlock{}, errors.Join(executeErr, sanitizeErr)
+			}
+			return protocol.ToolResultBlock{CallID: intent.CallID, Status: status, Text: message}, nil
 		}
 		if err := s.probe.After(ctx, BarrierEffectDispatch, barrierState); err != nil {
 			return protocol.ToolResultBlock{}, err
@@ -403,7 +531,7 @@ func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, s
 			return protocol.ToolResultBlock{}, err
 		}
 		execution.ToolResult.EvidenceIDs = evidenceIDs(records)
-		return execution.ToolResult, nil
+		return s.sanitizeToolResult(ctx, request.Runtime.ID, execution.ToolResult)
 	}
 	return protocol.ToolResultBlock{CallID: intent.CallID, Status: "failed", Text: "resource drift did not stabilize"}, nil
 }
@@ -420,6 +548,9 @@ func (s *Service) runObservationIntent(ctx context.Context, request StartTurnReq
 		return protocol.ToolResultBlock{}, err
 	}
 	if changed {
+		if err := s.appendSyntheticToolFailure(ctx, request, state, intent, &plan, "resource drift"); err != nil {
+			return protocol.ToolResultBlock{}, err
+		}
 		return protocol.ToolResultBlock{CallID: intent.CallID, Status: "failed", Text: "resource drift"}, nil
 	}
 	if !revalidated.Digest.IsZero() {
@@ -438,19 +569,43 @@ func (s *Service) runObservationIntent(ctx context.Context, request StartTurnReq
 	if err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
+	plannedHead := state.head
 	if err := s.append(ctx, state, label+"-planned", events); err != nil {
+		if state.head != plannedHead {
+			state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
+		}
+		return protocol.ToolResultBlock{}, err
+	}
+	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
+	barrierState := state.barrierState()
+	barrierState.ActivityID, barrierState.PlanDigest = activityID, plan.Digest
+	if err := s.cross(ctx, BarrierActionPlanCommitted, barrierState); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
 	token, err := s.authorizeActivity(ctx, request, state, activityID, intent.CallID, label, authRequest)
 	if err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
+	if err := s.cross(ctx, BarrierAuthorizationCommitted, barrierState); err != nil {
+		return protocol.ToolResultBlock{}, err
+	}
+	if err := s.probe.Before(ctx, BarrierEffectDispatch, barrierState); err != nil {
+		return protocol.ToolResultBlock{}, err
+	}
+	state.activeDispatched = true
 	execution, err := s.deps.Tools.Execute(ctx, handle, token)
 	if err != nil {
 		if appendErr := s.appendActivityEvidence(context.WithoutCancel(ctx), request, state, activityID, label+"-terminal", "uncertain", nil); appendErr != nil {
 			return protocol.ToolResultBlock{}, errors.Join(err, appendErr)
 		}
-		return protocol.ToolResultBlock{CallID: intent.CallID, Status: "uncertain", Text: err.Error()}, nil
+		message, sanitizeErr := s.deps.Admission.SanitizeText(context.WithoutCancel(ctx), request.Runtime.ID, err.Error())
+		if sanitizeErr != nil {
+			return protocol.ToolResultBlock{}, errors.Join(err, sanitizeErr)
+		}
+		return protocol.ToolResultBlock{CallID: intent.CallID, Status: "uncertain", Text: message}, nil
+	}
+	if err := s.probe.After(ctx, BarrierEffectDispatch, barrierState); err != nil {
+		return protocol.ToolResultBlock{}, err
 	}
 	records, err := s.recordEvidence(ctx, request, activityID, plan, execution.Evidence)
 	if err != nil {
@@ -460,7 +615,40 @@ func (s *Service) runObservationIntent(ctx context.Context, request StartTurnReq
 		return protocol.ToolResultBlock{}, err
 	}
 	execution.ToolResult.EvidenceIDs = evidenceIDs(records)
-	return execution.ToolResult, nil
+	return s.sanitizeToolResult(ctx, request.Runtime.ID, execution.ToolResult)
+}
+
+func (s *Service) sanitizeToolResult(ctx context.Context, generation protocol.RuntimeGenerationID, result protocol.ToolResultBlock) (protocol.ToolResultBlock, error) {
+	block, err := s.sanitizeContentBlock(ctx, generation, protocol.ContentBlock{Kind: protocol.ContentToolResult, ToolResult: &result})
+	if err != nil {
+		return protocol.ToolResultBlock{}, err
+	}
+	return protocol.DeepCopy(*block.ToolResult), nil
+}
+
+func (s *Service) appendSyntheticToolFailure(ctx context.Context, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock, plan *protocol.ActionPlan, reason string) error {
+	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "synthetic-tool", intent.CallID, reason))
+	planned := protocol.ActivityPlannedV1{
+		Kind: "tool", Purpose: reason, PurposeActor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorAgent},
+		Source: "model_tool_intent", InputEvidenceIDs: []protocol.EvidenceID{}, RequestedProfile: "none", EffectiveProfile: "none",
+	}
+	if plan != nil {
+		copyPlan := protocol.DeepCopy(*plan)
+		planned.Plan = &copyPlan
+		planned.Source, planned.RequestedProfile, planned.EffectiveProfile = copyPlan.Body.Tool.Source, copyPlan.Body.RequestedProfile, copyPlan.Body.EffectiveProfile
+	}
+	values := []struct {
+		kind    string
+		payload any
+	}{
+		{protocol.EventActivityPlanned, planned},
+		{protocol.EventActivityFailed, protocol.ActivityOutcomeV1{Status: "failed"}},
+	}
+	events, err := s.activityEvents(*state, request.Runtime.ID, activityID, "synthetic-tool-"+intent.CallID, values)
+	if err != nil {
+		return err
+	}
+	return s.append(ctx, state, "synthetic-tool-"+intent.CallID, events)
 }
 
 func (s *Service) recordEvidence(ctx context.Context, request StartTurnRequest, activityID protocol.ActivityID, plan protocol.ActionPlan, candidates []protocol.EvidenceCandidate) ([]protocol.EvidenceRecord, error) {
@@ -479,11 +667,50 @@ func (s *Service) recordEvidence(ctx context.Context, request StartTurnRequest, 
 		if candidate.Subject.Validate() != nil {
 			candidate.Subject = protocol.SubjectRef{Kind: "action", ID: plan.Body.CallID}
 		}
+		content, err := s.deps.Admission.SanitizeText(ctx, request.Runtime.ID, string(candidate.Content))
+		if err != nil {
+			return nil, err
+		}
+		candidate.Content = []byte(content)
+		candidateID, err := s.deps.Admission.SanitizeText(ctx, request.Runtime.ID, string(candidate.ID))
+		if err != nil {
+			return nil, err
+		}
+		kind, err := s.deps.Admission.SanitizeText(ctx, request.Runtime.ID, candidate.Kind)
+		if err != nil {
+			return nil, err
+		}
+		mediaType, err := s.deps.Admission.SanitizeText(ctx, request.Runtime.ID, candidate.MediaType)
+		if err != nil {
+			return nil, err
+		}
+		candidate.ID, candidate.Kind, candidate.MediaType = protocol.EvidenceID(candidateID), kind, mediaType
+		actorID, err := s.deps.Admission.SanitizeText(ctx, request.Runtime.ID, string(candidate.Actor.ID))
+		if err != nil {
+			return nil, err
+		}
+		subjectKind, err := s.deps.Admission.SanitizeText(ctx, request.Runtime.ID, candidate.Subject.Kind)
+		if err != nil {
+			return nil, err
+		}
+		subjectID, err := s.deps.Admission.SanitizeText(ctx, request.Runtime.ID, candidate.Subject.ID)
+		if err != nil {
+			return nil, err
+		}
+		candidate.Actor.ID, candidate.Subject.Kind, candidate.Subject.ID = protocol.ActorID(actorID), subjectKind, subjectID
 		record, err := s.deps.Evidence.Put(ctx, candidate)
 		if err != nil {
 			return nil, err
 		}
-		if record.Body.ID != candidate.ID || record.Body.ProducingActivityID != activityID {
+		if err := record.Body.Validate(); err != nil {
+			return nil, fmt.Errorf("evidence recorder returned invalid body: %w", err)
+		}
+		if err := canonicaljson.ValidateDigest(record.Body, record.Digest); err != nil {
+			return nil, fmt.Errorf("evidence recorder returned invalid digest: %w", err)
+		}
+		if record.Body.ID != candidate.ID || record.Body.Kind != candidate.Kind || record.Body.WorkspaceID != candidate.WorkspaceID ||
+			record.Body.SessionID != candidate.SessionID || record.Body.ProducingActivityID != activityID || record.Body.Actor != candidate.Actor ||
+			record.Body.Subject != candidate.Subject || record.Body.MediaType != candidate.MediaType {
 			return nil, fmt.Errorf("evidence recorder returned mismatched identity")
 		}
 		records = append(records, record)
@@ -525,8 +752,15 @@ func (s *Service) appendActivityEvidence(ctx context.Context, request StartTurnR
 	if err != nil {
 		return err
 	}
+	terminalHead := state.head
 	if err := s.append(ctx, state, label, events); err != nil {
+		if state.head != terminalHead && state.activeActivityID == activityID {
+			state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+		}
 		return err
+	}
+	if state.activeActivityID == activityID {
+		state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
 	}
 	barrierState := state.barrierState()
 	barrierState.ActivityID = activityID
@@ -566,18 +800,13 @@ func (s *Service) prepareCheckpoint(ctx context.Context, request StartTurnReques
 
 	materialIDs := make([]protocol.RecoveryMaterialID, 0, 1)
 	if coverageClass == "exact" {
-		candidate, candidateErr := s.deps.Tools.RecoveryCandidate(ctx, preview, body, plan)
-		if candidateErr != nil {
-			return protocol.CheckpointBody{}, s.failCheckpoint(ctx, request, state, activityID, label, plan.Digest, candidateErr)
-		}
-		candidate.ActivityID, candidate.CheckpointID, candidate.PlanDigest = activityID, body.ID, plan.Digest
-		material, putErr := s.deps.Recovery.Put(ctx, candidate)
+		material, putErr := s.deps.Recovery.PrepareAndPut(ctx, preview, activityID, body, plan)
 		if errors.Is(putErr, recovery.ErrSecretDetected) {
 			body.Coverage[0].Class = "drift_detectable"
 		} else if putErr != nil {
 			return protocol.CheckpointBody{}, s.failCheckpoint(ctx, request, state, activityID, label, plan.Digest, putErr)
 		} else {
-			if material.ID == "" || material.ActivityID != activityID || material.CheckpointID != body.ID || material.Body.PlanDigest != plan.Digest {
+			if err := validateRecoveryMaterialMetadata(material, protocol.WorkspaceID(request.SessionID), activityID, body, plan); err != nil {
 				return protocol.CheckpointBody{}, s.failCheckpoint(ctx, request, state, activityID, label, plan.Digest, fmt.Errorf("recovery material binding mismatch"))
 			}
 			body.Coverage[0].RecoveryMaterialID = material.ID
@@ -607,19 +836,65 @@ func (s *Service) prepareCheckpoint(ctx context.Context, request StartTurnReques
 	return body, nil
 }
 
+func validateRecoveryMaterialMetadata(record protocol.RecoveryMaterialRecord, workspaceID protocol.WorkspaceID, activityID protocol.ActivityID, checkpoint protocol.CheckpointBody, plan protocol.ActionPlan) error {
+	if record.ID == "" || record.WorkspaceID != workspaceID || record.ActivityID != activityID || record.CheckpointID != checkpoint.ID ||
+		record.Subject != checkpoint.Coverage[0].Subject || record.Body.PlanDigest != plan.Digest || record.Body.CreatedAt.IsZero() {
+		return fmt.Errorf("recovery material identity mismatch")
+	}
+	for _, digest := range []protocol.Digest{record.Body.PlanDigest, record.Body.PreimageDigest, record.Body.ExpectedPostimageDigest, record.MaterialDigest} {
+		if err := digest.Validate(); err != nil {
+			return err
+		}
+	}
+	return protocol.ValidateBounds(record)
+}
+
 func (s *Service) failCheckpoint(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, label string, planDigest protocol.Digest, cause error) error {
+	reason, sanitizeErr := s.deps.Admission.SanitizeText(context.WithoutCancel(ctx), request.Runtime.ID, cause.Error())
+	if sanitizeErr != nil {
+		reason = "checkpoint preparation failed"
+	}
 	failed := []struct {
 		kind    string
 		payload any
-	}{{protocol.EventCheckpointFailed, protocol.CheckpointFailedV1{PlanDigest: planDigest, ErrorCode: "checkpoint_failed", Reason: cause.Error()}}}
+	}{{protocol.EventCheckpointFailed, protocol.CheckpointFailedV1{PlanDigest: planDigest, ErrorCode: "checkpoint_failed", Reason: reason}}}
 	events, err := s.activityEvents(*state, request.Runtime.ID, activityID, label+"-checkpoint-failed", failed)
 	if err != nil {
-		return errors.Join(cause, err)
+		return errors.Join(cause, sanitizeErr, err)
 	}
 	if err := s.append(context.WithoutCancel(ctx), state, label+"-checkpoint-failed", events); err != nil {
-		return errors.Join(cause, err)
+		return errors.Join(cause, sanitizeErr, err)
 	}
-	return cause
+	return errors.Join(cause, sanitizeErr)
+}
+
+func (s *Service) abandonDriftRound(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, label string, planDigest protocol.Digest, status string) error {
+	activityKind := protocol.EventActivityCancelled
+	if status == "failed" {
+		activityKind = protocol.EventActivityFailed
+	}
+	values := []struct {
+		kind    string
+		payload any
+	}{
+		{protocol.EventCheckpointFailed, protocol.CheckpointFailedV1{PlanDigest: planDigest, ErrorCode: "resources_changed", Reason: "resources changed after checkpoint"}},
+		{activityKind, protocol.ActivityOutcomeV1{Status: status}},
+	}
+	events, err := s.activityEvents(*state, request.Runtime.ID, activityID, label+"-drift-terminal", values)
+	if err != nil {
+		return err
+	}
+	terminalHead := state.head
+	if err := s.append(ctx, state, label+"-drift-terminal", events); err != nil {
+		if state.head != terminalHead && state.activeActivityID == activityID {
+			state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+		}
+		return err
+	}
+	if state.activeActivityID == activityID {
+		state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+	}
+	return nil
 }
 
 func (s *Service) authorizeActivity(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, callID, label string, authorizationRequest protocol.AuthorizationRequest) (authorization.CommittedToken, error) {
@@ -644,7 +919,28 @@ func (s *Service) authorizeActivity(ctx context.Context, request StartTurnReques
 		return authorization.CommittedToken{}, err
 	}
 	if decision.Action != "allow" {
-		return authorization.CommittedToken{}, fmt.Errorf("authorization denied: %s", decision.Reason)
+		denied := &authorizationDeniedError{reason: decision.Reason}
+		decisionEvents := []struct {
+			kind    string
+			payload any
+		}{
+			{protocol.EventAuthorizationDecided, protocol.AuthorizationDecidedV1{Decision: decision}},
+			{protocol.EventActivityDenied, protocol.ActivityOutcomeV1{Status: "denied"}},
+		}
+		events, eventErr := s.activityEvents(*state, request.Runtime.ID, activityID, label+"-decision", decisionEvents)
+		if eventErr != nil {
+			return authorization.CommittedToken{}, eventErr
+		}
+		decisionHead := state.head
+		if appendErr := s.append(ctx, state, label+"-decision", events); appendErr != nil {
+			if state.head != decisionHead {
+				state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+				return authorization.CommittedToken{}, errors.Join(denied, appendErr)
+			}
+			return authorization.CommittedToken{}, appendErr
+		}
+		state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+		return authorization.CommittedToken{}, denied
 	}
 	decisionEventID := eventID(state.command.CommandID, label+"-decision", 0, protocol.EventAuthorizationDecided)
 	decisionEvents := []struct {
@@ -690,9 +986,12 @@ func (s *Service) authorizeActivity(ctx context.Context, request StartTurnReques
 	if err != nil {
 		return authorization.CommittedToken{}, err
 	}
+	startHead := state.head
 	if err := s.append(ctx, state, label+"-start", events); err != nil {
+		state.activeStarted = state.head != startHead
 		return authorization.CommittedToken{}, err
 	}
+	state.activeStarted = true
 	barrierState := state.barrierState()
 	barrierState.ActivityID, barrierState.PlanDigest = activityID, authorizationRequest.PlanDigest
 	if err := s.cross(ctx, BarrierActivityStartedCommitted, barrierState); err != nil {
@@ -769,9 +1068,12 @@ func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, st
 	if err != nil {
 		return RunResult{}, err
 	}
+	terminalHead := state.head
 	if err := s.append(ctx, state, "turn-terminal", events); err != nil {
+		state.terminal = state.head != terminalHead
 		return RunResult{}, err
 	}
+	state.terminal = true
 	if state.head != finalCursor {
 		return RunResult{}, fmt.Errorf("terminal command cursor prediction mismatch")
 	}
@@ -782,6 +1084,103 @@ func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, st
 		return RunResult{}, err
 	}
 	return RunResult{TaskID: state.taskID, TurnID: state.turnID, Cursor: state.head, Status: "completed", CommandResult: commandResult}, nil
+}
+
+func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnRequest, state *turnState, cause error) (RunResult, error) {
+	turnKind, turnStatus := protocol.EventTurnFailed, "failed"
+	commandStatus := "failed"
+	taskTo := string(protocol.TaskFailed)
+	reason, code := "turn orchestration failed", "turn_failed"
+	var denied *authorizationDeniedError
+	if errors.As(cause, &denied) {
+		commandStatus = "denied"
+		reason, code = "turn authorization denied", "authorization_denied"
+	} else if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		turnKind, turnStatus = protocol.EventTurnInterrupted, "interrupted"
+		commandStatus, taskTo = "interrupted", string(protocol.TaskCancelled)
+		reason, code = "turn orchestration interrupted", "turn_interrupted"
+	} else if !state.taskRunning {
+		taskTo = string(protocol.TaskCancelled)
+	}
+	activityStatus := "failed"
+	if denied != nil {
+		activityStatus = "denied"
+	} else if state.activeDispatched {
+		activityStatus = "uncertain"
+	} else if turnStatus == "interrupted" {
+		activityStatus = "cancelled"
+	} else if !state.activeStarted {
+		activityStatus = "cancelled"
+	}
+	eventCount := 3
+	if state.activeActivityID != "" {
+		eventCount++
+	}
+	transactionID := protocol.TransactionID(stableID("transaction", string(request.Command.CommandID), "turn-failure-terminal"))
+	finalCursor := protocol.CommittedCursor{
+		JournalKind: state.ref.Kind, JournalID: state.ref.ID,
+		CommitSeq: state.head.CommitSeq + uint64(eventCount) + 1, TransactionID: transactionID,
+	}
+	publicError := &protocol.PublicError{Code: code, Message: reason, Retryable: false}
+	payload, err := canonicaljson.Marshal(struct {
+		TaskID protocol.TaskID `json:"task_id"`
+		TurnID protocol.TurnID `json:"turn_id"`
+		Status string          `json:"status"`
+	}{state.taskID, state.turnID, commandStatus})
+	if err != nil {
+		return RunResult{}, err
+	}
+	commandResult := protocol.CommandResult{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, CommandID: request.Command.CommandID, Status: commandStatus,
+		RequestDigest: request.Command.RequestDigest, Cursor: protocol.ApplicationCursor{SelectedSession: &finalCursor},
+		PayloadVersion: 1, Payload: payload, Error: publicError,
+	}
+	rawResult, err := canonicaljson.Marshal(commandResult)
+	if err != nil {
+		return RunResult{}, err
+	}
+	events := make([]protocol.ProposedEvent, 0, eventCount)
+	if state.activeActivityID != "" {
+		activityKind := map[string]string{
+			"failed": protocol.EventActivityFailed, "denied": protocol.EventActivityDenied,
+			"cancelled": protocol.EventActivityCancelled, "uncertain": protocol.EventActivityUncertain,
+		}[activityStatus]
+		activityEvents, eventErr := s.activityEvents(*state, request.Runtime.ID, state.activeActivityID, "turn-failure-active", []struct {
+			kind    string
+			payload any
+		}{{activityKind, protocol.ActivityOutcomeV1{Status: activityStatus}}})
+		if eventErr != nil {
+			return RunResult{}, eventErr
+		}
+		events = append(events, activityEvents...)
+	}
+	from := string(protocol.TaskPending)
+	if state.taskRunning {
+		from = string(protocol.TaskRunning)
+	}
+	turnEvents, err := s.turnEvents(*state, request.Runtime.ID, "turn-failure-terminal", []struct {
+		kind    string
+		payload any
+	}{
+		{turnKind, protocol.TurnTerminalV1{Status: turnStatus, Reason: reason, ErrorCode: code}},
+		{protocol.EventTaskStatusChanged, protocol.TaskStatusChangedV1{From: from, To: taskTo, Reason: reason}},
+		{protocol.EventCommandCompleted, protocol.CommandCompletedV1{
+			CommandID: request.Command.CommandID, RequestDigest: request.Command.RequestDigest,
+			Status: commandStatus, Result: rawResult, Error: publicError,
+		}},
+	})
+	if err != nil {
+		return RunResult{}, err
+	}
+	events = append(events, turnEvents...)
+	if err := s.append(ctx, state, "turn-failure-terminal", events); err != nil {
+		return RunResult{}, err
+	}
+	if state.head != finalCursor {
+		return RunResult{}, fmt.Errorf("failure terminal cursor prediction mismatch")
+	}
+	state.activeActivityID, state.activeStarted, state.activeDispatched, state.terminal = "", false, false, true
+	return RunResult{TaskID: state.taskID, TurnID: state.turnID, Cursor: state.head, Status: commandStatus, CommandResult: commandResult}, nil
 }
 
 func contextMessages(plan protocol.ContextPlan) []protocol.ModelMessage {
@@ -915,13 +1314,48 @@ func evidenceDigests(records []protocol.EvidenceRecord) []protocol.Digest {
 	return digests
 }
 
-func collectProviderStream(ctx context.Context, stream <-chan protocol.ModelEvent) (protocol.AssistantMessageV1, protocol.ProviderAttemptTerminalV1, error) {
+func (s *Service) collectProviderStream(ctx context.Context, generation protocol.RuntimeGenerationID, stream <-chan protocol.ModelEvent) (protocol.AssistantMessageV1, protocol.ProviderAttemptTerminalV1, error) {
 	if stream == nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("provider returned nil stream")
 	}
 	message := protocol.AssistantMessageV1{}
 	terminal := protocol.ProviderAttemptTerminalV1{Status: "succeeded", Usage: unknownUsage()}
-	var text strings.Builder
+	var err error
+	type pendingDelta struct {
+		blockID string
+		kind    string
+		text    strings.Builder
+		json    strings.Builder
+		stream  StreamingSanitizer
+	}
+	var pending pendingDelta
+	flushDelta := func() error {
+		if pending.blockID == "" {
+			return nil
+		}
+		switch pending.kind {
+		case protocol.ContentText:
+			trailing, err := pending.stream.Close()
+			if err != nil {
+				return err
+			}
+			pending.text.WriteString(trailing)
+			if pending.text.Len() != 0 {
+				message.Blocks = append(message.Blocks, protocol.ContentBlock{Kind: protocol.ContentText, Text: pending.text.String()})
+			}
+		case protocol.ContentJSON:
+			raw := json.RawMessage(pending.json.String())
+			redacted, err := s.deps.Admission.SanitizeJSON(ctx, generation, raw)
+			if err != nil {
+				return err
+			}
+			message.Blocks = append(message.Blocks, protocol.ContentBlock{Kind: protocol.ContentJSON, JSON: redacted})
+		default:
+			return fmt.Errorf("unsupported provider delta kind %q", pending.kind)
+		}
+		pending = pendingDelta{}
+		return nil
+	}
 	var sequence uint64
 	for {
 		select {
@@ -932,14 +1366,8 @@ func collectProviderStream(ctx context.Context, stream <-chan protocol.ModelEven
 				if terminal.TerminalReason == "" {
 					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("provider stream closed without terminal")
 				}
-				if text.Len() != 0 {
-					message.Blocks = append(message.Blocks, protocol.ContentBlock{Kind: protocol.ContentText, Text: text.String()})
-				}
-				if len(message.Blocks) == 0 && len(message.ToolIntents) != 0 {
-					for _, intent := range message.ToolIntents {
-						copyIntent := protocol.DeepCopy(intent)
-						message.Blocks = append(message.Blocks, protocol.ContentBlock{Kind: protocol.ContentToolUse, ToolUse: &copyIntent})
-					}
+				if err := flushDelta(); err != nil {
+					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 				}
 				if len(message.Blocks) == 0 {
 					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("provider produced no durable assistant content")
@@ -953,22 +1381,160 @@ func collectProviderStream(ctx context.Context, stream <-chan protocol.ModelEven
 			if err := event.Validate(); err != nil {
 				return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 			}
+			if event.Kind != protocol.ModelEventContentDelta {
+				if err := flushDelta(); err != nil {
+					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+				}
+			}
 			switch event.Kind {
 			case protocol.ModelEventContentDelta:
-				text.WriteString(event.Delta.Text)
+				if pending.blockID != "" && (pending.blockID != event.Delta.BlockID || pending.kind != event.Delta.Kind) {
+					if err := flushDelta(); err != nil {
+						return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+					}
+				}
+				if pending.blockID == "" {
+					pending.blockID, pending.kind = event.Delta.BlockID, event.Delta.Kind
+					if pending.kind == protocol.ContentText {
+						pending.stream, err = s.deps.Admission.OpenTextStream(ctx, generation)
+						if err != nil {
+							return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+						}
+					}
+				}
+				if event.Delta.Kind == protocol.ContentText {
+					admitted, err := pending.stream.Write(event.Delta.Text)
+					if err != nil {
+						return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+					}
+					pending.text.WriteString(admitted)
+				} else {
+					pending.json.WriteString(event.Delta.JSONFragment)
+				}
 			case protocol.ModelEventContentBlock:
-				message.Blocks = append(message.Blocks, protocol.DeepCopy(*event.Block))
+				block, err := s.sanitizeContentBlock(ctx, generation, *event.Block)
+				if err != nil {
+					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+				}
+				message.Blocks = append(message.Blocks, block)
 			case protocol.ModelEventToolIntent:
-				message.ToolIntents = append(message.ToolIntents, protocol.DeepCopy(*event.ToolIntent))
+				intent := protocol.DeepCopy(*event.ToolIntent)
+				intent.CallID, err = s.deps.Admission.SanitizeText(ctx, generation, intent.CallID)
+				if err == nil {
+					intent.Alias, err = s.deps.Admission.SanitizeText(ctx, generation, intent.Alias)
+				}
+				if err == nil {
+					intent.Arguments, err = s.deps.Admission.SanitizeJSON(ctx, generation, intent.Arguments)
+				}
+				if err != nil {
+					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+				}
+				message.ToolIntents = append(message.ToolIntents, intent)
+				message.Blocks = append(message.Blocks, protocol.ContentBlock{Kind: protocol.ContentToolUse, ToolUse: &intent})
 			case protocol.ModelEventUsageUpdate:
-				terminal.Usage = protocol.DeepCopy(*event.Usage)
+				terminal.Usage, err = s.sanitizeModelUsage(ctx, generation, *event.Usage)
+				if err != nil {
+					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+				}
 			case protocol.ModelEventTerminal:
-				terminal.TerminalReason, terminal.NativeReason, terminal.ServerRequestID = event.Terminal.Reason, event.Terminal.NativeReason, event.Terminal.ServerRequestID
+				terminal.TerminalReason, err = s.deps.Admission.SanitizeText(ctx, generation, event.Terminal.Reason)
+				if err != nil {
+					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+				}
+				terminal.NativeReason, err = s.deps.Admission.SanitizeText(ctx, generation, event.Terminal.NativeReason)
+				if err != nil {
+					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+				}
+				terminal.ServerRequestID, err = s.deps.Admission.SanitizeText(ctx, generation, event.Terminal.ServerRequestID)
+				if err != nil {
+					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+				}
 			case protocol.ModelEventError:
-				return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("provider error %s: %s", event.Error.Code, event.Error.Message)
+				code, sanitizeErr := s.deps.Admission.SanitizeText(ctx, generation, event.Error.Code)
+				if sanitizeErr != nil {
+					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, sanitizeErr
+				}
+				messageText, sanitizeErr := s.deps.Admission.SanitizeText(ctx, generation, event.Error.Message)
+				if sanitizeErr != nil {
+					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, sanitizeErr
+				}
+				return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("provider error %s: %s", code, messageText)
 			}
 		}
 	}
+}
+
+func (s *Service) sanitizeContentBlock(ctx context.Context, generation protocol.RuntimeGenerationID, block protocol.ContentBlock) (protocol.ContentBlock, error) {
+	block = protocol.DeepCopy(block)
+	var err error
+	switch block.Kind {
+	case protocol.ContentText:
+		block.Text, err = s.deps.Admission.SanitizeText(ctx, generation, block.Text)
+	case protocol.ContentJSON:
+		block.JSON, err = s.deps.Admission.SanitizeJSON(ctx, generation, block.JSON)
+	case protocol.ContentReasoningSummary:
+		block.ReasoningSummary, err = s.deps.Admission.SanitizeText(ctx, generation, block.ReasoningSummary)
+	case protocol.ContentRefusal:
+		block.Refusal.Code, err = s.deps.Admission.SanitizeText(ctx, generation, block.Refusal.Code)
+		if err == nil {
+			block.Refusal.Message, err = s.deps.Admission.SanitizeText(ctx, generation, block.Refusal.Message)
+		}
+	case protocol.ContentToolUse:
+		block.ToolUse.CallID, err = s.deps.Admission.SanitizeText(ctx, generation, block.ToolUse.CallID)
+		if err == nil {
+			block.ToolUse.Alias, err = s.deps.Admission.SanitizeText(ctx, generation, block.ToolUse.Alias)
+		}
+		if err == nil {
+			block.ToolUse.Arguments, err = s.deps.Admission.SanitizeJSON(ctx, generation, block.ToolUse.Arguments)
+		}
+	case protocol.ContentToolResult:
+		block.ToolResult.CallID, err = s.deps.Admission.SanitizeText(ctx, generation, block.ToolResult.CallID)
+		if err == nil {
+			block.ToolResult.Status, err = s.deps.Admission.SanitizeText(ctx, generation, block.ToolResult.Status)
+		}
+		if err == nil {
+			block.ToolResult.Text, err = s.deps.Admission.SanitizeText(ctx, generation, block.ToolResult.Text)
+		}
+		if err == nil && block.ToolResult.JSON != nil {
+			block.ToolResult.JSON, err = s.deps.Admission.SanitizeJSON(ctx, generation, block.ToolResult.JSON)
+		}
+		for index := 0; err == nil && index < len(block.ToolResult.EvidenceIDs); index++ {
+			var admitted string
+			admitted, err = s.deps.Admission.SanitizeText(ctx, generation, string(block.ToolResult.EvidenceIDs[index]))
+			block.ToolResult.EvidenceIDs[index] = protocol.EvidenceID(admitted)
+		}
+	case protocol.ContentReferenceKind:
+		block.Reference.URI, err = s.deps.Admission.SanitizeText(ctx, generation, block.Reference.URI)
+		if err == nil {
+			block.Reference.Name, err = s.deps.Admission.SanitizeText(ctx, generation, block.Reference.Name)
+		}
+		if err == nil {
+			block.Reference.MediaType, err = s.deps.Admission.SanitizeText(ctx, generation, block.Reference.MediaType)
+		}
+	}
+	if err != nil {
+		return protocol.ContentBlock{}, err
+	}
+	if err := block.Validate(); err != nil {
+		return protocol.ContentBlock{}, fmt.Errorf("sanitized provider block: %w", err)
+	}
+	return block, nil
+}
+
+func (s *Service) sanitizeModelUsage(ctx context.Context, generation protocol.RuntimeGenerationID, usage protocol.ModelUsage) (protocol.ModelUsage, error) {
+	usage = protocol.DeepCopy(usage)
+	values := []*protocol.UsageValue{&usage.Input, &usage.Output, &usage.Cached, &usage.CacheWrite, &usage.Reasoning}
+	for _, value := range values {
+		admitted, err := s.deps.Admission.SanitizeText(ctx, generation, value.Provenance)
+		if err != nil {
+			return protocol.ModelUsage{}, err
+		}
+		value.Provenance = admitted
+	}
+	if err := usage.Validate(); err != nil {
+		return protocol.ModelUsage{}, fmt.Errorf("sanitized provider usage: %w", err)
+	}
+	return usage, nil
 }
 
 func unknownUsage() protocol.ModelUsage {
@@ -984,6 +1550,21 @@ type turnState struct {
 	turnID            protocol.TurnID
 	contractID        protocol.OutcomeContractID
 	contextPlanDigest protocol.Digest
+	accepted          bool
+	taskRunning       bool
+	terminal          bool
+	activeActivityID  protocol.ActivityID
+	activeStarted     bool
+	activeDispatched  bool
+}
+
+type authorizationDeniedError struct{ reason string }
+
+func (e *authorizationDeniedError) Error() string {
+	if e.reason == "" {
+		return "authorization denied"
+	}
+	return "authorization denied: " + e.reason
 }
 
 func newTurnState(request StartTurnRequest) turnState {
@@ -1011,7 +1592,13 @@ func (s *Service) initialTurnEvents(request StartTurnRequest, state turnState) (
 		{protocol.EventOutcomeContractDeclared, protocol.OutcomeContractDeclaredV1{OutcomeContractID: state.contractID, Version: 1, Goal: request.Prompt, Source: "v1_compatibility", Frozen: false, Criteria: []protocol.CriterionV1{criterion}}},
 		{protocol.EventTurnAccepted, protocol.TurnAcceptedV1{CommandID: request.Command.CommandID, Goal: request.Prompt, OutcomeContractID: state.contractID, ContractVersion: 1}},
 	}
-	return s.turnEvents(state, request.Runtime.ID, "turn-accepted", values)
+	events, err := s.turnEvents(state, request.Runtime.ID, "turn-accepted", values)
+	if err != nil {
+		return nil, err
+	}
+	commandActor := protocol.DeepCopy(request.Command.Actor)
+	events[0].Actor, events[2].Actor = &commandActor, &commandActor
+	return events, nil
 }
 
 func (s *Service) contractFreezeEvents(request StartTurnRequest, state turnState) ([]protocol.ProposedEvent, error) {
@@ -1072,6 +1659,9 @@ func eventID(commandID protocol.CommandID, label string, index int, kind string)
 }
 
 func (s *Service) append(ctx context.Context, state *turnState, label string, events []protocol.ProposedEvent) error {
+	if err := validateProposedEvents(events, state.ref); err != nil {
+		return err
+	}
 	transactionID := protocol.TransactionID(stableID("transaction", string(state.command.CommandID), label))
 	result, err := s.repository.AppendBatch(ctx, journal.AppendRequest{
 		Journal: state.ref, ExpectedHead: state.head, TransactionID: transactionID, Events: events,
@@ -1123,36 +1713,52 @@ func (s *Service) LookupCommand(ctx context.Context, ref protocol.JournalRef, co
 	if err := ref.Validate(); err != nil || commandID == "" || digest.Validate() != nil {
 		return protocol.CommandResult{}, false, fmt.Errorf("invalid command lookup")
 	}
-	page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: ref, Limit: protocol.MaxCollectionMembers})
-	if err != nil {
-		return protocol.CommandResult{}, false, err
-	}
 	accepted := false
-	for _, record := range page.Events {
-		switch record.Envelope.Kind {
-		case protocol.EventCommandAccepted:
-			var payload protocol.CommandAcceptedV1
-			if err := json.Unmarshal(record.Envelope.Payload, &payload); err != nil || payload.CommandID != commandID {
-				continue
-			}
-			if payload.RequestDigest != digest {
-				return protocol.CommandResult{}, false, ErrIdempotencyConflict
-			}
-			accepted = true
-		case protocol.EventCommandCompleted:
-			var payload protocol.CommandCompletedV1
-			if err := json.Unmarshal(record.Envelope.Payload, &payload); err != nil || payload.CommandID != commandID {
-				continue
-			}
-			if payload.RequestDigest != digest {
-				return protocol.CommandResult{}, false, ErrIdempotencyConflict
-			}
-			var result protocol.CommandResult
-			if err := json.Unmarshal(payload.Result, &result); err != nil {
-				return protocol.CommandResult{}, false, err
-			}
-			return protocol.DeepCopy(result), true, nil
+	after := protocol.CommittedCursor{}
+	var projectionHead protocol.CommittedCursor
+	for {
+		page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: ref, After: after, Limit: protocol.MaxCollectionMembers})
+		if err != nil {
+			return protocol.CommandResult{}, false, err
 		}
+		if projectionHead == (protocol.CommittedCursor{}) {
+			projectionHead = page.Head
+		} else if page.Head != projectionHead {
+			return protocol.CommandResult{}, false, fmt.Errorf("command projection head changed during lookup")
+		}
+		for _, record := range page.Events {
+			switch record.Envelope.Kind {
+			case protocol.EventCommandAccepted:
+				var payload protocol.CommandAcceptedV1
+				if err := json.Unmarshal(record.Envelope.Payload, &payload); err != nil || payload.CommandID != commandID {
+					continue
+				}
+				if payload.RequestDigest != digest {
+					return protocol.CommandResult{}, false, ErrIdempotencyConflict
+				}
+				accepted = true
+			case protocol.EventCommandCompleted:
+				var payload protocol.CommandCompletedV1
+				if err := json.Unmarshal(record.Envelope.Payload, &payload); err != nil || payload.CommandID != commandID {
+					continue
+				}
+				if payload.RequestDigest != digest {
+					return protocol.CommandResult{}, false, ErrIdempotencyConflict
+				}
+				var result protocol.CommandResult
+				if err := json.Unmarshal(payload.Result, &result); err != nil {
+					return protocol.CommandResult{}, false, err
+				}
+				return protocol.DeepCopy(result), true, nil
+			}
+		}
+		if !page.More {
+			break
+		}
+		if page.Cursor == after || page.Cursor == (protocol.CommittedCursor{}) {
+			return protocol.CommandResult{}, false, fmt.Errorf("command projection pagination did not advance")
+		}
+		after = page.Cursor
 	}
 	if !accepted {
 		return protocol.CommandResult{}, false, nil
@@ -1251,8 +1857,19 @@ func (s *Service) CommitSessionChange(ctx context.Context, request SessionChange
 	if err := validateSessionChangeRequest(request); err != nil {
 		return protocol.CommandResult{}, err
 	}
+	if s.deps.Admission == nil {
+		return protocol.CommandResult{}, fmt.Errorf("generation admission service is required")
+	}
+	admittedPayload, err := s.deps.Admission.SanitizeJSON(ctx, request.RuntimeGenerationID, request.Event.Payload)
+	if err != nil {
+		return protocol.CommandResult{}, err
+	}
+	request.Event.Payload = admittedPayload
+	if err := validateSessionChangeRequest(request); err != nil {
+		return protocol.CommandResult{}, fmt.Errorf("admitted session change: %w", err)
+	}
 	var lease OperationLease
-	var err error
+	err = nil
 	if request.Consequential {
 		lease, err = s.lane.Acquire(ctx, OperationClaim{Kind: OperationControl, SessionID: request.SessionID, ControlOperationID: request.OperationID})
 		if err != nil {
@@ -1298,6 +1915,9 @@ func (s *Service) CommitSessionChange(ctx context.Context, request SessionChange
 			Payload: mustCanonical(protocol.CommandCompletedV1{CommandID: request.Command.CommandID, RequestDigest: request.Command.RequestDigest, Status: "completed", Result: rawResult}),
 		},
 	}
+	if err := validateProposedEvents(events, request.Journal); err != nil {
+		return protocol.CommandResult{}, err
+	}
 	appendResult, err := s.repository.AppendBatch(ctx, journal.AppendRequest{Journal: request.Journal, ExpectedHead: request.ExpectedHead, TransactionID: request.TransactionID, Events: events})
 	if err != nil {
 		return protocol.CommandResult{}, err
@@ -1324,9 +1944,22 @@ func (s *Service) CommitSessionChange(ctx context.Context, request SessionChange
 	return protocol.CommandResult{}, fmt.Errorf("session change append status %q", appendResult.Status)
 }
 
-func (s *Service) RunControl(ctx context.Context, request ControlRequest) (ControlResult, error) {
+func (s *Service) RunControl(ctx context.Context, request ControlRequest) (result ControlResult, runErr error) {
 	if err := validateControlRequest(request, false); err != nil {
 		return ControlResult{}, err
+	}
+	if s.deps.Admission == nil {
+		return ControlResult{}, fmt.Errorf("generation admission service is required")
+	}
+	if request.Event.Kind == protocol.EventMigrationDiagnostic || request.Event.Kind == protocol.EventRecoveryDiagnostic {
+		admitted, err := s.deps.Admission.SanitizeJSON(ctx, request.Runtime.ID, request.Event.Payload)
+		if err != nil {
+			return ControlResult{}, err
+		}
+		request.Event.Payload = admitted
+		if err := validateControlRequest(request, false); err != nil {
+			return ControlResult{}, fmt.Errorf("admitted control event: %w", err)
+		}
 	}
 	lease, err := s.lane.Acquire(ctx, OperationClaim{Kind: request.Kind, ControlOperationID: request.OperationID})
 	if err != nil {
@@ -1342,6 +1975,17 @@ func (s *Service) RunControl(ctx context.Context, request ControlRequest) (Contr
 		return ControlResult{}, fmt.Errorf("authorization service is required")
 	}
 	state := controlState{ref: request.Journal, head: request.ExpectedHead, command: request.Command, operationID: request.OperationID}
+	defer func() {
+		if runErr == nil || !state.accepted || state.terminal {
+			return
+		}
+		terminalResult, terminalErr := s.terminalizeControlFailure(context.WithoutCancel(ctx), request, &state, runErr)
+		if terminalErr != nil {
+			runErr = errors.Join(runErr, terminalErr)
+			return
+		}
+		result = terminalResult
+	}()
 	authorizationRequest, err := controlAuthorizationRequest(request)
 	if err != nil {
 		return ControlResult{}, err
@@ -1358,9 +2002,12 @@ func (s *Service) RunControl(ctx context.Context, request ControlRequest) (Contr
 	if err != nil {
 		return ControlResult{}, err
 	}
+	plannedHead := state.head
 	if err := s.appendControl(ctx, &state, "control-planned", events, ""); err != nil {
+		state.accepted = state.head != plannedHead
 		return ControlResult{}, err
 	}
+	state.accepted = true
 	token, err := s.authorizeControl(ctx, request, &state, authorizationRequest)
 	if err != nil {
 		return ControlResult{}, err
@@ -1369,16 +2016,6 @@ func (s *Service) RunControl(ctx context.Context, request ControlRequest) (Contr
 		Kind: "control", HandleID: stableID("control-handle", string(request.OperationID)), ControlOperationID: request.OperationID,
 		CallID: authorizationRequest.CallID, PlanDigest: authorizationRequest.PlanDigest, RequestDigest: authorizationRequest.RequestDigest,
 		DispatchDigest: authorizationRequest.DispatchDigest, RuntimeGenerationID: request.Runtime.ID,
-	}
-	barrierState := BarrierState{Journal: state.ref, Cursor: state.head, CommandID: request.Command.CommandID, ControlOperationID: request.OperationID, PlanDigest: request.Plan.Digest}
-	if err := s.probe.Before(ctx, BarrierEffectDispatch, barrierState); err != nil {
-		return ControlResult{}, err
-	}
-	if err := s.deps.Authorization.Dispatch(ctx, token, binding, func(context.Context) error { return nil }); err != nil {
-		return ControlResult{}, err
-	}
-	if err := s.probe.After(ctx, BarrierEffectDispatch, barrierState); err != nil {
-		return ControlResult{}, err
 	}
 	finalCursor := protocol.CommittedCursor{
 		JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
@@ -1411,7 +2048,24 @@ func (s *Service) RunControl(ctx context.Context, request ControlRequest) (Contr
 	// Retain the caller's admitted event identity and actor while keeping the
 	// lifecycle event ordering authored by the orchestrator.
 	events[0] = protocol.CloneProposedEvent(request.Event)
-	if err := s.appendControl(ctx, &state, "control-terminal", events, request.TransactionID); err != nil {
+	barrierState := BarrierState{Journal: state.ref, Cursor: state.head, CommandID: request.Command.CommandID, ControlOperationID: request.OperationID, PlanDigest: request.Plan.Digest}
+	if err := s.cross(ctx, BarrierAuthorizationCommitted, barrierState); err != nil {
+		return ControlResult{}, err
+	}
+	if err := s.probe.Before(ctx, BarrierEffectDispatch, barrierState); err != nil {
+		return ControlResult{}, err
+	}
+	dispatchHead := state.head
+	if err := s.deps.Authorization.Dispatch(ctx, token, binding, func(runContext context.Context) error {
+		appendErr := s.appendControl(runContext, &state, "control-terminal", events, request.TransactionID)
+		if state.head != dispatchHead {
+			state.terminal = true
+		}
+		return appendErr
+	}); err != nil {
+		return ControlResult{}, err
+	}
+	if err := s.probe.After(ctx, BarrierEffectDispatch, barrierState); err != nil {
 		return ControlResult{}, err
 	}
 	if state.head != finalCursor {
@@ -1420,11 +2074,65 @@ func (s *Service) RunControl(ctx context.Context, request ControlRequest) (Contr
 	return ControlResult{OperationID: request.OperationID, Cursor: state.head, Status: "completed", CommandResult: commandResult}, nil
 }
 
+func (s *Service) terminalizeControlFailure(ctx context.Context, request ControlRequest, state *controlState, cause error) (ControlResult, error) {
+	operationStatus, commandStatus := "failed", "failed"
+	eventKind, code, message := protocol.EventControlOperationFailed, "control_failed", "control operation failed"
+	var denied *authorizationDeniedError
+	if errors.As(cause, &denied) {
+		commandStatus, code, message = "denied", "authorization_denied", "control authorization denied"
+	} else if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		operationStatus, commandStatus = "interrupted", "interrupted"
+		eventKind, code, message = protocol.EventControlOperationInterrupted, "control_interrupted", "control operation interrupted"
+	}
+	transactionID := protocol.TransactionID(stableID("transaction", string(request.Command.CommandID), "control-failure-terminal"))
+	finalCursor := protocol.CommittedCursor{
+		JournalKind: state.ref.Kind, JournalID: state.ref.ID,
+		CommitSeq: state.head.CommitSeq + 3, TransactionID: transactionID,
+	}
+	publicError := &protocol.PublicError{Code: code, Message: message, Retryable: false}
+	payload := mustCanonical(struct {
+		OperationID protocol.ControlOperationID `json:"operation_id"`
+		Status      string                      `json:"status"`
+	}{request.OperationID, commandStatus})
+	commandResult := protocol.CommandResult{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, CommandID: request.Command.CommandID, Status: commandStatus,
+		RequestDigest: request.Command.RequestDigest, Cursor: applicationCursor(state.ref, finalCursor), PayloadVersion: 1,
+		Payload: payload, Error: publicError,
+	}
+	rawResult, err := canonicaljson.Marshal(commandResult)
+	if err != nil {
+		return ControlResult{}, err
+	}
+	events, err := s.controlEvents(*state, request.Runtime.ID, "control-failure-terminal", []struct {
+		kind    string
+		payload any
+	}{
+		{eventKind, protocol.ControlOperationTerminalV1{ControlOperationID: request.OperationID, Status: operationStatus, ErrorCode: code}},
+		{protocol.EventCommandCompleted, protocol.CommandCompletedV1{
+			CommandID: request.Command.CommandID, RequestDigest: request.Command.RequestDigest,
+			Status: commandStatus, Result: rawResult, Error: publicError,
+		}},
+	})
+	if err != nil {
+		return ControlResult{}, err
+	}
+	if err := s.appendControl(ctx, state, "control-failure-terminal", events, transactionID); err != nil {
+		return ControlResult{}, err
+	}
+	if state.head != finalCursor {
+		return ControlResult{}, fmt.Errorf("control failure cursor prediction mismatch")
+	}
+	state.terminal = true
+	return ControlResult{OperationID: request.OperationID, Cursor: state.head, Status: commandStatus, Error: publicError, CommandResult: commandResult}, nil
+}
+
 type controlState struct {
 	ref         protocol.JournalRef
 	head        protocol.CommittedCursor
 	command     CommandMetadata
 	operationID protocol.ControlOperationID
+	accepted    bool
+	terminal    bool
 }
 
 func (s *Service) controlEvents(state controlState, generation protocol.RuntimeGenerationID, label string, values []struct {
@@ -1444,15 +2152,22 @@ func (s *Service) controlEvents(state controlState, generation protocol.RuntimeG
 			}
 			payload = encoded
 		}
+		eventActor := actor
+		if value.kind == protocol.EventCommandAccepted {
+			eventActor = protocol.DeepCopy(state.command.Actor)
+		}
 		events = append(events, protocol.ProposedEvent{
 			EventID: eventID(state.command.CommandID, label, index, value.kind), Time: time.Now().UTC(), PayloadVersion: 1,
-			Kind: value.kind, Actor: &actor, RuntimeGenerationID: generation, Payload: payload,
+			Kind: value.kind, Actor: &eventActor, RuntimeGenerationID: generation, Payload: payload,
 		})
 	}
 	return events, nil
 }
 
 func (s *Service) appendControl(ctx context.Context, state *controlState, label string, events []protocol.ProposedEvent, explicit protocol.TransactionID) error {
+	if err := validateProposedEvents(events, state.ref); err != nil {
+		return err
+	}
 	transactionID := explicit
 	if transactionID == "" {
 		transactionID = protocol.TransactionID(stableID("transaction", string(state.command.CommandID), label))
@@ -1492,10 +2207,28 @@ func (s *Service) authorizeControl(ctx context.Context, request ControlRequest, 
 			return authorization.CommittedToken{}, err
 		}
 	}
-	if err := authorization.ValidateBinding(authorizationRequest, decision); err != nil || decision.Action != "allow" {
-		return authorization.CommittedToken{}, errors.Join(err, fmt.Errorf("control authorization denied"))
+	if err := authorization.ValidateBinding(authorizationRequest, decision); err != nil {
+		return authorization.CommittedToken{}, err
 	}
 	decisionEventID := eventID(request.Command.CommandID, "control-decision", 0, protocol.EventAuthorizationDecided)
+	if decision.Action != "allow" {
+		denied := &authorizationDeniedError{reason: decision.Reason}
+		events, eventErr := s.controlEvents(*state, request.Runtime.ID, "control-decision", []struct {
+			kind    string
+			payload any
+		}{{protocol.EventAuthorizationDecided, protocol.AuthorizationDecidedV1{Decision: decision}}})
+		if eventErr != nil {
+			return authorization.CommittedToken{}, eventErr
+		}
+		decisionHead := state.head
+		if appendErr := s.appendControl(ctx, state, "control-decision", events, ""); appendErr != nil {
+			if state.head != decisionHead {
+				return authorization.CommittedToken{}, errors.Join(denied, appendErr)
+			}
+			return authorization.CommittedToken{}, appendErr
+		}
+		return authorization.CommittedToken{}, denied
+	}
 	decisionEvents := []struct {
 		kind    string
 		payload any
@@ -1601,8 +2334,14 @@ func validateControlRequest(request ControlRequest, recovery bool) error {
 	if err := validateProposedEvent(request.Event, request.Journal); err != nil {
 		return err
 	}
-	if request.Kind == OperationReloadActivation && request.Event.Kind != protocol.EventRuntimeGenerationActivated {
-		return fmt.Errorf("reload activation event kind mismatch")
+	wantEvent := map[OperationKind]string{
+		OperationControl:          protocol.EventMigrationDiagnostic,
+		OperationCompaction:       protocol.EventMigrationDiagnostic,
+		OperationRecovery:         protocol.EventRecoveryDiagnostic,
+		OperationReloadActivation: protocol.EventRuntimeGenerationActivated,
+	}[request.Kind]
+	if request.Event.Kind != wantEvent {
+		return fmt.Errorf("control kind %q requires event %q", request.Kind, wantEvent)
 	}
 	return nil
 }
@@ -1653,6 +2392,34 @@ func validateProposedEvent(event protocol.ProposedEvent, ref protocol.JournalRef
 	} else if event.SessionID != "" {
 		return fmt.Errorf("workspace-control event carries a session ID")
 	}
+	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
+	if err != nil {
+		return err
+	}
+	envelope := protocol.EventEnvelope{
+		SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: event.PayloadVersion,
+		JournalKind: ref.Kind, JournalID: ref.ID, EventID: event.EventID, Seq: 1, Time: event.Time, Kind: event.Kind,
+		SessionID: event.SessionID, TaskID: event.TaskID, TurnID: event.TurnID, ActivityID: event.ActivityID,
+		ParentActivityID: event.ParentActivityID, CausationEventID: event.CausationEventID, Actor: protocol.DeepCopy(event.Actor),
+		RuntimeGenerationID: event.RuntimeGenerationID, TransactionID: "validation", Payload: protocol.DeepCopy(event.Payload),
+	}
+	raw, err := canonicaljson.Marshal(envelope)
+	if err != nil {
+		return err
+	}
+	record, err := registry.Decode(raw)
+	if err != nil {
+		return err
+	}
+	return registry.Validate(record)
+}
+
+func validateProposedEvents(events []protocol.ProposedEvent, ref protocol.JournalRef) error {
+	for index, event := range events {
+		if err := validateProposedEvent(event, ref); err != nil {
+			return fmt.Errorf("proposed event %d (%s): %w", index, event.Kind, err)
+		}
+	}
 	return nil
 }
 
@@ -1697,24 +2464,15 @@ func validateStartTurnRequest(request StartTurnRequest) error {
 }
 
 func validateRuntimeManifest(manifest protocol.RuntimeGenerationManifest) error {
-	body := manifest.Body
-	if body.ProviderCatalogRevision == "" || body.ToolCatalogRevision == "" || body.InstructionRevision == "" || body.PolicyGeneration == "" || len(body.Models) == 0 || body.Limits.MaxToolCalls <= 0 || body.Limits.MaxToolCalls > 128 || body.Limits.ShellTimeoutNanos <= 0 || body.Limits.ApplicationQueueCapacity <= 0 {
-		return fmt.Errorf("manifest body is incomplete")
+	if len(manifest.Body.Models) == 0 || manifest.Body.Limits.MaxToolCalls > 128 {
+		return fmt.Errorf("runtime generation manifest has invalid execution limits or models")
 	}
-	for _, descriptor := range body.Models {
-		if err := descriptor.Validate(); err != nil || descriptor.RuntimeGenerationID != manifest.ID {
-			return fmt.Errorf("invalid model descriptor")
-		}
-	}
-	for _, descriptor := range body.Tools {
-		if err := descriptor.Body.Validate(); err != nil {
-			return err
-		}
-		if err := canonicaljson.ValidateDigest(descriptor.Body, descriptor.DescriptorDigest); err != nil {
-			return err
-		}
-	}
-	return canonicaljson.ValidateDigest(body, manifest.Digest)
+	actor := protocol.ActorRef{ID: "runtime-validator", Kind: protocol.ActorSystem}
+	return validateProposedEvent(protocol.ProposedEvent{
+		EventID: "runtime-validation", Time: time.Unix(1, 0).UTC(), PayloadVersion: 1,
+		Kind: protocol.EventRuntimeGenerationActivated, Actor: &actor, RuntimeGenerationID: manifest.ID,
+		Payload: mustCanonical(protocol.RuntimeGenerationActivatedV1{Manifest: manifest}),
+	}, protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "runtime-validation"})
 }
 
 func validateCommandMetadata(command CommandMetadata) error {

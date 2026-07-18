@@ -19,7 +19,6 @@ import (
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/provider"
-	"github.com/muratmirgun/yordam/internal/recovery"
 	"github.com/muratmirgun/yordam/internal/tooling"
 	"github.com/muratmirgun/yordam/internal/verification"
 )
@@ -30,6 +29,7 @@ func TestRunTurnProviderLifecycleUsesDurableAuthorizationAndTerminalBarriers(t *
 	request.Runtime = validRuntimeManifest(t, "observation")
 	repository := &recordingRepository{head: request.ExpectedHead, log: log}
 	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{},
 		Lane: &loggingLane{delegate: NewOperationLane(), log: log}, Repository: repository,
 		TurnLeases: &recordingTurnLeaseManager{log: log}, Context: fakeContextPlanner{log: log},
 		Providers: fakeProviderCatalog{log: log}, Provider: fakeProviderService{log: log},
@@ -76,6 +76,7 @@ func TestDurableOrderingMutationPreviewCheckpointRevalidationExecutionAndContinu
 	request.Runtime = validRuntimeManifest(t, "mutation")
 	repository := &recordingRepository{head: request.ExpectedHead, log: log}
 	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{},
 		Lane: &loggingLane{delegate: NewOperationLane(), log: log}, Repository: repository,
 		TurnLeases: &recordingTurnLeaseManager{log: log}, Context: fakeContextPlanner{log: log},
 		Providers: fakeProviderCatalog{log: log}, Provider: &toolThenFinalProvider{log: log},
@@ -116,6 +117,7 @@ func TestSequentialToolIntentsExecuteFIFOInProviderOrder(t *testing.T) {
 	request := validStartTurnRequest()
 	request.Runtime = validRuntimeManifest(t, "observation")
 	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{},
 		Lane: NewOperationLane(), Repository: &recordingRepository{head: request.ExpectedHead}, TurnLeases: &recordingTurnLeaseManager{},
 		Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &twoToolThenFinalProvider{log: log},
 		Tools: observationToolService{log: log}, Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log},
@@ -144,6 +146,7 @@ func TestRunTurnEventsValidateFoundationRegistry(t *testing.T) {
 	request.Runtime = validRuntimeManifest(t, "mutation")
 	repository := &recordingRepository{head: request.ExpectedHead}
 	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{},
 		Lane: NewOperationLane(), Repository: repository, TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log},
 		Providers: fakeProviderCatalog{log: log}, Provider: &toolThenFinalProvider{log: log}, Tools: mutationToolService{log: log},
 		Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log}, Recovery: recordingRecovery{log: log},
@@ -164,6 +167,7 @@ func TestRunTurnConcurrentDuplicateExecutesProviderExactlyOnce(t *testing.T) {
 	repository := &recordingRepository{head: request.ExpectedHead}
 	providerService := &countingProviderService{delegate: fakeProviderService{log: &recordLog{}}}
 	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{},
 		Lane: NewOperationLane(), Repository: repository, TurnLeases: &recordingTurnLeaseManager{},
 		Context: fakeContextPlanner{log: &recordLog{}}, Providers: fakeProviderCatalog{log: &recordLog{}}, Provider: providerService,
 		Tools: noToolService{}, Authorization: &allowingAuthorization{log: &recordLog{}}, Evidence: noEvidenceRecorder{},
@@ -279,7 +283,7 @@ func TestConcurrentSameCommandPureAndSessionChangesCommitOneLifecycle(t *testing
 	t.Run("pure", func(t *testing.T) {
 		request := validStartTurnRequest()
 		repository := &recordingRepository{head: request.ExpectedHead}
-		service, err := NewService(Dependencies{Lane: NewOperationLane(), Repository: repository})
+		service, err := NewService(Dependencies{Lane: NewOperationLane(), Repository: repository, Admission: passthroughAdmission{}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -299,7 +303,7 @@ func TestConcurrentSameCommandPureAndSessionChangesCommitOneLifecycle(t *testing
 	t.Run("session_change", func(t *testing.T) {
 		request := validStartTurnRequest()
 		repository := &recordingRepository{head: request.ExpectedHead}
-		service, err := NewService(Dependencies{Lane: NewOperationLane(), Repository: repository})
+		service, err := NewService(Dependencies{Lane: NewOperationLane(), Repository: repository, Admission: passthroughAdmission{}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -351,7 +355,7 @@ func TestCommitSessionChangeRoutesModeThroughApplicationControlLaneAndIsIdempote
 	log := &recordLog{}
 	request := validStartTurnRequest()
 	repository := &recordingRepository{head: request.ExpectedHead, log: log}
-	service, err := NewService(Dependencies{Lane: &loggingLane{delegate: NewOperationLane(), log: log}, Repository: repository})
+	service, err := NewService(Dependencies{Lane: &loggingLane{delegate: NewOperationLane(), log: log}, Repository: repository, Admission: passthroughAdmission{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,6 +398,7 @@ func TestRunControlCommitsAuthorizedLifecycleAndTerminalCommand(t *testing.T) {
 	authorization := &allowingAuthorization{log: log}
 	service, err := NewService(Dependencies{
 		Lane: &loggingLane{delegate: NewOperationLane(), log: log}, Repository: repository, Authorization: authorization,
+		Admission: passthroughAdmission{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -434,7 +439,7 @@ func TestRunControlConcurrentDuplicateDispatchesExactlyOnce(t *testing.T) {
 	head := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 1, TransactionID: "head-a"}
 	repository := &recordingRepository{head: head}
 	authorizationService := &allowingAuthorization{log: &recordLog{}}
-	service, err := NewService(Dependencies{Lane: NewOperationLane(), Repository: repository, Authorization: authorizationService})
+	service, err := NewService(Dependencies{Lane: NewOperationLane(), Repository: repository, Authorization: authorizationService, Admission: passthroughAdmission{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,6 +493,7 @@ func TestRunTurnCommitsCommandTaskContractAndTurnAcceptanceAtomically(t *testing
 	repository := &recordingRepository{head: request.ExpectedHead}
 	turnLeases := &recordingTurnLeaseManager{}
 	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{},
 		Lane: NewOperationLane(), Repository: repository, TurnLeases: turnLeases,
 	})
 	if err != nil {
@@ -934,9 +940,6 @@ func (s observationToolService) Execute(_ context.Context, _ tooling.ActionHandl
 	s.log.add("tool.execute(" + callID + ")")
 	return protocol.ExecutionResult{Outcome: protocol.ActivityOutcomeV1{Status: "succeeded"}, ToolResult: protocol.ToolResultBlock{CallID: callID, Status: "succeeded", Text: "ok"}}, nil
 }
-func (s observationToolService) RecoveryCandidate(context.Context, tooling.PreviewResult, protocol.CheckpointBody, protocol.ActionPlan) (recovery.Candidate, error) {
-	return recovery.Candidate{}, fmt.Errorf("unexpected recovery")
-}
 func (s mutationToolService) PlanPreviewInspection(_ context.Context, request tooling.PlanRequest) (tooling.ActionHandle, protocol.ActionPlan, error) {
 	s.log.add("tool.plan_preview")
 	return tooling.ActionHandle{}, testActionPlan(request, "observation", "not_applicable"), nil
@@ -962,13 +965,6 @@ func (s mutationToolService) Execute(_ context.Context, _ tooling.ActionHandle, 
 		Outcome:    protocol.ActivityOutcomeV1{Status: "succeeded"},
 		ToolResult: protocol.ToolResultBlock{CallID: "call-a", Status: "succeeded", Text: "edited"},
 		Evidence:   []protocol.EvidenceCandidate{{ID: "evidence-result", Kind: "tool_output", MediaType: "text/plain", ProducingActivityID: "placeholder", Actor: protocol.ActorRef{ID: "read", Kind: protocol.ActorTool}, Subject: protocol.SubjectRef{Kind: "file", ID: "a.go"}, Content: []byte("edited"), Limit: 1024}},
-	}, nil
-}
-func (s mutationToolService) RecoveryCandidate(_ context.Context, _ tooling.PreviewResult, checkpoint protocol.CheckpointBody, plan protocol.ActionPlan) (recovery.Candidate, error) {
-	s.log.add("tool.recovery_candidate")
-	return recovery.Candidate{
-		WorkspaceID: "workspace-a", ActivityID: "placeholder", CheckpointID: checkpoint.ID, Subject: protocol.SubjectRef{Kind: "file", ID: "a.go"},
-		PlanDigest: plan.Digest, Preimage: []byte("before"), PreimageDigest: repeatedDigest("d"), ExpectedPostimageDigest: repeatedDigest("e"), Mode: 0o644,
 	}, nil
 }
 
@@ -1001,9 +997,6 @@ func (noToolService) Revalidate(context.Context, tooling.ActionHandle) (protocol
 func (noToolService) Execute(context.Context, tooling.ActionHandle, authorization.CommittedToken) (protocol.ExecutionResult, error) {
 	return protocol.ExecutionResult{}, fmt.Errorf("unexpected execution")
 }
-func (noToolService) RecoveryCandidate(context.Context, tooling.PreviewResult, protocol.CheckpointBody, protocol.ActionPlan) (recovery.Candidate, error) {
-	return recovery.Candidate{}, fmt.Errorf("unexpected recovery candidate")
-}
 
 type noEvidenceRecorder struct{}
 
@@ -1027,18 +1020,19 @@ func (r recordingEvidence) Put(_ context.Context, candidate protocol.EvidenceCan
 
 type noRecoveryRecorder struct{}
 
-func (noRecoveryRecorder) Put(context.Context, recovery.Candidate) (protocol.RecoveryMaterialRecord, error) {
+func (noRecoveryRecorder) PrepareAndPut(context.Context, tooling.PreviewResult, protocol.ActivityID, protocol.CheckpointBody, protocol.ActionPlan) (protocol.RecoveryMaterialRecord, error) {
 	return protocol.RecoveryMaterialRecord{}, fmt.Errorf("unexpected recovery material")
 }
 
 type recordingRecovery struct{ log *recordLog }
 
-func (r recordingRecovery) Put(_ context.Context, candidate recovery.Candidate) (protocol.RecoveryMaterialRecord, error) {
+func (r recordingRecovery) PrepareAndPut(_ context.Context, _ tooling.PreviewResult, activityID protocol.ActivityID, checkpoint protocol.CheckpointBody, plan protocol.ActionPlan) (protocol.RecoveryMaterialRecord, error) {
+	r.log.add("tool.recovery_candidate")
 	r.log.add("recovery.put")
 	return protocol.RecoveryMaterialRecord{
-		ID: "recovery-a", WorkspaceID: protocol.WorkspaceID(candidate.WorkspaceID), ActivityID: candidate.ActivityID,
-		CheckpointID: candidate.CheckpointID, Subject: candidate.Subject,
-		Body:           protocol.RecoveryMaterialBody{PlanDigest: candidate.PlanDigest, PreimageDigest: candidate.PreimageDigest, ExpectedPostimageDigest: candidate.ExpectedPostimageDigest, Mode: candidate.Mode, CreatedAt: time.Now().UTC()},
+		ID: "recovery-a", WorkspaceID: protocol.WorkspaceID(checkpoint.SessionID), ActivityID: activityID,
+		CheckpointID: checkpoint.ID, Subject: checkpoint.Coverage[0].Subject,
+		Body:           protocol.RecoveryMaterialBody{PlanDigest: plan.Digest, PreimageDigest: repeatedDigest("d"), ExpectedPostimageDigest: repeatedDigest("e"), Mode: 0o644, CreatedAt: time.Now().UTC()},
 		MaterialDigest: repeatedDigest("f"),
 	}, nil
 }

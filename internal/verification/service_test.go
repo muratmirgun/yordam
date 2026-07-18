@@ -46,3 +46,25 @@ func TestLegacyCompatibilityAssessmentMapsNonSuccessToFailed(t *testing.T) {
 		t.Fatalf("criterion=%q final=%q", result.CriterionStatus, result.FinalStatus)
 	}
 }
+
+func TestAssessmentRejectsUnsupportedTerminalStatus(t *testing.T) {
+	service := verification.NewService(time.Now)
+	_, err := service.Assess(context.Background(), verification.Request{
+		TaskID: "task-a", OutcomeContractID: "contract-a", ContractVersion: 1,
+		CriterionID: "legacy_turn_terminal", ActivityID: "activity-a", TurnID: "turn-a", TerminalStatus: "mystery",
+	})
+	if err == nil {
+		t.Fatal("unsupported terminal status was accepted")
+	}
+}
+
+func TestAssessmentRejectsZeroClock(t *testing.T) {
+	service := verification.NewService(func() time.Time { return time.Time{} })
+	_, err := service.Assess(context.Background(), verification.Request{
+		TaskID: "task-a", OutcomeContractID: "contract-a", ContractVersion: 1,
+		CriterionID: "legacy_turn_terminal", ActivityID: "activity-a", TurnID: "turn-a", TerminalStatus: "completed",
+	})
+	if err == nil {
+		t.Fatal("zero verification clock was accepted")
+	}
+}

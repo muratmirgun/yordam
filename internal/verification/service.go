@@ -51,6 +51,9 @@ func (s *Service) Assess(ctx context.Context, request Request) (Result, error) {
 	if request.TaskID == "" || request.OutcomeContractID == "" || request.ContractVersion == 0 || request.CriterionID != "legacy_turn_terminal" || request.ActivityID == "" || request.TurnID == "" || request.TerminalStatus == "" {
 		return Result{}, fmt.Errorf("legacy compatibility verification request is incomplete")
 	}
+	if request.TerminalStatus != "completed" && request.TerminalStatus != "failed" && request.TerminalStatus != "denied" && request.TerminalStatus != "cancelled" && request.TerminalStatus != "interrupted" && request.TerminalStatus != "uncertain" {
+		return Result{}, fmt.Errorf("unsupported terminal status %q", request.TerminalStatus)
+	}
 	evidenceIDs := append(make([]protocol.EvidenceID, 0, len(request.EvidenceIDs)), request.EvidenceIDs...)
 	sort.Slice(evidenceIDs, func(i, j int) bool { return evidenceIDs[i] < evidenceIDs[j] })
 	for index, evidenceID := range evidenceIDs {
@@ -64,6 +67,9 @@ func (s *Service) Assess(ctx context.Context, request Request) (Result, error) {
 		criterionStatus, receiptStatus, reason = "failed", "failed", "legacy turn terminated unsuccessfully"
 	}
 	now := s.clock().UTC()
+	if now.IsZero() {
+		return Result{}, fmt.Errorf("verification clock returned zero time")
+	}
 	body := protocol.VerificationReceiptBody{
 		ID:                receiptID(request),
 		TaskID:            request.TaskID,

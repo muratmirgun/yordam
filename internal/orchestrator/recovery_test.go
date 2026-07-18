@@ -31,6 +31,7 @@ func TestRecoveryAuthorizedControlTerminalizesCommittedSessionBeforeLeaseRelease
 	service, err := NewService(Dependencies{
 		Lane: &loggingLane{delegate: NewOperationLane(), log: log}, Repository: repository,
 		TurnLeases: &recordingTurnLeaseManager{log: log}, Authorization: &allowingAuthorization{log: log}, Projection: projection,
+		Admission: passthroughAdmission{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +65,7 @@ func TestRecoveryAuthorizedControlTerminalizesCommittedSessionBeforeLeaseRelease
 		"authorization.decide", "append_control(authorization.decided,control_operation.authorized)",
 		"append_control(authorization.decision_consumed,control_operation.started)", "authorization.issue",
 		"session_repository.recover", "append_session(activity.uncertain,turn.interrupted,task.status_changed,command.completed)",
-		"turn_lease.release", "append_control(control_operation.completed,command.completed)", "lane.release",
+		"append_control(control_operation.completed,command.completed)", "turn_lease.release", "lane.release",
 	}
 	if got := log.snapshot(); !slices.Equal(got, want) {
 		t.Fatalf("recovery order got=%v want=%v", got, want)
@@ -91,6 +92,141 @@ func TestRecoveryAuthorizedControlTerminalizesCommittedSessionBeforeLeaseRelease
 	}
 }
 
+func TestRecoveryConflictTerminalizesControlWithoutSessionTerminal(t *testing.T) {
+	log := &recordLog{}
+	runtime := validRuntimeManifest(t, "observation")
+	controlRef := protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "workspace-control-a"}
+	sessionRef := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-a"}
+	controlHead := protocol.CommittedCursor{JournalKind: controlRef.Kind, JournalID: controlRef.ID, CommitSeq: 1, TransactionID: "control-head"}
+	sessionHead := protocol.CommittedCursor{JournalKind: sessionRef.Kind, JournalID: sessionRef.ID, CommitSeq: 10, TransactionID: "session-head"}
+	repository := newRecoveryRepository(log, controlRef, controlHead, sessionRef, sessionHead, sessionHead)
+	repository.result = journal.RecoveryResult{Status: "conflict", Cursor: sessionHead}
+	projection := recoveryProjectionFake{projection: RecoveryProjection{ActiveTurnID: "turn-original", TaskID: "task-original", OriginalCommandID: "command-original", OriginalRequestDigest: repeatedDigest("5")}}
+	service, err := NewService(Dependencies{Lane: NewOperationLane(), Repository: repository, TurnLeases: &recordingTurnLeaseManager{}, Authorization: &allowingAuthorization{log: &recordLog{}}, Projection: projection, Admission: passthroughAdmission{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := testActionPlan(tooling.PlanRequest{CallID: "recover-a", Alias: "recover", RuntimeGenerationID: runtime.ID}, "mutation", "not_reversible")
+	actor := protocol.ActorRef{ID: "operator-a", Kind: protocol.ActorUser}
+	request := RecoveryControlRequest{
+		Control: ControlRequest{
+			Command:     CommandMetadata{CommandID: "recovery-command-a", IdempotencyKey: "recovery-key-a", RequestDigest: repeatedDigest("6"), Actor: actor},
+			OperationID: "recovery-operation-a", Kind: OperationRecovery, Journal: controlRef, ExpectedHead: controlHead,
+			TransactionID: "recovery-control-terminal", Runtime: runtime, Plan: plan,
+			Event: protocol.ProposedEvent{EventID: "recovery-event", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventRecoveryDiagnostic, Actor: &actor, RuntimeGenerationID: runtime.ID, Payload: mustCanonical(protocol.DiagnosticV1{Diagnostic: protocol.Diagnostic{Code: "recovery.requested", Message: "recover", Journal: controlRef}})},
+		},
+		Storage: journal.RecoveryRequest{OperationID: "recovery-operation-a", Journal: sessionRef, ExpectedHead: sessionHead, ObservedTailDigest: repeatedDigest("7"), TransactionID: "storage-recovery-a", RuntimeGenerationID: runtime.ID},
+	}
+	if _, err := service.RecoverTurn(context.Background(), request); err == nil {
+		t.Fatal("conflicting physical recovery was accepted")
+	}
+	kinds := flattenAppendKinds(repository.appendRequests())
+	if slices.Contains(kinds, protocol.EventTurnInterrupted) || slices.Contains(kinds, protocol.EventActivityUncertain) {
+		t.Fatalf("session was terminalized for failed recovery: %v", kinds)
+	}
+	if !slices.Contains(kinds, protocol.EventControlOperationFailed) || !slices.Contains(kinds, protocol.EventCommandCompleted) {
+		t.Fatalf("recovery control was not failed durably: %v", kinds)
+	}
+	validateAppendRequests(t, repository.appendRequests())
+}
+
+func TestEveryRecoveryDispatchAndTerminalBarrierLeavesDurableControlTerminal(t *testing.T) {
+	for _, test := range []struct {
+		barrier          Barrier
+		phase            string
+		wantRecoveryCall bool
+		wantSessionTerm  bool
+	}{
+		{barrier: BarrierAuthorizationCommitted, phase: "before"},
+		{barrier: BarrierAuthorizationCommitted, phase: "after"},
+		{barrier: BarrierEffectDispatch, phase: "before"},
+		{barrier: BarrierEffectDispatch, phase: "after", wantRecoveryCall: true, wantSessionTerm: true},
+		{barrier: BarrierRecoveryTurnTerminalCommitted, phase: "before", wantRecoveryCall: true, wantSessionTerm: true},
+		{barrier: BarrierRecoveryTurnTerminalCommitted, phase: "after", wantRecoveryCall: true, wantSessionTerm: true},
+	} {
+		t.Run(string(test.barrier)+"_"+test.phase, func(t *testing.T) {
+			service, request, repository, log := recoveryBarrierFixture(t, phaseBarrierProbe{barrier: test.barrier, phase: test.phase})
+			if _, err := service.RecoverTurn(context.Background(), request); !errors.Is(err, errInjectedBarrier) {
+				t.Fatalf("recovery error=%v", err)
+			}
+			if got := repository.recoverCount(); (got == 1) != test.wantRecoveryCall {
+				t.Fatalf("recovery calls=%d want call=%v", got, test.wantRecoveryCall)
+			}
+			kinds := flattenAppendKinds(repository.appendRequests())
+			if slices.Contains(kinds, protocol.EventTurnInterrupted) != test.wantSessionTerm {
+				t.Fatalf("session terminal=%v want=%v kinds=%v", slices.Contains(kinds, protocol.EventTurnInterrupted), test.wantSessionTerm, kinds)
+			}
+			if !slices.Contains(kinds, protocol.EventControlOperationFailed) || !slices.Contains(kinds, protocol.EventCommandCompleted) {
+				t.Fatalf("control terminal missing: %v", kinds)
+			}
+			entries := log.snapshot()
+			terminalIndex := slices.Index(entries, "append_control(control_operation.failed,command.completed)")
+			releaseIndex := slices.Index(entries, "turn_lease.release")
+			if terminalIndex < 0 || releaseIndex <= terminalIndex {
+				t.Fatalf("lease released before control terminal: %v", entries)
+			}
+			validateAppendRequests(t, repository.appendRequests())
+		})
+	}
+}
+
+func TestRecoveryCommittedControlPublishFailureDoesNotAppendSecondTerminal(t *testing.T) {
+	service, request, repository, _ := recoveryBarrierFixture(t, NoopBarrierProbe())
+	service.publisher = &nthFailPublisher{failAt: 4}
+	if _, err := service.RecoverTurn(context.Background(), request); err == nil {
+		t.Fatal("publisher failure was ignored")
+	}
+	kinds := flattenAppendKinds(repository.appendRequests())
+	controlTerminals := 0
+	for _, kind := range kinds {
+		if kind == protocol.EventControlOperationCompleted || kind == protocol.EventControlOperationFailed || kind == protocol.EventControlOperationInterrupted {
+			controlTerminals++
+		}
+	}
+	if controlTerminals != 1 || !slices.Contains(kinds, protocol.EventControlOperationCompleted) {
+		t.Fatalf("control terminals=%d kinds=%v", controlTerminals, kinds)
+	}
+	validateAppendRequests(t, repository.appendRequests())
+}
+
+func recoveryBarrierFixture(t *testing.T, probe BarrierProbe) (*Service, RecoveryControlRequest, *recoveryRepository, *recordLog) {
+	t.Helper()
+	log := &recordLog{}
+	runtime := validRuntimeManifest(t, "observation")
+	controlRef := protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "workspace-control-a"}
+	sessionRef := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-a"}
+	controlHead := protocol.CommittedCursor{JournalKind: controlRef.Kind, JournalID: controlRef.ID, CommitSeq: 1, TransactionID: "control-head"}
+	sessionHead := protocol.CommittedCursor{JournalKind: sessionRef.Kind, JournalID: sessionRef.ID, CommitSeq: 10, TransactionID: "session-head"}
+	recoveredHead := protocol.CommittedCursor{JournalKind: sessionRef.Kind, JournalID: sessionRef.ID, CommitSeq: 8, TransactionID: "recovered-head"}
+	repository := newRecoveryRepository(log, controlRef, controlHead, sessionRef, sessionHead, recoveredHead)
+	projection := recoveryProjectionFake{projection: RecoveryProjection{
+		ActiveTurnID: "turn-original", TaskID: "task-original", OriginalCommandID: "command-original",
+		OriginalRequestDigest: repeatedDigest("5"), StartedActivities: []protocol.ActivityID{"activity-original"},
+	}}
+	service, err := NewService(Dependencies{
+		Lane: NewOperationLane(), Repository: repository, TurnLeases: &recordingTurnLeaseManager{log: log},
+		Authorization: &allowingAuthorization{log: &recordLog{}}, Projection: projection, Admission: passthroughAdmission{}, BarrierProbe: probe,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := testActionPlan(tooling.PlanRequest{CallID: "recover-a", Alias: "recover", RuntimeGenerationID: runtime.ID}, "mutation", "not_reversible")
+	actor := protocol.ActorRef{ID: "operator-a", Kind: protocol.ActorUser}
+	request := RecoveryControlRequest{
+		Control: ControlRequest{
+			Command:     CommandMetadata{CommandID: "recovery-command-a", IdempotencyKey: "recovery-key-a", RequestDigest: repeatedDigest("6"), Actor: actor},
+			OperationID: "recovery-operation-a", Kind: OperationRecovery, Journal: controlRef, ExpectedHead: controlHead,
+			TransactionID: "recovery-control-terminal", Runtime: runtime, Plan: plan,
+			Event: protocol.ProposedEvent{EventID: "recovery-event", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventRecoveryDiagnostic, Actor: &actor, RuntimeGenerationID: runtime.ID, Payload: mustCanonical(protocol.DiagnosticV1{Diagnostic: protocol.Diagnostic{Code: "recovery.requested", Message: "recover", Journal: controlRef}})},
+		},
+		Storage: journal.RecoveryRequest{
+			OperationID: "recovery-operation-a", Journal: sessionRef, ExpectedHead: sessionHead, ObservedTailDigest: repeatedDigest("7"),
+			TransactionID: "storage-recovery-a", RuntimeGenerationID: runtime.ID,
+		},
+	}
+	return service, request, repository, log
+}
+
 type recoveryProjectionFake struct{ projection RecoveryProjection }
 
 func (p recoveryProjectionFake) InspectRecovery(context.Context, protocol.JournalRef, protocol.CommittedCursor) (RecoveryProjection, error) {
@@ -108,10 +244,11 @@ type recoveryRepository struct {
 	recovers    int
 	lastStorage journal.RecoveryRequest
 	requests    []journal.AppendRequest
+	result      journal.RecoveryResult
 }
 
 func newRecoveryRepository(log *recordLog, controlRef protocol.JournalRef, controlHead protocol.CommittedCursor, sessionRef protocol.JournalRef, sessionHead, recovered protocol.CommittedCursor) *recoveryRepository {
-	return &recoveryRepository{log: log, controlRef: controlRef, sessionRef: sessionRef, heads: map[protocol.JournalRef]protocol.CommittedCursor{controlRef: controlHead, sessionRef: sessionHead}, events: make(map[protocol.JournalRef][]protocol.ProposedEvent), recovered: recovered}
+	return &recoveryRepository{log: log, controlRef: controlRef, sessionRef: sessionRef, heads: map[protocol.JournalRef]protocol.CommittedCursor{controlRef: controlHead, sessionRef: sessionHead}, events: make(map[protocol.JournalRef][]protocol.ProposedEvent), recovered: recovered, result: journal.RecoveryResult{Status: "recovered", Cursor: recovered}}
 }
 func (r *recoveryRepository) Inspect(context.Context, protocol.JournalRef) (journal.Inspection, error) {
 	return journal.Inspection{}, nil
@@ -163,8 +300,10 @@ func (r *recoveryRepository) Recover(_ context.Context, request journal.Recovery
 	r.log.add("session_repository.recover")
 	r.recovers++
 	r.lastStorage = request
-	r.heads[request.Journal] = r.recovered
-	return journal.RecoveryResult{Status: "recovered", Cursor: r.recovered}, nil
+	if r.result.Status == "recovered" {
+		r.heads[request.Journal] = r.result.Cursor
+	}
+	return r.result, nil
 }
 func (r *recoveryRepository) recoverCount() int { r.mu.Lock(); defer r.mu.Unlock(); return r.recovers }
 func (r *recoveryRepository) storageRequest() journal.RecoveryRequest {
