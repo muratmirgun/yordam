@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -150,6 +151,62 @@ func TestAdapterRejectsStructuredOutputBeforeTransport(t *testing.T) {
 	_, err := adapter.stream(context.Background(), request)
 	if !errors.Is(err, provider.ErrCapabilityUnavailable) || requests != 0 {
 		t.Fatalf("error=%v requests=%d", err, requests)
+	}
+}
+
+func TestAdapterClientDoesNotFollowProviderRedirects(t *testing.T) {
+	for _, statusCode := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			var originRequests atomic.Int32
+			var followupRequests atomic.Int32
+			var callerRedirectChecks atomic.Int32
+
+			followup := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				followupRequests.Add(1)
+				response.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprintln(response, "data: [DONE]")
+				fmt.Fprintln(response)
+			}))
+			defer followup.Close()
+
+			origin := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				originRequests.Add(1)
+				response.Header().Set("Location", followup.URL+"/chat/completions")
+				response.WriteHeader(statusCode)
+			}))
+			defer origin.Close()
+
+			callerClient := origin.Client()
+			callerClient.Timeout = 3 * time.Second
+			callerClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+				callerRedirectChecks.Add(1)
+				return nil
+			}
+			client := New(ClientOptions{HTTPClient: callerClient, BaseURL: origin.URL})
+
+			stream, err := client.Stream(context.Background(), domain.ModelRequest{})
+			if err == nil {
+				for event := range stream {
+					if event.Err != nil {
+						err = event.Err
+					}
+				}
+			}
+			var typed *domain.TypedError
+			var statusErr *HTTPStatusError
+			if !errors.As(err, &typed) || typed.Kind != domain.ErrorProviderFatal || !errors.As(err, &statusErr) || statusErr.Status != statusCode {
+				t.Fatalf("error=%v origin requests=%d follow-up requests=%d caller redirect checks=%d", err, originRequests.Load(), followupRequests.Load(), callerRedirectChecks.Load())
+			}
+			if originRequests.Load() != 1 || followupRequests.Load() != 0 || callerRedirectChecks.Load() != 0 {
+				t.Fatalf("origin requests=%d follow-up requests=%d caller redirect checks=%d", originRequests.Load(), followupRequests.Load(), callerRedirectChecks.Load())
+			}
+			if client.http == callerClient || client.http.Transport != callerClient.Transport || client.http.Timeout != callerClient.Timeout {
+				t.Fatalf("client copy=%p caller client=%p transport preserved=%t timeout=%s", client.http, callerClient, client.http.Transport == callerClient.Transport, client.http.Timeout)
+			}
+			if err := callerClient.CheckRedirect(&http.Request{}, nil); err != nil || callerRedirectChecks.Load() != 1 {
+				t.Fatalf("caller redirect policy was mutated: error=%v checks=%d", err, callerRedirectChecks.Load())
+			}
+		})
 	}
 }
 
