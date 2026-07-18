@@ -39,6 +39,7 @@ type Lease struct {
 	scanner  *AdmissionScanner
 	redactor Redactor
 	closed   bool
+	streams  map[*LeasedRedactionStream]struct{}
 }
 
 type LeasedRedactionStream struct {
@@ -137,9 +138,63 @@ func (r *Registry) releaseRetiredLocked(entry *generation) {
 
 func (l *Lease) Scanner() *AdmissionScanner {
 	if l == nil {
-		return NewAdmissionScanner()
+		scanner := NewAdmissionScanner()
+		scanner.revoke()
+		return scanner
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		scanner := NewAdmissionScanner()
+		scanner.revoke()
+		return scanner
 	}
 	return l.scanner
+}
+
+// Derive returns an independently owned producer lease for this generation.
+// A derived lease remains valid when its parent closes, but no new producer can
+// be derived after the generation is retired.
+func (l *Lease) Derive() (*Lease, error) {
+	if l == nil {
+		return nil, ErrLeaseClosed
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil, ErrLeaseClosed
+	}
+	registry, id := l.registry, l.entry.id
+	l.mu.Unlock()
+	return registry.AcquireExisting(id)
+}
+
+// Admit rejects a secret variant and also rejects use after lease close.
+func (l *Lease) Admit(value []byte) error {
+	if l == nil {
+		return ErrLeaseClosed
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return ErrLeaseClosed
+	}
+	if l.scanner.Scan(value) {
+		return ErrSecretDetected
+	}
+	return nil
+}
+
+func (l *Lease) GenerationID() (protocol.RuntimeGenerationID, error) {
+	if l == nil {
+		return "", ErrLeaseClosed
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return "", ErrLeaseClosed
+	}
+	return l.entry.id, nil
 }
 
 func (l *Lease) Stream() (*AdmissionStream, error) {
@@ -155,11 +210,20 @@ func (l *Lease) Stream() (*AdmissionStream, error) {
 }
 
 func (l *Lease) RedactionStream() (*LeasedRedactionStream, error) {
-	admission, err := l.Stream()
-	if err != nil {
-		return nil, err
+	if l == nil {
+		return nil, ErrLeaseClosed
 	}
-	return &LeasedRedactionStream{admission: admission, redaction: l.redactor.Stream()}, nil
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil, ErrLeaseClosed
+	}
+	stream := &LeasedRedactionStream{admission: l.scanner.Stream(), redaction: l.redactor.Stream()}
+	if l.streams == nil {
+		l.streams = make(map[*LeasedRedactionStream]struct{})
+	}
+	l.streams[stream] = struct{}{}
+	return stream, nil
 }
 
 func (s *LeasedRedactionStream) Write(value string) string {
@@ -186,7 +250,9 @@ func (s *LeasedRedactionStream) Close() string {
 	}
 	s.closed = true
 	s.admission.Close()
-	return s.redaction.Close()
+	output := s.redaction.Close()
+	s.redaction.revoke()
+	return output
 }
 
 func (l *Lease) Close() error {
@@ -200,6 +266,16 @@ func (l *Lease) Close() error {
 	}
 	l.closed = true
 	registry, entry := l.registry, l.entry
+	for stream := range l.streams {
+		stream.mu.Lock()
+		stream.closed = true
+		stream.admission.Close()
+		stream.redaction.revoke()
+		stream.mu.Unlock()
+	}
+	l.streams = nil
+	l.scanner.revoke()
+	l.redactor = New()
 	l.mu.Unlock()
 	registry.mu.Lock()
 	entry.leases--
@@ -210,21 +286,36 @@ func (l *Lease) Close() error {
 
 func (l *Lease) String(value string) string {
 	if l == nil {
-		return value
+		return "[REDACTED]"
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return "[REDACTED]"
 	}
 	return l.redactor.String(value)
 }
 
 func (l *Lease) Bytes(value []byte) []byte {
 	if l == nil {
-		return bytes.Clone(value)
+		return []byte("[REDACTED]")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return []byte("[REDACTED]")
 	}
 	return l.redactor.Bytes(value)
 }
 
 func (l *Lease) JSON(value any) (json.RawMessage, error) {
 	if l == nil {
-		return New().JSON(value)
+		return nil, ErrLeaseClosed
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil, ErrLeaseClosed
 	}
 	redacted, err := l.redactor.JSON(value)
 	if err != nil {

@@ -33,6 +33,7 @@ type Options struct {
 	Fault             FaultInjector
 	Secrets           *secret.Registry
 	ArtifactAdmission *secret.Lease
+	Admission         *secret.Binding
 }
 
 type Store struct {
@@ -45,6 +46,8 @@ type Store struct {
 	fault             FaultInjector
 	secrets           *secret.Registry
 	artifactAdmission *secret.Lease
+	admission         *secret.Binding
+	requireAdmission  bool
 	state             *rootState
 	verifiedScan      sync.Map
 }
@@ -63,6 +66,26 @@ var rootStates sync.Map
 const maxEventSize = 2 << 20
 
 func New(root string, opts Options) *Store {
+	return newStore(root, opts, false)
+}
+
+// NewAdmitted constructs a production store that cannot write a journal or
+// artifact without a generation-bound admission lease.
+func NewAdmitted(root string, opts Options) (*Store, error) {
+	if opts.Secrets == nil || opts.Admission == nil {
+		return nil, fmt.Errorf("production journal requires secret registry and generation binding")
+	}
+	lease, err := opts.Admission.AcquireLease()
+	if err != nil {
+		return nil, fmt.Errorf("validate production admission: %w", err)
+	}
+	if err := lease.Close(); err != nil {
+		return nil, err
+	}
+	return newStore(root, opts, true), nil
+}
+
+func newStore(root string, opts Options, requireAdmission bool) *Store {
 	encoder := opts.Encoder
 	if encoder == nil && opts.Sanitize != nil {
 		encoder = sanitizeEncoder{sanitize: opts.Sanitize}
@@ -87,7 +110,8 @@ func New(root string, opts Options) *Store {
 	return &Store{
 		root: root, clock: opts.Clock, entropy: opts.Entropy, sanitize: opts.Sanitize,
 		encoder: encoder, registry: registry, fault: opts.Fault, secrets: opts.Secrets,
-		artifactAdmission: opts.ArtifactAdmission, state: state.(*rootState),
+		artifactAdmission: opts.ArtifactAdmission, admission: opts.Admission,
+		requireAdmission: requireAdmission, state: state.(*rootState),
 	}
 }
 
@@ -457,7 +481,7 @@ func (s *Store) appendInTransaction(
 	kind domain.EventKind,
 	payload any,
 ) (domain.DurableEvent, error) {
-	raw, err := s.sanitize(payload)
+	raw, err := s.sanitizeForWrite(payload)
 	if err != nil {
 		return domain.DurableEvent{}, err
 	}
@@ -513,6 +537,25 @@ func (s *Store) appendInTransaction(
 		return domain.DurableEvent{}, err
 	}
 	return event, nil
+}
+
+func (s *Store) sanitizeForWrite(value any) (json.RawMessage, error) {
+	raw, err := s.sanitize(value)
+	if err != nil || !s.requireAdmission {
+		return raw, err
+	}
+	lease, err := s.admission.AcquireLease()
+	if err != nil {
+		return nil, fmt.Errorf("acquire journal admission: %w", err)
+	}
+	defer lease.Close()
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var tree any
+	if err := decoder.Decode(&tree); err != nil {
+		return nil, err
+	}
+	return lease.JSON(tree)
 }
 
 type eventLogSummary struct {

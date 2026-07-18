@@ -132,6 +132,9 @@ func (s *Store) AppendBatch(ctx context.Context, request journal.AppendRequest) 
 	if err := validateAppendRequest(request); err != nil {
 		return journal.AppendResult{}, err
 	}
+	if err := s.admitAppendRequestMetadata(request); err != nil {
+		return journal.AppendResult{}, err
+	}
 	if s.encoder == nil {
 		return journal.AppendResult{}, fmt.Errorf("journal encoder is required")
 	}
@@ -159,6 +162,45 @@ func (s *Store) AppendBatch(ctx context.Context, request journal.AppendRequest) 
 		s.clearMarkerUncertainty(request.Journal, request.TransactionID)
 	}
 	return result, resultErr
+}
+
+func (s *Store) admitAppendRequestMetadata(request journal.AppendRequest) error {
+	if s.secrets == nil {
+		return nil
+	}
+	type appendMetadata struct {
+		Journal       protocol.JournalRef
+		ExpectedHead  protocol.CommittedCursor
+		TransactionID protocol.TransactionID
+		Events        []protocol.ProposedEvent
+	}
+	metadata := appendMetadata{
+		Journal: request.Journal, ExpectedHead: request.ExpectedHead,
+		TransactionID: request.TransactionID, Events: make([]protocol.ProposedEvent, len(request.Events)),
+	}
+	for index, event := range request.Events {
+		metadata.Events[index] = protocol.CloneProposedEvent(event)
+		metadata.Events[index].Payload = nil
+		if event.RuntimeGenerationID == "" {
+			return fmt.Errorf("runtime generation is required for secret admission")
+		}
+		lease, err := s.secrets.AcquireExisting(event.RuntimeGenerationID)
+		if err != nil {
+			return fmt.Errorf("acquire secret admission lease: %w", err)
+		}
+		raw, marshalErr := canonicaljson.Marshal(struct {
+			Journal       protocol.JournalRef
+			ExpectedHead  protocol.CommittedCursor
+			TransactionID protocol.TransactionID
+			Event         protocol.ProposedEvent
+		}{request.Journal, request.ExpectedHead, request.TransactionID, metadata.Events[index]})
+		admitErr := lease.Admit(raw)
+		closeErr := lease.Close()
+		if err := errors.Join(marshalErr, admitErr, closeErr); err != nil {
+			return fmt.Errorf("admit proposed envelope metadata: %w", err)
+		}
+	}
+	return nil
 }
 
 func validateAppendRequest(request journal.AppendRequest) error {
@@ -387,7 +429,8 @@ func (s *Store) appendBatchLockedWithIdentity(
 		JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
 		EventID: generatedMarkerID, Seq: events[len(events)-1].Seq + 1,
 		Time: markerTime, Kind: protocol.EventTransactionCommitted,
-		TransactionID: request.TransactionID, Payload: markerPayload,
+		RuntimeGenerationID: events[0].RuntimeGenerationID,
+		TransactionID:       request.TransactionID, Payload: markerPayload,
 	}
 	if request.Journal.Kind == protocol.JournalSession {
 		marker.SessionID = protocol.SessionID(request.Journal.ID)

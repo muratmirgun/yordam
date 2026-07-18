@@ -51,6 +51,14 @@ func (s *Stream) Close() string {
 	return s.consume(true)
 }
 
+func (s *Stream) revoke() {
+	if s == nil {
+		return
+	}
+	s.redactor = New()
+	s.pending = ""
+}
+
 func (s *Stream) consume(flush bool) string {
 	var output strings.Builder
 	for s.pending != "" {

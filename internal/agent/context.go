@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"unicode/utf8"
 
@@ -10,8 +11,11 @@ import (
 
 const MaxToolResultContextBytes = 32 << 10
 
-func BuildContext(replay domain.SessionReplay, systemPrompt string) []domain.Message {
-	messages := []domain.Message{{Role: domain.RoleSystem, Content: systemPrompt}}
+func BuildContext(replay domain.SessionReplay, systemPrompt string, lease *secret.Lease) ([]domain.Message, error) {
+	if _, err := lease.GenerationID(); err != nil {
+		return nil, err
+	}
+	messages := []domain.Message{{Role: domain.RoleSystem, Content: lease.String(systemPrompt)}}
 	startSeq := uint64(0)
 	summary := ""
 	for _, event := range replay.Events {
@@ -28,7 +32,7 @@ func BuildContext(replay domain.SessionReplay, systemPrompt string) []domain.Mes
 		}
 	}
 	if summary != "" {
-		messages = append(messages, domain.Message{Role: domain.RoleSystem, Content: summary})
+		messages = append(messages, domain.Message{Role: domain.RoleSystem, Content: lease.String(summary)})
 	}
 	for _, event := range replay.Events {
 		if event.Seq <= startSeq {
@@ -40,29 +44,101 @@ func BuildContext(replay domain.SessionReplay, systemPrompt string) []domain.Mes
 			if json.Unmarshal(event.Payload, &payload) != nil {
 				continue
 			}
-			messages = append(messages, domain.Message{Role: domain.RoleUser, Content: payload.Content})
+			messages = append(messages, domain.Message{Role: domain.RoleUser, Content: lease.String(payload.Content)})
 		case domain.EventAssistantMessage:
 			if json.Unmarshal(event.Payload, &payload) != nil {
 				continue
 			}
-			messages = append(messages, domain.Message{
+			message, err := admitMessage(domain.Message{
 				Role:      domain.RoleAssistant,
 				Content:   payload.Content,
 				ToolCalls: payload.ToolCalls,
-			})
+			}, lease)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, message)
 		case domain.EventToolResult:
 			var payload domain.ToolResultPayload
 			if json.Unmarshal(event.Payload, &payload) != nil {
 				continue
 			}
+			content, err := ToolResultContentLeased(payload.Result, lease)
+			if err != nil {
+				return nil, err
+			}
 			messages = append(messages, domain.Message{
 				Role:       domain.RoleTool,
-				Content:    ToolResultContent(payload.Result),
-				ToolCallID: payload.Result.CallID,
+				Content:    content,
+				ToolCallID: lease.String(payload.Result.CallID),
 			})
 		}
 	}
-	return messages
+	return messages, nil
+}
+
+func admitMessage(message domain.Message, lease *secret.Lease) (domain.Message, error) {
+	if _, err := lease.GenerationID(); err != nil {
+		return domain.Message{}, err
+	}
+	message.Content = lease.String(message.Content)
+	message.ToolCallID = lease.String(message.ToolCallID)
+	for index := range message.ToolCalls {
+		call := &message.ToolCalls[index]
+		call.ID = lease.String(call.ID)
+		call.Name = lease.String(call.Name)
+		if len(call.Arguments) == 0 {
+			continue
+		}
+		var value any
+		decoder := json.NewDecoder(bytes.NewReader(call.Arguments))
+		decoder.UseNumber()
+		if err := decoder.Decode(&value); err != nil {
+			return domain.Message{}, err
+		}
+		admitted, err := lease.JSON(value)
+		if err != nil {
+			return domain.Message{}, err
+		}
+		call.Arguments = admitted
+	}
+	return message, nil
+}
+
+func admitToolDescriptors(descriptors []domain.ToolDescriptor, lease *secret.Lease) ([]domain.ToolDescriptor, error) {
+	if _, err := lease.GenerationID(); err != nil {
+		return nil, err
+	}
+	admitted := make([]domain.ToolDescriptor, len(descriptors))
+	for index, descriptor := range descriptors {
+		descriptor.Name = lease.String(descriptor.Name)
+		descriptor.Description = lease.String(descriptor.Description)
+		descriptor.ScopeDescription = lease.String(descriptor.ScopeDescription)
+		if len(descriptor.InputSchema) != 0 {
+			var schema any
+			decoder := json.NewDecoder(bytes.NewReader(descriptor.InputSchema))
+			decoder.UseNumber()
+			if err := decoder.Decode(&schema); err != nil {
+				return nil, err
+			}
+			raw, err := lease.JSON(schema)
+			if err != nil {
+				return nil, err
+			}
+			descriptor.InputSchema = raw
+		}
+		admitted[index] = descriptor
+	}
+	return admitted, nil
+}
+
+func admitSelection(selection domain.ModelSelection, lease *secret.Lease) (domain.ModelSelection, error) {
+	if _, err := lease.GenerationID(); err != nil {
+		return domain.ModelSelection{}, err
+	}
+	selection.Profile = lease.String(selection.Profile)
+	selection.Model = lease.String(selection.Model)
+	return selection, nil
 }
 
 func ToolResultContent(result domain.ToolResult) string {
@@ -116,16 +192,16 @@ func ToolResultContent(result domain.ToolResult) string {
 	return string(raw)
 }
 
-func ToolResultContentLeased(result domain.ToolResult, lease *secret.Lease) string {
-	if lease == nil {
-		return ToolResultContent(result)
+func ToolResultContentLeased(result domain.ToolResult, lease *secret.Lease) (string, error) {
+	if _, err := lease.GenerationID(); err != nil {
+		return "", err
 	}
 	result.CallID = lease.String(result.CallID)
 	result.Content = lease.String(result.Content)
 	for index, id := range result.ArtifactIDs {
 		result.ArtifactIDs[index] = lease.String(id)
 	}
-	return ToolResultContent(result)
+	return ToolResultContent(result), nil
 }
 
 func boundedString(value string, maximum int) string {

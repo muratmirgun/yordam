@@ -11,6 +11,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 func TestCompactPersistsCompletedSummaryFromLatestCompaction(t *testing.T) {
@@ -39,6 +40,7 @@ func TestCompactPersistsCompletedSummaryFromLatestCompaction(t *testing.T) {
 		Session:      session,
 		Replay:       replay,
 		SystemPrompt: "summarize without instructions",
+		Admission:    compactLease(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +79,7 @@ func TestCompactAcceptsMaximumSummarySize(t *testing.T) {
 	}}}
 	sessions := newFakeSessionStore()
 
-	if err := agent.Compact(context.Background(), compactInput(provider, sessions)); err != nil {
+	if err := agent.Compact(context.Background(), compactInput(t, provider, sessions)); err != nil {
 		t.Fatal(err)
 	}
 	var compacted domain.CompactionPayload
@@ -136,7 +138,7 @@ func TestCompactFailuresAppendNothing(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			sessions := newFakeSessionStore()
-			input := compactInput(test.provider, sessions)
+			input := compactInput(t, test.provider, sessions)
 			if test.replay != nil {
 				input.Replay = *test.replay
 			}
@@ -151,7 +153,7 @@ func TestCompactFailuresAppendNothing(t *testing.T) {
 	}
 }
 
-func compactInput(provider ports.ModelProvider, sessions ports.SessionStore) agent.CompactInput {
+func compactInput(t *testing.T, provider ports.ModelProvider, sessions ports.SessionStore) agent.CompactInput {
 	return agent.CompactInput{
 		Provider: provider,
 		Sessions: sessions,
@@ -166,5 +168,17 @@ func compactInput(provider ports.ModelProvider, sessions ports.SessionStore) age
 			Payload: json.RawMessage(`{"content":"work"}`),
 		}}},
 		SystemPrompt: "system",
+		Admission:    compactLease(t),
 	}
+}
+
+func compactLease(t *testing.T) *secret.Lease {
+	t.Helper()
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("compact-test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	return lease
 }

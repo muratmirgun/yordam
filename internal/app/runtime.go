@@ -106,6 +106,7 @@ type runtimeBuilder struct {
 	activeSession *sessionBinding
 	runtimeEvents chan<- agent.RuntimeEvent
 	httpClient    *http.Client
+	secrets       *secret.Registry
 }
 
 func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) (RuntimeSet, error) {
@@ -133,28 +134,40 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 			values = append(values, []byte(value))
 		}
 	}
-	secretRegistry := secret.NewRegistry()
+	secretRegistry := b.secrets
+	if secretRegistry == nil {
+		secretRegistry = secret.NewRegistry()
+	}
 	generationID := protocol.RuntimeGenerationID(fmt.Sprintf("runtime-%d", runtimeSecretGeneration.Add(1)))
 	admission, err := secretRegistry.Acquire(generationID, values)
 	if err != nil {
 		return RuntimeSet{}, configurationError(b.configPath, "bind runtime secret admission", err)
 	}
 	retireOnce := &sync.Once{}
+	producerLeases := make([]*secret.Lease, 0, len(cfg.Profiles)+2)
 	retire := func() {
 		retireOnce.Do(func() {
 			_ = secretRegistry.Retire(generationID)
+			_ = admission.Close()
+			for _, producer := range producerLeases {
+				_ = producer.Close()
+			}
 		})
 	}
 	succeeded := false
 	defer func() {
 		if !succeeded {
 			retire()
-			_ = admission.Close()
 		}
 	}()
 	clients := make(map[string]*openaicompat.Client, len(cfg.Profiles))
 	credentialEnvs := make(map[string]string, len(cfg.Profiles))
 	for name, profile := range cfg.Profiles {
+		clientAdmission, leaseErr := admission.Derive()
+		if leaseErr != nil {
+			return RuntimeSet{}, configurationError(b.configPath, "bind provider secret admission", leaseErr)
+		}
+		producerLeases = append(producerLeases, clientAdmission)
 		baseURL := profile.BaseURL
 		model := profile.DefaultModel
 		if name == selected.Name {
@@ -167,8 +180,8 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 			BaseURL:    baseURL,
 			APIKey:     credentials[name],
 			Model:      model,
-			Redact:     admission.String,
-			Admission:  admission,
+			Redact:     clientAdmission.String,
+			Admission:  clientAdmission,
 		})
 	}
 	provider, err := openaicompat.NewRouter(clients)
@@ -182,6 +195,16 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 		Redact:           admission,
 		Admission:        admission,
 	}
+	runnerAdmission, err := admission.Derive()
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "bind runner secret admission", err)
+	}
+	producerLeases = append(producerLeases, runnerAdmission)
+	compactAdmission, err := admission.Derive()
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "bind compaction secret admission", err)
+	}
+	producerLeases = append(producerLeases, compactAdmission)
 	progress := func(progress domain.ToolProgress) {
 		if b.runtimeEvents == nil {
 			return
@@ -211,12 +234,12 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 		Sessions:     b.store,
 		MaxToolCalls: effectiveMaxToolCalls(cfg, b.cli),
 		SystemPrompt: systemPrompt,
-		Redact:       admission.String,
-		Admission:    admission,
+		Redact:       runnerAdmission.String,
+		Admission:    runnerAdmission,
 		NewDeltaRedactor: func() agent.DeltaRedactor {
-			stream, streamErr := admission.RedactionStream()
+			stream, streamErr := runnerAdmission.RedactionStream()
 			if streamErr != nil {
-				return secret.New().Stream()
+				return failClosedDeltaRedactor{}
 			}
 			return stream
 		},
@@ -227,7 +250,7 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 	succeeded = true
 	return RuntimeSet{
 		Runtime:             runner,
-		CompactSession:      compactSession(provider, b.store),
+		CompactSession:      compactSession(provider, b.store, compactAdmission),
 		Models:              cfg.Models(),
 		DefaultSelection:    cfg.DefaultSelection(),
 		CredentialEnvs:      credentialEnvs,
@@ -242,6 +265,11 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 		retire: retire,
 	}, nil
 }
+
+type failClosedDeltaRedactor struct{}
+
+func (failClosedDeltaRedactor) Write(string) string { return "[REDACTED]" }
+func (failClosedDeltaRedactor) Close() string       { return "" }
 
 func profileKeyValues(keys map[string]string) []string {
 	values := make([]string, 0, len(keys))
@@ -267,7 +295,7 @@ func effectiveShellTimeout(cfg config.Config, options cli.Options) time.Duration
 	return time.Duration(cfg.ShellTimeoutSeconds) * time.Second
 }
 
-func compactSession(provider ports.ModelProvider, store ports.SessionStore) CompactSession {
+func compactSession(provider ports.ModelProvider, store ports.SessionStore, admission *secret.Lease) CompactSession {
 	return func(ctx context.Context, session domain.Session, replay domain.SessionReplay) error {
 		return agent.Compact(ctx, agent.CompactInput{
 			Provider:     provider,
@@ -275,6 +303,7 @@ func compactSession(provider ports.ModelProvider, store ports.SessionStore) Comp
 			Session:      session,
 			Replay:       replay,
 			SystemPrompt: systemPrompt,
+			Admission:    admission,
 		})
 	}
 }

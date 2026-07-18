@@ -142,11 +142,12 @@ type SessionInspection struct {
 }
 
 type RecoveryRequest struct {
-	OperationID        protocol.ControlOperationID
-	Journal            protocol.JournalRef
-	ExpectedHead       protocol.CommittedCursor
-	ObservedTailDigest protocol.Digest
-	TransactionID      protocol.TransactionID
+	OperationID         protocol.ControlOperationID
+	Journal             protocol.JournalRef
+	ExpectedHead        protocol.CommittedCursor
+	ObservedTailDigest  protocol.Digest
+	TransactionID       protocol.TransactionID
+	RuntimeGenerationID protocol.RuntimeGenerationID
 }
 
 type RecoveryResult struct {

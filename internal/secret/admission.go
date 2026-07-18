@@ -15,8 +15,10 @@ var ErrSecretDetected = errors.New("registered secret detected")
 // AdmissionScanner detects the raw and exact encoded forms of registered
 // secrets. It is immutable and safe for concurrent use.
 type AdmissionScanner struct {
+	mu            sync.RWMutex
 	variants      [][]byte
 	longest       int
+	revoked       bool
 	onStreamOpen  func()
 	onStreamClose func()
 }
@@ -47,7 +49,12 @@ func newAdmissionScanner(variants [][]byte, onOpen, onClose func()) *AdmissionSc
 
 func (s *AdmissionScanner) Scan(value []byte) bool {
 	if s == nil {
-		return false
+		return true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.revoked {
+		return true
 	}
 	for _, variant := range s.variants {
 		if bytes.Contains(value, variant) {
@@ -59,12 +66,36 @@ func (s *AdmissionScanner) Scan(value []byte) bool {
 
 func (s *AdmissionScanner) Stream() *AdmissionStream {
 	if s == nil {
-		s = NewAdmissionScanner()
+		s = newAdmissionScanner(nil, nil, nil)
+		s.revoke()
 	}
 	if s.onStreamOpen != nil {
 		s.onStreamOpen()
 	}
 	return &AdmissionStream{scanner: s}
+}
+
+func (s *AdmissionScanner) revoke() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.revoked = true
+	s.variants = nil
+	s.longest = 0
+	s.mu.Unlock()
+}
+
+func (s *AdmissionScanner) overlapSize() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.revoked {
+		return 0
+	}
+	return s.longest - 1
 }
 
 func (s *AdmissionStream) Write(value []byte) bool {
@@ -84,7 +115,7 @@ func (s *AdmissionStream) Write(value []byte) bool {
 		s.overlap = nil
 		return true
 	}
-	keep := s.scanner.longest - 1
+	keep := s.scanner.overlapSize()
 	if keep <= 0 {
 		s.overlap = nil
 	} else if len(candidate) <= keep {
@@ -108,7 +139,7 @@ func (s *AdmissionStream) Close() bool {
 		return detected
 	}
 	s.closed = true
-	detected := s.detected
+	detected := s.detected || s.scanner.Scan(nil)
 	onClose := s.scanner.onStreamClose
 	s.overlap = nil
 	s.mu.Unlock()

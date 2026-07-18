@@ -134,6 +134,7 @@ func (p *prepared) Preview() domain.PreparedToolRequest {
 func (p *prepared) Execute(ctx context.Context) domain.ToolResult {
 	started := time.Now()
 	buffer := output.New(p.output)
+	defer buffer.Close()
 	if err := ctx.Err(); err != nil {
 		return p.contextResult(ctx, started, buffer, nil)
 	}

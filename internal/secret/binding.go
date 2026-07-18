@@ -2,6 +2,7 @@ package secret
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 )
 
@@ -9,6 +10,22 @@ type Redacting interface {
 	String(string) string
 	Bytes([]byte) []byte
 	JSON(any) (json.RawMessage, error)
+}
+
+// AcquireLease returns an independently owned lease for the currently bound
+// runtime generation. Bindings backed only by compatibility redactors cannot
+// be used by production admission sinks.
+func (b *Binding) AcquireLease() (*Lease, error) {
+	if b == nil {
+		return nil, ErrLeaseClosed
+	}
+	b.mu.RLock()
+	lease, ok := b.current.(*Lease)
+	b.mu.RUnlock()
+	if !ok || lease == nil {
+		return nil, fmt.Errorf("generation-bound admission is required: %w", ErrLeaseClosed)
+	}
+	return lease.Derive()
 }
 
 type Binding struct {

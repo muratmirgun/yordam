@@ -164,6 +164,7 @@ func (p *prepared) Execute(ctx context.Context) domain.ToolResult {
 	}
 
 	buffer := output.New(p.output)
+	defer buffer.Close()
 	if err := streamLines(ctx, buffer, file, p.input.Offset, p.input.Limit); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return cancelled(p.request.CallID, started, err)

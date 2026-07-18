@@ -2,6 +2,7 @@ package agent_test
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -18,7 +19,10 @@ func TestBuildContextUsesLatestCompaction(t *testing.T) {
 		{Seq: 3, Kind: domain.EventUserMessage, Payload: payload(t, domain.MessagePayload{Content: "new"})},
 	}}
 
-	got := agent.BuildContext(replay, "system")
+	got, err := agent.BuildContext(replay, "system", contextLease(t))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got) != 3 || got[0].Content != "system" || got[1].Content != "old work summary" || got[2].Content != "new" {
 		t.Fatalf("context=%#v", got)
 	}
@@ -66,9 +70,12 @@ func TestToolResultContentUsesGenerationLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = lease.Close() }()
-	content := agent.ToolResultContentLeased(domain.ToolResult{
+	content, err := agent.ToolResultContentLeased(domain.ToolResult{
 		CallID: "call", Status: domain.ToolSucceeded, Content: "bW9kZWwtc2VjcmV0",
 	}, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if strings.Contains(content, "bW9kZWwtc2VjcmV0") || !strings.Contains(content, "[REDACTED]") {
 		t.Fatalf("model tool result=%q", content)
 	}
@@ -93,7 +100,10 @@ func TestBuildContextPreservesStructuredToolExchange(t *testing.T) {
 		{Seq: 3, Kind: domain.EventToolResult, Payload: payload(t, domain.ToolResultPayload{Result: denied})},
 	}}
 
-	got := agent.BuildContext(replay, "system")
+	got, err := agent.BuildContext(replay, "system", contextLease(t))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got) != 4 {
 		t.Fatalf("context=%#v", got)
 	}
@@ -124,10 +134,67 @@ func TestBuildContextIgnoresInvalidLaterCompaction(t *testing.T) {
 		{Seq: 5, Kind: domain.EventContextCompacted, Payload: payload(t, domain.CompactionPayload{FromSeq: 6, ThroughSeq: 4, Summary: "invalid summary"})},
 	}}
 
-	got := agent.BuildContext(replay, "system")
+	got, err := agent.BuildContext(replay, "system", contextLease(t))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got) != 3 || got[1].Content != "valid summary" || got[2].Content != "new" {
 		t.Fatalf("context=%#v", got)
 	}
+}
+
+func TestBuildContextAdmitsEveryHistoricalModelField(t *testing.T) {
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("generation-history", [][]byte{[]byte("history-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	encoded := "aGlzdG9yeS1zZWNyZXQ="
+	replay := domain.SessionReplay{Events: []domain.DurableEvent{
+		{Seq: 1, Kind: domain.EventContextCompacted, Payload: payload(t, domain.CompactionPayload{ThroughSeq: 0, Summary: encoded})},
+		{Seq: 2, Kind: domain.EventUserMessage, Payload: payload(t, domain.MessagePayload{Content: encoded})},
+		{Seq: 3, Kind: domain.EventAssistantMessage, Payload: payload(t, domain.MessagePayload{Content: encoded, ToolCalls: []domain.ToolCall{{ID: encoded, Name: encoded, Arguments: json.RawMessage(`{"value":"aGlzdG9yeS1zZWNyZXQ="}`)}}})},
+		{Seq: 4, Kind: domain.EventToolResult, Payload: payload(t, domain.ToolResultPayload{Result: domain.ToolResult{CallID: encoded, Status: domain.ToolSucceeded, Content: encoded, ArtifactIDs: []string{encoded}}})},
+	}}
+	messages, err := agent.BuildContext(replay, encoded, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), encoded) || !strings.Contains(string(raw), "[REDACTED]") {
+		t.Fatalf("historical context was not fully admitted: %s", raw)
+	}
+}
+
+func TestModelContextRejectsMissingOrClosedLease(t *testing.T) {
+	if _, err := agent.BuildContext(domain.SessionReplay{}, "system", nil); !errors.Is(err, secret.ErrLeaseClosed) {
+		t.Fatalf("nil context lease error=%v", err)
+	}
+	if _, err := agent.ToolResultContentLeased(domain.ToolResult{}, nil); !errors.Is(err, secret.ErrLeaseClosed) {
+		t.Fatalf("nil tool result lease error=%v", err)
+	}
+	lease := contextLease(t)
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.BuildContext(domain.SessionReplay{}, "system", lease); !errors.Is(err, secret.ErrLeaseClosed) {
+		t.Fatalf("closed context lease error=%v", err)
+	}
+}
+
+func contextLease(t *testing.T) *secret.Lease {
+	t.Helper()
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("generation-context", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	return lease
 }
 
 func payload(t testing.TB, value any) json.RawMessage {

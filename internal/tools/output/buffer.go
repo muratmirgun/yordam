@@ -3,6 +3,7 @@ package output
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -28,6 +29,7 @@ type Buffer struct {
 	data      bytes.Buffer
 	truncated bool
 	admission *secret.AdmissionStream
+	lease     *secret.Lease
 	admitErr  error
 	closed    bool
 }
@@ -36,8 +38,14 @@ func New(opts Options) *Buffer {
 	var stream *secret.AdmissionStream
 	var streamErr error
 	if opts.Admission != nil {
-		opts.Redact = opts.Admission
-		stream, streamErr = opts.Admission.Stream()
+		owned, deriveErr := opts.Admission.Derive()
+		if deriveErr != nil {
+			streamErr = deriveErr
+		} else {
+			opts.Redact = owned
+			stream, streamErr = owned.Stream()
+			return &Buffer{opts: opts, admission: stream, lease: owned, admitErr: streamErr}
+		}
 	}
 	if opts.Redact == nil {
 		opts.Redact = secret.New()
@@ -77,6 +85,9 @@ func (b *Buffer) Write(value []byte) (int, error) {
 func (b *Buffer) Snapshot() (string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.admitErr != nil || b.closed {
+		return "[REDACTED]", true
+	}
 
 	redacted := b.opts.Redact.Bytes(b.data.Bytes())
 	return string(excerpt(redacted)), b.truncated
@@ -127,10 +138,15 @@ func (b *Buffer) Close() error {
 }
 
 func (b *Buffer) closeAdmissionLocked() {
-	if b.admission == nil || b.closed {
+	if b.closed {
 		return
 	}
-	b.admission.Close()
+	if b.admission != nil {
+		b.admission.Close()
+	}
+	if b.lease != nil {
+		b.admitErr = errors.Join(b.admitErr, b.lease.Close())
+	}
 	b.closed = true
 }
 

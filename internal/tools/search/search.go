@@ -177,6 +177,7 @@ func (p *prepared) Execute(ctx context.Context) domain.ToolResult {
 	}
 
 	buffer := output.New(p.output)
+	defer buffer.Close()
 	var truncated bool
 	if p.rgPath == "" {
 		truncated, err = runFallback(ctx, buffer, root, p.input, p.maxMatches)

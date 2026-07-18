@@ -16,6 +16,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/logging"
 	"github.com/muratmirgun/yordam/internal/permission"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
 )
@@ -48,7 +49,26 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 		return nil, Snapshot{}, err
 	}
 
-	redactors := secret.NewBinding(secret.New())
+	secretRegistry := secret.NewRegistry()
+	bootstrapGeneration := protocol.RuntimeGenerationID(fmt.Sprintf("bootstrap-%d", runtimeSecretGeneration.Add(1)))
+	bootstrapAdmission, err := secretRegistry.Acquire(bootstrapGeneration, nil)
+	if err != nil {
+		return nil, Snapshot{}, fmt.Errorf("bind bootstrap admission: %w", err)
+	}
+	redactors := secret.NewBinding(bootstrapAdmission)
+	bootstrapRetireOnce := &sync.Once{}
+	bootstrapRetire := func() {
+		bootstrapRetireOnce.Do(func() {
+			_ = secretRegistry.Retire(bootstrapGeneration)
+			_ = bootstrapAdmission.Close()
+		})
+	}
+	bootstrapHandedOff := false
+	defer func() {
+		if err != nil && !bootstrapHandedOff {
+			bootstrapRetire()
+		}
+	}()
 	logger, closeDebugLog, err := openDebugLogger(options.CLI.DebugLog, redactors)
 	if err != nil {
 		return nil, Snapshot{}, err
@@ -59,7 +79,10 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 			_ = closeDebugLog()
 		}
 	}()
-	store := jsonl.New(dataDir, jsonl.Options{Sanitize: redactors.JSON})
+	store, err := jsonl.NewAdmitted(dataDir, jsonl.Options{Sanitize: redactors.JSON, Secrets: secretRegistry, Admission: redactors})
+	if err != nil {
+		return nil, Snapshot{}, err
+	}
 	cfg, configPath, configErr := loadBootstrapConfig(options)
 	initialSelection := domain.ModelSelection{}
 	if configErr == nil && !options.CLI.Continue && options.CLI.Session == "" {
@@ -101,13 +124,14 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 		activeSession: activeSession,
 		runtimeEvents: runtimeEvents,
 		httpClient:    options.HTTPClient,
+		secrets:       secretRegistry,
 	}
-	runtimeSet := RuntimeSet{ConfigurationError: configErr, configPath: configPath}
+	runtimeSet := RuntimeSet{ConfigurationError: configErr, configPath: configPath, Admission: bootstrapAdmission, Redactor: bootstrapAdmission, RuntimeGenerationID: bootstrapGeneration, retire: bootstrapRetire}
 	if configErr == nil {
 		candidate, buildErr := builder.build(cfg, session.Selection)
 		if buildErr != nil {
 			configErr = buildErr
-			runtimeSet = RuntimeSet{Models: cfg.Models(), DefaultSelection: cfg.DefaultSelection(), ConfigurationError: buildErr, configPath: configPath}
+			runtimeSet = RuntimeSet{Models: cfg.Models(), DefaultSelection: cfg.DefaultSelection(), ConfigurationError: buildErr, configPath: configPath, Admission: bootstrapAdmission, Redactor: bootstrapAdmission, RuntimeGenerationID: bootstrapGeneration, retire: bootstrapRetire}
 		} else {
 			runtimeSet = candidate
 			if options.CLI.ProfileSet || options.CLI.ModelSet {
@@ -134,6 +158,7 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 				}
 			}
 			redactors.Replace(candidate.Redactor)
+			bootstrapRetire()
 			configErr = candidate.Ready(session.Selection)
 		}
 	}
@@ -170,6 +195,7 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 		SessionChanged: activeSession.set,
 	})
 	debugLogOwned = false
+	bootstrapHandedOff = true
 	if logger != nil {
 		if err := logger.Event("bootstrap", map[string]any{
 			"workspace": workspace.CanonicalPath,
@@ -276,10 +302,15 @@ func selectSession(
 	return session, replay, nil
 }
 
-func openDebugLogger(path string, redactor secret.Redacting) (*logging.Logger, func() error, error) {
+func openDebugLogger(path string, redactor *secret.Binding) (*logging.Logger, func() error, error) {
 	if path == "" {
 		return nil, nil, nil
 	}
+	lease, err := redactor.AcquireLease()
+	if err != nil {
+		return nil, nil, fmt.Errorf("validate debug log admission: %w", err)
+	}
+	_ = lease.Close()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, nil, fmt.Errorf("create debug log directory: %w", err)
 	}
@@ -291,7 +322,12 @@ func openDebugLogger(path string, redactor secret.Redacting) (*logging.Logger, f
 		_ = file.Close()
 		return nil, nil, fmt.Errorf("set debug log permissions: %w", err)
 	}
-	return logging.New(file, redactor), file.Close, nil
+	logger, err := logging.NewGenerationBound(file, redactor)
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	return logger, file.Close, nil
 }
 
 func zeroBytes(value []byte) {

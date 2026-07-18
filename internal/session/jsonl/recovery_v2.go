@@ -54,6 +54,21 @@ func (s *Store) RecoverSession(ctx context.Context, request journal.RecoveryRequ
 	if err := validateRecoveryRequest(request); err != nil {
 		return journal.RecoveryResult{}, err
 	}
+	if s.secrets != nil && request.RuntimeGenerationID == "" {
+		return journal.RecoveryResult{}, fmt.Errorf("runtime generation is required for recovery admission")
+	}
+	if s.secrets != nil {
+		lease, err := s.secrets.AcquireExisting(request.RuntimeGenerationID)
+		if err != nil {
+			return journal.RecoveryResult{}, fmt.Errorf("acquire recovery admission lease: %w", err)
+		}
+		raw, marshalErr := canonicaljson.Marshal(request)
+		admitErr := lease.Admit(raw)
+		closeErr := lease.Close()
+		if err := errors.Join(marshalErr, admitErr, closeErr); err != nil {
+			return journal.RecoveryResult{}, fmt.Errorf("admit recovery request metadata: %w", err)
+		}
+	}
 	lock := s.journalLock(request.Journal)
 	if err := lock.lock(ctx); err != nil {
 		return journal.RecoveryResult{}, err
@@ -356,6 +371,7 @@ func (s *Store) admitRecoveryDiagnosticAppend(
 		proposed := protocol.ProposedEvent{
 			EventID: protocol.EventID(operationPrefix + ":compatibility"), Time: eventTime, PayloadVersion: 1,
 			Kind: protocol.EventMigrationCompatibilityDeclared, SessionID: protocol.SessionID(request.Journal.ID), Payload: payload,
+			RuntimeGenerationID: request.RuntimeGenerationID,
 		}
 		admitted.CompatibilityPayload, err = s.admitRecoveryPayload(proposed)
 		if err != nil {
@@ -369,6 +385,7 @@ func (s *Store) admitRecoveryDiagnosticAppend(
 	proposed := protocol.ProposedEvent{
 		EventID: protocol.EventID(operationPrefix + ":diagnostic"), Time: eventTime, PayloadVersion: 1,
 		Kind: protocol.EventRecoveryDiagnostic, SessionID: protocol.SessionID(request.Journal.ID), Payload: diagnosticPayload,
+		RuntimeGenerationID: request.RuntimeGenerationID,
 	}
 	admitted.DiagnosticPayload, err = s.admitRecoveryPayload(proposed)
 	if err != nil {
@@ -465,7 +482,7 @@ func (s *Store) buildRecoveryDiagnosticAppend(
 			JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
 			EventID: identity.compatibilityEventID, SessionID: protocol.SessionID(request.Journal.ID),
 			Seq: seq, Time: eventTime, Kind: protocol.EventMigrationCompatibilityDeclared,
-			TransactionID: request.TransactionID, Payload: compatibilityPayload,
+			RuntimeGenerationID: request.RuntimeGenerationID, TransactionID: request.TransactionID, Payload: compatibilityPayload,
 		})
 		seq++
 	} else if len(admitted.CompatibilityPayload) != 0 {
@@ -475,6 +492,7 @@ func (s *Store) buildRecoveryDiagnosticAppend(
 	diagnosticEvent := protocol.ProposedEvent{
 		EventID: protocol.EventID(operationPrefix + ":diagnostic"), Time: eventTime, PayloadVersion: 1,
 		Kind: protocol.EventRecoveryDiagnostic, SessionID: protocol.SessionID(request.Journal.ID), Payload: diagnosticPayload,
+		RuntimeGenerationID: request.RuntimeGenerationID,
 	}
 	identity.admittedPayloads[diagnosticEvent.EventID] = protocol.CloneRawMessage(diagnosticPayload)
 	appendRequest.Events = []protocol.ProposedEvent{diagnosticEvent}
@@ -483,7 +501,7 @@ func (s *Store) buildRecoveryDiagnosticAppend(
 		JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
 		EventID: diagnosticEvent.EventID, SessionID: diagnosticEvent.SessionID,
 		Seq: seq, Time: diagnosticEvent.Time, Kind: diagnosticEvent.Kind,
-		TransactionID: request.TransactionID, Payload: diagnosticPayload,
+		RuntimeGenerationID: request.RuntimeGenerationID, TransactionID: request.TransactionID, Payload: diagnosticPayload,
 	})
 
 	digest, err := canonicaljson.TransactionDigest(envelopes)
@@ -505,7 +523,7 @@ func (s *Store) buildRecoveryDiagnosticAppend(
 		JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
 		EventID: identity.markerEventID, SessionID: protocol.SessionID(request.Journal.ID),
 		Seq: envelopes[len(envelopes)-1].Seq + 1, Time: eventTime, Kind: protocol.EventTransactionCommitted,
-		TransactionID: request.TransactionID, Payload: markerPayload,
+		RuntimeGenerationID: request.RuntimeGenerationID, TransactionID: request.TransactionID, Payload: markerPayload,
 	}
 	raw := make([]byte, 0)
 	for _, envelope := range envelopes {

@@ -316,10 +316,11 @@ func waitForPID(t *testing.T, path string) int {
 		raw, err := os.ReadFile(path)
 		if err == nil {
 			pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-			if err != nil {
-				t.Fatal(err)
+			if err == nil {
+				return pid
 			}
-			return pid
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
 		if !os.IsNotExist(err) {
 			t.Fatal(err)

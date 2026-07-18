@@ -99,12 +99,15 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 	if max < 1 || max > 128 {
 		return fmt.Errorf("max tool calls must be 1..128")
 	}
+	messages, err := BuildContext(input.Replay, ComposeSystemPrompt(r.SystemPrompt, input.Session.Mode), r.Admission)
+	if err != nil {
+		return fmt.Errorf("build admitted model context: %w", err)
+	}
 	prompt := r.redact(input.Prompt)
 	if _, err := r.Sessions.Append(ctx, input.Session.ID, domain.EventUserMessage, domain.MessagePayload{Content: prompt}); err != nil {
 		return err
 	}
 
-	messages := BuildContext(input.Replay, ComposeSystemPrompt(r.SystemPrompt, input.Session.Mode))
 	messages = append(messages, domain.Message{Role: domain.RoleUser, Content: prompt})
 	completedTools := 0
 	for {
@@ -113,10 +116,18 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 		}
 
 		r.emit(RuntimeEvent{Kind: RuntimeStateChanged, State: "streaming_model"})
+		selection, err := admitSelection(input.Session.Selection, r.Admission)
+		if err != nil {
+			return r.appendTerminal(ctx, input.Session.ID, domain.EventTurnFailed, domain.TurnTerminalPayload{Reason: err.Error(), ErrorKind: domain.ErrorProviderFatal}, err)
+		}
+		descriptors, err := admitToolDescriptors(r.Tools.Descriptors(), r.Admission)
+		if err != nil {
+			return r.appendTerminal(ctx, input.Session.ID, domain.EventTurnFailed, domain.TurnTerminalPayload{Reason: err.Error(), ErrorKind: domain.ErrorProviderFatal}, err)
+		}
 		stream, err := r.Provider.Stream(ctx, domain.ModelRequest{
-			Selection: input.Session.Selection,
+			Selection: selection,
 			Messages:  messages,
-			Tools:     r.Tools.Descriptors(),
+			Tools:     descriptors,
 		})
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -131,12 +142,12 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 		var deltaRedactor DeltaRedactor = passthroughDeltaRedactor{}
 		if r.NewDeltaRedactor != nil {
 			deltaRedactor = r.NewDeltaRedactor()
+		} else if r.Redact != nil {
+			deltaRedactor = &bufferedDeltaRedactor{redact: r.Redact}
 		} else if r.Admission != nil {
 			if admitted, err := r.Admission.RedactionStream(); err == nil {
 				deltaRedactor = admitted
 			}
-		} else if r.Redact != nil {
-			deltaRedactor = &bufferedDeltaRedactor{redact: r.Redact}
 		}
 	streamLoop:
 		for {
@@ -231,6 +242,7 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 				} else {
 					preview := prepared.Preview()
 					preview.Mutation = tool.Descriptor().Mutation
+					expectedApprovalScope := approvalScope(preview)
 					decision := r.Policy.Evaluate(ctx, ports.PermissionContext{
 						SessionID: input.Session.ID,
 						Mode:      input.Session.Mode,
@@ -246,6 +258,7 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 						}
 						preview = prepared.Preview()
 						preview.Mutation = tool.Descriptor().Mutation
+						expectedApprovalScope = approvalScope(preview)
 						preview = r.redactPreview(preview)
 					}
 					requestedPreview := preview
@@ -272,8 +285,8 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 					if err := ctx.Err(); err != nil {
 						return r.interrupt(ctx, input.Session.ID, err)
 					}
-					if approved && !validApprovalResponse(decision, approvalScope(preview)) {
-						decision = domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: approvalScope(preview), Reason: "invalid approval response"}
+					if approved && !validApprovalResponse(decision, expectedApprovalScope) {
+						decision = domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: expectedApprovalScope, Reason: "invalid approval response"}
 					}
 					if approved && decision.Action == domain.PermissionAllow {
 						if deferredOutsidePreview {
@@ -291,6 +304,7 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 							}
 							preview = prepared.Preview()
 							preview.Mutation = tool.Descriptor().Mutation
+							expectedApprovalScope = approvalScope(preview)
 							preview = r.redactPreview(preview)
 						}
 						if deferredOutsidePreview {
@@ -307,8 +321,8 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 								}
 								return r.appendTerminal(ctx, input.Session.ID, domain.EventTurnFailed, domain.TurnTerminalPayload{Reason: err.Error(), ErrorKind: domain.ErrorToolFailed}, err)
 							}
-							if !validApprovalResponse(decision, approvalScope(preview)) {
-								decision = domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: approvalScope(preview), Reason: "invalid approval response"}
+							if !validApprovalResponse(decision, expectedApprovalScope) {
+								decision = domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: expectedApprovalScope, Reason: "invalid approval response"}
 							}
 						}
 					}
@@ -327,7 +341,7 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 						return err
 					}
 					if granter != nil {
-						granter.GrantSession(preview.Request.Name, approvalScope(preview))
+						granter.GrantSession(preview.Request.Name, expectedApprovalScope)
 					}
 					if err := ctx.Err(); err != nil {
 						return r.interrupt(ctx, input.Session.ID, err)
@@ -369,7 +383,11 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 			if postToolErr != nil {
 				return r.appendTerminal(resultContext, input.Session.ID, domain.EventTurnFailed, domain.TurnTerminalPayload{Reason: postToolErr.Error(), ErrorKind: domain.ErrorToolFailed}, postToolErr)
 			}
-			messages = append(messages, domain.Message{Role: domain.RoleTool, ToolCallID: call.ID, Content: ToolResultContentLeased(result, r.Admission)})
+			toolContent, err := ToolResultContentLeased(result, r.Admission)
+			if err != nil {
+				return r.appendTerminal(resultContext, input.Session.ID, domain.EventTurnFailed, domain.TurnTerminalPayload{Reason: err.Error(), ErrorKind: domain.ErrorToolFailed}, err)
+			}
+			messages = append(messages, domain.Message{Role: domain.RoleTool, ToolCallID: r.redact(call.ID), Content: toolContent})
 			completedTools++
 			if err := ctx.Err(); err != nil {
 				return r.interrupt(ctx, input.Session.ID, err)
@@ -384,7 +402,7 @@ func (r Runner) redactPreview(preview domain.PreparedToolRequest) domain.Prepare
 	}
 	preview.Summary = r.redact(preview.Summary)
 	preview.ProposedDiff = r.redact(preview.ProposedDiff)
-	preview.ApprovalScope = preview.CanonicalScope
+	preview.ApprovalScope = r.redact(preview.ApprovalScope)
 	preview.CanonicalScope = r.redact(preview.CanonicalScope)
 	if preview.FilePlan != nil {
 		plan := *preview.FilePlan
@@ -396,10 +414,10 @@ func (r Runner) redactPreview(preview domain.PreparedToolRequest) domain.Prepare
 
 func (r Runner) redact(value string) string {
 	if r.Admission != nil {
-		return r.Admission.String(value)
+		value = r.Admission.String(value)
 	}
 	if r.Redact != nil {
-		return r.Redact(value)
+		value = r.Redact(value)
 	}
 	return value
 }

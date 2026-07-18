@@ -188,6 +188,7 @@ func (p *prepared) buildPreview(ctx context.Context, before, after []byte, mode 
 		return fmt.Errorf("label edit diff: %w", err)
 	}
 	buffer := output.New(p.output)
+	defer buffer.Close()
 	if err := writeUnifiedDiff(buffer, before, after, relative); err != nil {
 		return fmt.Errorf("generate edit diff: %w", err)
 	}

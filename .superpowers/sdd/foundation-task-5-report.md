@@ -2,178 +2,212 @@
 
 Date: 2026-07-18
 
-Accepted base/head: `1ad106038d6d90651895f022bd4729cd4ad119c3`
+Accepted signed base before Task 5: `1ad106038d6d90651895f022bd4729cd4ad119c3`
 
-## Precondition evidence
+Rejected Task 5 commit: `9187376587a493223b20c4ea69bd34e11f699b07` (`feat: add content addressed evidence`)
 
-- `git status --short` produced no output before the first edit.
-- `git rev-parse HEAD` returned `1ad106038d6d90651895f022bd4729cd4ad119c3`.
-- `git verify-commit HEAD` returned a good signature from `Murat Mirgün Ercan (github) <muratmirgunercan225@gmail.com>` using RSA key `C333D69A035F6B952A9AC361E1E0E3973D0B6F43`.
-- `internal/protocol/evidence.go` was consumed unchanged.
-- `.superpowers/sdd/progress.md` was not modified.
+## Preconditions and protected scope
 
-## RED evidence
+- The rejection remediation began from clean `9187376587a493223b20c4ea69bd34e11f699b07`.
+- `git verify-commit 9187376587a493223b20c4ea69bd34e11f699b07` reported a good signature from Murat Mirgün Ercan using key `C333D69A035F6B952A9AC361E1E0E3973D0B6F43`.
+- `internal/protocol/evidence.go` remains byte-for-byte unchanged by this remediation.
+- `.superpowers/sdd/progress.md` remains unchanged.
+- No configuration schema, configuration persistence, or reload-policy contract was added or changed.
 
-The initial focused tests were written before the Task 5 production packages and APIs.
+## Rejection RED evidence
 
-Command:
+Regression tests were written before each remediation group.
+
+Lease revocation and producer ownership:
 
 ```text
-go test ./internal/secret ./internal/evidence ./internal/recovery -count=1
+go test ./internal/secret -run 'TestClosedLease|TestRetiredGenerationKeeps' -count=1
 ```
 
-Result: exit 1.
+Result: exit 1. `*secret.Lease` had no `Derive` method; closed leases still retained usable scanner/redactor state.
+
+Mandatory model-context admission:
 
 ```text
-github.com/muratmirgun/yordam/internal/evidence: no non-test Go files in .../internal/evidence
-github.com/muratmirgun/yordam/internal/recovery: no non-test Go files in .../internal/recovery
-internal/secret/admission_test.go:13:20: undefined: secret.NewAdmissionScanner
-internal/secret/registry_test.go:12:21: undefined: secret.NewRegistry
-FAIL github.com/muratmirgun/yordam/internal/secret [build failed]
-FAIL github.com/muratmirgun/yordam/internal/evidence [build failed]
-FAIL github.com/muratmirgun/yordam/internal/recovery [build failed]
+go test ./internal/agent -run 'TestBuildContextAdmitsEvery|TestModelContextRejects' -count=1
 ```
 
-The currently reachable sink adapters were then tested before their leased APIs were added.
+Result: exit 1. `BuildContext` accepted no lease and returned no error; `ToolResultContentLeased` still had a nil-lease compatibility fallback.
 
-Command:
+Pinned recovery generation:
 
 ```text
-go test ./internal/logging ./internal/tools/output ./internal/session/jsonl -run 'Test(LeasedLogger|BufferLease|AppendBatchUsesGenerationLease|ArtifactAdmission)' -count=1
+go test ./internal/session/jsonl -run TestRecoveryPinsGenerationAcrossFaultAndRestartAdmission -count=1
 ```
 
-Result: exit 1. Failures were the missing `logging.NewLeased`, `output.Options.Admission`, `jsonl.Options.Secrets`, `jsonl.Options.ArtifactAdmission`, and `secret.ErrSecretDetected` contracts.
+Result: exit 1. `journal.RecoveryRequest` had no `RuntimeGenerationID` field. After adding the field, the first deterministic-replay attempt remained RED because the prepared marker bytes omitted the pinned generation; the marker was then fixed and the fault/restart test passed.
 
-The Step 4 sink audit added provider, model-result, application-publishing, and runtime-lease tests before wiring.
-
-Command:
+Full envelope metadata admission:
 
 ```text
-go test ./internal/app ./internal/provider/openaicompat ./internal/agent -run 'Test(PublishUsesGenerationLease|ProviderNormalizationUsesLease|ToolResultContentUsesGenerationLease|RuntimeBuilderRedactsConfigured)' -count=1
+go test ./internal/session/jsonl -run TestAppendBatchRejectsSecretInFullEnvelopeMetadataBeforeWrite -count=1
 ```
 
-Result: exit 1. Failures were the missing `ToolResultContentLeased`, provider `Admission`, lease-capable binding, and runtime `Admission`/`RuntimeGenerationID` contracts.
+Result: exit 1. Secret event kind reached codec validation and secret actor/event identity metadata was not rejected by admission before journal mutation.
 
-A final focused diagnostic test was also observed RED before the fix.
-
-Command:
+Production composition:
 
 ```text
-go test ./internal/agent -run TestRunnerAdmitsDiagnosticReasonBeforePersistence -count=1
+go test ./internal/app ./internal/session/jsonl ./internal/secret -run 'TestRuntimeBuilderRegistersGeneration|TestNewAdmitted|TestBindingAcquires' -count=1
 ```
 
-Result: exit 1 because the persisted terminal reason still contained `ZGlhZ25vc3RpYy1zZWNyZXQ=`. After admitting terminal reasons through the lease, the same command passed.
+Result: exit 1. The runtime builder had no shared registry field, JSONL had no strict `NewAdmitted` constructor/generation binding, and bindings could not acquire independently owned leases.
 
-## Implemented contracts and design notes
-
-### Generation-leased secret admission
-
-- `AdmissionScanner` expands every non-empty raw value to raw bytes, padded and unpadded standard Base64, padded and unpadded URL-safe Base64, lowercase hex, and uppercase hex. Exact duplicate variants are removed.
-- Chunked scanning retains exactly `longestVariant-1` bytes of overlap, so variants split at arbitrary write boundaries are detected.
-- `Registry.Acquire` pins an immutable scanner/redactor to a runtime generation. `Retire` rejects new acquisitions. Existing producer leases and leased redaction/admission streams retain their variants until their own lifetime closes.
-- Lease JSON admission redacts values while preserving ordinary schema keys. If a registered variant survives in a structural key, admission fails closed to a minimal redacted JSON object instead of writing the key.
-
-### Immutable evidence
-
-- The retained limit is 10 MiB. Truncated records retain the original size and hash only the retained immutable content.
-- Blobs live at `workspaces/<workspace>/evidence/blobs/sha256/<digest>` and deduplicate across sessions in the same workspace.
-- Blob and metadata publication use same-directory temporary regular files, file sync, hard-link create-no-replace publication, identity verification, temporary removal, and directory sync.
-- Metadata lives at `evidence/records/<evidence-id>.json`, is canonicalized, body-digested, immutable, and never replaced.
-- Registered secret content produces `ContentWithheldSecret`, `Redacted=true`, and a nil blob. No candidate content is written.
-- `Open` safely resolves a regular file, reads it before returning, and verifies both size and SHA-256. Missing, digest-mismatched, and unsafe substituted blobs cannot verify.
-- `Get` leaves immutable metadata untouched and returns a freshly body-digested missing/corrupt projection. The store records typed recovery diagnostics, and `VerifyReceipt` returns `ErrEvidenceUnavailable` when any dependent evidence cannot verify.
-
-### Confidential recovery material
-
-- Candidate validation, preimage digest comparison, and exact admission scanning all happen before the recovery root, a temporary file, or a final file is created.
-- Recovery directories are forced to `0700`; material and metadata files are forced to `0600`.
-- An injected optional `Sealer` runs in memory before publication, and the protocol record states whether sealing was used.
-- `Candidate` has no JSON tags, rejects JSON marshaling, and implements redacted `String`/`GoString`; the store exposes no material read/display method.
-
-### Legacy artifact migration
-
-- Migration resolves a legacy artifact ID beneath the store-owned workspace/session/artifact hierarchy; caller paths are never accepted as identity.
-- Traversal, non-regular files, symlinks, ambiguous session identities, and substitutions are rejected.
-- Content is lazily hashed and published through the evidence store. A durable alias maps `(session ID, legacy artifact ID)` to the immutable evidence ID, so subsequent resolution does not reopen or rehash the legacy source.
-
-### Step 4 sink audit
-
-- Journal encoding and recovery-diagnostic admission: `jsonl.Store` optionally acquires the event generation for every encoded proposal; compatibility events inherit the caller generation. Persisted recovery admission reuses the same entry point and therefore fails closed without a generation instead of bypassing scanning.
-- Legacy artifact output: a configured artifact lease scans the complete bounded candidate before any temporary/final artifact write.
-- Provider normalization: the OpenAI-compatible client holds the runtime lease, performs boundary-safe SSE text redaction, and re-admits completed tool-call IDs, names, and JSON arguments before emission.
-- Tool normalization and model-visible construction: `Runner` re-admits prompts, deltas, tool calls, previews, results, and terminal diagnostic reasons. `ToolResultContentLeased` performs a final model-result admission step.
-- Evidence and recovery: both require a non-nil scanner at construction and scan before persistence.
-- Logging: `NewLeased` requires a producer lease. The bootstrap logger's binding holds the active runtime lease and therefore receives the same exact encoded variants.
-- Application publishing: the active binding accepts a generation lease, and all app events/errors are sanitized before they enter the published queue or logger.
-- TUI: there is no separate production ingress or sink. `tui.Run` and `tui.Model` consume only `application.Events()`, which is admitted before queue publication. TUI tests that inject raw events are test harnesses, not a production bypass.
-- Fake/headless: there is no production headless adapter in this repository. Acceptance and agent fixtures consume the same admitted app/runtime paths; direct fixture providers are test-only.
-
-No config schema, config persistence, or reload policy contract was added or changed. Runtime reload only retires the previous secret generation after successful activation; an already-leased producer keeps its immutable variants for its remaining lifetime.
-
-## GREEN evidence
-
-Focused admission/storage command:
+Evidence bounds, metadata, and rooted identity:
 
 ```text
-go test ./internal/secret ./internal/evidence ./internal/recovery -count=1
-ok github.com/muratmirgun/yordam/internal/secret 0.356s
-ok github.com/muratmirgun/yordam/internal/evidence 1.034s
-ok github.com/muratmirgun/yordam/internal/recovery 0.295s
+go test ./internal/evidence -run 'TestEvidenceRejectsSecretMetadata|TestEvidenceFailsAfterPinned' -count=1
 ```
 
-Focused reachable-sink command:
+Result: exit 1. Evidence still accepted arbitrary scanners, had no closeable owned lease, created/published before complete metadata admission, and did not pin root/ancestor identities.
+
+Rooted legacy migration:
 
 ```text
-go test ./internal/logging ./internal/tools/output ./internal/session/jsonl ./internal/provider/openaicompat ./internal/agent ./internal/app -count=1
-ok github.com/muratmirgun/yordam/internal/logging 0.214s
-ok github.com/muratmirgun/yordam/internal/tools/output 0.283s
-ok github.com/muratmirgun/yordam/internal/session/jsonl 33.896s
-ok github.com/muratmirgun/yordam/internal/provider/openaicompat 3.238s
-ok github.com/muratmirgun/yordam/internal/agent 0.249s
-ok github.com/muratmirgun/yordam/internal/app 4.421s
+go test ./internal/evidence -run TestLegacy -count=1
 ```
 
-Required security/race command:
+Result: exit 1. `LegacyResolver` and `WithLegacyResolver` did not exist; the implementation still enumerated arbitrary workspace directories and trusted undigested aliases.
+
+Atomic recovery publication:
 
 ```text
-go test -race ./internal/secret ./internal/evidence ./internal/recovery ./internal/tools/output ./internal/session/jsonl -count=1
-ok github.com/muratmirgun/yordam/internal/secret 1.322s
-ok github.com/muratmirgun/yordam/internal/evidence 2.003s
-ok github.com/muratmirgun/yordam/internal/recovery 1.279s
-ok github.com/muratmirgun/yordam/internal/tools/output 1.586s
-ok github.com/muratmirgun/yordam/internal/session/jsonl 61.876s
+go test ./internal/recovery -run 'TestRecoveryRejectsSecretMetadata|TestRecoverySingleContainer' -count=1
+```
+
+Result: exit 1. Recovery still accepted an arbitrary scanner, exposed no closeable owned lease, and had no fault points or crash-reconcilable single-container publication.
+
+Generation-bound production logging:
+
+```text
+go test ./internal/logging -run TestGenerationBound -count=1
+```
+
+Result: exit 1 because `logging.NewGenerationBound` did not exist.
+
+## Remediation of the nine Important findings
+
+### 1. No production admission bypass
+
+- Bootstrap now creates one shared generation registry before the logger/store/runtime composition.
+- `jsonl.NewAdmitted` requires both that registry and a live generation binding. Bootstrap uses only this strict constructor.
+- Runtime generations register in the shared registry rather than private per-build registries.
+- Debug logging uses `NewGenerationBound`; every event acquires an owned lease from the active binding and rejects a missing generation.
+- Artifact writes in the strict store acquire a live generation lease before reading or creating a temporary.
+- Compatibility constructors remain available for tests and v0.1 adapters, but are not reachable from production bootstrap.
+
+### 2. Recovery generation survives fault/restart
+
+- `journal.RecoveryRequest` now carries `RuntimeGenerationID`.
+- Recovery request manifests pin that generation because they persist the complete request.
+- Compatibility, recovery-diagnostic, and transaction-marker envelopes all carry the same generation.
+- Deterministic replay reconstructs the exact admitted bytes, including the generation.
+- Recovery request IDs/journal/head/transaction/generation metadata are admitted before manifest persistence.
+- An enabled-registry fault/restart test proves the same generation bytes survive retry.
+
+### 3. Every model-visible context field is leased
+
+- `BuildContext` now requires a live lease and returns an error.
+- System prompts, historical compaction summaries, user/assistant/tool messages, tool call IDs/names/arguments, tool-result IDs/content/artifact IDs, model selection, and tool descriptor names/descriptions/scopes/schemas are admitted.
+- `ToolResultContentLeased` rejects nil/closed leases; its permissive fallback was removed.
+- Runner and compaction both use independently owned generation leases.
+- Registered encoded variants in historical/compatibility replay cannot reach the provider.
+
+### 4. Registry and stream lifecycle is fail closed
+
+- `Lease.Derive` creates an independently owned producer lease.
+- Retirement blocks new producers while already-derived producers and buffers pin the generation.
+- Closing a lease revokes its scanner, redactor, admission streams, and redaction streams; lease-local variants and pending stream bytes are cleared.
+- Closed `String`/`Bytes` return only `[REDACTED]`; `JSON`, `Admit`, `Derive`, and stream acquisition return `ErrLeaseClosed`.
+- Provider clients, runner, compaction, output buffers, logger events, journal/artifact writes, evidence, and recovery each own or derive their producer lifetime.
+- Snapshot-only and error paths in read/search/edit/shell/workspace inspection now close buffers.
+- Focused and full race runs cover close/retire/reload/old-buffer behavior.
+
+### 5. Bounded evidence retention and pre-publication validation
+
+- Evidence clones only `candidate.Content[:min(limit,len)]`; it never clones the full oversized candidate before truncation.
+- Candidate non-content bounds and complete record-body bounds are validated before blob publication.
+- Secret/invalid metadata tests use multi-megabyte content and prove the storage root remains absent.
+
+### 6. Complete metadata/envelope admission
+
+- Evidence and recovery constructors require generation leases, not arbitrary scanners.
+- Evidence admits canonical ID/kind/workspace/session/media/activity/actor/subject/alias metadata before filesystem access.
+- Recovery admits canonical workspace/activity/checkpoint/subject/digest/mode metadata and material before filesystem access.
+- Journal append admits journal/head/transaction and every proposed non-payload envelope field before mutation; payload admission still redacts through the event encoder.
+- Explicit recovery admits the full request before persisting a manifest.
+- Encoded identity/path/actor/subject variants are rejected and leave no new durable bytes.
+
+### 7. Evidence/recovery root identity is pinned
+
+- Both stores normalize through the nearest existing canonical ancestor but create no root until validation/admission succeeds.
+- On first valid write they lazily create/open one `os.Root`, retain it for the store lifetime, and pin every root/ancestor inode.
+- Every later operation verifies the complete identity chain and uses only rooted relative operations.
+- Root replacement, ancestor replacement, symlinks, and non-regular substitutions fail closed.
+
+### 8. Recovery publication is one crash-reconcilable unit
+
+- Recovery ID is deterministic from admitted candidate metadata.
+- Metadata and material are encoded into one versioned `.recovery` container, eliminating split material/metadata finals.
+- Publication uses a synced regular temporary, hard-link no-replace, regular/SameFile final verification, temporary removal, and directory sync.
+- Startup/retry reconciles only verified regular recovery temporaries and validates final container digest/provenance before returning it.
+- Fault tests cover temporary-synced, before-publish, after-publish, and directory-synced windows and prove retry leaves exactly one final container.
+
+### 9. Legacy migration is rooted and verifiable
+
+- Evidence no longer enumerates `workspaces/` or opens caller-derived arbitrary workspace paths.
+- Migration requires an injected `LegacyResolver`; `jsonl.Store` implements it by opening one identified session/artifact through its store-owned rooted transaction.
+- Alias metadata contains workspace/session/artifact/target identity and a canonical digest.
+- Target evidence ID is deterministic, and every alias hit/`ErrEvidenceExists` path verifies workspace/session/kind/media/activity/actor/subject/alias provenance.
+- Alias hits return without reopening or rehashing the legacy source; tampered alias/record, ambiguous resolver, traversal, symlink, and substitution paths fail closed.
+
+## Verification evidence
+
+Focused journal/evidence/recovery verification:
+
+```text
+go test ./internal/session/jsonl ./internal/recovery ./internal/evidence -count=1
+ok github.com/muratmirgun/yordam/internal/session/jsonl 29.823s
+ok github.com/muratmirgun/yordam/internal/recovery 0.627s
+ok github.com/muratmirgun/yordam/internal/evidence 1.711s
+
+go test -race ./internal/recovery ./internal/evidence -count=1
+ok github.com/muratmirgun/yordam/internal/recovery 1.615s
+ok github.com/muratmirgun/yordam/internal/evidence 2.463s
+```
+
+Lifecycle race verification:
+
+```text
+go test -race ./internal/secret ./internal/tools/output ./internal/logging ./internal/app -count=1
+ok github.com/muratmirgun/yordam/internal/secret 1.423s
+ok github.com/muratmirgun/yordam/internal/tools/output 1.797s
+ok github.com/muratmirgun/yordam/internal/logging 1.374s
+ok github.com/muratmirgun/yordam/internal/app 4.996s
 ```
 
 Repository verification:
 
 ```text
-go test ./...
+go test ./... -count=1
 ```
 
-Result: exit 0. All packages passed; packages without tests reported `[no test files]`. Notable uncached results included `internal/app 4.921s`, `internal/evidence 1.622s`, `internal/integration 1.492s`, `internal/recovery 0.151s`, `internal/session/jsonl 36.793s`, and `internal/tui 0.344s`.
+Result: exit 0. All packages passed. Notable uncached results: `internal/app 5.169s`, `internal/evidence 2.399s`, `internal/integration 1.608s`, `internal/recovery 0.410s`, `internal/session/jsonl 31.559s`, `internal/tools/shell 1.053s`.
+
+```text
+go test -race ./... -count=1
+```
+
+Result: exit 0. All packages passed in the final post-review run. Notable results: `internal/app 6.003s`, `internal/evidence 2.830s`, `internal/recovery 1.564s`, `internal/secret 1.281s`, `internal/session/jsonl 65.706s`, `internal/tools/output 1.586s`.
 
 ```text
 go vet ./...
-```
-
-Result: exit 0 with no output.
-
-```text
-gofmt -w <all Task 5 Go files>
 git diff --check
 ```
 
-Result: exit 0 with no output.
-
-## Required security cases
-
-- Digest mismatch: covered for recovery candidate admission and corrupted evidence blobs.
-- Missing blob: covered with missing projection, diagnostic, and failed verification.
-- Truncation: covered at the 10 MiB boundary with retained content verification.
-- Symlink/substitution: covered for evidence blobs and legacy artifact sources.
-- Provenance: covered for workspace, session, activity, actor, subject, kind, and media type.
-- No-replace races: covered for concurrent immutable evidence metadata publication.
-- Encoded-secret zero on disk: covered for evidence, recovery, artifacts, journal records, logs, and model/tool artifacts.
-- Streaming boundary: covered for scanners and provider SSE normalization.
-- Registry retirement: covered for rejected new producers plus buffered stream lifetime after retirement.
-- Legacy alias: covered across store restart and legacy source removal.
+Result: both exited 0 with no output.

@@ -271,8 +271,9 @@ func TestRuntimeGenerationBootstrapBindingAdvancesStoreWhileOldOutputIsImmutable
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := prepared.Execute(t.Context()).Content; got != "[REDACTED] generation-b" {
-		t.Fatalf("generation-a output redactor=%q", got)
+	oldResult := prepared.Execute(t.Context())
+	if oldResult.Status != domain.ToolFailed || oldResult.Content != "" {
+		t.Fatalf("retired runtime started a new output producer: %+v", oldResult)
 	}
 
 	application.Commands() <- Command{Kind: CommandShutdown}
@@ -301,6 +302,25 @@ func TestRuntimeBuilderRedactsConfiguredAndOverrideCredentials(t *testing.T) {
 	}
 	if got := set.Redactor.String("Y29uZmlndXJlZC1zZWNyZXQ="); got != "[REDACTED]" {
 		t.Fatalf("encoded redacted=%q", got)
+	}
+}
+
+func TestRuntimeBuilderRegistersGenerationInSharedProductionRegistry(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "shared-production-secret")
+	shared := secret.NewRegistry()
+	builder := newRuntimeBuilderForTest(t, nil)
+	builder.secrets = shared
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, err := shared.AcquireExisting(set.RuntimeGenerationID)
+	if err != nil {
+		t.Fatalf("runtime generation not registered in shared registry: %v", err)
+	}
+	defer func() { _ = producer.Close() }()
+	if got := producer.String("c2hhcmVkLXByb2R1Y3Rpb24tc2VjcmV0"); got != "[REDACTED]" {
+		t.Fatalf("shared generation redaction=%q", got)
 	}
 }
 

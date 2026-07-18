@@ -31,6 +31,7 @@ func TestRunnerPersistsToolLoopInOrder(t *testing.T) {
 		Sessions:     sessions,
 		MaxToolCalls: 32,
 		SystemPrompt: "system",
+		Admission:    contextLease(t),
 	}
 	err := runner.RunTurn(context.Background(), agent.RunInput{
 		Session: domain.Session{
@@ -947,6 +948,11 @@ func testRunnerToolLimit32(t *testing.T) {
 }
 
 func newTestRunner(provider ports.ModelProvider, registry ports.ToolRegistry, policy ports.PermissionPolicy, approver ports.PermissionApprover, sessions ports.SessionStore) agent.Runner {
+	secrets := secret.NewRegistry()
+	admission, err := secrets.Acquire("test-runner", nil)
+	if err != nil {
+		panic(err)
+	}
 	return agent.Runner{
 		Provider:     provider,
 		Tools:        registry,
@@ -955,6 +961,7 @@ func newTestRunner(provider ports.ModelProvider, registry ports.ToolRegistry, po
 		Sessions:     sessions,
 		MaxToolCalls: 1,
 		SystemPrompt: "system",
+		Admission:    admission,
 	}
 }
 

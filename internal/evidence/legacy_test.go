@@ -3,9 +3,9 @@ package evidence_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
-	"os"
-	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/muratmirgun/yordam/internal/evidence"
@@ -14,8 +14,8 @@ import (
 )
 
 func TestLegacyArtifactMigrationCreatesDurableAlias(t *testing.T) {
-	root, store := newEvidenceStore(t, secret.NewAdmissionScanner())
-	legacy := createLegacyArtifact(t, root, "workspace-a", "session-a", "legacy-a", []byte("legacy-content"))
+	resolver := &legacyResolverFixture{artifacts: map[string][]byte{"session-a/legacy-a": []byte("legacy-content")}}
+	root, store := newEvidenceStoreWithResolver(t, resolver)
 	record, err := store.MigrateLegacyArtifact(context.Background(), "session-a", "legacy-a")
 	if err != nil {
 		t.Fatal(err)
@@ -23,10 +23,14 @@ func TestLegacyArtifactMigrationCreatesDurableAlias(t *testing.T) {
 	if len(record.Body.LegacyArtifactAliases) != 1 || record.Body.LegacyArtifactAliases[0] != "legacy-a" || record.Body.SessionID != "session-a" {
 		t.Fatalf("record=%+v", record)
 	}
-	if err := os.Remove(legacy); err != nil {
+	resolver.remove("session-a", "legacy-a")
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("legacy-restart", nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	restarted, err := evidence.New(root, secret.NewAdmissionScanner())
+	defer lease.Close()
+	restarted, err := evidence.New(root, lease, evidence.WithLegacyResolver(resolver))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,18 +52,7 @@ func TestLegacyArtifactMigrationCreatesDurableAlias(t *testing.T) {
 }
 
 func TestLegacyArtifactMigrationRejectsTraversalAndSymlink(t *testing.T) {
-	root, store := newEvidenceStore(t, secret.NewAdmissionScanner())
-	outside := filepath.Join(t.TempDir(), "outside")
-	if err := os.WriteFile(outside, []byte("outside"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	path := createLegacyArtifact(t, root, "workspace-a", "session-a", "legacy-a", []byte("inside"))
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, path); err != nil {
-		t.Fatal(err)
-	}
+	_, store := newEvidenceStoreWithResolver(t, &legacyResolverFixture{err: evidence.ErrUnsafePath})
 	for _, id := range []string{"../outside", "legacy-a"} {
 		if _, err := store.MigrateLegacyArtifact(context.Background(), protocol.SessionID("session-a"), id); !errors.Is(err, evidence.ErrUnsafePath) {
 			t.Fatalf("id=%q error=%v", id, err)
@@ -67,15 +60,43 @@ func TestLegacyArtifactMigrationRejectsTraversalAndSymlink(t *testing.T) {
 	}
 }
 
-func createLegacyArtifact(t *testing.T, root, workspace, session, id string, content []byte) string {
+func newEvidenceStoreWithResolver(t *testing.T, resolver evidence.LegacyResolver) (string, evidence.Store) {
 	t.Helper()
-	directory := filepath.Join(root, "workspaces", workspace, "sessions", session, "artifacts")
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	root := t.TempDir()
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("legacy-evidence", nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(directory, id+".bin")
-	if err := os.WriteFile(path, content, 0o600); err != nil {
+	store, err := evidence.New(root, lease, evidence.WithLegacyResolver(resolver))
+	if err != nil {
 		t.Fatal(err)
 	}
-	return path
+	t.Cleanup(func() { _ = store.Close(); _ = lease.Close() })
+	return root, store
+}
+
+type legacyResolverFixture struct {
+	mu        sync.Mutex
+	artifacts map[string][]byte
+	err       error
+}
+
+func (r *legacyResolverFixture) ResolveLegacyArtifact(_ context.Context, sessionID protocol.SessionID, artifactID string) (protocol.WorkspaceID, []byte, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return "", nil, r.err
+	}
+	raw, ok := r.artifacts[fmt.Sprintf("%s/%s", sessionID, artifactID)]
+	if !ok {
+		return "", nil, errors.New("legacy source must not be opened on alias hit")
+	}
+	return "workspace-a", append([]byte(nil), raw...), nil
+}
+
+func (r *legacyResolverFixture) remove(sessionID, artifactID string) {
+	r.mu.Lock()
+	delete(r.artifacts, fmt.Sprintf("%s/%s", sessionID, artifactID))
+	r.mu.Unlock()
 }

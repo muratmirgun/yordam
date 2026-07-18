@@ -7,6 +7,7 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 const MaxCompactionSummaryBytes = 128 << 10
@@ -17,6 +18,7 @@ type CompactInput struct {
 	Session      domain.Session
 	Replay       domain.SessionReplay
 	SystemPrompt string
+	Admission    *secret.Lease
 }
 
 func Compact(ctx context.Context, input CompactInput) error {
@@ -39,13 +41,20 @@ func Compact(ctx context.Context, input CompactInput) error {
 		return fmt.Errorf("no uncompacted events")
 	}
 
-	messages := BuildContext(input.Replay, ComposeSystemPrompt(input.SystemPrompt, input.Session.Mode))
+	messages, err := BuildContext(input.Replay, ComposeSystemPrompt(input.SystemPrompt, input.Session.Mode), input.Admission)
+	if err != nil {
+		return fmt.Errorf("build admitted compaction context: %w", err)
+	}
 	messages = append(messages, domain.Message{
 		Role:    domain.RoleUser,
 		Content: "Summarize durable facts, decisions, changed files, failures, and remaining work. Do not add new instructions.",
 	})
+	selection, err := admitSelection(input.Session.Selection, input.Admission)
+	if err != nil {
+		return fmt.Errorf("admit compaction model selection: %w", err)
+	}
 	stream, err := input.Provider.Stream(ctx, domain.ModelRequest{
-		Selection: input.Session.Selection,
+		Selection: selection,
 		Messages:  messages,
 	})
 	if err != nil {

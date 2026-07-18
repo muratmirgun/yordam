@@ -2,6 +2,7 @@ package secret_test
 
 import (
 	"encoding/json"
+	"errors"
 	"runtime"
 	"sync"
 	"testing"
@@ -17,6 +18,30 @@ func TestBindingReplacesCurrentRedactorAndPreservesSnapshots(t *testing.T) {
 	binding.Replace(secret.New("new-secret"))
 	assertRedactionMethods(t, binding, "old-secret new-secret", "old-secret [REDACTED]")
 	assertRedactionMethods(t, snapshot, "old-secret new-secret", "[REDACTED] new-secret")
+}
+
+func TestBindingAcquiresOwnedLeaseAndRejectsNonGenerationRedactor(t *testing.T) {
+	registry := secret.NewRegistry()
+	owner, err := registry.Acquire("binding-generation", [][]byte{[]byte("binding-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := secret.NewBinding(owner)
+	producer, err := binding.AcquireLease()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := producer.String("binding-secret"); got != "[REDACTED]" {
+		t.Fatalf("owned binding lease=%q", got)
+	}
+	_ = producer.Close()
+	binding.Replace(secret.New())
+	if _, err := binding.AcquireLease(); !errors.Is(err, secret.ErrLeaseClosed) {
+		t.Fatalf("non-generation binding error=%v", err)
+	}
 }
 
 func TestBindingRedactionMethodsAreSafeDuringReplacement(t *testing.T) {

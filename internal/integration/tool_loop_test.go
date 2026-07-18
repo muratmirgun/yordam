@@ -54,6 +54,12 @@ func TestAskModeEditAllowShellDeny(t *testing.T) {
 		{{Kind: domain.ModelTextDelta, Text: "done"}, {Kind: domain.ModelDone}},
 	}}
 	redactor := secret.New(sentinel)
+	secretRegistry := secret.NewRegistry()
+	admission, err := secretRegistry.Acquire("integration-generation", [][]byte{[]byte(sentinel)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admission.Close()
 	store := jsonl.New(t.TempDir(), jsonl.Options{Sanitize: redactor.JSON})
 	workspace, err := jsonl.WorkspaceFromPath(workspacePath)
 	if err != nil {
@@ -67,7 +73,7 @@ func TestAskModeEditAllowShellDeny(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bounded := output.Options{SessionID: session.ID, Artifacts: store, Redact: redactor}
+	bounded := output.Options{SessionID: session.ID, Artifacts: store, Redact: redactor, Admission: admission}
 	var shellProgress atomic.Int32
 	registry := tools.NewRegistry(
 		shelltool.New(shelltool.Options{
@@ -100,6 +106,7 @@ func TestAskModeEditAllowShellDeny(t *testing.T) {
 		MaxToolCalls: 32,
 		SystemPrompt: "test",
 		Redact:       redactor.String,
+		Admission:    admission,
 	}
 	if err := runner.RunTurn(context.Background(), agent.RunInput{Session: session, Replay: replay, Prompt: "update a.txt"}); err != nil {
 		t.Fatal(err)

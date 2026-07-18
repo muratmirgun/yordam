@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -18,7 +19,7 @@ import (
 )
 
 func TestTwoSessionsResolveOneImmutableBlob(t *testing.T) {
-	root, store := newEvidenceStore(t, secret.NewAdmissionScanner())
+	root, store := newEvidenceStore(t)
 	first := putEvidence(t, store, evidenceCandidate("ses-a", "ev-a", []byte("same")))
 	second := putEvidence(t, store, evidenceCandidate("ses-b", "ev-b", []byte("same")))
 	if first.Body.Blob == nil || second.Body.Blob == nil || first.Body.Blob.Digest != second.Body.Blob.Digest {
@@ -30,7 +31,7 @@ func TestTwoSessionsResolveOneImmutableBlob(t *testing.T) {
 }
 
 func TestEvidencePreservesCandidateProvenance(t *testing.T) {
-	_, store := newEvidenceStore(t, secret.NewAdmissionScanner())
+	_, store := newEvidenceStore(t)
 	candidate := evidenceCandidate("ses-a", "ev-a", []byte("result"))
 	record := putEvidence(t, store, candidate)
 	if record.Body.WorkspaceID != candidate.WorkspaceID || record.Body.SessionID != candidate.SessionID ||
@@ -44,7 +45,7 @@ func TestEvidenceWithholdsEveryRegisteredVariantAndWritesNoSecret(t *testing.T) 
 	raw := []byte("zero-on-disk-secret")
 	for name, variant := range encodedVariants(raw) {
 		t.Run(name, func(t *testing.T) {
-			root, store := newEvidenceStore(t, secret.NewAdmissionScanner(raw))
+			root, store := newEvidenceStore(t, raw)
 			record := putEvidence(t, store, evidenceCandidate("ses-a", "ev-a", variant))
 			if record.Body.Availability != protocol.ContentWithheldSecret || record.Body.Blob != nil || !record.Body.Redacted {
 				t.Fatalf("record=%+v", record)
@@ -55,7 +56,7 @@ func TestEvidenceWithholdsEveryRegisteredVariantAndWritesNoSecret(t *testing.T) 
 }
 
 func TestEvidenceProjectsMissingBlobAndCannotVerify(t *testing.T) {
-	root, store := newEvidenceStore(t, secret.NewAdmissionScanner())
+	root, store := newEvidenceStore(t)
 	record := putEvidence(t, store, evidenceCandidate("ses-a", "ev-a", []byte("missing")))
 	if record.Body.Blob == nil {
 		t.Fatal("available record has no blob")
@@ -76,7 +77,7 @@ func TestEvidenceProjectsMissingBlobAndCannotVerify(t *testing.T) {
 }
 
 func TestEvidenceDetectsDigestMismatchAndProjectsCorrupt(t *testing.T) {
-	root, store := newEvidenceStore(t, secret.NewAdmissionScanner())
+	root, store := newEvidenceStore(t)
 	record := putEvidence(t, store, evidenceCandidate("ses-a", "ev-a", []byte("original")))
 	if err := os.WriteFile(blobPath(root, record), []byte("tampered"), 0o600); err != nil {
 		t.Fatal(err)
@@ -97,7 +98,7 @@ func TestEvidenceDetectsDigestMismatchAndProjectsCorrupt(t *testing.T) {
 }
 
 func TestEvidenceTruncatesAtRetainedLimit(t *testing.T) {
-	_, store := newEvidenceStore(t, secret.NewAdmissionScanner())
+	_, store := newEvidenceStore(t)
 	content := bytes.Repeat([]byte("x"), int(evidence.MaxRetainedBytes)+17)
 	record := putEvidence(t, store, evidenceCandidate("ses-a", "ev-a", content))
 	if !record.Body.Truncated || record.Body.Size != evidence.MaxRetainedBytes || record.Body.OriginalSize != int64(len(content)) {
@@ -115,7 +116,7 @@ func TestEvidenceTruncatesAtRetainedLimit(t *testing.T) {
 }
 
 func TestEvidenceMetadataPublicationDoesNotReplace(t *testing.T) {
-	_, store := newEvidenceStore(t, secret.NewAdmissionScanner())
+	_, store := newEvidenceStore(t)
 	first := evidenceCandidate("ses-a", "ev-a", []byte("first"))
 	putEvidence(t, store, first)
 	second := first
@@ -134,7 +135,7 @@ func TestEvidenceMetadataPublicationDoesNotReplace(t *testing.T) {
 }
 
 func TestEvidenceNoReplaceRacePublishesOneRecord(t *testing.T) {
-	_, store := newEvidenceStore(t, secret.NewAdmissionScanner())
+	_, store := newEvidenceStore(t)
 	start := make(chan struct{})
 	errorsByWriter := make(chan error, 2)
 	var wait sync.WaitGroup
@@ -168,7 +169,7 @@ func TestEvidenceNoReplaceRacePublishesOneRecord(t *testing.T) {
 }
 
 func TestEvidenceRejectsBlobSymlinkSubstitution(t *testing.T) {
-	root, store := newEvidenceStore(t, secret.NewAdmissionScanner())
+	root, store := newEvidenceStore(t)
 	record := putEvidence(t, store, evidenceCandidate("ses-a", "ev-a", []byte("original")))
 	path := blobPath(root, record)
 	outside := filepath.Join(t.TempDir(), "outside")
@@ -186,13 +187,97 @@ func TestEvidenceRejectsBlobSymlinkSubstitution(t *testing.T) {
 	}
 }
 
-func newEvidenceStore(t *testing.T, scanner *secret.AdmissionScanner) (string, evidence.Store) {
+func TestEvidenceRejectsSecretMetadataAndInvalidBoundsBeforeCreatingRoot(t *testing.T) {
+	for name, mutate := range map[string]func(*protocol.EvidenceCandidate){
+		"identity_secret": func(candidate *protocol.EvidenceCandidate) { candidate.ID = "aWRlbnRpdHktc2VjcmV0" },
+		"kind_secret":     func(candidate *protocol.EvidenceCandidate) { candidate.Kind = "aWRlbnRpdHktc2VjcmV0" },
+		"actor_secret":    func(candidate *protocol.EvidenceCandidate) { candidate.Actor.ID = "aWRlbnRpdHktc2VjcmV0" },
+		"subject_secret":  func(candidate *protocol.EvidenceCandidate) { candidate.Subject.ID = "aWRlbnRpdHktc2VjcmV0" },
+		"invalid_bounds": func(candidate *protocol.EvidenceCandidate) {
+			candidate.MediaType = strings.Repeat("m", protocol.MaxStringBytes+1)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "not-created")
+			registry := secret.NewRegistry()
+			lease, err := registry.Acquire("evidence-metadata", [][]byte{[]byte("identity-secret")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lease.Close()
+			store, err := evidence.New(root, lease)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			candidate := evidenceCandidate("ses-a", "ev-a", bytes.Repeat([]byte("x"), 4<<20))
+			mutate(&candidate)
+			if _, err := store.Put(context.Background(), candidate); err == nil {
+				t.Fatal("invalid or secret metadata was accepted")
+			}
+			if _, err := os.Stat(root); !os.IsNotExist(err) {
+				t.Fatalf("rejected metadata created storage root: %v", err)
+			}
+		})
+	}
+}
+
+func TestEvidenceFailsAfterPinnedRootOrParentReplacement(t *testing.T) {
+	for _, target := range []string{"root", "parent"} {
+		t.Run(target, func(t *testing.T) {
+			parent := t.TempDir()
+			root := filepath.Join(parent, "evidence")
+			registry := secret.NewRegistry()
+			lease, err := registry.Acquire("evidence-root", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lease.Close()
+			store, err := evidence.New(root, lease)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			putEvidence(t, store, evidenceCandidate("ses-a", "root-a", []byte("first")))
+			if target == "root" {
+				if err := os.Rename(root, root+"-moved"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(root, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				moved := parent + "-moved"
+				if err := os.Rename(parent, moved); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(parent, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(filepath.Join(parent, "evidence"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := store.Put(context.Background(), evidenceCandidate("ses-a", "root-b", []byte("second"))); !errors.Is(err, evidence.ErrUnsafePath) {
+				t.Fatalf("replacement error=%v", err)
+			}
+		})
+	}
+}
+
+func newEvidenceStore(t *testing.T, values ...[]byte) (string, evidence.Store) {
 	t.Helper()
 	root := t.TempDir()
-	store, err := evidence.New(root, scanner)
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("evidence-test", values)
 	if err != nil {
 		t.Fatal(err)
 	}
+	store, err := evidence.New(root, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close(); _ = lease.Close() })
 	return root, store
 }
 

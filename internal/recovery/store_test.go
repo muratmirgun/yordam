@@ -24,7 +24,8 @@ func TestRecoveryMaterialRejectsRegisteredEncodedSecretBeforeDiskWrite(t *testin
 	for name, value := range recoveryVariants(raw) {
 		t.Run(name, func(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "not-created")
-			store, err := recovery.New(root, secret.NewAdmissionScanner(raw))
+			lease := recoveryLease(t, raw)
+			store, err := recovery.New(root, lease)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -41,7 +42,7 @@ func TestRecoveryMaterialRejectsRegisteredEncodedSecretBeforeDiskWrite(t *testin
 
 func TestRecoveryRejectsPreimageDigestMismatchBeforeDiskWrite(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "not-created")
-	store, err := recovery.New(root, secret.NewAdmissionScanner())
+	store, err := recovery.New(root, recoveryLease(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +65,7 @@ func TestRecoveryUsesConfidentialModesAndOptionalSealer(t *testing.T) {
 		}
 		return sealed, nil
 	})
-	store, err := recovery.New(root, secret.NewAdmissionScanner(), recovery.WithSealer(sealer))
+	store, err := recovery.New(root, recoveryLease(t), recovery.WithSealer(sealer))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,6 +105,73 @@ func TestRecoveryUsesConfidentialModesAndOptionalSealer(t *testing.T) {
 	}
 }
 
+func TestRecoveryRejectsSecretMetadataBeforeCreatingRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "not-created")
+	lease := recoveryLease(t, []byte("identity-secret"))
+	store, err := recovery.New(root, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	candidate := validRecoveryCandidate([]byte("safe-preimage"))
+	candidate.Subject.ID = "aWRlbnRpdHktc2VjcmV0"
+	if _, err := store.Put(context.Background(), candidate); !errors.Is(err, recovery.ErrSecretDetected) {
+		t.Fatalf("metadata error=%v", err)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("rejected metadata created root: %v", err)
+	}
+}
+
+func TestRecoverySingleContainerRetryReconcilesEveryFault(t *testing.T) {
+	for _, point := range []recovery.FaultPoint{
+		recovery.FaultTemporarySynced,
+		recovery.FaultBeforePublish,
+		recovery.FaultAfterPublish,
+		recovery.FaultDirectorySynced,
+	} {
+		t.Run(string(point), func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "recovery")
+			lease := recoveryLease(t)
+			crash := errors.New("simulated crash")
+			failed := false
+			faulting, err := recovery.New(root, lease, recovery.WithFault(func(got recovery.FaultPoint) error {
+				if got == point && !failed {
+					failed = true
+					return crash
+				}
+				return nil
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate := validRecoveryCandidate([]byte("retry-preimage"))
+			_, _ = faulting.Put(context.Background(), candidate)
+			_ = faulting.Close()
+			restarted, err := recovery.New(root, lease)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restarted.Close()
+			first, err := restarted.Put(context.Background(), candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := restarted.Put(context.Background(), candidate)
+			if err != nil || first.ID != second.ID {
+				t.Fatalf("retry first=%+v second=%+v err=%v", first, second, err)
+			}
+			entries, err := os.ReadDir(filepath.Join(root, "materials"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 || filepath.Ext(entries[0].Name()) != ".recovery" {
+				t.Fatalf("publication files=%v", entries)
+			}
+		})
+	}
+}
+
 func TestRecoveryCandidateCannotSerializeOrDisplayRawPreimage(t *testing.T) {
 	candidate := validRecoveryCandidate([]byte("do-not-display"))
 	if raw, err := json.Marshal(candidate); err == nil || bytes.Contains(raw, candidate.Preimage) {
@@ -123,6 +191,17 @@ func validRecoveryCandidate(preimage []byte) recovery.Candidate {
 		Preimage: append([]byte(nil), preimage...), PreimageDigest: digestBytes(preimage),
 		ExpectedPostimageDigest: digestBytes([]byte("postimage")), Mode: 0o644,
 	}
+}
+
+func recoveryLease(t *testing.T, values ...[]byte) *secret.Lease {
+	t.Helper()
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("recovery-test", values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	return lease
 }
 
 func digestBytes(value []byte) protocol.Digest {
