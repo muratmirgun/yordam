@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -17,10 +18,14 @@ const MaxArtifactBytes int64 = 10 << 20
 // Put checks ctx before and after each source read. It cannot interrupt an
 // arbitrary Reader whose Read method is itself blocked.
 func (s *Store) Put(ctx context.Context, sessionID, mediaType string, src io.Reader, limit int64) (domain.Artifact, error) {
-	if err := s.state.lockContext(ctx); err != nil {
+	if err := validateSessionID(sessionID); err != nil {
 		return domain.Artifact{}, err
 	}
-	defer s.state.unlock()
+	lock := s.journalLock(protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(sessionID)})
+	if err := lock.lock(ctx); err != nil {
+		return domain.Artifact{}, err
+	}
+	defer lock.unlock()
 	return s.putLocked(ctx, sessionID, mediaType, src, limit)
 }
 
@@ -164,10 +169,14 @@ func copyArtifact(ctx context.Context, dst io.Writer, src io.Reader, limit int64
 }
 
 func (s *Store) Open(ctx context.Context, artifact domain.Artifact) (io.ReadCloser, error) {
-	if err := s.state.lockContext(ctx); err != nil {
+	if err := validateSessionID(artifact.SessionID); err != nil {
 		return nil, err
 	}
-	defer s.state.unlock()
+	lock := s.journalLock(protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(artifact.SessionID)})
+	if err := lock.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer lock.unlock()
 	transaction, session, err := s.openSessionTransaction(ctx, artifact.SessionID, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err

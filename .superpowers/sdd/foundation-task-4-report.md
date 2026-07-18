@@ -42,3 +42,36 @@ Each case was rerun GREEN after its minimum production change. No production tur
 - `git diff --check`: PASS.
 
 The progress ledger was not edited.
+
+## Rejection remediation
+
+The first Task 4 checkpoint was rejected at `4e011874a29451c5ca817cdd1b017d361ee8669b`. Investigation traced the five findings to separate admission and publication defects:
+
+- session staging reconciliation had no cross-process ownership boundary;
+- lock identity existed only in process memory and initialization had no durable completion record;
+- lease release delegated to a head-only active-turn projection;
+- control members were published directly into the final directory one at a time;
+- artifact `Put` and `Open` still held the process-wide root lock across filesystem verification and I/O.
+
+Strict regression RED evidence:
+
+- the first combined rejection run failed the live-creator staging gate, missing-turn and missing-both lock-set checks, fresh-subprocess lock replacement, partial final control acceptance, abandoned control staging cleanup, and unrelated artifact progress (`go test` package time `1.598s`);
+- after correcting only the release test fixture's compatibility declaration, the exact-cursor test failed because `Release` accepted a later unrelated transaction (`0.448s`);
+- the explicit legacy initializer test then failed to compile solely because `FaultLockInitializationAfterJournalSync` and `InitializeJournalLocks` did not exist.
+
+The remediation adds a mode-`0600` per-workspace `flock` boundary around layout initialization and session staging cleanup, atomically publishes a fully synced control staging directory, and validates an existing final control layout before accepting it. Each session now persists `lock-set.json` with the journal identity and the device/inode identities of both `journal.lock` and `turn.lock`; control journals persist the corresponding journal-only set. Inspection, mutation, and lease admission open and validate the complete persisted set. Legacy lock initialization is an explicit, events-locked, idempotent operation that resumes a crash after the journal lock sync but never repairs a persisted initialized set. Process-local inode memory was removed.
+
+`TurnLease.Release` now finds the exact committed transaction named by the supplied cursor and requires a typed terminal event for the leased turn in that transaction. Later unrelated commits do not invalidate an earlier terminal cursor, and a later unrelated cursor cannot release the lease. Artifact `Put`/`Open` now use session-keyed coordination; the root-wide I/O lock was removed, leaving only the short monotonic-ID mutex as process-wide mutex coordination.
+
+Remediation GREEN evidence:
+
+- all original Task 4 and rejection regressions together: PASS (`5.124s`);
+- the combined focused subprocess/concurrency group with `-count=10`: PASS (`48.616s`);
+- the expanded focused race run: PASS with no race report (`10.564s`);
+- `go test ./internal/session/jsonl -count=1`: PASS (`32.426s`);
+- final `go test ./...`: PASS (storage package `32.559s` in the repository-wide run);
+- `go vet ./...`: PASS;
+- owned-file `gofmt -l`: no output;
+- `git diff --check`: PASS.
+
+The progress ledger remains untouched.

@@ -2,10 +2,13 @@ package jsonl
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
@@ -32,10 +35,29 @@ func (s *Store) EnsureWorkspaceControl(ctx context.Context, workspace domain.Wor
 	return protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: protocol.JournalID(workspace.ID)}, nil
 }
 
-func (s *Store) ensureControlJournalFiles(ctx context.Context, layout *workspaceLayout) error {
-	if layout.controlRoot == nil {
-		return fmt.Errorf("workspace control directory is not open")
+func (s *Store) ensureControlJournalLayout(ctx context.Context, layout *workspaceLayout) error {
+	controlRoot, controlInfo, err := openRootedDirectory(layout.workspaceRoot, "control")
+	if err == nil {
+		layout.controlRoot, layout.controlInfo = controlRoot, controlInfo
+		return s.validateControlJournalFiles(ctx, layout)
 	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	if err := reconcileControlStaging(ctx, layout.workspaceRoot); err != nil {
+		return err
+	}
+	stagingName, stagingRoot, stagingInfo, err := createControlStaging(ctx, layout.workspaceRoot)
+	if err != nil {
+		return err
+	}
+	published := false
+	defer func() {
+		_ = stagingRoot.Close()
+		if !published {
+			_ = cleanupRootEntryIfSame(layout.workspaceRoot, stagingInfo, stagingName)
+		}
+	}()
 	metadata := controlMetadata{WorkspaceID: protocol.WorkspaceID(layout.workspaceID), UpdatedAt: s.clock().UTC()}
 	raw, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
@@ -49,11 +71,156 @@ func (s *Store) ensureControlJournalFiles(ctx context.Context, layout *workspace
 		{name: "events.jsonl"},
 		{name: journalLockName},
 	} {
-		if err := ensureDurableRootedFile(ctx, layout.controlRoot, member.name, member.raw); err != nil {
+		if err := writeStagedFile(ctx, stagingRoot, member.name, member.raw); err != nil {
 			return err
 		}
 	}
-	return errors.Join(layout.verify(), syncRootDir(layout.controlRoot, "."))
+	if err := writeDurableLockSetState(ctx, stagingRoot, protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: protocol.JournalID(layout.workspaceID)}); err != nil {
+		return err
+	}
+	if err := syncRootDir(stagingRoot, "."); err != nil {
+		return err
+	}
+	if err := errors.Join(layout.verifyWorkspace(), verifyRootedDirectory(layout.workspaceRoot, stagingName, stagingInfo)); err != nil {
+		return err
+	}
+	if _, err := layout.workspaceRoot.Lstat("control"); err == nil {
+		return fmt.Errorf("control layout appeared while workspace coordination lock was held")
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := layout.workspaceRoot.Rename(stagingName, "control"); err != nil {
+		return err
+	}
+	published = true
+	if err := syncRootDir(layout.workspaceRoot, "."); err != nil {
+		return err
+	}
+	layout.controlRoot, layout.controlInfo, err = openRootedDirectory(layout.workspaceRoot, "control")
+	if err != nil {
+		return err
+	}
+	return s.validateControlJournalFiles(ctx, layout)
+}
+
+func (s *Store) validateControlJournalFiles(ctx context.Context, layout *workspaceLayout) error {
+	if layout.controlRoot == nil {
+		return fmt.Errorf("workspace control directory is not open")
+	}
+	metadata, metadataInfo, err := openRootedRegularFile(ctx, layout.controlRoot, "metadata.json", os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	raw, readErr := readOpenedFile(ctx, metadata, maxSessionMetadataBytes)
+	var state controlMetadata
+	if readErr == nil {
+		readErr = json.Unmarshal(raw, &state)
+	}
+	if readErr == nil && state.WorkspaceID != protocol.WorkspaceID(layout.workspaceID) {
+		readErr = fmt.Errorf("control metadata workspace ID mismatch")
+	}
+	readErr = errors.Join(readErr, verifyRootedRegularFile(layout.controlRoot, "metadata.json", metadataInfo), metadata.Close())
+	if readErr != nil {
+		return readErr
+	}
+	for _, name := range []string{"events.jsonl", journalLockName} {
+		file, info, err := openRootedRegularFile(ctx, layout.controlRoot, name, os.O_RDONLY, 0)
+		if err != nil {
+			return err
+		}
+		memberErr := error(nil)
+		if info.Mode().Perm() != 0o600 {
+			memberErr = fmt.Errorf("%q mode is %04o, want 0600", name, info.Mode().Perm())
+		}
+		memberErr = errors.Join(memberErr, verifyRootedRegularFile(layout.controlRoot, name, info), file.Close())
+		if memberErr != nil {
+			return memberErr
+		}
+	}
+	lockSet, err := openValidatedLockSetAtRoot(
+		ctx,
+		layout.controlRoot,
+		true,
+		protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: protocol.JournalID(layout.workspaceID)},
+	)
+	if err != nil {
+		return err
+	}
+	if err := lockSet.close(); err != nil {
+		return err
+	}
+	return layout.verify()
+}
+
+func createControlStaging(ctx context.Context, workspaceRoot *os.Root) (string, *os.Root, os.FileInfo, error) {
+	for range 100 {
+		if err := ctx.Err(); err != nil {
+			return "", nil, nil, err
+		}
+		var random [16]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return "", nil, nil, err
+		}
+		name := ".yordam-control-" + hex.EncodeToString(random[:]) + ".tmp"
+		if err := workspaceRoot.Mkdir(name, 0o700); os.IsExist(err) {
+			continue
+		} else if err != nil {
+			return "", nil, nil, err
+		}
+		root, info, err := openRootedDirectory(workspaceRoot, name)
+		if err != nil {
+			return "", nil, nil, errors.Join(err, cleanupRootEntries(workspaceRoot, name))
+		}
+		return name, root, info, nil
+	}
+	return "", nil, nil, fmt.Errorf("could not allocate control staging directory")
+}
+
+func reconcileControlStaging(ctx context.Context, workspaceRoot *os.Root) error {
+	directory, err := workspaceRoot.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, readErr := directory.ReadDir(-1)
+	readErr = errors.Join(readErr, directory.Close())
+	if readErr != nil {
+		return readErr
+	}
+	removed := false
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !entry.IsDir() || !validControlStagingName(entry.Name()) {
+			continue
+		}
+		info, err := workspaceRoot.Lstat(entry.Name())
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		if err := workspaceRoot.RemoveAll(entry.Name()); err != nil {
+			return err
+		}
+		removed = true
+	}
+	if removed {
+		return syncRootDir(workspaceRoot, ".")
+	}
+	return nil
+}
+
+func validControlStagingName(name string) bool {
+	const prefix = ".yordam-control-"
+	const suffix = ".tmp"
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+		return false
+	}
+	random := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+	decoded, err := hex.DecodeString(random)
+	return err == nil && len(decoded) == 16 && random == strings.ToLower(random)
 }
 
 func ensureDurableRootedFile(ctx context.Context, root *os.Root, name string, contents []byte) error {

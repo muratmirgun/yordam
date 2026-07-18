@@ -128,8 +128,11 @@ func TestFoundationFixtureInspectionMatrix(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if inspection.Journal.Writable != fixture.want.Writable || len(inspection.Journal.Events) != fixture.want.CommittedEvents {
-				t.Fatalf("inspection writable=%v events=%d want writable=%v events=%d", inspection.Journal.Writable, len(inspection.Journal.Events), fixture.want.Writable, fixture.want.CommittedEvents)
+			if inspection.Journal.Writable || len(inspection.Journal.Events) != fixture.want.CommittedEvents {
+				t.Fatalf("legacy inspection writable=%v events=%d want writable=false events=%d", inspection.Journal.Writable, len(inspection.Journal.Events), fixture.want.CommittedEvents)
+			}
+			if fixture.want.Writable && !hasDiagnostic(inspection.Journal.Diagnostics, "lock.initialization_required") {
+				t.Fatalf("legacy inspection diagnostics=%+v want lock.initialization_required", inspection.Journal.Diagnostics)
 			}
 			for _, code := range fixture.want.Diagnostics {
 				if !hasDiagnostic(inspection.Journal.Diagnostics, code) {
@@ -303,6 +306,9 @@ func TestV1UpcastFirstV2AppendDeclaresCompatibilityOnce(t *testing.T) {
 	inspection, err := store.InspectSession(context.Background(), fixtureSessionID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := store.InitializeJournalLocks(context.Background(), inspection.Journal.Journal); err != nil {
+		t.Fatalf("explicit legacy lock initialization: %v", err)
 	}
 	request := journal.AppendRequest{
 		Journal: inspection.Journal.Journal, ExpectedHead: inspection.Journal.Head, TransactionID: "txn-first-v2",

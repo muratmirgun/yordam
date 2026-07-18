@@ -45,13 +45,11 @@ type Store struct {
 }
 
 type rootState struct {
-	lock              chan struct{}
 	idMu              sync.Mutex
 	lastID            ulid.ULID
 	hasLast           bool
 	journalLocks      sync.Map
 	markerUncertainty sync.Map
-	lockIdentities    sync.Map
 	activeCreates     sync.Map
 }
 
@@ -88,29 +86,7 @@ func New(root string, opts Options) *Store {
 }
 
 func newRootState() *rootState {
-	state := &rootState{lock: make(chan struct{}, 1)}
-	state.lock <- struct{}{}
-	return state
-}
-
-func (s *rootState) lockContext(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.lock:
-		if err := ctx.Err(); err != nil {
-			s.unlock()
-			return err
-		}
-		return nil
-	}
-}
-
-func (s *rootState) unlock() {
-	s.lock <- struct{}{}
+	return &rootState{}
 }
 
 func normalizeRoot(root string) string {
@@ -198,6 +174,11 @@ func (s *Store) create(ctx context.Context, workspace domain.Workspace, mode dom
 		return domain.Session{}, err
 	}
 	defer func() { _ = layout.close() }()
+	workspaceGuard, err := waitWorkspaceCoordination(ctx, layout.workspaceRoot)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	defer func() { _ = workspaceGuard.release() }()
 	if err := reconcileSessionStaging(ctx, layout.sessionsRoot); err != nil {
 		return domain.Session{}, err
 	}
@@ -261,6 +242,9 @@ func (s *Store) createStagedSession(ctx context.Context, layout *workspaceLayout
 		return domain.Session{}, err
 	}
 	if err := writeStagedFile(ctx, stagingRoot, turnLockName, nil); err != nil {
+		return domain.Session{}, err
+	}
+	if err := writeDurableLockSetState(ctx, stagingRoot, protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(session.ID)}); err != nil {
 		return domain.Session{}, err
 	}
 	if lineage != nil {

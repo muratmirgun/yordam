@@ -299,9 +299,31 @@ func TestConcurrentLegacyLockInitializationUsesOneStableInode(t *testing.T) {
 		t.Fatal(err)
 	}
 	sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
-	for _, name := range []string{"journal.lock", "turn.lock"} {
+	for _, name := range []string{"lock-set.json", "journal.lock", "turn.lock"} {
 		if err := os.Remove(filepath.Join(sessionDir, name)); err != nil {
 			t.Fatal(err)
+		}
+	}
+	initializers := []*exec.Cmd{
+		legacyAppendHelperCommand(root, protocol.SessionID(session.ID), head, "init-a"),
+		legacyAppendHelperCommand(root, protocol.SessionID(session.ID), head, "init-b"),
+	}
+	for _, command := range initializers {
+		command.Env = append(command.Env, "YORDAM_INITIALIZE_LOCKS=1")
+	}
+	initializerOutputs := make([]bytes.Buffer, len(initializers))
+	for index, command := range initializers {
+		command.Stdout = &initializerOutputs[index]
+		command.Stderr = &initializerOutputs[index]
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index, command := range initializers {
+		err := command.Wait()
+		fields := strings.Fields(initializerOutputs[index].String())
+		if err != nil || len(fields) == 0 || fields[0] != "INITIALIZED" {
+			t.Fatalf("initializer %d: err=%v output=%q", index, err, initializerOutputs[index].String())
 		}
 	}
 	commands := []*exec.Cmd{
@@ -330,7 +352,7 @@ func TestConcurrentLegacyLockInitializationUsesOneStableInode(t *testing.T) {
 	if statuses[string(journal.AppendCommitted)] != 1 || statuses[string(journal.AppendConflict)] != 1 {
 		t.Fatalf("legacy append statuses=%v", statuses)
 	}
-	for _, name := range []string{"journal.lock", "turn.lock"} {
+	for _, name := range []string{"lock-set.json", "journal.lock", "turn.lock"} {
 		info, err := os.Lstat(filepath.Join(sessionDir, name))
 		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
 			t.Fatalf("%s info=%v err=%v", name, info, err)
@@ -439,6 +461,15 @@ func TestLegacyAppendHelperProcess(t *testing.T) {
 		encoder = &processGateEncoder{gate: gate}
 	}
 	store := jsonl.New(root, jsonl.Options{Encoder: encoder})
+	if os.Getenv("YORDAM_INITIALIZE_LOCKS") == "1" {
+		err := store.InitializeJournalLocks(context.Background(), protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(sessionID)})
+		if err != nil {
+			fmt.Printf("ERROR:%v\n", err)
+			return
+		}
+		fmt.Println("INITIALIZED")
+		return
+	}
 	result, err := store.AppendBatch(context.Background(), legacyCompatibilityRequest(t,
 		protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(sessionID)}, head,
 		protocol.TransactionID("txn-"+suffix), protocol.EventID("evt-"+suffix)))

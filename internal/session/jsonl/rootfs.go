@@ -197,6 +197,14 @@ func (s *Store) openWorkspaceLayout(ctx context.Context, workspace domain.Worksp
 		}
 		return fail(err)
 	}
+	var workspaceGuard *rootedFlock
+	if create {
+		workspaceGuard, err = waitWorkspaceCoordination(ctx, layout.workspaceRoot)
+		if err != nil {
+			return fail(err)
+		}
+		defer func() { _ = workspaceGuard.release() }()
+	}
 	if err := ensureWorkspaceIdentity(ctx, layout, workspace, create); err != nil {
 		return fail(err)
 	}
@@ -208,11 +216,7 @@ func (s *Store) openWorkspaceLayout(ctx context.Context, workspace domain.Worksp
 		return fail(err)
 	}
 	if create {
-		layout.controlRoot, layout.controlInfo, err = openOrCreateRootedDirectory(ctx, layout.workspaceRoot, "control", true)
-		if err != nil {
-			return fail(err)
-		}
-		if err := s.ensureControlJournalFiles(ctx, layout); err != nil {
+		if err := s.ensureControlJournalLayout(ctx, layout); err != nil {
 			return fail(err)
 		}
 	} else {
@@ -477,8 +481,10 @@ type sessionTransaction struct {
 	artifactsInfo   os.FileInfo
 	control         bool
 	controlState    controlMetadata
-	journalLock     *os.File
+	lockSetBound    bool
+	lockSetInfo     os.FileInfo
 	journalLockInfo os.FileInfo
+	turnLockInfo    os.FileInfo
 }
 
 func (s *Store) openSessionTransaction(
@@ -709,8 +715,15 @@ func (t *sessionTransaction) verifyEvents() error {
 		t.verifyMetadata(),
 		verifyRootedRegularFile(t.sessionRoot, "events.jsonl", t.eventsInfo),
 	)
-	if t.journalLock != nil {
-		err = errors.Join(err, verifyRootedRegularFile(t.sessionRoot, journalLockName, t.journalLockInfo))
+	if t.lockSetBound {
+		err = errors.Join(
+			err,
+			verifyRootedRegularFile(t.sessionRoot, lockSetStateName, t.lockSetInfo),
+			verifyRootedRegularFile(t.sessionRoot, journalLockName, t.journalLockInfo),
+		)
+		if !t.control {
+			err = errors.Join(err, verifyRootedRegularFile(t.sessionRoot, turnLockName, t.turnLockInfo))
+		}
 	}
 	return err
 }
@@ -732,9 +745,6 @@ func (t *sessionTransaction) closeWithoutStoreRoot() error {
 	}
 	if t.events != nil {
 		closeErrs = append(closeErrs, t.events.Close())
-	}
-	if t.journalLock != nil {
-		closeErrs = append(closeErrs, t.journalLock.Close())
 	}
 	if t.metadata != nil {
 		closeErrs = append(closeErrs, t.metadata.Close())

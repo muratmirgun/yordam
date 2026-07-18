@@ -25,10 +25,6 @@ func (e *missingEventLogError) Error() string {
 }
 
 func (s *Store) Load(ctx context.Context, sessionID string) (domain.SessionReplay, error) {
-	if err := s.state.lockContext(ctx); err != nil {
-		return domain.SessionReplay{}, err
-	}
-	s.state.unlock()
 	if err := validateSessionID(sessionID); err != nil {
 		return domain.SessionReplay{}, err
 	}

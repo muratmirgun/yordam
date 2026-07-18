@@ -3,14 +3,15 @@ package jsonl
 type FaultPoint string
 
 const (
-	FaultEventWrite        FaultPoint = "event_write"
-	FaultEventSync         FaultPoint = "event_sync"
-	FaultMarkerWrite       FaultPoint = "marker_write"
-	FaultMarkerSync        FaultPoint = "marker_sync"
-	FaultMetadataWrite     FaultPoint = "metadata_write"
-	FaultMetadataRename    FaultPoint = "metadata_rename"
-	FaultDirectorySync     FaultPoint = "directory_sync"
-	FaultCommittedViewSync FaultPoint = "committed_view_sync"
+	FaultEventWrite                         FaultPoint = "event_write"
+	FaultEventSync                          FaultPoint = "event_sync"
+	FaultMarkerWrite                        FaultPoint = "marker_write"
+	FaultMarkerSync                         FaultPoint = "marker_sync"
+	FaultMetadataWrite                      FaultPoint = "metadata_write"
+	FaultMetadataRename                     FaultPoint = "metadata_rename"
+	FaultDirectorySync                      FaultPoint = "directory_sync"
+	FaultCommittedViewSync                  FaultPoint = "committed_view_sync"
+	FaultLockInitializationAfterJournalSync FaultPoint = "lock_initialization_after_journal_sync"
 
 	FaultQuarantineWrite          FaultPoint = "quarantine_write"
 	FaultQuarantineSync           FaultPoint = "quarantine_sync"

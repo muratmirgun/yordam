@@ -63,15 +63,10 @@ func TestCancellationDuringEventRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := newCancelAfterChecksContext(2)
-	store := New(t.TempDir(), Options{})
-	err = withStoreLock(store, func() error {
-		_, scanErr := validateEventLog(ctx, file, "01ARZ3NDEKTSV4RRFFQ69G5FAV", true)
-		return scanErr
-	})
+	_, err = validateEventLog(ctx, file, "01ARZ3NDEKTSV4RRFFQ69G5FAV", true)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("validateEventLog error=%v want context canceled", err)
 	}
-	assertStoreReacquires(t, store)
 }
 
 func TestCanceledPersistentReadReleasesDescriptor(t *testing.T) {
@@ -117,33 +112,10 @@ func testCanceledFiniteRead(t *testing.T, limit int64, contents []byte) {
 	}
 	defer file.Close()
 	ctx := newCancelAfterChecksContext(2)
-	store := New(t.TempDir(), Options{})
-	err = withStoreLock(store, func() error {
-		_, readErr := readOpenedFile(ctx, file, limit)
-		return readErr
-	})
+	_, err = readOpenedFile(ctx, file, limit)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("readOpenedFile error=%v want context canceled", err)
 	}
-	assertStoreReacquires(t, store)
-}
-
-func withStoreLock(store *Store, operation func() error) error {
-	if err := store.state.lockContext(context.Background()); err != nil {
-		return err
-	}
-	defer store.state.unlock()
-	return operation()
-}
-
-func assertStoreReacquires(t *testing.T, store *Store) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := store.state.lockContext(ctx); err != nil {
-		t.Fatalf("persistent read left store locked: %v", err)
-	}
-	store.state.unlock()
 }
 
 type cancelAfterChecksContext struct {

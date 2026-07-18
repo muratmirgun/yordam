@@ -63,7 +63,7 @@ func TestWorkspaceControlJournalUsesWorkspaceIdentity(t *testing.T) {
 		t.Fatalf("first control append=%+v err=%v", appended, err)
 	}
 	controlDir := filepath.Join(root, "workspaces", workspace.ID, "control")
-	for _, name := range []string{"events.jsonl", "metadata.json", "journal.lock"} {
+	for _, name := range []string{"events.jsonl", "metadata.json", "journal.lock", "lock-set.json"} {
 		info, err := os.Lstat(filepath.Join(controlDir, name))
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
