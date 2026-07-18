@@ -8,7 +8,9 @@ import (
 	"strings"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/orchestrator"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 )
 
@@ -59,6 +61,34 @@ type RunInput struct {
 	Session domain.Session
 	Replay  domain.SessionReplay
 	Prompt  string
+}
+
+type TurnOrchestrator interface {
+	RunTurn(context.Context, orchestrator.StartTurnRequest) (orchestrator.RunResult, error)
+}
+
+// OrchestratedRunner is the Gate 1 compatibility facade. Runner remains the
+// production implementation until composition switches atomically in Task 12.
+type OrchestratedRunner struct {
+	Orchestrator TurnOrchestrator
+	Prepare      func(context.Context, RunInput) (orchestrator.StartTurnRequest, error)
+}
+
+func (r OrchestratedRunner) RunTurn(ctx context.Context, input RunInput) error {
+	if r.Orchestrator == nil || r.Prepare == nil {
+		return fmt.Errorf("orchestrated runner is not configured")
+	}
+	if input.Session.ID == "" || strings.TrimSpace(input.Prompt) == "" {
+		return fmt.Errorf("legacy run input is incomplete")
+	}
+	request, err := r.Prepare(ctx, input)
+	if err != nil {
+		return err
+	}
+	request.SessionID = protocol.SessionID(input.Session.ID)
+	request.Prompt = input.Prompt
+	_, err = r.Orchestrator.RunTurn(ctx, request)
+	return err
 }
 
 func (r Runner) emit(event RuntimeEvent) {
