@@ -187,13 +187,14 @@ git commit -S -m "test: materialize foundation acceptance fixtures"
 - Modify: `internal/testsupport/ptyfixture/pty_unix.go`
 - Modify: `internal/testsupport/ptyfixture/pty_unix_test.go`
 - Modify: `internal/ptytest/yordam_test.go`
+- Create: `internal/repolint/testdata_test.go`
 - Delete: `internal/tui/testdata/**`
 
 **Interfaces:**
 - Produces: test-local `goldenView(width int) (string, bool)`
 - Produces: `ptyfixture.ScriptedSSE() string`
 
-- [ ] **Step 1: Write failing exact-byte tests**
+- [ ] **Step 1: Write failing exact-byte and repository-invariant tests**
 
 Assert widths 80, 120, and 160 exist and hash respectively to:
 
@@ -208,6 +209,12 @@ Assert width 100 is absent. Assert `ptyfixture.ScriptedSSE()` hashes to `c2cabff
 Run: `go test ./internal/tui ./internal/testsupport/ptyfixture -run 'Test(GoldenViewFixturesAreStable|ScriptedSSEFixtureIsStable)' -count=1`
 
 Expected: FAIL because both helpers are absent.
+
+Add `TestRepositoryContainsNoTestdataDirectories` under `internal/repolint`.
+Resolve the repository root, walk directories while skipping `.git`,
+`.worktrees`, and `dist`, and fail on a directory whose base name is
+`testdata`. Run it while `internal/tui/testdata` still exists and verify RED
+with that exact remaining path.
 
 - [ ] **Step 2: Move exact bytes into helpers**
 
@@ -230,13 +237,16 @@ go test ./internal/tui ./internal/testsupport/ptyfixture ./internal/ptytest -cou
 ```
 
 Delete exactly `internal/tui/testdata`, then rerun the same command.
+Also rerun
+`go test ./internal/repolint -run '^TestRepositoryContainsNoTestdataDirectories$' -count=1`.
 
-Expected: PASS with all four byte digests unchanged.
+Expected: PASS with all four byte digests unchanged and the repository lint
+transitioned from RED to GREEN for the intended reason.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add -- internal/tui internal/ptytest internal/testsupport/ptyfixture
+git add -- internal/tui internal/ptytest internal/testsupport/ptyfixture internal/repolint/testdata_test.go
 git commit -S -m "test: inline tui and pty fixtures"
 ```
 
@@ -245,7 +255,7 @@ git commit -S -m "test: inline tui and pty fixtures"
 ### Task 5: Enforce the invariant and renew release evidence
 
 **Files:**
-- Create: `internal/repolint/testdata_test.go`
+- Modify: `internal/repolint/testdata_test.go`
 - Modify: `internal/acceptance/foundation_architecture_test.go`
 - Modify: `docs/releases/v0.2.0-foundation-acceptance.md`
 
@@ -254,13 +264,15 @@ git commit -S -m "test: inline tui and pty fixtures"
 - Produces: production dependency isolation gate
 - Produces: renewed report-only signed Gate 1 evidence
 
-- [ ] **Step 1: Write and observe the repository lint RED**
+- [ ] **Step 1: Re-run the repository lint at the integrated source head**
 
-Before deleting the final fixture directory, add `TestRepositoryContainsNoTestdataDirectories`. Resolve the repository root, walk directories while skipping `.git`, `.worktrees`, and `dist`, and fail on a directory whose base name is `testdata`.
+Task 4 already established the lint test RED before the final deletion and GREEN
+after it. Run it again at the integrated source head.
 
 Run: `go test ./internal/repolint -run '^TestRepositoryContainsNoTestdataDirectories$' -count=1`
 
-Expected: FAIL listing the remaining TUI fixture path. After Task 4 deletion, rerun and expect PASS.
+Expected: PASS with no skipped repository subtree capable of containing tracked
+source fixtures.
 
 - [ ] **Step 2: Add the production dependency isolation gate**
 
