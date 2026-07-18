@@ -159,6 +159,7 @@ func (a *App) Events() <-chan Event {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	defer func() { a.runtimeSet.retireSecrets() }()
 	publisherCtx, stopPublisher := context.WithCancel(context.Background())
 	publisherDone := make(chan struct{})
 	go func() {
@@ -448,12 +449,14 @@ func (a *App) completeReload(ctx context.Context, result operationResult) {
 		if selection == (domain.ModelSelection{}) {
 			err := configurationError(candidate.configPath, "configuration has no default model", nil)
 			a.publish(ctx, Event{Kind: EventReloadCompleted, Err: err, Message: err.Error()})
+			candidate.retireSecrets()
 			return
 		}
 		if a.sessions != nil && a.session.ID != "" {
 			event, err := a.sessions.Append(ctx, a.session.ID, domain.EventModelChanged, domain.ModelChangedPayload{Selection: selection})
 			if err != nil {
 				a.publish(ctx, Event{Kind: EventReloadCompleted, Err: err, Message: err.Error()})
+				candidate.retireSecrets()
 				return
 			}
 			a.replay.Events = append(a.replay.Events, event)
@@ -464,10 +467,12 @@ func (a *App) completeReload(ctx context.Context, result operationResult) {
 		a.replay.Session = a.session
 	}
 	candidate.BindApprover(a)
+	previous := a.runtimeSet
 	a.runtimeSet = candidate
 	if a.redactors != nil {
 		a.redactors.Replace(candidate.Redactor)
 	}
+	previous.retireSecrets()
 	event := Event{
 		Kind:      EventReloadCompleted,
 		Applied:   true,
@@ -647,7 +652,7 @@ func (a *App) settingEvent() Event {
 
 func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domain.PermissionDecision, error) {
 	internalCallID := prompt.Call.Request.CallID
-	redactor := secret.New()
+	var redactor secret.Redacting = secret.New()
 	if a.redactors != nil {
 		redactor = a.redactors.Snapshot()
 	}
@@ -698,7 +703,7 @@ func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domai
 	}
 }
 
-func (a *App) newDisplayedPermissionCallID(redactor secret.Redactor) (string, error) {
+func (a *App) newDisplayedPermissionCallID(redactor secret.Redacting) (string, error) {
 	for range 32 {
 		if a.permissionCallSequence == ^uint64(0) {
 			return "", errPermissionCorrelationUnavailable

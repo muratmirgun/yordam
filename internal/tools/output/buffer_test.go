@@ -175,6 +175,39 @@ func TestBufferKeepsImmutableRedactorSnapshot(t *testing.T) {
 	}
 }
 
+func TestBufferLeaseRedactsEncodedSecretBeforeModelAndArtifactOutput(t *testing.T) {
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("generation-a", [][]byte{[]byte("buffer-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeArtifactStore{}
+	buffer := output.New(output.Options{SessionID: "s", Artifacts: store, Admission: lease})
+	encoded := "YnVmZmVyLXNlY3JldA=="
+	input := strings.Repeat("x", output.ModelExcerptBytes) + encoded
+	if _, err := buffer.Write([]byte(input)); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Retire("generation-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := buffer.Result(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Content, encoded) {
+		t.Fatalf("encoded secret remained model-visible: %q", result.Content)
+	}
+	for _, raw := range store.contents() {
+		if bytes.Contains(raw, []byte(encoded)) {
+			t.Fatalf("encoded secret remained in artifact: %q", raw)
+		}
+	}
+}
+
 type fakeArtifactStore struct {
 	mu        sync.Mutex
 	artifacts [][]byte

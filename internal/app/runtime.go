@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/agent"
@@ -13,6 +15,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/provider/openaicompat"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
@@ -25,17 +28,28 @@ import (
 )
 
 type RuntimeSet struct {
-	Runtime            Runtime
-	CompactSession     CompactSession
-	Models             []domain.ModelSelection
-	DefaultSelection   domain.ModelSelection
-	CredentialEnvs     map[string]string
-	Credentials        map[string]string
-	Redactor           secret.Redactor
-	ConfigurationError error
-	configPath         string
-	bindApprover       func(ports.PermissionApprover)
-	unchecked          bool
+	Runtime             Runtime
+	CompactSession      CompactSession
+	Models              []domain.ModelSelection
+	DefaultSelection    domain.ModelSelection
+	CredentialEnvs      map[string]string
+	Credentials         map[string]string
+	Redactor            secret.Redacting
+	Admission           *secret.Lease
+	RuntimeGenerationID protocol.RuntimeGenerationID
+	ConfigurationError  error
+	configPath          string
+	bindApprover        func(ports.PermissionApprover)
+	unchecked           bool
+	retire              func()
+}
+
+var runtimeSecretGeneration atomic.Uint64
+
+func (s RuntimeSet) retireSecrets() {
+	if s.retire != nil {
+		s.retire()
+	}
 }
 
 type ReloadRuntime func(context.Context, domain.ModelSelection) (RuntimeSet, error)
@@ -112,7 +126,32 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 	credentials := cfg.APIKeys()
 	redactionValues := profileKeyValues(credentials)
 	credentials[selected.Name] = selected.APIKey
-	redactor := secret.New(append(redactionValues, selected.APIKey)...)
+	redactionValues = append(redactionValues, selected.APIKey)
+	values := make([][]byte, 0, len(redactionValues))
+	for _, value := range redactionValues {
+		if value != "" {
+			values = append(values, []byte(value))
+		}
+	}
+	secretRegistry := secret.NewRegistry()
+	generationID := protocol.RuntimeGenerationID(fmt.Sprintf("runtime-%d", runtimeSecretGeneration.Add(1)))
+	admission, err := secretRegistry.Acquire(generationID, values)
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "bind runtime secret admission", err)
+	}
+	retireOnce := &sync.Once{}
+	retire := func() {
+		retireOnce.Do(func() {
+			_ = secretRegistry.Retire(generationID)
+		})
+	}
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			retire()
+			_ = admission.Close()
+		}
+	}()
 	clients := make(map[string]*openaicompat.Client, len(cfg.Profiles))
 	credentialEnvs := make(map[string]string, len(cfg.Profiles))
 	for name, profile := range cfg.Profiles {
@@ -128,7 +167,8 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 			BaseURL:    baseURL,
 			APIKey:     credentials[name],
 			Model:      model,
-			Redact:     redactor.String,
+			Redact:     admission.String,
+			Admission:  admission,
 		})
 	}
 	provider, err := openaicompat.NewRouter(clients)
@@ -139,7 +179,8 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 		SessionID:        b.activeSession.get(),
 		CurrentSessionID: b.activeSession.get,
 		Artifacts:        b.store,
-		Redact:           redactor,
+		Redact:           admission,
+		Admission:        admission,
 	}
 	progress := func(progress domain.ToolProgress) {
 		if b.runtimeEvents == nil {
@@ -164,30 +205,41 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 		}),
 	)
 	runner := &agent.Runner{
-		Provider:         provider,
-		Tools:            registry,
-		Policy:           b.policy,
-		Sessions:         b.store,
-		MaxToolCalls:     effectiveMaxToolCalls(cfg, b.cli),
-		SystemPrompt:     systemPrompt,
-		Redact:           redactor.String,
-		NewDeltaRedactor: func() agent.DeltaRedactor { return redactor.Stream() },
+		Provider:     provider,
+		Tools:        registry,
+		Policy:       b.policy,
+		Sessions:     b.store,
+		MaxToolCalls: effectiveMaxToolCalls(cfg, b.cli),
+		SystemPrompt: systemPrompt,
+		Redact:       admission.String,
+		Admission:    admission,
+		NewDeltaRedactor: func() agent.DeltaRedactor {
+			stream, streamErr := admission.RedactionStream()
+			if streamErr != nil {
+				return secret.New().Stream()
+			}
+			return stream
+		},
 	}
 	if b.runtimeEvents != nil {
 		runner.Sink = func(event agent.RuntimeEvent) { b.runtimeEvents <- event }
 	}
+	succeeded = true
 	return RuntimeSet{
-		Runtime:          runner,
-		CompactSession:   compactSession(provider, b.store),
-		Models:           cfg.Models(),
-		DefaultSelection: cfg.DefaultSelection(),
-		CredentialEnvs:   credentialEnvs,
-		Credentials:      credentials,
-		Redactor:         redactor,
-		configPath:       b.configPath,
+		Runtime:             runner,
+		CompactSession:      compactSession(provider, b.store),
+		Models:              cfg.Models(),
+		DefaultSelection:    cfg.DefaultSelection(),
+		CredentialEnvs:      credentialEnvs,
+		Credentials:         credentials,
+		Redactor:            admission,
+		Admission:           admission,
+		RuntimeGenerationID: generationID,
+		configPath:          b.configPath,
 		bindApprover: func(approver ports.PermissionApprover) {
 			runner.Approver = approver
 		},
+		retire: retire,
 	}, nil
 }
 

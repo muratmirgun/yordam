@@ -270,6 +270,7 @@ func (s *Store) appendBatchLockedWithIdentity(
 		declaration := protocol.ProposedEvent{
 			EventID: compatibilityID, Time: compatibilityTime, PayloadVersion: 1,
 			Kind: protocol.EventMigrationCompatibilityDeclared, SessionID: protocol.SessionID(request.Journal.ID), Payload: payload,
+			RuntimeGenerationID: request.Events[0].RuntimeGenerationID,
 		}
 		request.Events = append([]protocol.ProposedEvent{declaration}, request.Events...)
 	} else if request.Compatibility != nil {
@@ -311,7 +312,7 @@ func (s *Store) appendBatchLockedWithIdentity(
 			if s.encoder == nil {
 				return base, fmt.Errorf("journal encoder is required")
 			}
-			admitted, err = s.encoder.EncodeProposed(protocol.CloneProposedEvent(proposed))
+			admitted, err = s.admitProposed(protocol.CloneProposedEvent(proposed))
 			if err != nil {
 				return base, fmt.Errorf("encode proposed event %q: %w", proposed.EventID, err)
 			}

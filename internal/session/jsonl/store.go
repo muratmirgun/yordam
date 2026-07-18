@@ -20,28 +20,33 @@ import (
 	"github.com/muratmirgun/yordam/internal/eventcodec"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/oklog/ulid/v2"
 )
 
 type Options struct {
-	Clock    func() time.Time
-	Entropy  io.Reader
-	Sanitize func(any) (json.RawMessage, error)
-	Encoder  journal.Encoder
-	Registry *eventcodec.Registry
-	Fault    FaultInjector
+	Clock             func() time.Time
+	Entropy           io.Reader
+	Sanitize          func(any) (json.RawMessage, error)
+	Encoder           journal.Encoder
+	Registry          *eventcodec.Registry
+	Fault             FaultInjector
+	Secrets           *secret.Registry
+	ArtifactAdmission *secret.Lease
 }
 
 type Store struct {
-	root         string
-	clock        func() time.Time
-	entropy      io.Reader
-	sanitize     func(any) (json.RawMessage, error)
-	encoder      journal.Encoder
-	registry     *eventcodec.Registry
-	fault        FaultInjector
-	state        *rootState
-	verifiedScan sync.Map
+	root              string
+	clock             func() time.Time
+	entropy           io.Reader
+	sanitize          func(any) (json.RawMessage, error)
+	encoder           journal.Encoder
+	registry          *eventcodec.Registry
+	fault             FaultInjector
+	secrets           *secret.Registry
+	artifactAdmission *secret.Lease
+	state             *rootState
+	verifiedScan      sync.Map
 }
 
 type rootState struct {
@@ -81,7 +86,8 @@ func New(root string, opts Options) *Store {
 	state, _ := rootStates.LoadOrStore(root, newRootState())
 	return &Store{
 		root: root, clock: opts.Clock, entropy: opts.Entropy, sanitize: opts.Sanitize,
-		encoder: encoder, registry: registry, fault: opts.Fault, state: state.(*rootState),
+		encoder: encoder, registry: registry, fault: opts.Fault, secrets: opts.Secrets,
+		artifactAdmission: opts.ArtifactAdmission, state: state.(*rootState),
 	}
 }
 

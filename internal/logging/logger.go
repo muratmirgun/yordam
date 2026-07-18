@@ -3,6 +3,7 @@ package logging
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -21,6 +22,16 @@ func New(destination io.Writer, redactor secret.Redacting) *Logger {
 		redactor = secret.New()
 	}
 	return &Logger{dest: destination, redactor: redactor}
+}
+
+// NewLeased constructs a logger whose redaction set is pinned to one runtime
+// generation. The caller owns the producer lease and closes it after the logger
+// can no longer emit events.
+func NewLeased(destination io.Writer, lease *secret.Lease) (*Logger, error) {
+	if lease == nil {
+		return nil, fmt.Errorf("secret producer lease is required")
+	}
+	return New(destination, lease), nil
 }
 
 func (l *Logger) Event(name string, fields map[string]any) error {

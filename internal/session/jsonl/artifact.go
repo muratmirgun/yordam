@@ -1,6 +1,7 @@
 package jsonl
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -39,6 +41,16 @@ func (s *Store) putLocked(ctx context.Context, sessionID, mediaType string, src 
 	if limit <= 0 || limit > MaxArtifactBytes {
 		limit = MaxArtifactBytes
 	}
+	if s.artifactAdmission != nil {
+		candidate, err := readArtifactCandidate(ctx, src, limit)
+		if err != nil {
+			return domain.Artifact{}, err
+		}
+		if s.artifactAdmission.Scanner().Scan(candidate) {
+			return domain.Artifact{}, secret.ErrSecretDetected
+		}
+		src = bytes.NewReader(candidate)
+	}
 	transaction, session, err := s.openSessionTransaction(ctx, sessionID, os.O_RDONLY, 0)
 	if err != nil {
 		return domain.Artifact{}, err
@@ -66,6 +78,30 @@ func (s *Store) putLocked(ctx context.Context, sessionID, mediaType string, src 
 		Size:      written,
 		Truncated: truncated,
 	}, nil
+}
+
+func readArtifactCandidate(ctx context.Context, src io.Reader, limit int64) ([]byte, error) {
+	reader := io.LimitReader(src, limit+1)
+	var content bytes.Buffer
+	buffer := make([]byte, 32*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		count, err := reader.Read(buffer)
+		if count > 0 {
+			_, _ = content.Write(buffer[:count])
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return content.Bytes(), nil
+			}
+			return nil, err
+		}
+		if count == 0 {
+			return nil, io.ErrNoProgress
+		}
+	}
 }
 
 func writeArtifactTransactional(

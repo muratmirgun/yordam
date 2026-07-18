@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 type ClientOptions struct {
@@ -21,6 +22,7 @@ type ClientOptions struct {
 	RetryDelays []time.Duration
 	Jitter      func(time.Duration) time.Duration
 	Redact      func(string) string
+	Admission   *secret.Lease
 }
 
 type Client struct {
@@ -31,6 +33,7 @@ type Client struct {
 	retryDelays []time.Duration
 	jitter      func(time.Duration) time.Duration
 	redact      func(string) string
+	admission   *secret.Lease
 }
 
 func New(opts ClientOptions) *Client {
@@ -49,6 +52,9 @@ func New(opts ClientOptions) *Client {
 	if opts.Redact == nil {
 		opts.Redact = func(value string) string { return value }
 	}
+	if opts.Admission != nil {
+		opts.Redact = opts.Admission.String
+	}
 	return &Client{
 		http:        opts.HTTPClient,
 		endpoint:    strings.TrimRight(opts.BaseURL, "/") + "/chat/completions",
@@ -57,6 +63,7 @@ func New(opts ClientOptions) *Client {
 		retryDelays: append([]time.Duration(nil), opts.RetryDelays...),
 		jitter:      opts.Jitter,
 		redact:      opts.Redact,
+		admission:   opts.Admission,
 	}
 }
 

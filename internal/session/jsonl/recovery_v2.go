@@ -383,7 +383,7 @@ func (s *Store) admitRecoveryDiagnosticAppend(
 }
 
 func (s *Store) admitRecoveryPayload(proposed protocol.ProposedEvent) ([]byte, error) {
-	admitted, err := s.encoder.EncodeProposed(protocol.CloneProposedEvent(proposed))
+	admitted, err := s.admitProposed(protocol.CloneProposedEvent(proposed))
 	if err != nil {
 		return nil, fmt.Errorf("encode proposed event %q: %w", proposed.EventID, err)
 	}

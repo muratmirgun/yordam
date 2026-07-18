@@ -39,6 +39,38 @@ func (e sanitizeEncoder) EncodeProposed(event protocol.ProposedEvent) (json.RawM
 	return e.sanitize(value)
 }
 
+func (s *Store) admitProposed(event protocol.ProposedEvent) (json.RawMessage, error) {
+	if s.encoder == nil {
+		return nil, fmt.Errorf("journal encoder is required")
+	}
+	admitted, err := s.encoder.EncodeProposed(protocol.CloneProposedEvent(event))
+	if err != nil || s.secrets == nil {
+		return admitted, err
+	}
+	if event.RuntimeGenerationID == "" {
+		return nil, fmt.Errorf("runtime generation is required for secret admission")
+	}
+	lease, err := s.secrets.AcquireExisting(event.RuntimeGenerationID)
+	if err != nil {
+		return nil, fmt.Errorf("acquire secret admission lease: %w", err)
+	}
+	defer lease.Close()
+	decoder := json.NewDecoder(bytes.NewReader(admitted))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	redacted, err := lease.JSON(value)
+	if err != nil {
+		return nil, err
+	}
+	if err := protocol.ValidateRawJSON(redacted); err != nil {
+		return nil, err
+	}
+	return redacted, nil
+}
+
 type scannedEvent struct {
 	record protocol.EventRecord
 	cursor protocol.CommittedCursor

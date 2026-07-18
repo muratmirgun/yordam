@@ -296,6 +296,12 @@ func TestRuntimeBuilderRedactsConfiguredAndOverrideCredentials(t *testing.T) {
 	if got := set.Redactor.String("configured-secret override-secret"); got != "[REDACTED] [REDACTED]" {
 		t.Fatalf("redacted=%q", got)
 	}
+	if set.Admission == nil || set.RuntimeGenerationID == "" {
+		t.Fatalf("runtime has no generation lease: %+v", set)
+	}
+	if got := set.Redactor.String("Y29uZmlndXJlZC1zZWNyZXQ="); got != "[REDACTED]" {
+		t.Fatalf("encoded redacted=%q", got)
+	}
 }
 
 func TestRuntimeSetBindsApproverToItsRunner(t *testing.T) {

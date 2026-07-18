@@ -8,6 +8,7 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 func TestBuildContextUsesLatestCompaction(t *testing.T) {
@@ -55,6 +56,21 @@ func TestToolResultContentIsStructuredAndBounded(t *testing.T) {
 	}
 	if _, exists := projected["workspace_changes"]; exists {
 		t.Fatalf("model result duplicated workspace_changes excerpt: %#v", projected)
+	}
+}
+
+func TestToolResultContentUsesGenerationLease(t *testing.T) {
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("generation-model-result", [][]byte{[]byte("model-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lease.Close() }()
+	content := agent.ToolResultContentLeased(domain.ToolResult{
+		CallID: "call", Status: domain.ToolSucceeded, Content: "bW9kZWwtc2VjcmV0",
+	}, lease)
+	if strings.Contains(content, "bW9kZWwtc2VjcmV0") || !strings.Contains(content, "[REDACTED]") {
+		t.Fatalf("model tool result=%q", content)
 	}
 }
 

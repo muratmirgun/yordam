@@ -1,0 +1,492 @@
+package evidence
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
+	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/safefile"
+	"github.com/muratmirgun/yordam/internal/secret"
+)
+
+const MaxRetainedBytes int64 = 10 << 20
+
+var (
+	ErrEvidenceExists      = errors.New("evidence already exists")
+	ErrEvidenceNotFound    = errors.New("evidence not found")
+	ErrEvidenceUnavailable = errors.New("evidence is unavailable")
+	ErrBlobMissing         = errors.New("evidence blob is missing")
+	ErrDigestMismatch      = errors.New("evidence blob digest mismatch")
+	ErrUnsafePath          = errors.New("unsafe evidence path")
+)
+
+type Store interface {
+	Put(context.Context, protocol.EvidenceCandidate) (protocol.EvidenceRecord, error)
+	Get(context.Context, protocol.EvidenceID) (protocol.EvidenceRecord, error)
+	Open(context.Context, protocol.EvidenceID) (io.ReadCloser, error)
+	Verify(context.Context, protocol.EvidenceID) error
+	MigrateLegacyArtifact(context.Context, protocol.SessionID, string) (protocol.EvidenceRecord, error)
+	VerifyReceipt(context.Context, protocol.VerificationReceipt) error
+	Diagnostics() []Diagnostic
+}
+
+type Diagnostic struct {
+	EvidenceID   protocol.EvidenceID
+	Availability protocol.ContentAvailability
+	Message      string
+}
+
+type fileStore struct {
+	root         string
+	scanner      *secret.AdmissionScanner
+	clock        func() time.Time
+	diagnosticMu sync.Mutex
+	diagnostics  []Diagnostic
+}
+
+func New(root string, scanner *secret.AdmissionScanner) (Store, error) {
+	if scanner == nil {
+		return nil, fmt.Errorf("admission scanner is required")
+	}
+	absolute, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return nil, err
+	}
+	if canonical, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
+		absolute = canonical
+	}
+	return &fileStore{root: absolute, scanner: scanner, clock: time.Now}, nil
+}
+
+func (s *fileStore) Put(ctx context.Context, candidate protocol.EvidenceCandidate) (protocol.EvidenceRecord, error) {
+	return s.put(ctx, candidate, nil)
+}
+
+func (s *fileStore) put(ctx context.Context, candidate protocol.EvidenceCandidate, aliases []string) (protocol.EvidenceRecord, error) {
+	if err := validateCandidate(candidate); err != nil {
+		return protocol.EvidenceRecord{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return protocol.EvidenceRecord{}, err
+	}
+	originalSize := int64(len(candidate.Content))
+	limit := candidate.Limit
+	if limit <= 0 || limit > MaxRetainedBytes {
+		limit = MaxRetainedBytes
+	}
+	retained := bytes.Clone(candidate.Content)
+	truncated := int64(len(retained)) > limit
+	if truncated {
+		retained = retained[:limit]
+	}
+	body := protocol.EvidenceRecordBody{
+		ID: candidate.ID, Kind: candidate.Kind, WorkspaceID: candidate.WorkspaceID, SessionID: candidate.SessionID,
+		MediaType: candidate.MediaType, Size: int64(len(retained)), ProducingActivityID: candidate.ProducingActivityID,
+		Actor: protocol.DeepCopy(candidate.Actor), Subject: protocol.DeepCopy(candidate.Subject), CreatedAt: s.clock().UTC(),
+		Truncated: truncated, LegacyArtifactAliases: append([]string(nil), aliases...),
+	}
+	if truncated {
+		body.OriginalSize = originalSize
+	}
+	if s.scanner.Scan(candidate.Content) {
+		body.Availability = protocol.ContentWithheldSecret
+		body.Redacted = true
+	} else {
+		digest := digestBytes(retained)
+		if err := s.publishBlob(ctx, candidate.WorkspaceID, digest, retained); err != nil {
+			return protocol.EvidenceRecord{}, fmt.Errorf("publish evidence blob: %w", err)
+		}
+		body.Availability = protocol.ContentAvailable
+		body.Blob = &protocol.BlobRef{Digest: digest}
+	}
+	recordDigest, err := canonicaljson.Digest(body)
+	if err != nil {
+		return protocol.EvidenceRecord{}, err
+	}
+	record := protocol.EvidenceRecord{Body: body, Digest: recordDigest}
+	if err := record.Validate(); err != nil {
+		return protocol.EvidenceRecord{}, err
+	}
+	if err := s.publishRecord(ctx, record); err != nil {
+		return protocol.EvidenceRecord{}, fmt.Errorf("publish evidence metadata: %w", err)
+	}
+	return protocol.DeepCopy(record), nil
+}
+
+func (s *fileStore) Get(ctx context.Context, id protocol.EvidenceID) (protocol.EvidenceRecord, error) {
+	record, err := s.readRecord(ctx, id)
+	if err != nil {
+		return protocol.EvidenceRecord{}, err
+	}
+	if record.Body.Availability != protocol.ContentAvailable {
+		return record, nil
+	}
+	_, err = s.readVerifiedBlob(ctx, record)
+	if err == nil {
+		return record, nil
+	}
+	availability := protocol.ContentCorrupt
+	if errors.Is(err, ErrBlobMissing) {
+		availability = protocol.ContentMissing
+	}
+	s.recordDiagnostic(id, availability, err.Error())
+	return projectUnavailable(record, availability)
+}
+
+func (s *fileStore) Open(ctx context.Context, id protocol.EvidenceID) (io.ReadCloser, error) {
+	record, err := s.readRecord(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if record.Body.Availability != protocol.ContentAvailable || record.Body.Blob == nil {
+		return nil, ErrEvidenceUnavailable
+	}
+	raw, err := s.readVerifiedBlob(ctx, record)
+	if err != nil {
+		availability := protocol.ContentCorrupt
+		if errors.Is(err, ErrBlobMissing) {
+			availability = protocol.ContentMissing
+		}
+		s.recordDiagnostic(id, availability, err.Error())
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(raw)), nil
+}
+
+func (s *fileStore) Verify(ctx context.Context, id protocol.EvidenceID) error {
+	opened, err := s.Open(ctx, id)
+	if err != nil {
+		return err
+	}
+	return opened.Close()
+}
+
+func (s *fileStore) VerifyReceipt(ctx context.Context, receipt protocol.VerificationReceipt) error {
+	for _, id := range receipt.Body.EvidenceIDs {
+		if err := s.Verify(ctx, id); err != nil {
+			return fmt.Errorf("%w: evidence %q: %v", ErrEvidenceUnavailable, id, err)
+		}
+	}
+	return nil
+}
+
+func (s *fileStore) Diagnostics() []Diagnostic {
+	s.diagnosticMu.Lock()
+	defer s.diagnosticMu.Unlock()
+	return append([]Diagnostic(nil), s.diagnostics...)
+}
+
+func (s *fileStore) recordDiagnostic(id protocol.EvidenceID, availability protocol.ContentAvailability, message string) {
+	s.diagnosticMu.Lock()
+	defer s.diagnosticMu.Unlock()
+	s.diagnostics = append(s.diagnostics, Diagnostic{EvidenceID: id, Availability: availability, Message: message})
+}
+
+func (s *fileStore) publishBlob(ctx context.Context, workspace protocol.WorkspaceID, digest protocol.Digest, content []byte) error {
+	directory := filepath.Join("workspaces", string(workspace), "evidence", "blobs", "sha256")
+	if err := s.ensureDirectory(ctx, directory, 0o700); err != nil {
+		return fmt.Errorf("prepare blob directory: %w", err)
+	}
+	path := filepath.Join(s.root, directory, digest.Value)
+	if raw, err := readRegular(ctx, path, MaxRetainedBytes); err == nil {
+		if digestBytes(raw) != digest {
+			return ErrDigestMismatch
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect existing blob: %w", err)
+	}
+	root, err := os.OpenRoot(filepath.Join(s.root, directory))
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	created, err := publishNoReplace(ctx, root, digest.Value, content, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		raw, readErr := readRegular(ctx, path, MaxRetainedBytes)
+		if readErr != nil {
+			return readErr
+		}
+		if digestBytes(raw) != digest {
+			return ErrDigestMismatch
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("publish no-replace blob: %w", err)
+	}
+	if !created {
+		return fmt.Errorf("blob publication made no progress")
+	}
+	return nil
+}
+
+func (s *fileStore) publishRecord(ctx context.Context, record protocol.EvidenceRecord) error {
+	directory := filepath.Join("evidence", "records")
+	if err := s.ensureDirectory(ctx, directory, 0o700); err != nil {
+		return err
+	}
+	raw, err := canonicaljson.Marshal(record)
+	if err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(filepath.Join(s.root, directory))
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	_, err = publishNoReplace(ctx, root, string(record.Body.ID)+".json", raw, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		info, statErr := root.Lstat(string(record.Body.ID) + ".json")
+		if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.Join(ErrUnsafePath, statErr)
+		}
+		return ErrEvidenceExists
+	}
+	return err
+}
+
+func (s *fileStore) readRecord(ctx context.Context, id protocol.EvidenceID) (protocol.EvidenceRecord, error) {
+	if !safeName(string(id)) {
+		return protocol.EvidenceRecord{}, ErrUnsafePath
+	}
+	path := filepath.Join(s.root, "evidence", "records", string(id)+".json")
+	raw, err := readRegular(ctx, path, protocol.MaxEventBytes)
+	if os.IsNotExist(err) {
+		return protocol.EvidenceRecord{}, ErrEvidenceNotFound
+	}
+	if err != nil {
+		return protocol.EvidenceRecord{}, err
+	}
+	var record protocol.EvidenceRecord
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return protocol.EvidenceRecord{}, fmt.Errorf("decode evidence metadata: %w", err)
+	}
+	if err := record.Validate(); err != nil {
+		return protocol.EvidenceRecord{}, fmt.Errorf("validate evidence metadata: %w", err)
+	}
+	if err := canonicaljson.ValidateDigest(record.Body, record.Digest); err != nil {
+		return protocol.EvidenceRecord{}, fmt.Errorf("validate evidence metadata digest: %w", err)
+	}
+	if record.Body.ID != id {
+		return protocol.EvidenceRecord{}, fmt.Errorf("evidence metadata identity mismatch")
+	}
+	return protocol.DeepCopy(record), nil
+}
+
+func (s *fileStore) readVerifiedBlob(ctx context.Context, record protocol.EvidenceRecord) ([]byte, error) {
+	if record.Body.Blob == nil {
+		return nil, ErrEvidenceUnavailable
+	}
+	path := filepath.Join(s.root, "workspaces", string(record.Body.WorkspaceID), "evidence", "blobs", "sha256", record.Body.Blob.Digest.Value)
+	raw, err := readRegular(ctx, path, MaxRetainedBytes)
+	if os.IsNotExist(err) {
+		return nil, ErrBlobMissing
+	}
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) != record.Body.Size || digestBytes(raw) != record.Body.Blob.Digest {
+		return nil, ErrDigestMismatch
+	}
+	return raw, nil
+}
+
+func (s *fileStore) ensureDirectory(ctx context.Context, relative string, mode os.FileMode) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.root, mode); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(s.root)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	cursor := ""
+	for _, part := range strings.Split(filepath.Clean(relative), string(filepath.Separator)) {
+		if !safeName(part) {
+			return ErrUnsafePath
+		}
+		cursor = filepath.Join(cursor, part)
+		info, statErr := root.Lstat(cursor)
+		created := false
+		if os.IsNotExist(statErr) {
+			if err := root.Mkdir(cursor, mode); err != nil && !os.IsExist(err) {
+				return err
+			} else if err == nil {
+				created = true
+			}
+			info, statErr = root.Lstat(cursor)
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return ErrUnsafePath
+		}
+		if created {
+			parent := filepath.Dir(cursor)
+			if parent == "" {
+				parent = "."
+			}
+			if err := syncRootDirectory(root, parent); err != nil {
+				return err
+			}
+		}
+	}
+	return syncDirectory(filepath.Join(s.root, relative))
+}
+
+func syncRootDirectory(root *os.Root, name string) error {
+	directory, err := root.Open(name)
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
+}
+
+func publishNoReplace(ctx context.Context, root *os.Root, final string, content []byte, mode os.FileMode) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if !safeName(final) {
+		return false, fmt.Errorf("%w: invalid publication name %q", ErrUnsafePath, final)
+	}
+	temporary, err := temporaryName()
+	if err != nil {
+		return false, err
+	}
+	file, err := root.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return false, err
+	}
+	cleanup := func(operationErr error) (bool, error) {
+		closeErr := file.Close()
+		removeErr := root.Remove(temporary)
+		if os.IsNotExist(removeErr) {
+			removeErr = nil
+		}
+		return false, errors.Join(operationErr, closeErr, removeErr)
+	}
+	if err := file.Chmod(mode); err != nil {
+		return cleanup(err)
+	}
+	if _, err := file.Write(content); err != nil {
+		return cleanup(err)
+	}
+	if err := errors.Join(ctx.Err(), file.Sync()); err != nil {
+		return cleanup(err)
+	}
+	createdInfo, err := file.Stat()
+	if err != nil || !createdInfo.Mode().IsRegular() {
+		regular := err == nil && createdInfo.Mode().IsRegular()
+		return cleanup(errors.Join(err, fmt.Errorf("%w: temporary regular=%t", ErrUnsafePath, regular)))
+	}
+	if err := file.Close(); err != nil {
+		_ = root.Remove(temporary)
+		return false, err
+	}
+	file = nil
+	if err := root.Link(temporary, final); err != nil {
+		_ = root.Remove(temporary)
+		return false, err
+	}
+	finalInfo, err := root.Lstat(final)
+	if err != nil || !finalInfo.Mode().IsRegular() || !os.SameFile(createdInfo, finalInfo) {
+		_ = root.Remove(final)
+		_ = root.Remove(temporary)
+		return false, errors.Join(err, fmt.Errorf("%w: final regular=%t same=%t", ErrUnsafePath, err == nil && finalInfo.Mode().IsRegular(), err == nil && os.SameFile(createdInfo, finalInfo)))
+	}
+	if err := root.Remove(temporary); err != nil {
+		return false, err
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return false, err
+	}
+	err = errors.Join(directory.Sync(), directory.Close())
+	return true, err
+}
+
+func temporaryName() (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return ".publish-" + hex.EncodeToString(random[:]) + ".tmp", nil
+}
+
+func readRegular(ctx context.Context, path string, limit int64) ([]byte, error) {
+	file, err := safefile.OpenRegular(ctx, path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, err
+		}
+		return nil, errors.Join(ErrUnsafePath, err)
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("file exceeds %d bytes", limit)
+	}
+	return raw, nil
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
+}
+
+func projectUnavailable(record protocol.EvidenceRecord, availability protocol.ContentAvailability) (protocol.EvidenceRecord, error) {
+	record.Body.Availability = availability
+	record.Body.Blob = nil
+	digest, err := canonicaljson.Digest(record.Body)
+	if err != nil {
+		return protocol.EvidenceRecord{}, err
+	}
+	record.Digest = digest
+	return record, record.Validate()
+}
+
+func validateCandidate(candidate protocol.EvidenceCandidate) error {
+	if !safeName(string(candidate.ID)) || !safeName(string(candidate.WorkspaceID)) || candidate.Kind == "" || candidate.MediaType == "" || candidate.ProducingActivityID == "" {
+		return fmt.Errorf("evidence candidate is incomplete")
+	}
+	if candidate.SessionID != "" && !safeName(string(candidate.SessionID)) {
+		return ErrUnsafePath
+	}
+	if err := candidate.Actor.Validate(); err != nil {
+		return err
+	}
+	return candidate.Subject.Validate()
+}
+
+func safeName(value string) bool {
+	return value != "" && value != "." && value != ".." && filepath.Base(value) == value && !strings.ContainsAny(value, "/\\\x00")
+}
+
+func digestBytes(value []byte) protocol.Digest {
+	sum := sha256.Sum256(value)
+	return protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hex.EncodeToString(sum[:])}
+}

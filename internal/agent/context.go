@@ -5,6 +5,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 const MaxToolResultContextBytes = 32 << 10
@@ -113,6 +114,18 @@ func ToolResultContent(result domain.ToolResult) string {
 		return string(base)
 	}
 	return string(raw)
+}
+
+func ToolResultContentLeased(result domain.ToolResult, lease *secret.Lease) string {
+	if lease == nil {
+		return ToolResultContent(result)
+	}
+	result.CallID = lease.String(result.CallID)
+	result.Content = lease.String(result.Content)
+	for index, id := range result.ArtifactIDs {
+		result.ArtifactIDs[index] = lease.String(id)
+	}
+	return ToolResultContent(result)
 }
 
 func boundedString(value string, maximum int) string {

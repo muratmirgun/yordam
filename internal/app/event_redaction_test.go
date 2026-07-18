@@ -134,6 +134,26 @@ func TestPublishRedactsSecretFoundOnlyInApprovalScope(t *testing.T) {
 	}
 }
 
+func TestPublishUsesGenerationLeaseForEncodedVariants(t *testing.T) {
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("generation-app", [][]byte{[]byte("publish-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lease.Close() }()
+	application := New(Options{Redactors: secret.NewBinding(lease)})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.publishEvents(ctx)
+	encoded := "cHVibGlzaC1zZWNyZXQ="
+	if !application.publish(ctx, Event{Kind: EventNotice, Message: encoded}) {
+		t.Fatal("publish rejected event")
+	}
+	if published := <-application.Events(); strings.Contains(published.Message, encoded) || published.Message != "[REDACTED]" {
+		t.Fatalf("published=%+v", published)
+	}
+}
+
 func assertErrorTreeOmits(t *testing.T, err error, forbidden string) {
 	t.Helper()
 	if err == nil {

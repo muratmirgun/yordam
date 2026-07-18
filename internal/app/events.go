@@ -48,7 +48,7 @@ type Event struct {
 	Applied     bool
 }
 
-func sanitizePublishedEvent(redactor secret.Redactor, event Event) (Event, error) {
+func sanitizePublishedEvent(redactor secret.Redacting, event Event) (Event, error) {
 	originalErr := event.Err
 	event.Err = nil
 	var sanitizedApprovalScope string
@@ -108,7 +108,7 @@ type sanitizedPublishedErrors struct {
 func (e *sanitizedPublishedErrors) Error() string   { return e.message }
 func (e *sanitizedPublishedErrors) Unwrap() []error { return e.causes }
 
-func sanitizePublishedError(redactor secret.Redactor, err error) (error, bool) {
+func sanitizePublishedError(redactor secret.Redacting, err error) (error, bool) {
 	if err == nil {
 		return nil, false
 	}

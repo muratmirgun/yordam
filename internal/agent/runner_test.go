@@ -14,6 +14,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 func TestRunnerPersistsToolLoopInOrder(t *testing.T) {
@@ -548,6 +549,27 @@ func TestRunnerPersistsApproverFailureAsTerminalState(t *testing.T) {
 	}
 	if got := sessions.lastKind(); got != domain.EventTurnFailed {
 		t.Fatalf("last event=%q want=%q", got, domain.EventTurnFailed)
+	}
+}
+
+func TestRunnerAdmitsDiagnosticReasonBeforePersistence(t *testing.T) {
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("generation-diagnostic", [][]byte{[]byte("diagnostic-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lease.Close() }()
+	sessions := newFakeSessionStore()
+	runner := newTestRunner(&fakeProvider{streams: [][]domain.ModelEvent{{
+		{Kind: domain.ModelStreamError, Err: errors.New("ZGlhZ25vc3RpYy1zZWNyZXQ=")},
+	}}}, recordingRegistry{tool: &recordingTool{}}, allowPolicy{}, denyIfCalled{}, sessions)
+	runner.Admission = lease
+	if err := runner.RunTurn(context.Background(), testRunInput()); err == nil {
+		t.Fatal("provider failure unexpectedly succeeded")
+	}
+	payload := terminalPayload(t, sessions.lastEvent())
+	if strings.Contains(payload.Reason, "ZGlhZ25vc3RpYy1zZWNyZXQ=") || payload.Reason != "[REDACTED]" {
+		t.Fatalf("terminal payload=%+v", payload)
 	}
 }
 

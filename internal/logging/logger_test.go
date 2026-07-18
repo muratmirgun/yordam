@@ -3,6 +3,7 @@ package logging_test
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -131,6 +132,32 @@ func TestLoggerUsesCurrentRedactorBinding(t *testing.T) {
 		if event.Event != "[REDACTED]" || event.Message != wantMessages[index] {
 			t.Fatalf("line %d event=%+v want message=%q", index, event, wantMessages[index])
 		}
+	}
+}
+
+func TestLeasedLoggerRedactsEncodedSecretVariants(t *testing.T) {
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("generation-a", [][]byte{[]byte("logger-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lease.Close() }()
+	var destination bytes.Buffer
+	logger, err := logging.NewLeased(&destination, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logger.Event("provider", map[string]any{"message": "bG9nZ2VyLXNlY3JldA=="}); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(destination.Bytes(), []byte("bG9nZ2VyLXNlY3JldA==")) {
+		t.Fatalf("encoded secret remained in log: %s", destination.Bytes())
+	}
+}
+
+func TestLeasedLoggerRejectsMissingLease(t *testing.T) {
+	if _, err := logging.NewLeased(io.Discard, nil); err == nil {
+		t.Fatal("leased logger accepted a nil lease")
 	}
 }
 

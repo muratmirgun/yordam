@@ -2,12 +2,14 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 type Runner struct {
@@ -19,6 +21,7 @@ type Runner struct {
 	MaxToolCalls     int
 	SystemPrompt     string
 	Redact           func(string) string
+	Admission        *secret.Lease
 	NewDeltaRedactor func() DeltaRedactor
 	Sink             Sink
 }
@@ -73,6 +76,7 @@ func providerErrorKind(err error) domain.ErrorKind {
 }
 
 func (r Runner) appendTerminal(ctx context.Context, sessionID string, kind domain.EventKind, payload domain.TurnTerminalPayload, cause error) error {
+	payload.Reason = r.redact(payload.Reason)
 	_, appendErr := r.Sessions.Append(context.WithoutCancel(ctx), sessionID, kind, payload)
 	if appendErr != nil {
 		appendErr = fmt.Errorf("append %s: %w", kind, appendErr)
@@ -95,10 +99,7 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 	if max < 1 || max > 128 {
 		return fmt.Errorf("max tool calls must be 1..128")
 	}
-	prompt := input.Prompt
-	if r.Redact != nil {
-		prompt = r.Redact(prompt)
-	}
+	prompt := r.redact(input.Prompt)
 	if _, err := r.Sessions.Append(ctx, input.Session.ID, domain.EventUserMessage, domain.MessagePayload{Content: prompt}); err != nil {
 		return err
 	}
@@ -130,6 +131,10 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 		var deltaRedactor DeltaRedactor = passthroughDeltaRedactor{}
 		if r.NewDeltaRedactor != nil {
 			deltaRedactor = r.NewDeltaRedactor()
+		} else if r.Admission != nil {
+			if admitted, err := r.Admission.RedactionStream(); err == nil {
+				deltaRedactor = admitted
+			}
 		} else if r.Redact != nil {
 			deltaRedactor = &bufferedDeltaRedactor{redact: r.Redact}
 		}
@@ -167,7 +172,7 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 				}
 			}
 			if event.Kind == domain.ModelToolCall && event.ToolCall != nil {
-				calls = append(calls, *event.ToolCall)
+				calls = append(calls, r.redactToolCall(*event.ToolCall))
 			}
 			if event.Kind == domain.ModelDone {
 				modelDone = true
@@ -184,9 +189,7 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 			return r.appendTerminal(ctx, input.Session.ID, domain.EventTurnInterrupted, domain.TurnTerminalPayload{Reason: err.Error(), ErrorKind: domain.ErrorProviderInterrupted}, err)
 		}
 		textValue := text.String()
-		if r.Redact != nil {
-			textValue = r.Redact(textValue)
-		}
+		textValue = r.redact(textValue)
 		if completedTools+len(calls) > max {
 			err := fmt.Errorf("tool call limit %d reached", max)
 			return r.appendTerminal(ctx, input.Session.ID, domain.EventTurnFailed, domain.TurnTerminalPayload{Reason: err.Error(), ErrorKind: domain.ErrorToolFailed}, err)
@@ -357,9 +360,7 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 				}
 			}
 		persistResult:
-			if r.Redact != nil {
-				result.Content = r.Redact(result.Content)
-			}
+			result = r.redactResult(result)
 			resultContext := context.WithoutCancel(ctx)
 			if _, err := r.Sessions.Append(resultContext, input.Session.ID, domain.EventToolResult, domain.ToolResultPayload{Result: result}); err != nil {
 				return r.appendTerminal(resultContext, input.Session.ID, domain.EventTurnFailed, domain.TurnTerminalPayload{Reason: err.Error(), ErrorKind: domain.ErrorToolFailed}, err)
@@ -368,7 +369,7 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 			if postToolErr != nil {
 				return r.appendTerminal(resultContext, input.Session.ID, domain.EventTurnFailed, domain.TurnTerminalPayload{Reason: postToolErr.Error(), ErrorKind: domain.ErrorToolFailed}, postToolErr)
 			}
-			messages = append(messages, domain.Message{Role: domain.RoleTool, ToolCallID: call.ID, Content: ToolResultContent(result)})
+			messages = append(messages, domain.Message{Role: domain.RoleTool, ToolCallID: call.ID, Content: ToolResultContentLeased(result, r.Admission)})
 			completedTools++
 			if err := ctx.Err(); err != nil {
 				return r.interrupt(ctx, input.Session.ID, err)
@@ -378,19 +379,80 @@ func (r Runner) RunTurn(ctx context.Context, input RunInput) error {
 }
 
 func (r Runner) redactPreview(preview domain.PreparedToolRequest) domain.PreparedToolRequest {
-	if r.Redact == nil {
+	if r.Redact == nil && r.Admission == nil {
 		return preview
 	}
-	preview.Summary = r.Redact(preview.Summary)
-	preview.ProposedDiff = r.Redact(preview.ProposedDiff)
+	preview.Summary = r.redact(preview.Summary)
+	preview.ProposedDiff = r.redact(preview.ProposedDiff)
 	preview.ApprovalScope = preview.CanonicalScope
-	preview.CanonicalScope = r.Redact(preview.CanonicalScope)
+	preview.CanonicalScope = r.redact(preview.CanonicalScope)
 	if preview.FilePlan != nil {
 		plan := *preview.FilePlan
-		plan.Diff = r.Redact(plan.Diff)
+		plan.Diff = r.redact(plan.Diff)
 		preview.FilePlan = &plan
 	}
 	return preview
+}
+
+func (r Runner) redact(value string) string {
+	if r.Admission != nil {
+		return r.Admission.String(value)
+	}
+	if r.Redact != nil {
+		return r.Redact(value)
+	}
+	return value
+}
+
+func (r Runner) redactToolCall(call domain.ToolCall) domain.ToolCall {
+	call.ID = r.redact(call.ID)
+	call.Name = r.redact(call.Name)
+	if r.Admission == nil || len(call.Arguments) == 0 {
+		return call
+	}
+	var value any
+	decoder := json.NewDecoder(strings.NewReader(string(call.Arguments)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		call.Arguments = json.RawMessage(`{"error":"tool arguments unavailable"}`)
+		return call
+	}
+	redacted, err := r.Admission.JSON(value)
+	if err != nil {
+		call.Arguments = json.RawMessage(`{"error":"tool arguments unavailable"}`)
+		return call
+	}
+	call.Arguments = redacted
+	return call
+}
+
+func (r Runner) redactResult(result domain.ToolResult) domain.ToolResult {
+	result.CallID = r.redact(result.CallID)
+	result.Content = r.redact(result.Content)
+	for index, id := range result.ArtifactIDs {
+		result.ArtifactIDs[index] = r.redact(id)
+	}
+	if result.FileChange != nil {
+		change := *result.FileChange
+		change.CallID = r.redact(change.CallID)
+		change.Path = r.redact(change.Path)
+		change.Diff = r.redact(change.Diff)
+		for index, id := range change.ArtifactIDs {
+			change.ArtifactIDs[index] = r.redact(id)
+		}
+		result.FileChange = &change
+	}
+	if result.WorkspaceChanges != nil {
+		changes := *result.WorkspaceChanges
+		changes.Status = r.redact(changes.Status)
+		changes.Diff = r.redact(changes.Diff)
+		changes.Notice = r.redact(changes.Notice)
+		for index, id := range changes.ArtifactIDs {
+			changes.ArtifactIDs[index] = r.redact(id)
+		}
+		result.WorkspaceChanges = &changes
+	}
+	return result
 }
 
 func validApprovalResponse(decision domain.PermissionDecision, scope string) bool {

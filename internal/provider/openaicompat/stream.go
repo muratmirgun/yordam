@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 const (
@@ -99,6 +100,22 @@ type callParts struct {
 
 func (c *Client) consumeAttempt(ctx context.Context, resp *http.Response, out chan<- domain.ModelEvent) (bool, error) {
 	defer resp.Body.Close()
+	var redaction *secret.LeasedRedactionStream
+	if c.admission != nil {
+		var err error
+		redaction, err = c.admission.RedactionStream()
+		if err != nil {
+			return false, fatalStreamError("acquire provider admission stream", err)
+		}
+		defer redaction.Close()
+	}
+	flushText := func() bool {
+		if redaction == nil {
+			return true
+		}
+		value := redaction.Close()
+		return value == "" || sendEvent(ctx, out, domain.ModelEvent{Kind: domain.ModelTextDelta, Text: value})
+	}
 
 	observed := false
 	calls := map[int]*callParts{}
@@ -122,7 +139,10 @@ func (c *Client) consumeAttempt(ctx context.Context, resp *http.Response, out ch
 		dataFields = 0
 		eventBytes = 0
 		if encoded == "[DONE]" {
-			if err := emitCompletedCalls(ctx, out, calls); err != nil {
+			if !flushText() {
+				return true, ctx.Err()
+			}
+			if err := emitCompletedCalls(ctx, out, calls, c.admission); err != nil {
 				return true, err
 			}
 			if !sendEvent(ctx, out, domain.ModelEvent{Kind: domain.ModelDone}) {
@@ -144,7 +164,11 @@ func (c *Client) consumeAttempt(ctx context.Context, resp *http.Response, out ch
 			}
 			observed = true
 			if choice.Delta.Content != "" {
-				if !sendEvent(ctx, out, domain.ModelEvent{Kind: domain.ModelTextDelta, Text: choice.Delta.Content}) {
+				content := choice.Delta.Content
+				if redaction != nil {
+					content = redaction.Write(content)
+				}
+				if content != "" && !sendEvent(ctx, out, domain.ModelEvent{Kind: domain.ModelTextDelta, Text: content}) {
 					return false, ctx.Err()
 				}
 			}
@@ -236,7 +260,7 @@ func (c *Client) consumeAttempt(ctx context.Context, resp *http.Response, out ch
 	return observed, interruptedError(io.ErrUnexpectedEOF)
 }
 
-func emitCompletedCalls(ctx context.Context, out chan<- domain.ModelEvent, calls map[int]*callParts) error {
+func emitCompletedCalls(ctx context.Context, out chan<- domain.ModelEvent, calls map[int]*callParts, admission *secret.Lease) error {
 	indexes := make([]int, 0, len(calls))
 	for index := range calls {
 		indexes = append(indexes, index)
@@ -249,12 +273,29 @@ func emitCompletedCalls(ctx context.Context, out chan<- domain.ModelEvent, calls
 	}
 	for _, index := range indexes {
 		part := calls[index]
+		id, name := part.id.String(), part.name.String()
+		arguments := json.RawMessage(part.arguments.String())
+		if admission != nil {
+			id = admission.String(id)
+			name = admission.String(name)
+			var value any
+			decoder := json.NewDecoder(strings.NewReader(string(arguments)))
+			decoder.UseNumber()
+			if err := decoder.Decode(&value); err != nil {
+				return interruptedError(fmt.Errorf("decode provider tool arguments at index %d", index))
+			}
+			redacted, err := admission.JSON(value)
+			if err != nil {
+				return interruptedError(fmt.Errorf("redact provider tool arguments at index %d", index))
+			}
+			arguments = redacted
+		}
 		if !sendEvent(ctx, out, domain.ModelEvent{
 			Kind: domain.ModelToolCall,
 			ToolCall: &domain.ToolCall{
-				ID:        part.id.String(),
-				Name:      part.name.String(),
-				Arguments: json.RawMessage(part.arguments.String()),
+				ID:        id,
+				Name:      name,
+				Arguments: arguments,
 			},
 		}) {
 			return ctx.Err()
