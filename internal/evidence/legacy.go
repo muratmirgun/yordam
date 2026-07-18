@@ -120,21 +120,13 @@ func (s *fileStore) publishLegacyAlias(ctx context.Context, alias legacyAlias) e
 	if err != nil {
 		return err
 	}
-	root, err := s.pinnedRoot(ctx, false)
-	if err != nil {
-		return err
-	}
-	_, err = publishNoReplace(ctx, root, filepath.Join(directory, alias.Body.ArtifactID+".json"), raw, 0o600)
+	_, err = s.publishNoReplace(ctx, directory, alias.Body.ArtifactID+".json", raw, 0o600)
 	return errors.Join(err, s.verifyRootIdentity())
 }
 
 func (s *fileStore) readLegacyAlias(ctx context.Context, sessionID protocol.SessionID, artifactID string) (legacyAlias, error) {
-	root, err := s.pinnedRoot(ctx, false)
-	if err != nil {
-		return legacyAlias{}, err
-	}
-	path := filepath.Join("evidence", "aliases", string(sessionID), artifactID+".json")
-	raw, err := s.readRegularRoot(ctx, root, path, protocol.MaxByteFieldBytes)
+	directory := filepath.Join("evidence", "aliases", string(sessionID))
+	raw, err := s.readRegularDirectory(ctx, directory, artifactID+".json", protocol.MaxByteFieldBytes)
 	if err != nil {
 		return legacyAlias{}, err
 	}

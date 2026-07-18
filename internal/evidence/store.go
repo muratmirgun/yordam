@@ -59,7 +59,14 @@ type Option func(*storeOptions) error
 
 type storeOptions struct {
 	legacy LegacyResolver
+	fault  FaultInjector
 }
+
+type FaultPoint string
+
+const FaultBeforePublish FaultPoint = "before_publish"
+
+type FaultInjector func(FaultPoint) error
 
 func WithLegacyResolver(resolver LegacyResolver) Option {
 	return func(options *storeOptions) error {
@@ -67,6 +74,16 @@ func WithLegacyResolver(resolver LegacyResolver) Option {
 			return fmt.Errorf("legacy resolver is nil")
 		}
 		options.legacy = resolver
+		return nil
+	}
+}
+
+func WithFault(fault FaultInjector) Option {
+	return func(options *storeOptions) error {
+		if fault == nil {
+			return fmt.Errorf("evidence fault injector is nil")
+		}
+		options.fault = fault
 		return nil
 	}
 }
@@ -79,6 +96,7 @@ type fileStore struct {
 	rootAnchor   *rootanchor.Anchor
 	closed       bool
 	legacy       LegacyResolver
+	fault        FaultInjector
 	diagnosticMu sync.Mutex
 	diagnostics  []Diagnostic
 }
@@ -107,7 +125,7 @@ func New(root string, admission *secret.Lease, configured ...Option) (Store, err
 		_ = owned.Close()
 		return nil, err
 	}
-	return &fileStore{root: anchor.Target(), admission: owned, clock: time.Now, legacy: options.legacy, rootAnchor: anchor}, nil
+	return &fileStore{root: anchor.Target(), admission: owned, clock: time.Now, legacy: options.legacy, fault: options.fault, rootAnchor: anchor}, nil
 }
 
 func (s *fileStore) Close() error {
@@ -288,22 +306,17 @@ func (s *fileStore) publishBlob(ctx context.Context, workspace protocol.Workspac
 	if err := s.ensureDirectory(ctx, directory, 0o700); err != nil {
 		return fmt.Errorf("prepare blob directory: %w", err)
 	}
-	root, err := s.pinnedRoot(ctx, false)
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(directory, digest.Value)
-	if raw, err := s.readRegularRoot(ctx, root, path, MaxRetainedBytes); err == nil {
+	if raw, err := s.readRegularDirectory(ctx, directory, digest.Value, MaxRetainedBytes); err == nil {
 		if digestBytes(raw) != digest {
 			return ErrDigestMismatch
 		}
 		return nil
-	} else if !os.IsNotExist(err) {
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect existing blob: %w", err)
 	}
-	created, err := publishNoReplace(ctx, root, path, content, 0o600)
+	created, err := s.publishNoReplace(ctx, directory, digest.Value, content, 0o600)
 	if errors.Is(err, os.ErrExist) {
-		raw, readErr := s.readRegularRoot(ctx, root, path, MaxRetainedBytes)
+		raw, readErr := s.readRegularDirectory(ctx, directory, digest.Value, MaxRetainedBytes)
 		if readErr != nil {
 			return readErr
 		}
@@ -330,16 +343,18 @@ func (s *fileStore) publishRecord(ctx context.Context, record protocol.EvidenceR
 	if err != nil {
 		return err
 	}
-	root, err := s.pinnedRoot(ctx, false)
-	if err != nil {
-		return err
-	}
-	name := filepath.Join(directory, string(record.Body.ID)+".json")
-	_, err = publishNoReplace(ctx, root, name, raw, 0o600)
+	name := string(record.Body.ID) + ".json"
+	_, err = s.publishNoReplace(ctx, directory, name, raw, 0o600)
 	if errors.Is(err, os.ErrExist) {
-		info, statErr := root.Lstat(name)
-		if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			return errors.Join(ErrUnsafePath, statErr)
+		statErr := s.useDirectory(ctx, directory, func(root *os.Root) error {
+			info, statErr := root.Lstat(name)
+			if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+				return errors.Join(ErrUnsafePath, statErr)
+			}
+			return nil
+		})
+		if statErr != nil {
+			return statErr
 		}
 		return errors.Join(ErrEvidenceExists, s.verifyRootIdentity())
 	}
@@ -350,16 +365,8 @@ func (s *fileStore) readRecord(ctx context.Context, id protocol.EvidenceID) (pro
 	if !safeName(string(id)) {
 		return protocol.EvidenceRecord{}, ErrUnsafePath
 	}
-	root, err := s.pinnedRoot(ctx, false)
-	if os.IsNotExist(err) {
-		return protocol.EvidenceRecord{}, ErrEvidenceNotFound
-	}
-	if err != nil {
-		return protocol.EvidenceRecord{}, err
-	}
-	path := filepath.Join("evidence", "records", string(id)+".json")
-	raw, err := s.readRegularRoot(ctx, root, path, protocol.MaxEventBytes)
-	if os.IsNotExist(err) {
+	raw, err := s.readRegularDirectory(ctx, filepath.Join("evidence", "records"), string(id)+".json", protocol.MaxEventBytes)
+	if errors.Is(err, os.ErrNotExist) {
 		return protocol.EvidenceRecord{}, ErrEvidenceNotFound
 	}
 	if err != nil {
@@ -385,16 +392,9 @@ func (s *fileStore) readVerifiedBlob(ctx context.Context, record protocol.Eviden
 	if record.Body.Blob == nil {
 		return nil, ErrEvidenceUnavailable
 	}
-	root, err := s.pinnedRoot(ctx, false)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrBlobMissing
-		}
-		return nil, err
-	}
-	path := filepath.Join("workspaces", string(record.Body.WorkspaceID), "evidence", "blobs", "sha256", record.Body.Blob.Digest.Value)
-	raw, err := s.readRegularRoot(ctx, root, path, MaxRetainedBytes)
-	if os.IsNotExist(err) {
+	directory := filepath.Join("workspaces", string(record.Body.WorkspaceID), "evidence", "blobs", "sha256")
+	raw, err := s.readRegularDirectory(ctx, directory, record.Body.Blob.Digest.Value, MaxRetainedBytes)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrBlobMissing
 	}
 	if err != nil {
@@ -425,46 +425,15 @@ func (s *fileStore) ensureDirectory(ctx context.Context, relative string, mode o
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	root, err := s.pinnedRoot(ctx, true)
-	if err != nil {
+	s.rootMu.Lock()
+	defer s.rootMu.Unlock()
+	if s.closed || s.rootAnchor == nil {
+		return secret.ErrLeaseClosed
+	}
+	if _, err := s.rootAnchor.Open(ctx, true); err != nil {
 		return err
 	}
-	cursor := ""
-	for _, part := range strings.Split(filepath.Clean(relative), string(filepath.Separator)) {
-		if !safeName(part) {
-			return ErrUnsafePath
-		}
-		cursor = filepath.Join(cursor, part)
-		info, statErr := root.Lstat(cursor)
-		created := false
-		if os.IsNotExist(statErr) {
-			if err := root.Mkdir(cursor, mode); err != nil && !os.IsExist(err) {
-				return err
-			} else if err == nil {
-				created = true
-			}
-			info, statErr = root.Lstat(cursor)
-		}
-		if statErr != nil {
-			return statErr
-		}
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return ErrUnsafePath
-		}
-		if created {
-			parent := filepath.Dir(cursor)
-			if parent == "" {
-				parent = "."
-			}
-			if err := syncRootDirectory(root, parent); err != nil {
-				return err
-			}
-		}
-		if err := s.pinDirectory(cursor); err != nil {
-			return err
-		}
-	}
-	return errors.Join(syncRootDirectory(root, relative), s.verifyRootIdentity())
+	return s.rootAnchor.EnsureDirectory(relative, mode)
 }
 
 func (s *fileStore) pinDirectory(relative string) error {
@@ -485,45 +454,58 @@ func (s *fileStore) verifyRootIdentity() error {
 	return s.rootAnchor.Verify()
 }
 
-func (s *fileStore) readRegularRoot(ctx context.Context, root *os.Root, path string, limit int64) ([]byte, error) {
-	s.rootMu.Lock()
-	if s.closed || s.rootAnchor == nil {
-		s.rootMu.Unlock()
-		return nil, secret.ErrLeaseClosed
-	}
-	err := s.rootAnchor.VerifyRelative(path)
-	s.rootMu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	raw, readErr := readRegularRoot(ctx, root, path, limit)
-	return raw, errors.Join(readErr, s.verifyRootIdentity())
-}
-
-func syncRootDirectory(root *os.Root, name string) error {
-	directory, err := root.Open(name)
-	if err != nil {
+func (s *fileStore) useDirectory(ctx context.Context, relative string, operation func(*os.Root) error) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return errors.Join(directory.Sync(), directory.Close())
+	s.rootMu.Lock()
+	defer s.rootMu.Unlock()
+	if s.closed || s.rootAnchor == nil {
+		return secret.ErrLeaseClosed
+	}
+	if _, err := s.rootAnchor.Open(ctx, false); err != nil {
+		return err
+	}
+	return s.rootAnchor.UseDirectory(relative, operation)
 }
 
-func publishNoReplace(ctx context.Context, root *os.Root, final string, content []byte, mode os.FileMode) (bool, error) {
+func (s *fileStore) readRegularDirectory(ctx context.Context, directory, name string, limit int64) ([]byte, error) {
+	var raw []byte
+	err := s.useDirectory(ctx, directory, func(root *os.Root) (readErr error) {
+		raw, readErr = readRegularRoot(ctx, root, name, limit)
+		return readErr
+	})
+	return raw, err
+}
+
+func (s *fileStore) publishNoReplace(ctx context.Context, directory, final string, content []byte, mode os.FileMode) (bool, error) {
+	var created bool
+	err := s.useDirectory(ctx, directory, func(root *os.Root) (publishErr error) {
+		created, publishErr = publishNoReplace(ctx, root, final, content, mode, s.fault, s.rootAnchor.Verify)
+		return publishErr
+	})
+	return created, err
+}
+
+func publishNoReplace(
+	ctx context.Context,
+	root *os.Root,
+	final string,
+	content []byte,
+	mode os.FileMode,
+	fault FaultInjector,
+	verify func() error,
+) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if !safeRelative(final) {
+	if !safeName(final) {
 		return false, fmt.Errorf("%w: invalid publication name %q", ErrUnsafePath, final)
 	}
 	temporary, err := temporaryName()
 	if err != nil {
 		return false, err
 	}
-	directory := filepath.Dir(final)
-	if directory == "." {
-		directory = ""
-	}
-	temporary = filepath.Join(directory, temporary)
 	file, err := root.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 	if err != nil {
 		return false, err
@@ -555,6 +537,18 @@ func publishNoReplace(ctx context.Context, root *os.Root, final string, content 
 		return false, err
 	}
 	file = nil
+	if fault != nil {
+		if err := fault(FaultBeforePublish); err != nil {
+			_ = root.Remove(temporary)
+			return false, err
+		}
+	}
+	if verify != nil {
+		if err := verify(); err != nil {
+			_ = root.Remove(temporary)
+			return false, err
+		}
+	}
 	if err := root.Link(temporary, final); err != nil {
 		_ = root.Remove(temporary)
 		return false, err
@@ -568,19 +562,7 @@ func publishNoReplace(ctx context.Context, root *os.Root, final string, content 
 	if err := root.Remove(temporary); err != nil {
 		return false, err
 	}
-	directoryFile, err := root.Open(firstNonempty(directory, "."))
-	if err != nil {
-		return false, err
-	}
-	err = errors.Join(directoryFile.Sync(), directoryFile.Close())
-	return true, err
-}
-
-func firstNonempty(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
+	return true, syncRootDirectory(root)
 }
 
 func temporaryName() (string, error) {
@@ -614,7 +596,7 @@ func readRegularRoot(ctx context.Context, root *os.Root, path string, limit int6
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !safeRelative(path) {
+	if !safeName(path) {
 		return nil, ErrUnsafePath
 	}
 	info, err := root.Lstat(path)
@@ -641,6 +623,14 @@ func readRegularRoot(ctx context.Context, root *os.Root, path string, limit int6
 		return nil, fmt.Errorf("file exceeds %d bytes", limit)
 	}
 	return raw, nil
+}
+
+func syncRootDirectory(root *os.Root) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
 }
 
 func safeRelative(path string) bool {

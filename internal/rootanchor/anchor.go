@@ -31,8 +31,10 @@ type identity struct {
 }
 
 type pinnedDirectory struct {
-	info   os.FileInfo
-	handle *os.Root
+	info       os.FileInfo
+	handle     *os.Root
+	parent     *os.Root
+	parentName string
 }
 
 func New(path string, unsafe error) (*Anchor, error) {
@@ -164,8 +166,8 @@ func (a *Anchor) Verify() error {
 		a.rootInfo == nil || !os.SameFile(a.rootInfo, info) || !os.SameFile(a.rootInfo, opened) {
 		return errors.Join(a.unsafe, err, openErr)
 	}
-	for name, pinned := range a.descendants {
-		info, err := a.root.Lstat(name)
+	for _, pinned := range a.descendants {
+		info, err := pinned.parent.Lstat(pinned.parentName)
 		opened, openErr := pinned.handle.Stat(".")
 		if err != nil || openErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 ||
 			!os.SameFile(pinned.info, info) || !os.SameFile(pinned.info, opened) {
@@ -176,52 +178,130 @@ func (a *Anchor) Verify() error {
 }
 
 func (a *Anchor) PinDirectory(relative string) error {
-	if a.root == nil || !safeRelative(relative) {
+	if a.root == nil || (relative != "." && !safeRelative(relative)) {
 		return a.unsafe
 	}
-	if err := a.VerifyRelative(relative); err != nil {
+	if err := a.Verify(); err != nil {
 		return err
 	}
-	info, err := a.root.Lstat(relative)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.Join(a.unsafe, err)
-	}
-	if pinned, ok := a.descendants[relative]; ok {
-		if !os.SameFile(pinned.info, info) {
-			return a.unsafe
-		}
+	if relative == "." {
 		return nil
 	}
-	handle, err := a.root.OpenRoot(relative)
-	if err != nil {
-		return err
-	}
-	opened, err := handle.Stat(".")
-	if err != nil || !os.SameFile(info, opened) {
-		_ = handle.Close()
-		return errors.Join(a.unsafe, err)
-	}
-	a.descendants[relative] = pinnedDirectory{info: info, handle: handle}
-	return a.Verify()
-}
-
-// VerifyRelative rejects a symbolic-link directory component, including for a
-// freshly constructed store that has not pinned the descendant before.
-func (a *Anchor) VerifyRelative(relative string) error {
-	if a.root == nil || !safeRelative(relative) {
-		return a.unsafe
-	}
-	parts := strings.Split(filepath.Clean(relative), string(filepath.Separator))
+	current := a.root
 	cursor := ""
-	for index, part := range parts {
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
 		cursor = filepath.Join(cursor, part)
-		info, err := a.root.Lstat(cursor)
+		if pinned, ok := a.descendants[cursor]; ok {
+			if err := a.verifyPinned(pinned); err != nil {
+				return err
+			}
+			current = pinned.handle
+			continue
+		}
+		info, err := current.Lstat(part)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.Join(a.unsafe, err)
+		}
+		handle, err := current.OpenRoot(part)
 		if err != nil {
 			return err
 		}
-		if index < len(parts)-1 && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
-			return a.unsafe
+		opened, err := handle.Stat(".")
+		if err != nil || !os.SameFile(info, opened) {
+			_ = handle.Close()
+			return errors.Join(a.unsafe, err)
 		}
+		a.descendants[cursor] = pinnedDirectory{info: info, handle: handle, parent: current, parentName: part}
+		current = handle
+	}
+	return a.Verify()
+}
+
+// EnsureDirectory creates every missing component beneath the exact retained
+// parent handle and pins every resulting directory identity.
+func (a *Anchor) EnsureDirectory(relative string, mode os.FileMode) error {
+	if a.root == nil || !safeRelative(relative) {
+		return a.unsafe
+	}
+	if err := a.Verify(); err != nil {
+		return err
+	}
+	current := a.root
+	cursor := ""
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		cursor = filepath.Join(cursor, part)
+		if pinned, ok := a.descendants[cursor]; ok {
+			if err := a.verifyPinned(pinned); err != nil {
+				return err
+			}
+			current = pinned.handle
+			continue
+		}
+		info, err := current.Lstat(part)
+		if os.IsNotExist(err) {
+			if err := current.Mkdir(part, mode); err != nil && !os.IsExist(err) {
+				return err
+			}
+			if err := syncDirectory(current); err != nil {
+				return err
+			}
+			info, err = current.Lstat(part)
+		}
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.Join(a.unsafe, err)
+		}
+		handle, err := current.OpenRoot(part)
+		if err != nil {
+			return err
+		}
+		opened, err := handle.Stat(".")
+		if err != nil || !os.SameFile(info, opened) {
+			_ = handle.Close()
+			return errors.Join(a.unsafe, err)
+		}
+		a.descendants[cursor] = pinnedDirectory{info: info, handle: handle, parent: current, parentName: part}
+		current = handle
+	}
+	return errors.Join(syncDirectory(current), a.Verify())
+}
+
+// UseDirectory scopes I/O to an exact retained directory handle and verifies
+// the complete identity graph before and after the callback.
+func (a *Anchor) UseDirectory(relative string, operation func(*os.Root) error) error {
+	if operation == nil || a.root == nil || (relative != "." && !safeRelative(relative)) {
+		return a.unsafe
+	}
+	if err := a.PinDirectory(relative); err != nil {
+		return err
+	}
+	handle := a.root
+	if relative != "." {
+		handle = a.descendants[relative].handle
+	}
+	operationErr := operation(handle)
+	return errors.Join(operationErr, a.Verify())
+}
+
+// UseParent resolves only the basename beneath an exact retained parent.
+func (a *Anchor) UseParent(relative string, operation func(*os.Root, string) error) error {
+	if operation == nil || !safeRelative(relative) {
+		return a.unsafe
+	}
+	parent, basename := filepath.Dir(relative), filepath.Base(relative)
+	if parent == "" {
+		parent = "."
+	}
+	return a.UseDirectory(parent, func(handle *os.Root) error {
+		return operation(handle, basename)
+	})
+}
+
+func (a *Anchor) verifyPinned(pinned pinnedDirectory) error {
+	info, err := pinned.parent.Lstat(pinned.parentName)
+	opened, openErr := pinned.handle.Stat(".")
+	if err != nil || openErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(pinned.info, info) || !os.SameFile(pinned.info, opened) {
+		return errors.Join(a.unsafe, err, openErr)
 	}
 	return nil
 }
@@ -356,4 +436,12 @@ func closeRoots(roots []*os.Root) {
 	for _, root := range roots {
 		_ = root.Close()
 	}
+}
+
+func syncDirectory(root *os.Root) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
 }

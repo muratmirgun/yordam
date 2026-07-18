@@ -152,6 +152,8 @@ Result: exit 1 because `logging.NewGenerationBound` did not exist.
 - Both stores normalize through the nearest existing canonical ancestor, retain that ancestor's `os.Root` and inode chain at construction, and create no missing root component until validation/admission succeeds.
 - Missing components are created one at a time beneath retained `os.Root.OpenRoot` handles; the original absolute path is never reaccepted as creation authority.
 - Root, creation-chain, and dynamically discovered descendant directory handles/identities are retained for the store lifetime and verified before later use.
+- Directory discovery and creation traverse one basename at a time beneath the exact retained parent. Evidence/recovery reads, temporary creation, hard-link publication, removal, reconciliation, and directory sync run through scoped retained-directory callbacks using basenames only.
+- Every scoped callback verifies the root and descendant identity graph before and after I/O; replacement paths are never reopened for the operation in flight.
 - Fresh access also checks every relative directory component, so in-root symlinks cannot be accepted merely because the store was constructed after substitution.
 - Tests cover root/deepest-ancestor replacement before first `Put`, root non-creation on rejection, and existing/fresh substitutions of materials, evidence records, blobs, aliases, and dynamic workspace paths.
 
@@ -162,8 +164,8 @@ Result: exit 1 because `logging.NewGenerationBound` did not exist.
 - Publication uses a synced regular temporary, hard-link no-replace, regular/SameFile final verification, temporary removal, and directory sync.
 - Startup/retry reconciles only verified regular recovery temporaries and validates final container digest/provenance before returning it.
 - Fault tests cover temporary-synced, before-publish, after-publish, and directory-synced windows and prove retry leaves exactly one final container.
-- A stable rooted `.recovery.lock` is verified as a regular same-file leaf, forced to mode `0600`, synced when created, and protected with context-aware `flock` on Darwin/Linux.
-- All temporary reconciliation and publication occurs under that cross-process lock. Live contenders fail with typed `ErrRecoveryBusy` plus their context error; owner death releases the kernel lock and permits abandoned temporary cleanup.
+- The rooted `.recovery.lock` leaf is retained only as a mode-`0600`, synced, same-file audit marker. Mutual exclusion uses context-aware `flock` on an opened retained root-directory inode on Darwin/Linux, so replacing the marker cannot create an independent lock domain.
+- Marker identity is checked after lock acquisition and before unlock; a mid-operation replacement makes the owner fail closed. Live contenders fail with typed `ErrRecoveryBusy` plus their context error; owner death releases the kernel directory lock and permits abandoned temporary cleanup.
 
 ### 9. Legacy migration is rooted and verifiable
 
@@ -255,6 +257,68 @@ Repeated and focused race verification:
 ```
 
 All repeated and focused race commands passed.
+
+## Fourth remediation RED evidence
+
+The fourth independent review found that retained descendant handles were used only for identity verification while evidence and recovery I/O still resolved complete descendant paths from the root. It also found that recovery coordination locked the replaceable `.recovery.lock` leaf rather than the retained root directory inode.
+
+Deterministic evidence boundary tests added a callback after temporary sync and replaced the pinned publication directory with a new directory containing a same-named sentinel temporary. Existing and fresh stores for blob, record, and nested legacy-alias paths all removed the sentinel through the replacement path:
+
+```text
+go test ./internal/evidence -run 'Test(EvidencePublishNeverUsesReplacementDescendantAtBoundary|LegacyAliasPublishNeverUsesReplacementDescendantAtBoundary)' -count=1
+```
+
+Result: exit 1. All six cases reported `operation touched replacement temporary ... no such file or directory`.
+
+The equivalent recovery publication test showed the replacement `materials` sentinel was removed. A second store also bypassed a live writer after `.recovery.lock` was renamed and recreated:
+
+```text
+go test ./internal/recovery -run 'Test(RecoveryPublishNeverUsesReplacementMaterialsPathAfterBoundarySwap|RecoveryDirectoryInodeLockSurvivesMarkerReplacement)' -count=1
+```
+
+Result: exit 1. The first case reported the replacement temporary was missing; the second reported `marker replacement bypassed coordination: <nil>`.
+
+These failures were observed before the retained-directory I/O and root-directory-inode lock implementation.
+
+## Fourth remediation closure
+
+- `rootanchor.Anchor` now pins each descendant from its exact retained parent handle and records that parent handle plus basename for identity verification.
+- `EnsureDirectory` creates and syncs components beneath retained parent handles. `UseDirectory` and `UseParent` scope access to an exact handle and verify the complete graph before and after the callback.
+- Evidence blob, record, and legacy-alias read/publication paths use the deepest retained directory handle and leaf basenames for `Lstat`, `Open`, temporary creation, `Link`, `Remove`, and `Sync`.
+- Recovery material reads, temporary reconciliation, publication, cleanup, and directory sync likewise use only the retained `materials` handle plus basenames.
+- Recovery coordination opens and flocks the retained root directory itself. The marker remains an audited leaf, and release errors are joined into the `Put` result so marker replacement cannot be silently ignored.
+
+Focused GREEN and repetition evidence:
+
+```text
+go test ./internal/evidence ./internal/recovery -count=1
+ok github.com/muratmirgun/yordam/internal/evidence 2.579s
+ok github.com/muratmirgun/yordam/internal/recovery 1.535s
+
+# final post-boundary evidence cases, count=10
+ok github.com/muratmirgun/yordam/internal/evidence 7.461s
+
+# final post-boundary marker/live-process/crash/fault recovery cases, count=10
+ok github.com/muratmirgun/yordam/internal/recovery 11.149s
+
+# focused race, count=3
+ok github.com/muratmirgun/yordam/internal/evidence 4.515s
+ok github.com/muratmirgun/yordam/internal/recovery 8.056s
+```
+
+Final fourth-remediation repository verification:
+
+```text
+go test ./... -count=1
+```
+
+Result: exit 0. Notable uncached results: `internal/app 8.776s`, `internal/evidence 6.988s`, `internal/recovery 3.037s`, `internal/session/jsonl 36.737s`, `internal/ptytest 10.831s`.
+
+```text
+go test -race ./... -count=1
+```
+
+Result: exit 0. Notable results: `internal/app 10.415s`, `internal/evidence 8.704s`, `internal/recovery 5.507s`, `internal/secret 1.244s`, `internal/session/jsonl 72.056s`, `internal/tools/output 1.530s`.
 
 ```text
 go vet ./...

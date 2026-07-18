@@ -421,6 +421,95 @@ func TestEvidenceRejectsInRootSymlinkSwapOfPinnedDescendant(t *testing.T) {
 	}
 }
 
+func TestEvidencePublishNeverUsesReplacementDescendantAtBoundary(t *testing.T) {
+	for _, target := range []string{"blob", "record"} {
+		for _, lifecycle := range []string{"existing_store", "fresh_store"} {
+			t.Run(target+"/"+lifecycle, func(t *testing.T) {
+				root := filepath.Join(t.TempDir(), "evidence")
+				if lifecycle == "fresh_store" {
+					baseline := newEvidenceStoreAtRoot(t, root)
+					putEvidence(t, baseline, evidenceCandidate("ses-a", "baseline-"+target, []byte("baseline-content")))
+					if err := baseline.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				publication := 0
+				var replacementTemporary string
+				store := newEvidenceStoreAtRoot(t, root, evidence.WithFault(func(point evidence.FaultPoint) error {
+					if point != evidence.FaultBeforePublish {
+						return nil
+					}
+					publication++
+					wanted := 1
+					directory := filepath.Join(root, "workspaces", "workspace-a", "evidence", "blobs", "sha256")
+					if target == "record" {
+						wanted = 2
+						directory = filepath.Join(root, "evidence", "records")
+					}
+					if publication != wanted {
+						return nil
+					}
+					retained := directory + "-retained"
+					if err := os.Rename(directory, retained); err != nil {
+						return err
+					}
+					if err := os.Mkdir(directory, 0o700); err != nil {
+						return err
+					}
+					temporary, err := onlyEvidenceTemporary(retained)
+					if err != nil {
+						return err
+					}
+					replacementTemporary = filepath.Join(directory, temporary)
+					return os.WriteFile(replacementTemporary, []byte("replacement-path-content"), 0o600)
+				}))
+				_, putErr := store.Put(context.Background(), evidenceCandidate("ses-a", "boundary-"+target+"-"+lifecycle, []byte("boundary-content-"+lifecycle)))
+				if !errors.Is(putErr, evidence.ErrUnsafePath) {
+					t.Fatalf("boundary replacement error=%v", putErr)
+				}
+				if raw, err := os.ReadFile(replacementTemporary); err != nil || string(raw) != "replacement-path-content" {
+					t.Fatalf("operation touched replacement temporary: raw=%q err=%v", raw, err)
+				}
+			})
+		}
+	}
+}
+
+func newEvidenceStoreAtRoot(t *testing.T, root string, options ...evidence.Option) evidence.Store {
+	t.Helper()
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire(protocol.RuntimeGenerationID("evidence-root-"+filepath.Base(t.TempDir())), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := evidence.New(root, lease, options...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close(); _ = lease.Close() })
+	return store
+}
+
+func onlyEvidenceTemporary(directory string) (string, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return "", err
+	}
+	var matched string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".publish-") && strings.HasSuffix(entry.Name(), ".tmp") {
+			if matched != "" {
+				return "", errors.New("multiple evidence temporaries")
+			}
+			matched = entry.Name()
+		}
+	}
+	if matched == "" {
+		return "", errors.New("evidence temporary not found")
+	}
+	return matched, nil
+}
+
 func newEvidenceStore(t *testing.T, values ...[]byte) (string, evidence.Store) {
 	t.Helper()
 	root := t.TempDir()

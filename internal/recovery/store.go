@@ -159,7 +159,7 @@ func (s *fileStore) Close() error {
 	return errors.Join(rootErr, s.admission.Close())
 }
 
-func (s *fileStore) Put(ctx context.Context, candidate Candidate) (protocol.RecoveryMaterialRecord, error) {
+func (s *fileStore) Put(ctx context.Context, candidate Candidate) (result protocol.RecoveryMaterialRecord, resultErr error) {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	metadata, err := validateAndAdmitCandidate(s.admission, candidate)
@@ -178,8 +178,8 @@ func (s *fileStore) Put(ctx context.Context, candidate Candidate) (protocol.Reco
 		if coordinationErr != nil {
 			return protocol.RecoveryMaterialRecord{}, coordinationErr
 		}
-		defer coordination.release()
-		if err := s.reconcileTemporaries(root); err != nil {
+		defer func() { resultErr = errors.Join(resultErr, coordination.release()) }()
+		if err := s.reconcileTemporaries(ctx); err != nil {
 			return protocol.RecoveryMaterialRecord{}, err
 		}
 		return existing, nil
@@ -220,25 +220,25 @@ func (s *fileStore) Put(ctx context.Context, candidate Candidate) (protocol.Reco
 	if err != nil {
 		return protocol.RecoveryMaterialRecord{}, err
 	}
-	if err := s.ensureMaterials(root); err != nil {
+	if err := s.ensureMaterials(ctx); err != nil {
 		return protocol.RecoveryMaterialRecord{}, err
 	}
 	coordination, err := acquireRecoveryCoordination(ctx, root)
 	if err != nil {
 		return protocol.RecoveryMaterialRecord{}, err
 	}
-	defer coordination.release()
-	if err := s.reconcileTemporaries(root); err != nil {
+	defer func() { resultErr = errors.Join(resultErr, coordination.release()) }()
+	if err := s.reconcileTemporaries(ctx); err != nil {
 		return protocol.RecoveryMaterialRecord{}, err
 	}
-	if existing, exists, err := s.readExistingRoot(ctx, root, id, candidate); err != nil {
+	if existing, exists, err := s.readExistingRoot(ctx, id, candidate); err != nil {
 		return protocol.RecoveryMaterialRecord{}, err
 	} else if exists {
 		return existing, nil
 	}
-	name := filepath.Join("materials", string(id)+".recovery")
-	if err := s.publishContainer(ctx, root, name, container); errors.Is(err, os.ErrExist) {
-		existing, exists, readErr := s.readExistingRoot(ctx, root, id, candidate)
+	name := string(id) + ".recovery"
+	if err := s.publishContainer(ctx, name, container); errors.Is(err, os.ErrExist) {
+		existing, exists, readErr := s.readExistingRoot(ctx, id, candidate)
 		if readErr != nil || !exists {
 			return protocol.RecoveryMaterialRecord{}, errors.Join(err, readErr)
 		}
@@ -354,30 +354,26 @@ func decodeContainer(raw []byte) (protocol.RecoveryMaterialRecord, []byte, error
 }
 
 func (s *fileStore) readExisting(ctx context.Context, id protocol.RecoveryMaterialID, candidate Candidate) (protocol.RecoveryMaterialRecord, bool, error) {
-	root, err := s.pinnedRoot(ctx, false)
+	_, err := s.pinnedRoot(ctx, false)
 	if os.IsNotExist(err) {
 		return protocol.RecoveryMaterialRecord{}, false, nil
 	}
 	if err != nil {
 		return protocol.RecoveryMaterialRecord{}, false, err
 	}
-	info, err := root.Lstat("materials")
-	if os.IsNotExist(err) {
-		return protocol.RecoveryMaterialRecord{}, false, nil
-	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return protocol.RecoveryMaterialRecord{}, false, errors.Join(ErrUnsafePath, err)
-	}
 	if err := s.pinDirectory("materials"); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return protocol.RecoveryMaterialRecord{}, false, nil
+		}
 		return protocol.RecoveryMaterialRecord{}, false, err
 	}
-	return s.readExistingRoot(ctx, root, id, candidate)
+	return s.readExistingRoot(ctx, id, candidate)
 }
 
-func (s *fileStore) readExistingRoot(ctx context.Context, root *os.Root, id protocol.RecoveryMaterialID, candidate Candidate) (protocol.RecoveryMaterialRecord, bool, error) {
-	name := filepath.Join("materials", string(id)+".recovery")
-	raw, err := s.readRegularRoot(ctx, root, name, 64<<20)
-	if os.IsNotExist(err) {
+func (s *fileStore) readExistingRoot(ctx context.Context, id protocol.RecoveryMaterialID, candidate Candidate) (protocol.RecoveryMaterialRecord, bool, error) {
+	name := string(id) + ".recovery"
+	raw, err := s.readRegularDirectory(ctx, "materials", name, 64<<20)
+	if errors.Is(err, os.ErrNotExist) {
 		return protocol.RecoveryMaterialRecord{}, false, nil
 	}
 	if err != nil {
@@ -398,60 +394,64 @@ func (s *fileStore) readExistingRoot(ctx context.Context, root *os.Root, id prot
 	return protocol.DeepCopy(record), true, nil
 }
 
-func (s *fileStore) ensureMaterials(root *os.Root) error {
-	info, err := root.Lstat("materials")
-	if os.IsNotExist(err) {
-		if err := root.Mkdir("materials", 0o700); err != nil && !os.IsExist(err) {
-			return err
-		}
-		if err := syncRootDir(root, "."); err != nil {
-			return err
-		}
-		info, err = root.Lstat("materials")
+func (s *fileStore) ensureMaterials(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.rootAnchor == nil {
+		return secret.ErrLeaseClosed
 	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.Join(ErrUnsafePath, err)
-	}
-	return s.pinDirectory("materials")
-}
-
-func (s *fileStore) reconcileTemporaries(root *os.Root) (resultErr error) {
-	defer func() { resultErr = errors.Join(resultErr, s.verifyRootIdentity()) }()
-	directory, err := root.Open("materials")
-	if err != nil {
+	if _, err := s.rootAnchor.Open(ctx, true); err != nil {
 		return err
 	}
-	entries, readErr := directory.ReadDir(-1)
-	closeErr := directory.Close()
-	if readErr != nil || closeErr != nil {
-		return errors.Join(readErr, closeErr)
-	}
-	changed := false
-	for _, entry := range entries {
-		if !strings.HasPrefix(entry.Name(), ".recovery-") || !strings.HasSuffix(entry.Name(), ".tmp") {
-			continue
-		}
-		info, err := root.Lstat(filepath.Join("materials", entry.Name()))
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			return errors.Join(ErrUnsafePath, err)
-		}
-		if err := root.Remove(filepath.Join("materials", entry.Name())); err != nil {
-			return err
-		}
-		changed = true
-	}
-	if changed {
-		return syncRootDir(root, "materials")
-	}
-	return nil
+	return s.rootAnchor.EnsureDirectory("materials", 0o700)
 }
 
-func (s *fileStore) publishContainer(ctx context.Context, root *os.Root, final string, content []byte) (resultErr error) {
-	defer func() { resultErr = errors.Join(resultErr, s.verifyRootIdentity()) }()
+func (s *fileStore) reconcileTemporaries(ctx context.Context) error {
+	return s.useDirectory(ctx, "materials", func(root *os.Root) error {
+		directory, err := root.Open(".")
+		if err != nil {
+			return err
+		}
+		entries, readErr := directory.ReadDir(-1)
+		closeErr := directory.Close()
+		if readErr != nil || closeErr != nil {
+			return errors.Join(readErr, closeErr)
+		}
+		changed := false
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), ".recovery-") || !strings.HasSuffix(entry.Name(), ".tmp") {
+				continue
+			}
+			info, err := root.Lstat(entry.Name())
+			if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+				return errors.Join(ErrUnsafePath, err)
+			}
+			if err := root.Remove(entry.Name()); err != nil {
+				return err
+			}
+			changed = true
+		}
+		if changed {
+			return syncRootDir(root, ".")
+		}
+		return nil
+	})
+}
+
+func (s *fileStore) publishContainer(ctx context.Context, final string, content []byte) error {
+	return s.useDirectory(ctx, "materials", func(root *os.Root) error {
+		return s.publishContainerDirectory(ctx, root, final, content, s.rootAnchor.Verify)
+	})
+}
+
+func (s *fileStore) publishContainerDirectory(ctx context.Context, root *os.Root, final string, content []byte, verify func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	temporary := filepath.Join("materials", fmt.Sprintf(".recovery-%d.tmp", time.Now().UnixNano()))
+	if !safeName(final) {
+		return ErrUnsafePath
+	}
+	temporary := fmt.Sprintf(".recovery-%d.tmp", time.Now().UnixNano())
 	file, err := root.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -485,8 +485,20 @@ func (s *fileStore) publishContainer(ctx context.Context, root *os.Root, final s
 	if err := s.inject(FaultTemporarySynced); err != nil {
 		return err
 	}
+	if verify != nil {
+		if err := verify(); err != nil {
+			_ = root.Remove(temporary)
+			return err
+		}
+	}
 	if err := s.inject(FaultBeforePublish); err != nil {
 		return err
+	}
+	if verify != nil {
+		if err := verify(); err != nil {
+			_ = root.Remove(temporary)
+			return err
+		}
 	}
 	if err := root.Link(temporary, final); err != nil {
 		_ = root.Remove(temporary)
@@ -501,10 +513,15 @@ func (s *fileStore) publishContainer(ctx context.Context, root *os.Root, final s
 	if err := s.inject(FaultAfterPublish); err != nil {
 		return err
 	}
+	if verify != nil {
+		if err := verify(); err != nil {
+			return err
+		}
+	}
 	if err := root.Remove(temporary); err != nil {
 		return err
 	}
-	if err := syncRootDir(root, "materials"); err != nil {
+	if err := syncRootDir(root, "."); err != nil {
 		return err
 	}
 	return s.inject(FaultDirectorySynced)
@@ -550,24 +567,36 @@ func (s *fileStore) verifyRootIdentity() error {
 	return s.rootAnchor.Verify()
 }
 
-func (s *fileStore) readRegularRoot(ctx context.Context, root *os.Root, name string, limit int64) ([]byte, error) {
+func (s *fileStore) useDirectory(ctx context.Context, relative string, operation func(*os.Root) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed || s.rootAnchor == nil {
-		s.mu.Unlock()
-		return nil, secret.ErrLeaseClosed
+		return secret.ErrLeaseClosed
 	}
-	err := s.rootAnchor.VerifyRelative(name)
-	s.mu.Unlock()
-	if err != nil {
-		return nil, err
+	if _, err := s.rootAnchor.Open(ctx, false); err != nil {
+		return err
 	}
-	raw, readErr := readRegularRoot(ctx, root, name, limit)
-	return raw, errors.Join(readErr, s.verifyRootIdentity())
+	return s.rootAnchor.UseDirectory(relative, operation)
+}
+
+func (s *fileStore) readRegularDirectory(ctx context.Context, directory, name string, limit int64) ([]byte, error) {
+	var raw []byte
+	err := s.useDirectory(ctx, directory, func(root *os.Root) (readErr error) {
+		raw, readErr = readRegularRoot(ctx, root, name, limit)
+		return readErr
+	})
+	return raw, err
 }
 
 func readRegularRoot(ctx context.Context, root *os.Root, name string, limit int64) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if !safeName(name) {
+		return nil, ErrUnsafePath
 	}
 	info, err := root.Lstat(name)
 	if err != nil {

@@ -264,6 +264,112 @@ func TestRecoveryCoordinationPreventsSecondStoreFromDeletingLiveTemporary(t *tes
 	assertOneRecoveryContainerNoTemporary(t, root)
 }
 
+func TestRecoveryPublishNeverUsesReplacementMaterialsPathAfterBoundarySwap(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "recovery")
+	var retained string
+	var replacementTemporary string
+	store, err := recovery.New(root, recoveryLease(t), recovery.WithFault(func(point recovery.FaultPoint) error {
+		if point != recovery.FaultBeforePublish || retained != "" {
+			return nil
+		}
+		materials := filepath.Join(root, "materials")
+		retained = materials + "-retained"
+		if err := os.Rename(materials, retained); err != nil {
+			return err
+		}
+		if err := os.Mkdir(materials, 0o700); err != nil {
+			return err
+		}
+		temporary, err := onlyTemporaryBasename(retained, ".recovery-", ".tmp")
+		if err != nil {
+			return err
+		}
+		replacementTemporary = filepath.Join(materials, temporary)
+		return os.WriteFile(replacementTemporary, []byte("replacement-path-content"), 0o600)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	_, putErr := store.Put(context.Background(), validRecoveryCandidate([]byte("retained-directory-preimage")))
+	if !errors.Is(putErr, recovery.ErrUnsafePath) {
+		t.Fatalf("boundary replacement error=%v", putErr)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "materials"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".recovery") {
+			t.Fatalf("publication reached replacement materials path: %v", entries)
+		}
+	}
+	if raw, err := os.ReadFile(replacementTemporary); err != nil || string(raw) != "replacement-path-content" {
+		t.Fatalf("operation touched replacement temporary: raw=%q err=%v", raw, err)
+	}
+}
+
+func TestRecoveryDirectoryInodeLockSurvivesMarkerReplacement(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "recovery")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	writer, err := recovery.New(root, recoveryLease(t), recovery.WithFault(func(point recovery.FaultPoint) error {
+		if point == recovery.FaultTemporarySynced {
+			close(entered)
+			<-release
+		}
+		return nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	contender, err := recovery.New(root, recoveryLease(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer contender.Close()
+	candidate := validRecoveryCandidate([]byte("directory-lock-preimage"))
+	finished := make(chan error, 1)
+	go func() {
+		_, putErr := writer.Put(context.Background(), candidate)
+		finished <- putErr
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writer did not reach synced temporary gate")
+	}
+	marker := filepath.Join(root, ".recovery.lock")
+	if err := os.Rename(marker, marker+"-retained"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	_, contenderErr := contender.Put(ctx, candidate)
+	cancel()
+	if !errors.Is(contenderErr, recovery.ErrRecoveryBusy) {
+		t.Fatalf("marker replacement bypassed coordination: %v", contenderErr)
+	}
+	close(release)
+	if writerErr := <-finished; !errors.Is(writerErr, recovery.ErrUnsafePath) {
+		t.Fatalf("writer did not fail closed after marker replacement: %v", writerErr)
+	}
+	if _, err := contender.Put(context.Background(), candidate); err != nil {
+		t.Fatalf("retry after serialized writer completion: %v", err)
+	}
+	assertOneRecoveryContainerNoTemporary(t, root)
+}
+
 func TestRecoveryCoordinationAcrossProcessesAndOwnerDeath(t *testing.T) {
 	for _, mode := range []string{"live", "crash"} {
 		t.Run(mode, func(t *testing.T) {
@@ -383,6 +489,26 @@ func countRecoveryEntries(entries []os.DirEntry, suffix string) int {
 		}
 	}
 	return count
+}
+
+func onlyTemporaryBasename(directory, prefix, suffix string) (string, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return "", err
+	}
+	var matched string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), prefix) && strings.HasSuffix(entry.Name(), suffix) {
+			if matched != "" {
+				return "", fmt.Errorf("multiple temporary files in %q", directory)
+			}
+			matched = entry.Name()
+		}
+	}
+	if matched == "" {
+		return "", fmt.Errorf("no temporary file in %q", directory)
+	}
+	return matched, nil
 }
 
 func assertOneRecoveryContainerNoTemporary(t *testing.T, root string) {

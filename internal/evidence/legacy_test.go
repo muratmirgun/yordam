@@ -134,6 +134,62 @@ func TestLegacyAliasRejectsInRootSymlinkSwapForExistingAndFreshStores(t *testing
 	}
 }
 
+func TestLegacyAliasPublishNeverUsesReplacementDescendantAtBoundary(t *testing.T) {
+	for _, lifecycle := range []string{"existing_store", "fresh_store"} {
+		t.Run(lifecycle, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "evidence")
+			resolver := &legacyResolverFixture{artifacts: map[string][]byte{
+				"session-a/baseline": []byte("baseline-content"),
+				"session-a/boundary": []byte("boundary-content"),
+			}}
+			if lifecycle == "fresh_store" {
+				baseline := newEvidenceStoreAtRoot(t, root, evidence.WithLegacyResolver(resolver))
+				if _, err := baseline.MigrateLegacyArtifact(context.Background(), "session-a", "baseline"); err != nil {
+					t.Fatal(err)
+				}
+				if err := baseline.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			publication := 0
+			var replacementTemporary string
+			store := newEvidenceStoreAtRoot(t, root,
+				evidence.WithLegacyResolver(resolver),
+				evidence.WithFault(func(point evidence.FaultPoint) error {
+					if point != evidence.FaultBeforePublish {
+						return nil
+					}
+					publication++
+					if publication != 3 {
+						return nil
+					}
+					directory := filepath.Join(root, "evidence", "aliases", "session-a")
+					retained := directory + "-retained"
+					if err := os.Rename(directory, retained); err != nil {
+						return err
+					}
+					if err := os.Mkdir(directory, 0o700); err != nil {
+						return err
+					}
+					temporary, err := onlyEvidenceTemporary(retained)
+					if err != nil {
+						return err
+					}
+					replacementTemporary = filepath.Join(directory, temporary)
+					return os.WriteFile(replacementTemporary, []byte("replacement-path-content"), 0o600)
+				}),
+			)
+			_, migrationErr := store.MigrateLegacyArtifact(context.Background(), "session-a", "boundary")
+			if !errors.Is(migrationErr, evidence.ErrUnsafePath) {
+				t.Fatalf("boundary replacement error=%v", migrationErr)
+			}
+			if raw, err := os.ReadFile(replacementTemporary); err != nil || string(raw) != "replacement-path-content" {
+				t.Fatalf("operation touched replacement temporary: raw=%q err=%v", raw, err)
+			}
+		})
+	}
+}
+
 func newEvidenceStoreWithResolver(t *testing.T, resolver evidence.LegacyResolver) (string, evidence.Store) {
 	t.Helper()
 	root := t.TempDir()
