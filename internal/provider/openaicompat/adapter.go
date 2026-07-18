@@ -35,6 +35,42 @@ func (a *Adapter) Normalize(ctx context.Context, request protocol.ModelRequest) 
 	return provider.NewPreparedRequest(a.Kind(), normalizedRequest{ProviderID: request.ProviderID, Body: normalized})
 }
 
+// StartPrepared is the sole Gate 1 dispatch seam. provider.Service calls it
+// only from the shared authorization gate's registration callback.
+func (a *Adapter) StartPrepared(ctx context.Context, prepared provider.PreparedRequest) (<-chan protocol.ModelEvent, error) {
+	var normalized normalizedRequest
+	if err := prepared.Decode(a.Kind(), &normalized); err != nil {
+		return nil, err
+	}
+	if normalized.ProviderID == "" {
+		return nil, fmt.Errorf("prepared provider identity is missing")
+	}
+	if a == nil || a.client == nil {
+		return nil, fmt.Errorf("OpenAI-compatible client is required")
+	}
+	out := make(chan protocol.ModelEvent)
+	go func() {
+		defer close(out)
+		stream, err := a.startNormalized(ctx, normalized.Body)
+		if err != nil {
+			event := protocol.ModelEvent{Sequence: 1, Kind: protocol.ModelEventError, Error: &protocol.ProviderError{Code: "provider_start_failed", Message: err.Error()}}
+			select {
+			case <-ctx.Done():
+			case out <- event:
+			}
+			return
+		}
+		for event := range stream {
+			select {
+			case <-ctx.Done():
+				return
+			case out <- event:
+			}
+		}
+	}()
+	return out, nil
+}
+
 func (*Adapter) normalize(ctx context.Context, request protocol.ModelRequest) (chatRequest, error) {
 	if err := ctx.Err(); err != nil {
 		return chatRequest{}, err
@@ -128,6 +164,13 @@ func (a *Adapter) stream(ctx context.Context, request protocol.ModelRequest) (<-
 	normalized, err := a.normalize(ctx, request)
 	if err != nil {
 		return nil, err
+	}
+	return a.startNormalized(ctx, normalized)
+}
+
+func (a *Adapter) startNormalized(ctx context.Context, normalized chatRequest) (<-chan protocol.ModelEvent, error) {
+	if a == nil || a.client == nil {
+		return nil, fmt.Errorf("OpenAI-compatible client is required")
 	}
 	legacy, err := a.client.streamOnce(ctx, legacyRequest(normalized))
 	if err != nil {

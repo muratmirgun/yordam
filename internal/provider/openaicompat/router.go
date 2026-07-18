@@ -45,5 +45,17 @@ func (r *Router) Normalize(ctx context.Context, request protocol.ModelRequest) (
 	return NewAdapter(nil).Normalize(ctx, request)
 }
 
+func (r *Router) StartPrepared(ctx context.Context, prepared provider.PreparedRequest) (<-chan protocol.ModelEvent, error) {
+	var normalized normalizedRequest
+	if err := prepared.Decode(r.Kind(), &normalized); err != nil {
+		return nil, err
+	}
+	client, ok := r.clients[string(normalized.ProviderID)]
+	if !ok {
+		return nil, fmt.Errorf("unknown provider profile %q", normalized.ProviderID)
+	}
+	return NewAdapter(client).StartPrepared(ctx, prepared)
+}
+
 var _ ports.ModelProvider = (*Router)(nil)
 var _ provider.Adapter = (*Router)(nil)

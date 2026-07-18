@@ -54,6 +54,67 @@ func TestRouterNormalizationIsEffectFree(t *testing.T) {
 	}
 }
 
+func TestAdapterStartPreparedUsesActualSingleAttemptSeam(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		response.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	adapter := NewAdapter(New(ClientOptions{HTTPClient: server.Client(), BaseURL: server.URL, RetryDelays: []time.Duration{0, 0, 0}}))
+	prepared, err := adapter.Normalize(context.Background(), protocol.ModelRequest{RequestID: "request", ProviderID: "openai", ModelID: "model", Messages: []protocol.ModelMessage{{Role: "user", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "hello"}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.StartPrepared(context.Background(), prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var providerError bool
+	for event := range stream {
+		providerError = providerError || event.Kind == protocol.ModelEventError
+	}
+	if !providerError {
+		t.Fatal("503 attempt emitted no provider error")
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("requests=%d want 1", requests.Load())
+	}
+}
+
+func TestAdapterStartPreparedReturnsPromptlyWhileAttemptIsInFlight(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		response.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(response, "data: [DONE]")
+		fmt.Fprintln(response)
+	}))
+	defer server.Close()
+	adapter := NewAdapter(New(ClientOptions{HTTPClient: server.Client(), BaseURL: server.URL}))
+	prepared, err := adapter.Normalize(context.Background(), protocol.ModelRequest{RequestID: "request", ProviderID: "openai", ModelID: "model", Messages: []protocol.ModelMessage{{Role: "user", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "hello"}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	returned := make(chan (<-chan protocol.ModelEvent), 1)
+	go func() {
+		stream, _ := adapter.StartPrepared(context.Background(), prepared)
+		returned <- stream
+	}()
+	<-entered
+	select {
+	case stream := <-returned:
+		close(release)
+		for range stream {
+		}
+	case <-time.After(100 * time.Millisecond):
+		close(release)
+		t.Fatal("adapter start held the dispatch callback for the in-flight HTTP attempt")
+	}
+}
+
 func TestAdapterNormalizesStreamEventsWithOrderingUsageAndTerminalMetadata(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		response.Header().Set("X-Request-ID", "header-request")

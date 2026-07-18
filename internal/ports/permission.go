@@ -4,12 +4,16 @@ import (
 	"context"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
 type PermissionContext struct {
-	SessionID string
-	Mode      domain.PermissionMode
-	Workspace string
+	SessionID          string
+	Mode               domain.PermissionMode
+	Workspace          string
+	PlatformAction     domain.PermissionAction
+	ProjectAction      domain.PermissionAction
+	ConfiguredProvider bool
 }
 
 type PermissionPolicy interface {
@@ -18,4 +22,12 @@ type PermissionPolicy interface {
 
 type PermissionGranter interface {
 	GrantSession(tool, scope string)
+}
+
+type AuthorizationPolicy interface {
+	EvaluateAuthorization(context.Context, PermissionContext, protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error)
+}
+
+type AuthorizationGranter interface {
+	GrantAuthorizationSession(protocol.AuthorizationRequest, []protocol.AuthorizationConstraint) error
 }

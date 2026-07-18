@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
+	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
@@ -16,6 +18,16 @@ type PreparedRequest struct {
 }
 
 func (r PreparedRequest) Valid() bool { return r.adapterKind != "" && len(r.canonical) != 0 }
+
+// Decode is available only to adapter implementations receiving an opaque
+// PreparedRequest from Service. It never exposes the canonical bytes or a
+// transport capability to callers holding ProviderHandle.
+func (r PreparedRequest) Decode(adapterKind string, target any) error {
+	if !r.Valid() || adapterKind == "" || r.adapterKind != adapterKind || target == nil {
+		return fmt.Errorf("prepared request adapter binding mismatch")
+	}
+	return json.Unmarshal(r.canonical, target)
+}
 
 func NewPreparedRequest(adapterKind string, value any) (PreparedRequest, error) {
 	if adapterKind == "" || value == nil {
@@ -31,11 +43,13 @@ func NewPreparedRequest(adapterKind string, value any) (PreparedRequest, error) 
 type Adapter interface {
 	Kind() string
 	Normalize(context.Context, protocol.ModelRequest) (PreparedRequest, error)
+	StartPrepared(context.Context, PreparedRequest) (<-chan protocol.ModelEvent, error)
 }
 
 type preparedRequest struct {
 	adapterKind string
 	normalized  PreparedRequest
+	adapter     Adapter
 }
 
 type ProviderHandle struct {
@@ -51,20 +65,29 @@ type ProviderHandle struct {
 }
 
 func (h ProviderHandle) Valid() bool {
-	return h.id != "" && h.activityID != "" && h.callID != "" && h.prepared != nil && h.planDigest.Validate() == nil && h.requestDigest.Validate() == nil && h.contextPlanDigest.Validate() == nil && h.dispatchDigest.Validate() == nil
+	return h.id != "" && h.activityID != "" && h.callID != "" && h.runtimeGenerationID != "" && h.prepared != nil && h.planDigest.Validate() == nil && h.requestDigest.Validate() == nil && h.contextPlanDigest.Validate() == nil && h.dispatchDigest.Validate() == nil
 }
 
 type Service struct {
 	catalog  Catalog
 	adapters map[string]Adapter
 	nextID   atomic.Uint64
+	gate     authorization.DispatchGate
+	mu       sync.RWMutex
+	handles  map[string]ProviderHandle
 }
 
-func NewService(catalog Catalog, adapters []Adapter) (*Service, error) {
+func NewService(catalog Catalog, adapters []Adapter, gates ...authorization.DispatchGate) (*Service, error) {
 	if catalog == nil {
 		return nil, fmt.Errorf("provider catalog is required")
 	}
-	service := &Service{catalog: catalog, adapters: make(map[string]Adapter, len(adapters))}
+	if len(gates) > 1 {
+		return nil, fmt.Errorf("provider service accepts at most one dispatch gate")
+	}
+	service := &Service{catalog: catalog, adapters: make(map[string]Adapter, len(adapters)), handles: make(map[string]ProviderHandle)}
+	if len(gates) == 1 {
+		service.gate = gates[0]
+	}
 	for _, adapter := range adapters {
 		if adapter == nil || adapter.Kind() == "" {
 			return nil, fmt.Errorf("provider adapter is invalid")
@@ -117,7 +140,50 @@ func (s *Service) Prepare(ctx context.Context, activityID protocol.ActivityID, c
 		return ProviderHandle{}, err
 	}
 	id := fmt.Sprintf("provider-handle-%d", s.nextID.Add(1))
-	return ProviderHandle{id: id, activityID: activityID, callID: callID, planDigest: request.Plan.Digest, runtimeGenerationID: request.Plan.Body.Descriptor.RuntimeGenerationID, requestDigest: requestDigest, contextPlanDigest: contextPlanDigest, dispatchDigest: boundDispatchDigest, prepared: &preparedRequest{adapterKind: adapter.Kind(), normalized: normalized}}, nil
+	handle := ProviderHandle{id: id, activityID: activityID, callID: callID, planDigest: request.Plan.Digest, runtimeGenerationID: request.Plan.Body.Descriptor.RuntimeGenerationID, requestDigest: requestDigest, contextPlanDigest: contextPlanDigest, dispatchDigest: boundDispatchDigest, prepared: &preparedRequest{adapterKind: adapter.Kind(), normalized: normalized, adapter: adapter}}
+	s.mu.Lock()
+	s.handles[id] = handle
+	s.mu.Unlock()
+	return handle, nil
+}
+
+func (s *Service) Stream(ctx context.Context, handle ProviderHandle, token authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	if s == nil || s.gate == nil || !handle.Valid() {
+		return nil, authorization.ErrInvalidCommittedToken
+	}
+	s.mu.RLock()
+	stored, ok := s.handles[handle.id]
+	s.mu.RUnlock()
+	if !ok || !sameProviderHandle(stored, handle) {
+		return nil, authorization.ErrInvalidCommittedToken
+	}
+	binding := authorization.DispatchBinding{
+		Kind: "provider", HandleID: stored.id, ActivityID: stored.activityID, CallID: stored.callID,
+		PlanDigest: stored.planDigest, RequestDigest: stored.requestDigest, DispatchDigest: stored.dispatchDigest,
+		RuntimeGenerationID: stored.runtimeGenerationID,
+	}
+	var stream <-chan protocol.ModelEvent
+	runContext, cancel := context.WithCancel(ctx)
+	err := s.gate.Dispatch(ctx, token, binding, func(startContext context.Context) error {
+		if registerErr := authorization.RegisterCancellation(startContext, cancel); registerErr != nil {
+			return registerErr
+		}
+		var startErr error
+		stream, startErr = stored.prepared.adapter.StartPrepared(runContext, stored.prepared.normalized)
+		return startErr
+	})
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if stream == nil {
+		return nil, fmt.Errorf("provider adapter returned a nil stream")
+	}
+	return stream, nil
+}
+
+func sameProviderHandle(left, right ProviderHandle) bool {
+	return left.id == right.id && left.activityID == right.activityID && left.callID == right.callID && left.planDigest == right.planDigest && left.runtimeGenerationID == right.runtimeGenerationID && left.requestDigest == right.requestDigest && left.contextPlanDigest == right.contextPlanDigest && left.dispatchDigest == right.dispatchDigest && left.prepared == right.prepared
 }
 
 func dispatchDigest(requestDigest, contextPlanDigest, providerPlanDigest protocol.Digest, runtimeGenerationID protocol.RuntimeGenerationID) (protocol.Digest, error) {

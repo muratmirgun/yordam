@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,14 +13,227 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
+	"github.com/muratmirgun/yordam/internal/authorization"
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/tools/edit"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 	"github.com/muratmirgun/yordam/internal/tools/read"
 )
+
+func TestDispatchToolExecuteConsumesHandleAndTokenBeforeOneEffect(t *testing.T) {
+	tool := newDispatchTool("mutate", trustedRemoteClassification())
+	catalog, err := NewCatalog("revision-1", tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := &countingDispatchGate{}
+	service := NewService(catalog, gate)
+	handle, _, err := service.Plan(context.Background(), planRequest("mutate", `{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Execute(context.Background(), handle, authorization.CommittedToken{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ToolResult.Status != "succeeded" || tool.effects.Load() != 1 {
+		t.Fatalf("result=%#v effects=%d", result, tool.effects.Load())
+	}
+	if _, err := service.Execute(context.Background(), handle, authorization.CommittedToken{}); !errors.Is(err, authorization.ErrAlreadyDispatched) {
+		t.Fatalf("repeat err=%v", err)
+	}
+	if tool.effects.Load() != 1 {
+		t.Fatalf("repeat effects=%d", tool.effects.Load())
+	}
+}
+
+func TestDispatchToolConcurrentDoubleExecuteProducesOneEffect(t *testing.T) {
+	tool := newDispatchTool("mutate", trustedRemoteClassification())
+	catalog, err := NewCatalog("revision-1", tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(catalog, &countingDispatchGate{})
+	handle, _, err := service.Plan(context.Background(), planRequest("mutate", `{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			_, executeErr := service.Execute(context.Background(), handle, authorization.CommittedToken{})
+			errs <- executeErr
+		}()
+	}
+	close(start)
+	var success, repeated int
+	for range 2 {
+		err := <-errs
+		if err == nil {
+			success++
+		} else if errors.Is(err, authorization.ErrAlreadyDispatched) {
+			repeated++
+		} else {
+			t.Fatalf("err=%v", err)
+		}
+	}
+	if success != 1 || repeated != 1 || tool.effects.Load() != 1 {
+		t.Fatalf("success=%d repeated=%d effects=%d", success, repeated, tool.effects.Load())
+	}
+}
+
+func TestDispatchToolRejectsZeroTokenBeforeEffect(t *testing.T) {
+	tool := newDispatchTool("mutate", trustedRemoteClassification())
+	catalog, err := NewCatalog("revision-1", tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(catalog, authorization.NewService(nil))
+	handle, _, err := service.Plan(context.Background(), planRequest("mutate", `{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Execute(context.Background(), handle, authorization.CommittedToken{}); !errors.Is(err, authorization.ErrInvalidCommittedToken) {
+		t.Fatalf("zero err=%v", err)
+	}
+	if tool.effects.Load() != 0 {
+		t.Fatalf("zero token effects=%d", tool.effects.Load())
+	}
+	if tool.revalidations.Load() != 0 {
+		t.Fatalf("zero token crossed revalidation boundary=%d", tool.revalidations.Load())
+	}
+}
+
+func TestPreviewDispatchRejectionOpensNoResourceAndReturnsObservationAuthority(t *testing.T) {
+	classification := domain.ToolClassification{Effect: "mutation", Mutation: "file", ExecutionLoci: []string{"builtin"}, Boundary: "workspace", Reversibility: "preimage", VerificationCoverage: "full", Idempotency: "conditional", Retry: "never_after_dispatch", RequestedProfile: "restricted", EffectiveProfile: "restricted"}
+	tool := newDispatchTool("edit_preview", classification)
+	catalog, err := NewCatalog("revision-1", tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejecting := NewService(catalog, authorization.NewService(nil))
+	rejectedHandle, rejectedPlan, err := rejecting.PlanPreviewInspection(context.Background(), planRequest("edit_preview", `{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejectedPlan.Body.Effect != "observation" || rejectedPlan.Body.Purpose != "inspect" || rejectedPlan.Body.Action == tool.CanonicalDescriptor().Body.Identity.Name {
+		t.Fatalf("preview plan retained mutation authority: %#v", rejectedPlan.Body)
+	}
+	if _, _, _, err := rejecting.PreparePreview(context.Background(), rejectedHandle, authorization.CommittedToken{}); !errors.Is(err, authorization.ErrInvalidCommittedToken) {
+		t.Fatalf("rejected preview err=%v", err)
+	}
+	if tool.opens.Load() != 0 {
+		t.Fatalf("rejected preview opens=%d", tool.opens.Load())
+	}
+	if tool.revalidations.Load() != 0 {
+		t.Fatalf("rejected preview crossed revalidation boundary=%d", tool.revalidations.Load())
+	}
+
+	allowed := NewService(catalog, &countingDispatchGate{})
+	handle, plan, err := allowed.PlanPreviewInspection(context.Background(), planRequest("edit_preview", `{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, returnedPlan, evidence, err := allowed.PreparePreview(context.Background(), handle, authorization.CommittedToken{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tool.opens.Load() != 1 || preview.handleID != handle.id || returnedPlan.Digest != plan.Digest || len(evidence) != 1 || len(evidence[0].Content) == 0 {
+		t.Fatalf("opens=%d preview=%#v plan=%#v evidence=%#v", tool.opens.Load(), preview, returnedPlan, evidence)
+	}
+	if strings.Contains(string(evidence[0].Content), "before") || strings.Contains(string(evidence[0].Content), "after") {
+		t.Fatalf("preview evidence was returned before redaction: %q", evidence[0].Content)
+	}
+	mutationRequest := planRequest("edit_preview", `{}`)
+	plansBeforeMutation := tool.plans.Load()
+	_, mutationPlan, err := allowed.PlanMutation(context.Background(), preview, mutationRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutationPlan.Body.Effect != "mutation" || mutationPlan.Digest == plan.Digest {
+		t.Fatalf("mutation plan=%#v preview=%#v", mutationPlan, plan)
+	}
+	if tool.plans.Load() != plansBeforeMutation {
+		t.Fatalf("mutation discarded observed prepared state and replanned: before=%d after=%d", plansBeforeMutation, tool.plans.Load())
+	}
+}
+
+type countingDispatchGate struct {
+	mu   sync.Mutex
+	used bool
+}
+
+func (g *countingDispatchGate) Dispatch(ctx context.Context, _ authorization.CommittedToken, _ authorization.DispatchBinding, callback func(context.Context) error) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.used {
+		return authorization.ErrAlreadyDispatched
+	}
+	g.used = true
+	return callback(ctx)
+}
+
+type dispatchTool struct {
+	alias          string
+	descriptor     protocol.ToolDescriptor
+	classification domain.ToolClassification
+	effects        atomic.Int64
+	opens          atomic.Int64
+	revalidations  atomic.Int64
+	plans          atomic.Int64
+}
+
+func newDispatchTool(alias string, classification domain.ToolClassification) *dispatchTool {
+	body := protocol.ToolDescriptorBody{Identity: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: alias}, SourceRevision: "source-r1", DisplayName: alias, Description: alias, InputSchema: json.RawMessage(`{"type":"object"}`), Effect: classification.Effect, Mutation: classification.Mutation, ExecutionLoci: append([]string(nil), classification.ExecutionLoci...), ClassificationSource: "trusted_adapter", Idempotency: classification.Idempotency, Retry: classification.Retry}
+	digest, _ := canonicaljson.Digest(body)
+	return &dispatchTool{alias: alias, descriptor: protocol.ToolDescriptor{Body: body, DescriptorDigest: digest}, classification: classification}
+}
+
+func (t *dispatchTool) Descriptor() domain.ToolDescriptor {
+	mutation := domain.MutationFile
+	if t.classification.Mutation == "read_only" {
+		mutation = domain.MutationReadOnly
+	} else if t.classification.Mutation == "process" || t.classification.Mutation == "remote" {
+		mutation = domain.MutationProcess
+	}
+	return domain.ToolDescriptor{Name: t.alias, Description: t.alias, ScopeDescription: "target", InputSchema: json.RawMessage(`{"type":"object"}`), Mutation: mutation}
+}
+func (t *dispatchTool) CanonicalDescriptor() protocol.ToolDescriptor     { return t.descriptor }
+func (t *dispatchTool) TrustedClassification() domain.ToolClassification { return t.classification }
+func (t *dispatchTool) Prepare(context.Context, domain.ToolRequest) (ports.PreparedTool, error) {
+	return nil, errors.New("legacy prepare is unavailable")
+}
+func (t *dispatchTool) Plan(_ context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
+	t.plans.Add(1)
+	return &dispatchPrepared{request: request, tool: t}, nil
+}
+
+type dispatchPrepared struct {
+	request domain.ToolRequest
+	tool    *dispatchTool
+}
+
+func (p *dispatchPrepared) Preview() domain.PreparedToolRequest {
+	return domain.PreparedToolRequest{Request: p.request, Mutation: domain.MutationFile, CanonicalScope: "/workspace/file", InsideWorkspace: true, Summary: "preview", ProposedDiff: "-before\n+after", Resources: []protocol.ResourceTarget{{Kind: "file", CanonicalID: "/workspace/file"}}}
+}
+
+func (p *dispatchPrepared) Revalidate(context.Context) (domain.PreparedToolRequest, error) {
+	p.tool.revalidations.Add(1)
+	return p.Preview(), nil
+}
+func (p *dispatchPrepared) PreparePreview(context.Context) error { p.tool.opens.Add(1); return nil }
+func (p *dispatchPrepared) Execute(context.Context) domain.ToolResult {
+	p.tool.effects.Add(1)
+	return domain.ToolResult{CallID: p.request.CallID, Status: domain.ToolSucceeded, Content: "effect"}
+}
 
 func TestPlanDigestUsesCanonicalResourcesAndHandleIsOpaque(t *testing.T) {
 	workspace := t.TempDir()
@@ -50,6 +264,9 @@ func TestPlanDigestUsesCanonicalResourcesAndHandleIsOpaque(t *testing.T) {
 	}
 	if plan.Body.Tool != (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "read"}) || plan.Body.Resources[0].CanonicalID != canonicalTarget {
 		t.Fatalf("plan=%#v", plan)
+	}
+	if plan.Body.Action != "read" || plan.Body.Effect != "observation" {
+		t.Fatalf("native observation was relabeled as preview authority: %#v", plan.Body)
 	}
 	if err := plan.Body.Validate(); err != nil {
 		t.Fatal(err)

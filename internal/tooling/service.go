@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
@@ -33,26 +34,38 @@ type PlanRequest struct {
 }
 
 type plannedAction struct {
-	turnID      protocol.TurnID
-	activityID  protocol.ActivityID
-	request     PlanRequest
-	entry       catalogEntry
-	prepared    ports.PreparedTool
-	plan        protocol.ActionPlan
-	revalidated bool
+	turnID          protocol.TurnID
+	activityID      protocol.ActivityID
+	request         PlanRequest
+	entry           catalogEntry
+	prepared        ports.PreparedTool
+	plan            protocol.ActionPlan
+	requestDigest   protocol.Digest
+	dispatchDigest  protocol.Digest
+	evidenceDigests []protocol.Digest
+	revalidated     bool
+	operationMu     *sync.Mutex
 }
 
 type Service struct {
 	catalog *Catalog
 	mu      sync.Mutex
 	actions map[string]*plannedAction
+	gate    authorization.DispatchGate
 }
 
-func NewService(catalog *Catalog) *Service {
+func NewService(catalog *Catalog, gates ...authorization.DispatchGate) *Service {
 	if catalog == nil {
 		panic("tooling: catalog is nil")
 	}
-	return &Service{catalog: catalog, actions: make(map[string]*plannedAction)}
+	if len(gates) > 1 {
+		panic("tooling: at most one dispatch gate is allowed")
+	}
+	service := &Service{catalog: catalog, actions: make(map[string]*plannedAction)}
+	if len(gates) == 1 {
+		service.gate = gates[0]
+	}
+	return service
 }
 
 func (s *Service) Plan(ctx context.Context, request PlanRequest) (ActionHandle, protocol.ActionPlan, error) {
@@ -72,10 +85,20 @@ func (s *Service) PlanMutation(ctx context.Context, preview PreviewResult, reque
 	var observedTurnID protocol.TurnID
 	var observedActivityID protocol.ActivityID
 	var observedDigest protocol.Digest
+	var observedRequest PlanRequest
+	var observedEntry catalogEntry
+	var observedPrepared ports.PreparedTool
+	var observedRequestDigest protocol.Digest
+	var observedOperationMu *sync.Mutex
 	if ok {
 		observedTurnID = observed.turnID
 		observedActivityID = observed.activityID
 		observedDigest = observed.plan.Digest
+		observedRequest = clonePlanRequest(observed.request)
+		observedEntry = observed.entry
+		observedPrepared = observed.prepared
+		observedRequestDigest = observed.requestDigest
+		observedOperationMu = observed.operationMu
 	}
 	s.mu.Unlock()
 	if !ok || observedTurnID != request.TurnID || observedActivityID != request.ActivityID || observedDigest != preview.observationDigest {
@@ -85,6 +108,34 @@ func (s *Service) PlanMutation(ctx context.Context, preview PreviewResult, reque
 		if err := digest.Validate(); err != nil {
 			return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("preview evidence digest: %w", err)
 		}
+	}
+	if observedRequest.Alias == request.Alias && observedEntry.classification.Effect != "observation" {
+		if err := validatePlanRequest(request); err != nil {
+			return ActionHandle{}, protocol.ActionPlan{}, err
+		}
+		requestDigest, err := canonicalDigest(request)
+		if err != nil {
+			return ActionHandle{}, protocol.ActionPlan{}, err
+		}
+		if requestDigest != observedRequestDigest {
+			return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("mutation request does not match the observed preview input")
+		}
+		plan, err := buildActionPlan(request, observedEntry, observedPrepared.Preview(), "")
+		if err != nil {
+			return ActionHandle{}, protocol.ActionPlan{}, err
+		}
+		dispatchDigest, err := toolDispatchDigest(plan, requestDigest, preview.evidenceDigests)
+		if err != nil {
+			return ActionHandle{}, protocol.ActionPlan{}, err
+		}
+		id, err := newHandleID()
+		if err != nil {
+			return ActionHandle{}, protocol.ActionPlan{}, err
+		}
+		s.mu.Lock()
+		s.actions[id] = &plannedAction{turnID: request.TurnID, activityID: request.ActivityID, request: clonePlanRequest(request), entry: observedEntry, prepared: observedPrepared, plan: plan, requestDigest: requestDigest, dispatchDigest: dispatchDigest, evidenceDigests: append([]protocol.Digest(nil), preview.evidenceDigests...), operationMu: observedOperationMu}
+		s.mu.Unlock()
+		return ActionHandle{id: id}, plan, nil
 	}
 	return s.plan(ctx, request, "mutation")
 }
@@ -97,7 +148,8 @@ func (s *Service) plan(ctx context.Context, request PlanRequest, requiredEffect 
 	if !ok {
 		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("unknown tool alias %q", request.Alias)
 	}
-	if requiredEffect != "" && entry.classification.Effect != requiredEffect {
+	previewOnly := requiredEffect == "observation" && entry.classification.Effect != "observation"
+	if requiredEffect != "" && entry.classification.Effect != requiredEffect && !previewOnly {
 		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("tool alias %q has effect %q, want %q", request.Alias, entry.classification.Effect, requiredEffect)
 	}
 	planner, ok := entry.tool.(ports.ToolPlanner)
@@ -112,7 +164,16 @@ func (s *Service) plan(ctx context.Context, request PlanRequest, requiredEffect 
 	if prepared == nil {
 		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("tool alias %q returned nil plan", request.Alias)
 	}
-	plan, err := buildActionPlan(request, entry, prepared.Preview())
+	if previewOnly {
+		if _, ok := prepared.(ports.PreviewPreparer); !ok {
+			return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("tool alias %q has effect %q, want %q (no observation preview seam)", request.Alias, entry.classification.Effect, requiredEffect)
+		}
+	}
+	effectOverride := ""
+	if previewOnly {
+		effectOverride = "observation"
+	}
+	plan, err := buildActionPlan(request, entry, prepared.Preview(), effectOverride)
 	if err != nil {
 		return ActionHandle{}, protocol.ActionPlan{}, err
 	}
@@ -120,8 +181,16 @@ func (s *Service) plan(ctx context.Context, request PlanRequest, requiredEffect 
 	if err != nil {
 		return ActionHandle{}, protocol.ActionPlan{}, err
 	}
+	requestDigest, err := canonicalDigest(request)
+	if err != nil {
+		return ActionHandle{}, protocol.ActionPlan{}, err
+	}
+	boundDispatchDigest, err := toolDispatchDigest(plan, requestDigest, nil)
+	if err != nil {
+		return ActionHandle{}, protocol.ActionPlan{}, err
+	}
 	s.mu.Lock()
-	s.actions[id] = &plannedAction{turnID: request.TurnID, activityID: request.ActivityID, request: clonePlanRequest(request), entry: entry, prepared: prepared, plan: plan}
+	s.actions[id] = &plannedAction{turnID: request.TurnID, activityID: request.ActivityID, request: clonePlanRequest(request), entry: entry, prepared: prepared, plan: plan, requestDigest: requestDigest, dispatchDigest: boundDispatchDigest, operationMu: &sync.Mutex{}}
 	s.mu.Unlock()
 	return ActionHandle{id: id}, plan, nil
 }
@@ -143,6 +212,8 @@ func (s *Service) Revalidate(ctx context.Context, handle ActionHandle) (protocol
 	action.revalidated = true
 	originalPlan := action.plan
 	s.mu.Unlock()
+	action.operationMu.Lock()
+	defer action.operationMu.Unlock()
 
 	revalidator, ok := action.prepared.(ports.ResourceRevalidator)
 	if !ok {
@@ -152,14 +223,22 @@ func (s *Service) Revalidate(ctx context.Context, handle ActionHandle) (protocol
 	if err != nil {
 		return protocol.ActionPlan{}, false, err
 	}
-	current, err := buildActionPlan(action.request, action.entry, preview)
+	override := ""
+	if originalPlan.Body.Effect == "observation" && action.entry.classification.Effect != "observation" {
+		override = "observation"
+	}
+	current, err := buildActionPlan(action.request, action.entry, preview, override)
 	if err != nil {
 		return protocol.ActionPlan{}, false, err
 	}
 	changed := current.Digest != originalPlan.Digest
 	s.mu.Lock()
 	action.plan = current
+	action.dispatchDigest, err = toolDispatchDigest(current, action.requestDigest, action.evidenceDigests)
 	s.mu.Unlock()
+	if err != nil {
+		return protocol.ActionPlan{}, false, err
+	}
 	return current, changed, nil
 }
 
@@ -173,7 +252,7 @@ func validatePlanRequest(request PlanRequest) error {
 	return nil
 }
 
-func buildActionPlan(request PlanRequest, entry catalogEntry, preview domain.PreparedToolRequest) (protocol.ActionPlan, error) {
+func buildActionPlan(request PlanRequest, entry catalogEntry, preview domain.PreparedToolRequest, effectOverride string) (protocol.ActionPlan, error) {
 	resources, err := canonicalResources(preview.Resources)
 	if err != nil {
 		return protocol.ActionPlan{}, err
@@ -193,6 +272,12 @@ func buildActionPlan(request PlanRequest, entry catalogEntry, preview domain.Pre
 	if entry.classification.Effect == "observation" {
 		body.Purpose = "inspect"
 	}
+	if effectOverride == "observation" {
+		body.Action += ".preview"
+		body.Purpose = "inspect"
+		body.Effect = "observation"
+		body.Reversibility = "not_applicable"
+	}
 	if err := body.Validate(); err != nil {
 		return protocol.ActionPlan{}, fmt.Errorf("validate action plan: %w", err)
 	}
@@ -201,6 +286,201 @@ func buildActionPlan(request PlanRequest, entry catalogEntry, preview domain.Pre
 		return protocol.ActionPlan{}, err
 	}
 	return protocol.ActionPlan{Body: body, Digest: digest}, nil
+}
+
+type toolDispatchBinding struct {
+	PlanDigest          protocol.Digest
+	RequestDigest       protocol.Digest
+	Resources           []protocol.ResourceTarget
+	ExecutionLocus      string
+	Effect              string
+	Boundary            string
+	RequestedProfile    string
+	EffectiveProfile    string
+	RuntimeGenerationID protocol.RuntimeGenerationID
+	EvidenceDigests     []protocol.Digest
+}
+
+func toolDispatchDigest(plan protocol.ActionPlan, requestDigest protocol.Digest, evidenceDigests []protocol.Digest) (protocol.Digest, error) {
+	return canonicalDigest(toolDispatchBinding{
+		PlanDigest: plan.Digest, RequestDigest: requestDigest, Resources: plan.Body.Resources,
+		ExecutionLocus: plan.Body.ExecutionLocus, Effect: plan.Body.Effect, Boundary: plan.Body.Boundary,
+		RequestedProfile: plan.Body.RequestedProfile, EffectiveProfile: plan.Body.EffectiveProfile,
+		RuntimeGenerationID: plan.Body.RuntimeGenerationID, EvidenceDigests: evidenceDigests,
+	})
+}
+
+func (s *Service) Execute(ctx context.Context, handle ActionHandle, token authorization.CommittedToken) (protocol.ExecutionResult, error) {
+	action, err := s.actionForDispatch(ctx, handle)
+	if err != nil {
+		return protocol.ExecutionResult{}, err
+	}
+	type executionOutput struct {
+		result domain.ToolResult
+		err    error
+	}
+	resultChannel := make(chan executionOutput, 1)
+	runContext, cancel := context.WithCancel(ctx)
+	binding := actionBinding(handle.id, action)
+	err = s.gate.Dispatch(ctx, token, binding, func(registrationContext context.Context) error {
+		if err := authorization.RegisterCancellation(registrationContext, cancel); err != nil {
+			return err
+		}
+		go func() {
+			action.operationMu.Lock()
+			defer action.operationMu.Unlock()
+			if revalidateErr := revalidateDispatch(runContext, action); revalidateErr != nil {
+				resultChannel <- executionOutput{err: revalidateErr}
+				return
+			}
+			resultChannel <- executionOutput{result: action.prepared.Execute(runContext)}
+		}()
+		return nil
+	})
+	if err != nil {
+		cancel()
+		return protocol.ExecutionResult{}, err
+	}
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		return protocol.ExecutionResult{}, ctx.Err()
+	case completed := <-resultChannel:
+		if completed.err != nil {
+			return protocol.ExecutionResult{}, completed.err
+		}
+		return executionResult(completed.result), nil
+	}
+}
+
+func (s *Service) PreparePreview(ctx context.Context, handle ActionHandle, token authorization.CommittedToken) (PreviewResult, protocol.ActionPlan, []protocol.EvidenceCandidate, error) {
+	action, err := s.actionForDispatch(ctx, handle)
+	if err != nil {
+		return PreviewResult{}, protocol.ActionPlan{}, nil, err
+	}
+	if action.plan.Body.Effect != "observation" {
+		return PreviewResult{}, protocol.ActionPlan{}, nil, fmt.Errorf("action handle is not an observation preview")
+	}
+	type previewOutput struct {
+		result domain.ToolResult
+		err    error
+	}
+	output := make(chan previewOutput, 1)
+	runContext, cancel := context.WithCancel(ctx)
+	err = s.gate.Dispatch(ctx, token, actionBinding(handle.id, action), func(registrationContext context.Context) error {
+		if err := authorization.RegisterCancellation(registrationContext, cancel); err != nil {
+			return err
+		}
+		go func() {
+			action.operationMu.Lock()
+			defer action.operationMu.Unlock()
+			if revalidateErr := revalidateDispatch(runContext, action); revalidateErr != nil {
+				output <- previewOutput{err: revalidateErr}
+				return
+			}
+			if preparer, ok := action.prepared.(ports.PreviewPreparer); ok {
+				if prepareErr := preparer.PreparePreview(runContext); prepareErr != nil {
+					output <- previewOutput{err: prepareErr}
+					return
+				}
+				preview := action.prepared.Preview()
+				output <- previewOutput{result: domain.ToolResult{CallID: action.request.CallID, Status: domain.ToolSucceeded, Content: preview.ProposedDiff}}
+				return
+			}
+			output <- previewOutput{result: action.prepared.Execute(runContext)}
+		}()
+		return nil
+	})
+	if err != nil {
+		cancel()
+		return PreviewResult{}, protocol.ActionPlan{}, nil, err
+	}
+	defer cancel()
+	var completed previewOutput
+	select {
+	case <-ctx.Done():
+		return PreviewResult{}, protocol.ActionPlan{}, nil, ctx.Err()
+	case completed = <-output:
+	}
+	if completed.err != nil {
+		return PreviewResult{}, protocol.ActionPlan{}, nil, completed.err
+	}
+	if completed.result.Status != domain.ToolSucceeded {
+		return PreviewResult{}, protocol.ActionPlan{}, nil, fmt.Errorf("preview failed: %s", completed.result.Content)
+	}
+	evidence, evidenceDigest, err := previewEvidence(action, completed.result.Content)
+	if err != nil {
+		return PreviewResult{}, protocol.ActionPlan{}, nil, err
+	}
+	return PreviewResult{handleID: handle.id, observationDigest: action.plan.Digest, evidenceDigests: []protocol.Digest{evidenceDigest}}, action.plan, []protocol.EvidenceCandidate{evidence}, nil
+}
+
+func (s *Service) actionForDispatch(_ context.Context, handle ActionHandle) (*plannedAction, error) {
+	if s == nil || s.gate == nil || handle.id == "" {
+		return nil, authorization.ErrInvalidCommittedToken
+	}
+	s.mu.Lock()
+	action, ok := s.actions[handle.id]
+	if !ok {
+		s.mu.Unlock()
+		return nil, authorization.ErrInvalidCommittedToken
+	}
+	snapshot := *action
+	s.mu.Unlock()
+	return &snapshot, nil
+}
+
+func revalidateDispatch(ctx context.Context, action *plannedAction) error {
+	revalidator, ok := action.prepared.(ports.ResourceRevalidator)
+	if !ok {
+		return fmt.Errorf("tool alias %q does not support resource revalidation", action.request.Alias)
+	}
+	preview, err := revalidator.Revalidate(ctx)
+	if err != nil {
+		return err
+	}
+	override := ""
+	if action.plan.Body.Effect == "observation" && action.entry.classification.Effect != "observation" {
+		override = "observation"
+	}
+	current, err := buildActionPlan(action.request, action.entry, preview, override)
+	if err != nil {
+		return err
+	}
+	dispatchDigest, err := toolDispatchDigest(current, action.requestDigest, action.evidenceDigests)
+	if err != nil {
+		return err
+	}
+	if current.Digest != action.plan.Digest || dispatchDigest != action.dispatchDigest {
+		return authorization.ErrStaleDecision
+	}
+	return nil
+}
+
+func actionBinding(handleID string, action *plannedAction) authorization.DispatchBinding {
+	return authorization.DispatchBinding{Kind: "tool", HandleID: handleID, ActivityID: action.activityID, CallID: action.request.CallID, PlanDigest: action.plan.Digest, RequestDigest: action.requestDigest, DispatchDigest: action.dispatchDigest, RuntimeGenerationID: action.request.RuntimeGenerationID}
+}
+
+func executionResult(result domain.ToolResult) protocol.ExecutionResult {
+	return protocol.ExecutionResult{Outcome: protocol.ActivityOutcomeV1{Status: string(result.Status), Reason: string(result.ErrorKind)}, ToolResult: protocol.ToolResultBlock{CallID: result.CallID, Status: string(result.Status), Text: result.Content}}
+}
+
+func previewEvidence(action *plannedAction, content string) (protocol.EvidenceCandidate, protocol.Digest, error) {
+	digest, err := canonicalDigest(struct {
+		ActivityID protocol.ActivityID
+		PlanDigest protocol.Digest
+		Content    string
+	}{action.activityID, action.plan.Digest, content})
+	if err != nil {
+		return protocol.EvidenceCandidate{}, protocol.Digest{}, err
+	}
+	subject := protocol.SubjectRef{Kind: "action", ID: action.request.CallID}
+	if len(action.plan.Body.Resources) != 0 {
+		subject = protocol.SubjectRef{Kind: action.plan.Body.Resources[0].Kind, ID: action.plan.Body.Resources[0].CanonicalID}
+	}
+	redacted := []byte("[redacted preview; observation digest sha256:" + digest.Value + "]")
+	candidate := protocol.EvidenceCandidate{ID: protocol.EvidenceID(digest.Value), Kind: "tool_preview", MediaType: "text/plain", ProducingActivityID: action.activityID, Actor: protocol.ActorRef{ID: protocol.ActorID(action.plan.Body.Tool.Name), Kind: protocol.ActorTool}, Subject: subject, Content: redacted, Limit: protocol.MaxByteFieldBytes}
+	return candidate, digest, nil
 }
 
 func canonicalResources(resources []protocol.ResourceTarget) ([]protocol.ResourceTarget, error) {

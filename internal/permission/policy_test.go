@@ -3,12 +3,157 @@ package permission_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/permission"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
+
+func TestAuthorizationPolicyPrecedenceCrossProduct(t *testing.T) {
+	tests := []struct {
+		name        string
+		platform    domain.PermissionAction
+		hardDeny    bool
+		user        domain.PermissionAction
+		project     domain.PermissionAction
+		grant       domain.PermissionAction
+		interactive domain.PermissionAction
+		want        domain.PermissionAction
+	}{
+		{"platform hard deny terminal", domain.PermissionDeny, true, domain.PermissionAllow, domain.PermissionAllow, domain.PermissionAllow, domain.PermissionAllow, domain.PermissionDeny},
+		{"ordinary platform deny terminal", domain.PermissionDeny, false, domain.PermissionAllow, domain.PermissionAllow, domain.PermissionAllow, domain.PermissionAllow, domain.PermissionDeny},
+		{"user deny terminal", domain.PermissionAllow, false, domain.PermissionDeny, domain.PermissionAllow, domain.PermissionAllow, domain.PermissionAllow, domain.PermissionDeny},
+		{"project deny terminal", domain.PermissionAllow, false, domain.PermissionAllow, domain.PermissionDeny, domain.PermissionAllow, domain.PermissionAllow, domain.PermissionDeny},
+		{"project cannot broaden user ask", domain.PermissionAllow, false, domain.PermissionAsk, domain.PermissionAllow, "", "", domain.PermissionAsk},
+		{"project narrows user allow", domain.PermissionAllow, false, domain.PermissionAllow, domain.PermissionAsk, "", "", domain.PermissionAsk},
+		{"grant resolves ask", domain.PermissionAllow, false, domain.PermissionAsk, domain.PermissionAllow, domain.PermissionAllow, "", domain.PermissionAllow},
+		{"grant cannot change allow", domain.PermissionAllow, false, domain.PermissionAllow, domain.PermissionAllow, domain.PermissionDeny, "", domain.PermissionAllow},
+		{"interactive resolves remaining ask", domain.PermissionAllow, false, domain.PermissionAllow, domain.PermissionAsk, "", domain.PermissionDeny, domain.PermissionDeny},
+		{"interactive cannot change allow", domain.PermissionAllow, false, domain.PermissionAllow, domain.PermissionAllow, "", domain.PermissionDeny, domain.PermissionAllow},
+		{"grant wins before interactive", domain.PermissionAllow, false, domain.PermissionAsk, domain.PermissionAllow, domain.PermissionAllow, domain.PermissionDeny, domain.PermissionAllow},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := permission.ResolvePolicy(permission.PolicyInput{
+				Platform:     permission.PolicyRule{Action: test.platform, HardDeny: test.hardDeny, Source: "platform"},
+				User:         permission.PolicyRule{Action: test.user, Source: "user"},
+				Project:      permission.PolicyRule{Action: test.project, Source: "project"},
+				SessionGrant: permission.PolicyRule{Action: test.grant, Source: "session"},
+				Interactive:  permission.PolicyRule{Action: test.interactive, Source: "interactive"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Action != test.want {
+				t.Fatalf("action=%s want=%s result=%#v", got.Action, test.want, got)
+			}
+		})
+	}
+}
+
+func TestPermissionModeUsesStructuredDescriptorAndResourceFactsNotNames(t *testing.T) {
+	policy := permission.NewSession(domain.ModeAuto)
+	builtinRenamed := structuredRequest("not_edit", protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "renamed_mutator"})
+	builtinRenamed.Effect = "mutation"
+	builtinRenamed.Boundary = "workspace"
+	externalSpoof := structuredRequest("edit", protocol.ToolIdentity{Source: "mcp", Authority: "server", Name: "edit"})
+	externalSpoof.Effect = "mutation"
+	externalSpoof.Boundary = "workspace"
+
+	allowed, err := policy.EvaluateAuthorization(context.Background(), ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAuto}, builtinRenamed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked, err := policy.EvaluateAuthorization(context.Background(), ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAuto}, externalSpoof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allowed.Action != "allow" || asked.Action != "ask" {
+		t.Fatalf("builtin=%s external-spoof=%s", allowed.Action, asked.Action)
+	}
+}
+
+func TestSessionGrantBindsStructuredAuthorizationScopeAndResolvesOnlyAsk(t *testing.T) {
+	policy := permission.NewSession(domain.ModeAsk)
+	request := structuredRequest("write", protocol.ToolIdentity{Source: "mcp", Authority: "server", Name: "write"})
+	if err := policy.GrantAuthorizationSession(request, nil); err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := policy.EvaluateAuthorization(context.Background(), ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAsk}, request)
+	if err != nil || allowed.Action != "allow" || allowed.Lifetime != protocol.AuthorizationLifetimeSession {
+		t.Fatalf("allowed=%#v err=%v", allowed, err)
+	}
+	mutations := map[string]func(*protocol.AuthorizationRequest){
+		"session":         func(r *protocol.AuthorizationRequest) { r.SessionID = "session-2" },
+		"capability":      func(r *protocol.AuthorizationRequest) { r.Action = "other" },
+		"source":          func(r *protocol.AuthorizationRequest) { r.Source.Authority = "other" },
+		"source revision": func(r *protocol.AuthorizationRequest) { r.SourceRevision = "revision-2" },
+		"descriptor": func(r *protocol.AuthorizationRequest) {
+			r.DescriptorDigest = protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("d", 64)}
+		},
+		"policy generation": func(r *protocol.AuthorizationRequest) { r.PolicyGeneration = "policy-2" },
+		"resource":          func(r *protocol.AuthorizationRequest) { r.Resources[0].CanonicalID = "/workspace/other" },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			changed := protocol.DeepCopy(request)
+			mutate(&changed)
+			decision, evaluateErr := policy.EvaluateAuthorization(context.Background(), ports.PermissionContext{SessionID: string(changed.SessionID), Mode: domain.ModeAsk}, changed)
+			if evaluateErr != nil {
+				t.Fatal(evaluateErr)
+			}
+			if decision.Action != "ask" {
+				t.Fatalf("changed binding reused grant: %#v", decision)
+			}
+		})
+	}
+
+	deniedRequest := protocol.DeepCopy(request)
+	deniedRequest.PolicyProvenance[0].HardDeny = true
+	denied, err := policy.EvaluateAuthorization(context.Background(), ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAsk, PlatformAction: domain.PermissionDeny}, deniedRequest)
+	if err != nil || denied.Action != "deny" {
+		t.Fatalf("grant overrode deny: %#v err=%v", denied, err)
+	}
+}
+
+func TestPermissionConfiguredProviderCompatibilityPolicyIsDurableAllow(t *testing.T) {
+	request := structuredRequest("model_egress", protocol.ToolIdentity{Source: "provider", Authority: "openai", Name: "model-a"})
+	request.Effect = "egress"
+	request.Boundary = "network"
+	decision, err := permission.NewSession(domain.ModeAsk).EvaluateAuthorization(context.Background(), ports.PermissionContext{
+		SessionID: "session-1", Mode: domain.ModeAsk, ConfiguredProvider: true,
+	}, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Action != "allow" || decision.Lifetime != protocol.AuthorizationLifetimeSession || decision.PolicySource != "compatibility" {
+		t.Fatalf("decision=%#v", decision)
+	}
+	request.Source.Authority = "unconfigured"
+	unconfigured, err := permission.NewSession(domain.ModeAsk).EvaluateAuthorization(context.Background(), ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAsk}, request)
+	if err != nil || unconfigured.Action != "ask" {
+		t.Fatalf("unconfigured=%#v err=%v", unconfigured, err)
+	}
+}
+
+func structuredRequest(action string, source protocol.ToolIdentity) protocol.AuthorizationRequest {
+	return protocol.AuthorizationRequest{
+		RequestID: "request-1", Principal: protocol.ActorRef{ID: "user-1", Kind: protocol.ActorUser}, Actor: protocol.ActorRef{ID: "agent-1", Kind: protocol.ActorAgent},
+		SessionID: "session-1", TaskID: "task-1", TurnID: "turn-1", ActivityID: "activity-1", CallID: "call-1", QueueID: "queue-1",
+		Source: source, SourceRevision: "revision-1", DescriptorDigest: permissionDigest("a"), Action: action,
+		Resources: []protocol.ResourceTarget{{Kind: "file", CanonicalID: "/workspace/file"}}, ExecutionLocus: "local", RequestedProfile: "default", EffectiveProfile: "default",
+		Effect: "mutation", Boundary: "workspace", Reversibility: "reversible", VerificationCoverage: "full", RuntimeGenerationID: "generation-1", PolicyGeneration: "policy-1",
+		PolicyProvenance: []protocol.PolicyProvenance{{Source: "user", Revision: "revision-1", Generation: "policy-1"}},
+		PlanDigest:       permissionDigest("b"), RequestDigest: permissionDigest("c"), DispatchDigest: permissionDigest("e"),
+	}
+}
+
+func permissionDigest(fill string) protocol.Digest {
+	return protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat(fill, 64)}
+}
 
 func TestPermissionMatrix(t *testing.T) {
 	cases := []struct {
