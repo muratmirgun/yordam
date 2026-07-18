@@ -28,6 +28,26 @@ func TestBuildContextUsesLatestCompaction(t *testing.T) {
 	}
 }
 
+func TestBuildLegacyContextSourcesPreservesCurrentCompactionTranscript(t *testing.T) {
+	replay := domain.SessionReplay{Events: []domain.DurableEvent{
+		{Seq: 1, Kind: domain.EventUserMessage, Payload: payload(t, domain.MessagePayload{Content: "old"})},
+		{Seq: 2, Kind: domain.EventContextCompacted, Payload: payload(t, domain.CompactionPayload{ThroughSeq: 1, Summary: "old work summary"})},
+		{Seq: 3, Kind: domain.EventUserMessage, Payload: payload(t, domain.MessagePayload{Content: "new"})},
+	}}
+	sources, err := agent.BuildLegacyContextSources(replay, "system", contextLease(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 3 || sources[0].Content[0].Text != "system" || sources[1].Content[0].Text != "old work summary" || sources[2].Content[0].Text != "new" {
+		t.Fatalf("sources=%#v", sources)
+	}
+	for _, source := range sources {
+		if source.Validate() != nil || source.Digest.Validate() != nil || source.Provenance != "legacy_context_adapter_v1" {
+			t.Fatalf("source=%#v validation=%v", source, source.Validate())
+		}
+	}
+}
+
 func TestToolResultContentIsStructuredAndBounded(t *testing.T) {
 	large := strings.Repeat("nested excerpt ", 32<<10)
 	result := domain.ToolResult{

@@ -8,6 +8,7 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
 type Provider struct {
@@ -80,4 +81,19 @@ func ToolStream(id, name, input string) []domain.ModelEvent {
 
 func FinalStream(text string) []domain.ModelEvent {
 	return []domain.ModelEvent{{Kind: domain.ModelTextDelta, Text: text}, {Kind: domain.ModelDone}}
+}
+
+func NeutralToolStream(id, alias, input string) []protocol.ModelEvent {
+	return []protocol.ModelEvent{
+		{Kind: protocol.ModelEventToolIntent, Sequence: 1, ToolIntent: &protocol.ToolUseBlock{CallID: id, Alias: alias, Arguments: json.RawMessage(input)}},
+		{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "tool_use", NativeReason: "tool_calls"}},
+	}
+}
+
+func NeutralFinalStream(text, requestID string) []protocol.ModelEvent {
+	return []protocol.ModelEvent{
+		{Kind: protocol.ModelEventContentDelta, Sequence: 1, Delta: &protocol.ContentDelta{BlockID: "content-1", Kind: protocol.ContentText, Text: text}},
+		{Kind: protocol.ModelEventContentBlock, Sequence: 2, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: text}},
+		{Kind: protocol.ModelEventTerminal, Sequence: 3, Terminal: &protocol.ModelTerminal{Reason: "stop", NativeReason: "stop", ServerRequestID: requestID}},
+	}
 }

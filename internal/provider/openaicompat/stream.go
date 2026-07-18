@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 )
 
@@ -64,6 +65,22 @@ func (c *Client) Stream(ctx context.Context, input domain.ModelRequest) (<-chan 
 	return out, nil
 }
 
+func (c *Client) streamOnce(ctx context.Context, input domain.ModelRequest) (<-chan domain.ModelEvent, error) {
+	resp, err := c.openAttempt(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	out := make(chan domain.ModelEvent)
+	go func() {
+		defer close(out)
+		_, consumeErr := c.consumeAttempt(ctx, resp, out)
+		if consumeErr != nil && ctx.Err() == nil {
+			sendEvent(ctx, out, domain.ModelEvent{Kind: domain.ModelStreamError, Err: consumeErr})
+		}
+	}()
+	return out, nil
+}
+
 func (c *Client) openWithRetries(ctx context.Context, input domain.ModelRequest) (*http.Response, int, error) {
 	retriesUsed := 0
 	for {
@@ -98,6 +115,27 @@ type callParts struct {
 	arguments strings.Builder
 }
 
+type streamMetadata struct {
+	ID      string     `json:"id"`
+	Usage   *wireUsage `json:"usage"`
+	Choices []struct {
+		Delta *struct {
+			Refusal string `json:"refusal"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+type wireUsage struct {
+	PromptTokens     *int64 `json:"prompt_tokens"`
+	CompletionTokens *int64 `json:"completion_tokens"`
+	PromptDetails    *struct {
+		CachedTokens *int64 `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	CompletionDetails *struct {
+		ReasoningTokens *int64 `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
+}
+
 func (c *Client) consumeAttempt(ctx context.Context, resp *http.Response, out chan<- domain.ModelEvent) (bool, error) {
 	defer resp.Body.Close()
 	var redaction *secret.LeasedRedactionStream
@@ -118,6 +156,11 @@ func (c *Client) consumeAttempt(ctx context.Context, resp *http.Response, out ch
 	}
 
 	observed := false
+	serverRequestID := resp.Header.Get("X-Request-ID")
+	if serverRequestID == "" {
+		serverRequestID = resp.Header.Get("Request-ID")
+	}
+	finishReason := ""
 	calls := map[int]*callParts{}
 	toolBytes := 0
 	toolFragments := 0
@@ -145,7 +188,7 @@ func (c *Client) consumeAttempt(ctx context.Context, resp *http.Response, out ch
 			if err := emitCompletedCalls(ctx, out, calls, c.admission); err != nil {
 				return true, err
 			}
-			if !sendEvent(ctx, out, domain.ModelEvent{Kind: domain.ModelDone}) {
+			if !sendEvent(ctx, out, domain.ModelEvent{Kind: domain.ModelDone, RequestID: serverRequestID, FinishReason: finishReason}) {
 				return true, ctx.Err()
 			}
 			return true, nil
@@ -158,7 +201,25 @@ func (c *Client) consumeAttempt(ctx context.Context, resp *http.Response, out ch
 			}
 			return false, fatalStreamError("decode provider stream", err)
 		}
-		for _, choice := range chunk.Choices {
+		var metadata streamMetadata
+		if err := json.Unmarshal([]byte(encoded), &metadata); err != nil {
+			return false, fatalStreamError("decode provider stream metadata", err)
+		}
+		if metadata.ID != "" {
+			serverRequestID = metadata.ID
+		}
+		if metadata.Usage != nil {
+			observed = true
+			usage := normalizeUsage(*metadata.Usage)
+			if !sendEvent(ctx, out, domain.ModelEvent{Kind: domain.ModelUsageUpdate, Usage: &usage, RequestID: serverRequestID}) {
+				return false, ctx.Err()
+			}
+		}
+		for choiceIndex, choice := range chunk.Choices {
+			if choice.FinishReason != nil {
+				observed = true
+				finishReason = *choice.FinishReason
+			}
 			if choice.Delta == nil {
 				continue
 			}
@@ -169,6 +230,16 @@ func (c *Client) consumeAttempt(ctx context.Context, resp *http.Response, out ch
 					content = redaction.Write(content)
 				}
 				if content != "" && !sendEvent(ctx, out, domain.ModelEvent{Kind: domain.ModelTextDelta, Text: content}) {
+					return false, ctx.Err()
+				}
+			}
+			refusalDelta := ""
+			if choiceIndex < len(metadata.Choices) && metadata.Choices[choiceIndex].Delta != nil {
+				refusalDelta = metadata.Choices[choiceIndex].Delta.Refusal
+			}
+			if refusalDelta != "" {
+				refusal := c.redact(refusalDelta)
+				if refusal != "" && !sendEvent(ctx, out, domain.ModelEvent{Kind: domain.ModelRefusalDelta, Refusal: refusal, RequestID: serverRequestID}) {
 					return false, ctx.Err()
 				}
 			}
@@ -258,6 +329,27 @@ func (c *Client) consumeAttempt(ctx context.Context, resp *http.Response, out ch
 		return observed, err
 	}
 	return observed, interruptedError(io.ErrUnexpectedEOF)
+}
+
+func normalizeUsage(usage wireUsage) protocol.ModelUsage {
+	providerValue := func(value *int64) protocol.UsageValue {
+		if value == nil {
+			return protocol.UsageValue{State: protocol.UsageUnknown, Provenance: "openai_compatible"}
+		}
+		return protocol.UsageValue{State: protocol.UsageProviderReported, Value: *value, Provenance: "openai_compatible"}
+	}
+	unknown := protocol.UsageValue{State: protocol.UsageUnknown, Provenance: "openai_compatible"}
+	var cached, reasoning *int64
+	if usage.PromptDetails != nil {
+		cached = usage.PromptDetails.CachedTokens
+	}
+	if usage.CompletionDetails != nil {
+		reasoning = usage.CompletionDetails.ReasoningTokens
+	}
+	return protocol.ModelUsage{
+		Input: providerValue(usage.PromptTokens), Output: providerValue(usage.CompletionTokens),
+		Cached: providerValue(cached), CacheWrite: unknown, Reasoning: providerValue(reasoning),
+	}
 }
 
 func emitCompletedCalls(ctx context.Context, out chan<- domain.ModelEvent, calls map[int]*callParts, admission *secret.Lease) error {

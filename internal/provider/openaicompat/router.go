@@ -6,6 +6,8 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/provider"
 )
 
 type Router struct {
@@ -34,4 +36,14 @@ func (r *Router) Stream(ctx context.Context, input domain.ModelRequest) (<-chan 
 	return client.Stream(ctx, input)
 }
 
+func (*Router) Kind() string { return AdapterKind }
+
+func (r *Router) Normalize(ctx context.Context, request protocol.ModelRequest) (provider.PreparedRequest, error) {
+	if _, ok := r.clients[string(request.ProviderID)]; !ok {
+		return provider.PreparedRequest{}, fmt.Errorf("unknown provider profile %q", request.ProviderID)
+	}
+	return NewAdapter(nil).Normalize(ctx, request)
+}
+
 var _ ports.ModelProvider = (*Router)(nil)
+var _ provider.Adapter = (*Router)(nil)

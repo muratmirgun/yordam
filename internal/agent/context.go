@@ -3,9 +3,12 @@ package agent
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"unicode/utf8"
 
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 )
 
@@ -75,6 +78,39 @@ func BuildContext(replay domain.SessionReplay, systemPrompt string, lease *secre
 		}
 	}
 	return messages, nil
+}
+
+func BuildLegacyContextSources(replay domain.SessionReplay, systemPrompt string, lease *secret.Lease) ([]protocol.ContentSource, error) {
+	messages, err := BuildContext(replay, systemPrompt, lease)
+	if err != nil {
+		return nil, err
+	}
+	sources := make([]protocol.ContentSource, 0, len(messages))
+	for index, message := range messages {
+		blocks := make([]protocol.ContentBlock, 0, len(message.ToolCalls)+1)
+		if message.Content != "" {
+			blocks = append(blocks, protocol.ContentBlock{Kind: protocol.ContentText, Text: message.Content})
+		}
+		for _, call := range message.ToolCalls {
+			blocks = append(blocks, protocol.ContentBlock{Kind: protocol.ContentToolUse, ToolUse: &protocol.ToolUseBlock{CallID: call.ID, Alias: call.Name, Arguments: protocol.CloneRawMessage(call.Arguments)}})
+		}
+		if len(blocks) == 0 {
+			return nil, fmt.Errorf("legacy context message %d is empty", index)
+		}
+		digest, err := canonicaljson.Digest(blocks)
+		if err != nil {
+			return nil, err
+		}
+		source := protocol.ContentSource{
+			ID: fmt.Sprintf("legacy-context-%06d", index), Kind: "legacy_" + string(message.Role) + "_message", Scope: "session",
+			Provenance: "legacy_context_adapter_v1", Digest: digest, Content: blocks,
+		}
+		if err := source.Validate(); err != nil {
+			return nil, err
+		}
+		sources = append(sources, source)
+	}
+	return protocol.DeepCopy(sources), nil
 }
 
 func admitMessage(message domain.Message, lease *secret.Lease) (domain.Message, error) {
