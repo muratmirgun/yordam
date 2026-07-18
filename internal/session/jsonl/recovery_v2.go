@@ -101,6 +101,18 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 	if err != nil {
 		return journal.RecoveryResult{}, err
 	}
+	activeRaw, err := readRecoveryJournal(ctx, transaction.events)
+	if err != nil {
+		return journal.RecoveryResult{}, err
+	}
+	if exists {
+		if err := validatePersistedRecoveryManifest(ctx, transaction, manifest, request, manifestName, operationHash, activeRaw); err != nil {
+			return journal.RecoveryResult{}, err
+		}
+		if int64(len(activeRaw)) == manifest.Observation.SourceBytes && digestBytes(activeRaw) == manifest.SourceDigest && !recoveryEligible(scan) {
+			return journal.RecoveryResult{Status: "conflict", Cursor: scan.head}, nil
+		}
+	}
 	if committed, ok := scan.transactions[request.TransactionID]; ok {
 		if !exists {
 			return journal.RecoveryResult{Status: "conflict", Cursor: committed.cursor}, nil
@@ -109,17 +121,29 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 		if !ok {
 			return journal.RecoveryResult{Status: "conflict", Cursor: committed.cursor}, nil
 		}
+		if err := repairCommittedRecoveryMetadata(ctx, transaction, session, scan); err != nil {
+			return journal.RecoveryResult{}, err
+		}
 		return journal.RecoveryResult{
 			Status: "already_recovered", Cursor: committed.cursor,
 			QuarantineDigest: request.ObservedTailDigest, Diagnostic: diagnostic,
 		}, nil
 	}
-
-	activeRaw, err := readRecoveryJournal(ctx, transaction.events)
-	if err != nil {
-		return journal.RecoveryResult{}, err
+	if exists && recoveryDiagnosticAppendIsPartial(scan, manifest, request, activeRaw) {
+		if err := preserveAndResetPartialRecoveryDiagnostic(ctx, transaction, manifest, operationHash, activeRaw); err != nil {
+			return journal.RecoveryResult{}, err
+		}
+		if err := transaction.close(); err != nil {
+			transactionOpen = false
+			return journal.RecoveryResult{}, err
+		}
+		transactionOpen = false
+		return s.recoverSessionLocked(ctx, request)
 	}
 	if !exists {
+		if !recoveryEligible(scan) {
+			return journal.RecoveryResult{Status: "conflict", Cursor: scan.head}, nil
+		}
 		if scan.head != request.ExpectedHead || scan.validPrefixSize < 0 || scan.validPrefixSize >= int64(len(activeRaw)) {
 			return journal.RecoveryResult{Status: "conflict", Cursor: scan.head}, nil
 		}
@@ -133,10 +157,6 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 		}
 		exists = true
 	}
-	if manifest.Version != recoveryManifestVersion || manifest.Observation.ObservedTailDigest != request.ObservedTailDigest || manifest.Observation.ValidPrefixBytes < 0 || manifest.Observation.SourceBytes <= manifest.Observation.ValidPrefixBytes {
-		return journal.RecoveryResult{}, fmt.Errorf("persisted recovery manifest is invalid")
-	}
-
 	prefix, tail, activated, err := recoveryMaterialFromActive(ctx, transaction, manifest, activeRaw, scan)
 	if err != nil {
 		return journal.RecoveryResult{}, err
@@ -181,13 +201,15 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 		}); err != nil {
 			return journal.RecoveryResult{}, err
 		}
-		if err := s.runRecoveryAction(FaultCandidateValidate, func() error {
-			return validateRecoveryCandidate(ctx, transaction, manifest, prefix, rebuilt)
+		var validated recoveryCandidateValidation
+		if err := s.runRecoveryAction(FaultCandidateValidate, func() (err error) {
+			validated, err = validateRecoveryCandidate(ctx, transaction, manifest, prefix, tail, rebuilt)
+			return err
 		}); err != nil {
 			return journal.RecoveryResult{}, err
 		}
 		if err := s.runRecoveryAction(FaultCandidateActivate, func() error {
-			return activateRecoveryCandidate(ctx, transaction, manifest)
+			return activateRecoveryCandidate(ctx, transaction, manifest, tail, validated)
 		}); err != nil {
 			return journal.RecoveryResult{}, err
 		}
@@ -229,10 +251,6 @@ func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.Re
 		if err != nil {
 			return errors.Join(err, transaction.close())
 		}
-		eventID, err := s.nextID()
-		if err != nil {
-			return errors.Join(err, transaction.close())
-		}
 		eventTime := s.clock().UTC()
 		if eventTime.Before(session.UpdatedAt) {
 			eventTime = session.UpdatedAt
@@ -240,7 +258,7 @@ func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.Re
 		appendRequest := journal.AppendRequest{
 			Journal: request.Journal, ExpectedHead: request.ExpectedHead, TransactionID: request.TransactionID,
 			Events: []protocol.ProposedEvent{{
-				EventID: protocol.EventID(eventID), Time: eventTime, PayloadVersion: 1,
+				EventID: protocol.EventID("recovery:" + recoveryOperationHash(request.OperationID)), Time: eventTime, PayloadVersion: 1,
 				Kind: protocol.EventRecoveryDiagnostic, SessionID: protocol.SessionID(request.Journal.ID), Payload: payload,
 			}},
 		}
@@ -293,6 +311,189 @@ func newExplicitRecoveryManifest(request journal.RecoveryRequest, manifestName, 
 		RequestFileName:  manifestName,
 		RequestTemporary: strings.TrimSuffix(manifestName, ".json") + ".tmp",
 	}
+}
+
+func validatePersistedRecoveryManifest(
+	ctx context.Context,
+	transaction *sessionTransaction,
+	manifest explicitRecoveryManifest,
+	request journal.RecoveryRequest,
+	manifestName string,
+	operationHash string,
+	active []byte,
+) error {
+	expectedQuarantine := "recovery-tail-" + operationHash + "-" + request.ObservedTailDigest.Value + ".bin"
+	expectedCandidate := ".recovery-candidate-" + operationHash + ".jsonl"
+	expectedMetadata := ".recovery-metadata-" + operationHash + ".json"
+	expectedTemporary := strings.TrimSuffix(manifestName, ".json") + ".tmp"
+	if manifest.Version != recoveryManifestVersion || !reflect.DeepEqual(manifest.Request, request) ||
+		manifest.Observation.ObservedTailDigest != request.ObservedTailDigest ||
+		manifest.Observation.ValidPrefixBytes < 0 || manifest.Observation.SourceBytes <= manifest.Observation.ValidPrefixBytes ||
+		manifest.PrefixDigest.Validate() != nil || manifest.SourceDigest.Validate() != nil ||
+		manifest.QuarantineName != expectedQuarantine || manifest.CandidateName != expectedCandidate ||
+		manifest.MetadataName != expectedMetadata || manifest.RequestFileName != manifestName ||
+		manifest.RequestTemporary != expectedTemporary {
+		return fmt.Errorf("persisted recovery manifest does not match the derived recovery operation")
+	}
+	for _, name := range []string{manifest.QuarantineName, manifest.CandidateName, manifest.MetadataName, manifest.RequestTemporary} {
+		if !safeRecoveryLeaf(name) {
+			return fmt.Errorf("persisted recovery manifest contains unsafe leaf %q", name)
+		}
+	}
+	prefixSize := manifest.Observation.ValidPrefixBytes
+	if int64(len(active)) < prefixSize || digestBytes(active[:prefixSize]) != manifest.PrefixDigest {
+		return fmt.Errorf("persisted recovery prefix identity mismatch")
+	}
+	if int64(len(active)) == manifest.Observation.SourceBytes && digestBytes(active) == manifest.SourceDigest {
+		if digestBytes(active[prefixSize:]) != request.ObservedTailDigest {
+			return fmt.Errorf("persisted recovery tail identity mismatch")
+		}
+		return nil
+	}
+	if err := transaction.openArtifacts(); err != nil {
+		return err
+	}
+	quarantine, quarantineInfo, err := openRootedRegularFile(ctx, transaction.artifactsRoot, expectedQuarantine, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	tail, readErr := readOpenedFile(ctx, quarantine, maxRecoveryJournalBytes)
+	readErr = errors.Join(readErr, verifyRootedRegularFile(transaction.artifactsRoot, expectedQuarantine, quarantineInfo), quarantine.Close())
+	if readErr != nil {
+		return readErr
+	}
+	if int64(len(tail)) != manifest.Observation.SourceBytes-prefixSize || digestBytes(tail) != request.ObservedTailDigest {
+		return fmt.Errorf("persisted recovery quarantine identity mismatch")
+	}
+	source := make([]byte, 0, int(prefixSize)+len(tail))
+	source = append(source, active[:prefixSize]...)
+	source = append(source, tail...)
+	if digestBytes(source) != manifest.SourceDigest {
+		return fmt.Errorf("persisted recovery source identity mismatch")
+	}
+	return nil
+}
+
+func safeRecoveryLeaf(name string) bool {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\\`) {
+		return false
+	}
+	switch name {
+	case "events.jsonl", "metadata.json", "journal.index.json", "artifacts", "workspace.json":
+		return false
+	default:
+		return true
+	}
+}
+
+func recoveryDiagnosticAppendIsPartial(
+	scan journalScan,
+	manifest explicitRecoveryManifest,
+	request journal.RecoveryRequest,
+	active []byte,
+) bool {
+	prefixSize := manifest.Observation.ValidPrefixBytes
+	if scan.incompleteTransaction != request.TransactionID || scan.head != request.ExpectedHead ||
+		scan.validPrefixSize != prefixSize || int64(len(active)) <= prefixSize ||
+		digestBytes(active[:prefixSize]) != manifest.PrefixDigest {
+		return false
+	}
+	return recoveryDiagnosticTailBelongsToRequest(active[prefixSize:], request)
+}
+
+func recoveryDiagnosticTailBelongsToRequest(tail []byte, request journal.RecoveryRequest) bool {
+	complete := 0
+	for len(tail) > 0 {
+		newline := bytes.IndexByte(tail, '\n')
+		if newline < 0 {
+			break
+		}
+		line := tail[:newline]
+		tail = tail[newline+1:]
+		var envelope protocol.EventEnvelope
+		if json.Unmarshal(line, &envelope) != nil || envelope.SchemaVersion != protocol.EnvelopeVersion ||
+			envelope.JournalKind != request.Journal.Kind || envelope.JournalID != request.Journal.ID ||
+			envelope.TransactionID != request.TransactionID {
+			return false
+		}
+		switch envelope.Kind {
+		case protocol.EventMigrationCompatibilityDeclared:
+			var declaration protocol.MigrationCompatibilityDeclaredV1
+			if json.Unmarshal(envelope.Payload, &declaration) != nil || declaration.ReaderVersion != protocol.EnvelopeVersion ||
+				declaration.WriterVersion != protocol.EnvelopeVersion || declaration.LegacyHead != request.ExpectedHead ||
+				declaration.DowngradeStatus != "v0.1_read_only_after_v2" {
+				return false
+			}
+		case protocol.EventRecoveryDiagnostic:
+			var payload protocol.DiagnosticV1
+			var details struct {
+				OperationID protocol.ControlOperationID `json:"operation_id"`
+			}
+			if json.Unmarshal(envelope.Payload, &payload) != nil || payload.Diagnostic.Code != recoveryDiagnosticStatus ||
+				json.Unmarshal(payload.Diagnostic.Details, &details) != nil || details.OperationID != request.OperationID {
+				return false
+			}
+		default:
+			return false
+		}
+		complete++
+	}
+	return complete > 0
+}
+
+func preserveAndResetPartialRecoveryDiagnostic(
+	ctx context.Context,
+	transaction *sessionTransaction,
+	manifest explicitRecoveryManifest,
+	operationHash string,
+	active []byte,
+) error {
+	prefixSize := manifest.Observation.ValidPrefixBytes
+	prefix := bytes.Clone(active[:prefixSize])
+	partial := bytes.Clone(active[prefixSize:])
+	partialDigest := digestBytes(partial)
+	partialName := "recovery-diagnostic-tail-" + operationHash + "-" + partialDigest.Value + ".bin"
+	if !safeRecoveryLeaf(partialName) {
+		return fmt.Errorf("derived recovery diagnostic quarantine name is unsafe")
+	}
+	if err := transaction.openArtifacts(); err != nil {
+		return err
+	}
+	if err := ensureRootedContents(ctx, transaction.artifactsRoot, partialName, partial, 0o600); err != nil {
+		return err
+	}
+	if err := syncRootedFileAndDirectory(ctx, transaction.artifactsRoot, partialName); err != nil {
+		return err
+	}
+	if err := ensureRootedContents(ctx, transaction.sessionRoot, manifest.CandidateName, prefix, 0o600); err != nil {
+		return err
+	}
+	if err := syncRootedFile(ctx, transaction.sessionRoot, manifest.CandidateName); err != nil {
+		return err
+	}
+	candidate, candidateInfo, err := openRootedRegularFile(ctx, transaction.sessionRoot, manifest.CandidateName, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	candidateRaw, readErr := readOpenedFile(ctx, candidate, int64(len(prefix)))
+	if readErr == nil && !bytes.Equal(candidateRaw, prefix) {
+		readErr = fmt.Errorf("recovery diagnostic reset candidate differs from validated prefix")
+	}
+	readErr = errors.Join(readErr, verifyRootedRegularFile(transaction.sessionRoot, manifest.CandidateName, candidateInfo), candidate.Close())
+	if readErr != nil {
+		return readErr
+	}
+	if err := transaction.verifyArtifacts(); err != nil {
+		return err
+	}
+	if err := transaction.events.Close(); err != nil {
+		return err
+	}
+	transaction.events = nil
+	if err := transaction.sessionRoot.Rename(manifest.CandidateName, "events.jsonl"); err != nil {
+		return err
+	}
+	return syncRootDir(transaction.sessionRoot, ".")
 }
 
 func recoveryOperationHash(operationID protocol.ControlOperationID) string {
@@ -367,7 +568,7 @@ func recoveryMaterialFromActive(
 	case int64(len(active)) == sourceSize && digestBytes(active) == manifest.SourceDigest:
 		prefix = bytes.Clone(active[:prefixSize])
 		tail = bytes.Clone(active[prefixSize:])
-		if scan.head != manifest.Request.ExpectedHead || digestBytes(tail) != manifest.Request.ObservedTailDigest {
+		if scan.head != manifest.Request.ExpectedHead || digestBytes(prefix) != manifest.PrefixDigest || digestBytes(tail) != manifest.Request.ObservedTailDigest {
 			return nil, nil, false, fmt.Errorf("active recovery source no longer matches persisted observation")
 		}
 		return prefix, tail, false, nil
@@ -390,6 +591,13 @@ func recoveryMaterialFromActive(
 		}
 		if digestBytes(tail) != manifest.Request.ObservedTailDigest {
 			return nil, nil, false, fmt.Errorf("recovery quarantine digest mismatch")
+		}
+		if int64(len(tail)) != sourceSize-prefixSize {
+			return nil, nil, false, fmt.Errorf("recovery quarantine size mismatch")
+		}
+		source := append(bytes.Clone(prefix), tail...)
+		if digestBytes(source) != manifest.SourceDigest {
+			return nil, nil, false, fmt.Errorf("recovery source digest mismatch")
 		}
 		return prefix, tail, true, nil
 	default:
@@ -467,13 +675,57 @@ func rebuiltRecoveryMetadata(session domain.Session, scan journalScan) domain.Se
 	return rebuilt
 }
 
-func validateRecoveryCandidate(ctx context.Context, transaction *sessionTransaction, manifest explicitRecoveryManifest, prefix []byte, rebuilt domain.Session) error {
-	if err := transaction.verifyEvents(); err != nil {
+func repairCommittedRecoveryMetadata(ctx context.Context, transaction *sessionTransaction, session domain.Session, scan journalScan) error {
+	want := session
+	want.LastSeq = scan.head.CommitSeq
+	if len(scan.commits) > 0 {
+		last := scan.commits[len(scan.commits)-1]
+		if !last.markerTime.IsZero() {
+			want.UpdatedAt = last.markerTime
+		} else if len(last.events) > 0 {
+			record := last.events[len(last.events)-1]
+			if record.Legacy != nil {
+				want.UpdatedAt = record.Legacy.Time
+			} else {
+				want.UpdatedAt = record.Envelope.Time
+			}
+		}
+	}
+	if reflect.DeepEqual(session, want) {
+		return nil
+	}
+	if err := writeJSONAtomicRooted(ctx, transaction, want); err != nil {
 		return err
+	}
+	_ = writeJournalIndex(ctx, transaction, scan)
+	return syncRootDir(transaction.sessionRoot, ".")
+}
+
+type recoveryCandidateValidation struct {
+	candidate  os.FileInfo
+	metadata   os.FileInfo
+	quarantine os.FileInfo
+	artifacts  os.FileInfo
+}
+
+func validateRecoveryCandidate(
+	ctx context.Context,
+	transaction *sessionTransaction,
+	manifest explicitRecoveryManifest,
+	prefix []byte,
+	tail []byte,
+	rebuilt domain.Session,
+) (recoveryCandidateValidation, error) {
+	var validated recoveryCandidateValidation
+	if err := transaction.verifyEvents(); err != nil {
+		return validated, err
+	}
+	if err := transaction.verifyArtifacts(); err != nil {
+		return validated, err
 	}
 	candidate, candidateInfo, err := openRootedRegularFile(ctx, transaction.sessionRoot, manifest.CandidateName, os.O_RDONLY, 0)
 	if err != nil {
-		return err
+		return validated, err
 	}
 	raw, readErr := readOpenedFile(ctx, candidate, int64(len(prefix)))
 	if readErr == nil && !bytes.Equal(raw, prefix) {
@@ -481,11 +733,11 @@ func validateRecoveryCandidate(ctx context.Context, transaction *sessionTransact
 	}
 	readErr = errors.Join(readErr, verifyRootedRegularFile(transaction.sessionRoot, manifest.CandidateName, candidateInfo), candidate.Close())
 	if readErr != nil {
-		return readErr
+		return validated, readErr
 	}
 	metadata, metadataInfo, err := openRootedRegularFile(ctx, transaction.sessionRoot, manifest.MetadataName, os.O_RDONLY, 0)
 	if err != nil {
-		return err
+		return validated, err
 	}
 	metadataRaw, readErr := readOpenedFile(ctx, metadata, maxSessionMetadataBytes)
 	var decoded domain.Session
@@ -495,15 +747,59 @@ func validateRecoveryCandidate(ctx context.Context, transaction *sessionTransact
 	if readErr == nil && !reflect.DeepEqual(decoded, rebuilt) {
 		readErr = fmt.Errorf("recovery metadata does not match rebuilt committed head")
 	}
-	return errors.Join(readErr, verifyRootedRegularFile(transaction.sessionRoot, manifest.MetadataName, metadataInfo), metadata.Close())
+	readErr = errors.Join(readErr, verifyRootedRegularFile(transaction.sessionRoot, manifest.MetadataName, metadataInfo), metadata.Close())
+	if readErr != nil {
+		return validated, readErr
+	}
+	quarantine, quarantineInfo, err := openRootedRegularFile(ctx, transaction.artifactsRoot, manifest.QuarantineName, os.O_RDONLY, 0)
+	if err != nil {
+		return validated, err
+	}
+	quarantineRaw, readErr := readOpenedFile(ctx, quarantine, int64(len(tail)))
+	if readErr == nil && !bytes.Equal(quarantineRaw, tail) {
+		readErr = fmt.Errorf("recovery quarantine differs from observed tail")
+	}
+	readErr = errors.Join(readErr, verifyRootedRegularFile(transaction.artifactsRoot, manifest.QuarantineName, quarantineInfo), quarantine.Close())
+	if readErr != nil {
+		return validated, readErr
+	}
+	validated = recoveryCandidateValidation{
+		candidate: candidateInfo, metadata: metadataInfo, quarantine: quarantineInfo, artifacts: transaction.artifactsInfo,
+	}
+	return validated, nil
 }
 
-func activateRecoveryCandidate(ctx context.Context, transaction *sessionTransaction, manifest explicitRecoveryManifest) error {
+func activateRecoveryCandidate(
+	ctx context.Context,
+	transaction *sessionTransaction,
+	manifest explicitRecoveryManifest,
+	tail []byte,
+	validated recoveryCandidateValidation,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := transaction.verifyEvents(); err != nil {
+	if validated.candidate == nil || validated.metadata == nil || validated.quarantine == nil || validated.artifacts == nil {
+		return fmt.Errorf("recovery candidate has no retained validation identity")
+	}
+	if err := errors.Join(
+		transaction.verifyArtifacts(),
+		verifyRootedRegularFile(transaction.sessionRoot, manifest.CandidateName, validated.candidate),
+		verifyRootedRegularFile(transaction.sessionRoot, manifest.MetadataName, validated.metadata),
+		verifyRootedDirectory(transaction.sessionRoot, "artifacts", validated.artifacts),
+	); err != nil {
 		return err
+	}
+	quarantine, quarantineInfo, err := openRootedRegularFile(ctx, transaction.artifactsRoot, manifest.QuarantineName, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	quarantineRaw, readErr := readOpenedFile(ctx, quarantine, int64(len(tail)))
+	if readErr == nil && (!os.SameFile(quarantineInfo, validated.quarantine) || !bytes.Equal(quarantineRaw, tail)) {
+		readErr = fmt.Errorf("recovery quarantine identity changed before activation")
+	}
+	if readErr = errors.Join(readErr, verifyRootedRegularFile(transaction.artifactsRoot, manifest.QuarantineName, validated.quarantine), quarantine.Close()); readErr != nil {
+		return readErr
 	}
 	if err := transaction.metadata.Close(); err != nil {
 		return err

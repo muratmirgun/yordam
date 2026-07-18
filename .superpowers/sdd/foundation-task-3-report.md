@@ -9,6 +9,9 @@ Task 3 is implemented from signed base `45b656d2256c604cbacfce9feeb5704578c195e1
 - All ten named recovery probes are injected before and after their physical action and are restart/idempotency tested.
 - v0.1 events are deterministically upcast in memory with original envelope evidence preserved and missing v2 facts left unknown.
 - The first v2 append to a v1 journal atomically prepends the required compatibility declaration; later declarations are rejected.
+- Scanning now validates the semantics of every recognized v1 payload before advancing the committed prefix and validates the exact durable v1-to-v2 compatibility transition at the commit marker.
+- Recovery is advertised and accepted only for eligible incomplete final fragments or incomplete known transactions; unsupported, malformed, and invalid-transition data stays read-only and non-discardable.
+- Persisted recovery manifests, activation candidates, metadata, quarantine artifacts, and their rooted identities are revalidated immediately before mutation. Recovery-diagnostic append retries cover every Task 2 append crash window.
 - The exact 11-case fixture matrix contains 33 fixture files plus one sorted lowercase SHA-256 manifest.
 - No config, schema, reload, Task 4+, or progress-ledger semantics were changed.
 
@@ -36,6 +39,18 @@ The pure-Load correction received a separate RED source snapshot test: the old i
 
 A final crash-window RED test truncated each operation-owned quarantine/journal-candidate/metadata-candidate file between write and sync. Retry initially failed with a permanent conflict; recovery now reconstructs only manifest-owned candidates and resumes. The active journal is never truncated in place.
 
+### Independent review correction batch
+
+The independent Task 3 review returned seven Important findings. They were reproduced together in one RED batch before production changes:
+
+1. A recognized v1 `mode.changed` record with `{}` advanced the durable head and left append possible. GREEN: the mapped v2 payload's semantic validator runs during the scan (and index verification), the prefix stops before the malformed event, `invalid_known_payload` is emitted, no recovery request is exposed, and append is blocked.
+2. `tool.started -> succeeded result` without a request and `tool.requested -> succeeded result` without a start both became `activity.succeeded`. GREEN: requested and started phases are tracked independently; missing, orphaned, duplicate, and out-of-order phases remain `activity.uncertain`.
+3. Recovery-diagnostic faults before the marker left operation-owned event bytes that conflicted forever; faults after the marker could return `already_recovered` while metadata lagged. GREEN: partial diagnostic transactions are recognized by the retained transaction/operation identity, preserved under a deterministic diagnostic-tail artifact, reset to the validated prefix, and retried. A committed marker repairs and syncs metadata before success. The test matrix covers `event_write`, `event_sync`, `marker_write`, `marker_sync`, `metadata_write`, `metadata_rename`, and `directory_sync` inside `recovery_diagnostic_commit`.
+4. Persisted manifest filenames and observation fields were trusted. GREEN: names are reconstructed from request/operation identity, reserved leaves are rejected, and prefix/source sizes and digests are rebound to the active source or preserved quarantine before any action. Eight forged-field cases plus changed-request identity fail with zero mutation.
+5. Candidate validation had a validate-to-activate substitution window. GREEN: candidate, metadata, artifacts directory, and quarantine identities are retained and reopened/recompared at activation; quarantine bytes are rechecked. Substitution at `candidate_activate` fails before either active file is renamed.
+6. Unsupported envelope, payload, and unknown stateful records could expose discard-style recovery details. GREEN: only supported incomplete fragments/transactions are eligible; unsupported/malformed/invalid-transition scans never emit `recovery.available`, and `RecoverSession` returns conflict without mutation.
+7. Mixed durable journals did not validate the compatibility transition. GREEN: the first committed v2 transaction after legacy data requires exactly one declaration as its first event with reader/writer `2`, the exact legacy head, and `v0.1_read_only_after_v2`; missing, later, duplicate, wrong-field, and repeated declarations stop at `invalid_transition`.
+
 ## Implementation and compatibility
 
 ### Inspection and upcasting
@@ -53,7 +68,7 @@ A final crash-window RED test truncated each operation-owned quarantine/journal-
 - The exact tail is retained under an operation/tail-digest-derived artifact name, including tails larger than the legacy 10 MiB retention cap (bounded by the 64 MiB recovery-journal limit).
 - Journal and metadata candidates are separately written, synced, rooted-identity checked, content validated, activated by replacement, and followed by directory sync.
 - Same-request restart returns `recovered` or `already_recovered`; changed request/head/tail returns `conflict` without mutation.
-- Partial operation-owned files resume safely. Candidate/session-root substitution tests fail closed without changing the active/replacement source.
+- Partial operation-owned files and diagnostic append bytes resume safely. Candidate/session/artifacts/quarantine substitution tests fail closed without changing the active source.
 - Recovery appends `recovery.diagnostic` in a new committed transaction and automatically includes the first-v2 compatibility declaration for a legacy-only prefix.
 
 ## Test migrations outside the nominal brief list
@@ -76,6 +91,8 @@ go test ./internal/session/jsonl -run 'Test(FoundationFixture|InspectSession|V1U
 go test ./internal/session/jsonl -run 'Test(FoundationFixture|InspectSession|ExplicitRecovery|V1Upcast|MixedV1V2|ValidatedPrefix)' -count=1
 go test -race ./internal/session/jsonl -run 'Test(InspectSession|ExplicitRecovery)' -count=1
 go test ./internal/session/jsonl -count=1
+go test -race ./internal/session/jsonl -count=1
+go test ./... -count=1
 go vet ./...
 git diff --check
 gofmt -l internal/session/jsonl
@@ -84,24 +101,18 @@ gofmt -l internal/session/jsonl
 Latest package results:
 
 ```text
-jsonl package: PASS (15.196s final gate; 15.598s after dead-path cleanup)
-focused race: PASS (5.728s)
+seven-finding focused regression batch: PASS
+jsonl package: PASS (17.028s final package rerun)
+jsonl race package: PASS (37.541s final rerun)
+repository-wide go test ./...: PASS (including internal/ptytest)
 go vet ./...: PASS
 diff/gofmt checks: PASS
 ```
-
-Repository-wide `go test ./... -count=1` passed every package except one pre-existing PTY raw-output assertion:
-
-```text
-internal/ptytest/TestEditAndReloadPreservesSessionAndSecretBoundaries
-timed out waiting for "assistant response after reload"
-```
-
-The output contains the complete rendered response, but secret streaming intentionally buffers the suffix `reload` (a prefix of `reload-secret`) until close, causing two alternate-screen redraws and escape bytes between `assistant response after` and `reload`. Isolated `-count=3` reproduced the test-harness defect. No PTY/TUI files are part of this Task 3 change; the parent task is handling that test-infrastructure correction separately before final review.
 
 ## Scope and concerns
 
 - `.superpowers/sdd/progress.md` was not modified.
 - The source fixture directory is immutable in tests; recovery operates only on copied trees.
+- The exact fixture inventory remains 11 directories/33 files; the malformed-known fixture is now a recognized malformed v1 source, while unknown/unsupported v2 fixtures carry the required compatibility declaration.
 - Workspace-control journals remain the Task 4 boundary.
 - Production composition migration remains Task 12.

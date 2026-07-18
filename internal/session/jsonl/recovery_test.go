@@ -568,7 +568,7 @@ func TestLoadReportsUnmatchedToolStartWithoutAppending(t *testing.T) {
 	}
 }
 
-func TestLoadDoesNotInterruptMatchedToolStart(t *testing.T) {
+func TestLoadMarksOrphanToolStartAndTerminalUncertain(t *testing.T) {
 	store, _, session := createTestSession(t, t.TempDir())
 	if _, err := store.Append(
 		context.Background(),
@@ -591,7 +591,7 @@ func TestLoadDoesNotInterruptMatchedToolStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replay.ReadOnly || len(replay.Events) != 3 || replay.RecoveryNote != "" {
+	if replay.ReadOnly || len(replay.Events) != 3 || !strings.Contains(replay.RecoveryNote, "migration.out_of_order") {
 		t.Fatalf("replay=%+v", replay)
 	}
 }

@@ -183,6 +183,8 @@ func (s *Store) loadVerifiedJournalIndex(
 	var expectedSeq uint64 = 1
 	hasLegacy := false
 	hasV2 := false
+	legacyHead := protocol.CommittedCursor{}
+	legacyState := UpcastState{SessionID: protocol.SessionID(ref.ID)}
 	verifiedCommits := make([]scannedCommit, 0, len(index.Transactions))
 	for _, entry := range index.Transactions {
 		commit, physicalIDs, legacy, ok := s.verifyIndexedCommit(ctx, transaction, ref, entry, expectedSeq)
@@ -193,8 +195,20 @@ func (s *Store) loadVerifiedJournalIndex(
 			if hasV2 {
 				return seed, false
 			}
+			if len(commit.events) != 1 || commit.events[0].Legacy == nil {
+				return seed, false
+			}
+			mapped, next, diagnostics := UpcastV1(*commit.events[0].Legacy, legacyState)
+			if _, invalid := diagnosticWithCode(diagnostics, "migration.invalid_payload"); invalid || validateMappedLegacyRecord(s.registry, mapped) != nil {
+				return seed, false
+			}
+			legacyState = next
 			hasLegacy = true
+			legacyHead = commit.cursor
 		} else {
+			if validateCompatibilityTransition(hasLegacy, hasV2, legacyHead, commit.events) != nil {
+				return seed, false
+			}
 			hasV2 = true
 		}
 		verifiedCommits = append(verifiedCommits, commit)
@@ -369,7 +383,7 @@ func (s *Store) verifyIndexedCommit(
 		}
 		commit := scannedCommit{
 			cursor: entry.Cursor, events: records, envelopes: cloneEnvelopes(envelopes),
-			firstOffset: entry.FirstOffset, endOffset: entry.EndOffset,
+			markerTime: envelope.Time, firstOffset: entry.FirstOffset, endOffset: entry.EndOffset,
 		}
 		return commit, eventIDs, false, true
 	}

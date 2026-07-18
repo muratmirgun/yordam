@@ -185,12 +185,12 @@ func (s *Store) appendBatchLocked(
 		return journal.AppendResult{}, err
 	}
 	base := journal.AppendResult{CurrentHead: scan.head}
-	if scan.incompleteTail {
+	if recoveryEligible(scan) {
 		base.Status = journal.AppendRecoveryRequired
 		return base, nil
 	}
-	if !scan.writable {
-		return base, fmt.Errorf("journal is read-only because its validated prefix contains unsupported data")
+	if scan.incompleteTail || !scan.writable {
+		return base, fmt.Errorf("journal is read-only because data beyond its validated prefix is not eligible for recovery")
 	}
 	if request.ExpectedHead != scan.head {
 		base.Status = journal.AppendConflict

@@ -507,10 +507,10 @@ func TestLoadProjectsToolCallMultiplicityWithoutAppendingInterruption(t *testing
 		payload any
 	}
 	tests := []struct {
-		name            string
-		events          []eventSpec
-		wantInterrupted bool
-		wantCallCount   int
+		name           string
+		events         []eventSpec
+		wantReadOnly   bool
+		wantDiagnostic string
 	}{
 		{
 			name: "one result closes only one duplicate start",
@@ -519,8 +519,7 @@ func TestLoadProjectsToolCallMultiplicityWithoutAppendingInterruption(t *testing
 				{kind: domain.EventToolStarted, payload: map[string]any{"call_id": "same"}},
 				{kind: domain.EventToolResult, payload: map[string]any{"call_id": "same"}},
 			},
-			wantInterrupted: true,
-			wantCallCount:   1,
+			wantDiagnostic: "migration.unmatched_activity",
 		},
 		{
 			name: "two results close two duplicate starts",
@@ -530,6 +529,7 @@ func TestLoadProjectsToolCallMultiplicityWithoutAppendingInterruption(t *testing
 				{kind: domain.EventToolResult, payload: map[string]any{"call_id": "same"}},
 				{kind: domain.EventToolResult, payload: map[string]any{"call_id": "same"}},
 			},
+			wantDiagnostic: "migration.out_of_order",
 		},
 		{
 			name: "nested runner result closes flat start",
@@ -537,6 +537,7 @@ func TestLoadProjectsToolCallMultiplicityWithoutAppendingInterruption(t *testing
 				{kind: domain.EventToolStarted, payload: map[string]any{"call_id": "nested"}},
 				{kind: domain.EventToolResult, payload: map[string]any{"result": map[string]any{"call_id": "nested"}}},
 			},
+			wantDiagnostic: "migration.out_of_order",
 		},
 		{
 			name: "malformed starts remain independently unmatched",
@@ -547,8 +548,8 @@ func TestLoadProjectsToolCallMultiplicityWithoutAppendingInterruption(t *testing
 				{kind: domain.EventToolResult, payload: map[string]any{"call_id": ""}},
 				{kind: domain.EventToolResult, payload: map[string]any{"result": map[string]any{"call_id": 42}}},
 			},
-			wantInterrupted: true,
-			wantCallCount:   3,
+			wantReadOnly:   true,
+			wantDiagnostic: "corruption at sequence 2",
 		},
 		{
 			name: "prior interruption does not close future start",
@@ -557,8 +558,7 @@ func TestLoadProjectsToolCallMultiplicityWithoutAppendingInterruption(t *testing
 				{kind: domain.EventTurnInterrupted, payload: map[string]any{"reason": "prior restart"}},
 				{kind: domain.EventToolStarted, payload: map[string]any{"call_id": "future"}},
 			},
-			wantInterrupted: true,
-			wantCallCount:   1,
+			wantDiagnostic: "migration.unmatched_activity",
 		},
 	}
 
@@ -575,17 +575,17 @@ func TestLoadProjectsToolCallMultiplicityWithoutAppendingInterruption(t *testing
 			if err != nil {
 				t.Fatal(err)
 			}
-			if replay.ReadOnly {
-				t.Fatal("valid tool events replayed read-only")
+			if replay.ReadOnly != test.wantReadOnly {
+				t.Fatalf("read-only=%v want %v note=%q", replay.ReadOnly, test.wantReadOnly, replay.RecoveryNote)
 			}
-			if !test.wantInterrupted {
-				if len(replay.Events) != before || replay.RecoveryNote != "" {
-					t.Fatalf("events=%d note=%q want fully matched", len(replay.Events), replay.RecoveryNote)
+			if test.wantReadOnly {
+				if !strings.Contains(replay.RecoveryNote, test.wantDiagnostic) {
+					t.Fatalf("events=%d note=%q want %q", len(replay.Events), replay.RecoveryNote, test.wantDiagnostic)
 				}
 				return
 			}
-			if len(replay.Events) != before || !strings.Contains(replay.RecoveryNote, "migration.unmatched_activity") {
-				t.Fatalf("events=%d note=%q want unchanged source plus historical interruption diagnostic (legacy count %d)", len(replay.Events), replay.RecoveryNote, test.wantCallCount)
+			if len(replay.Events) != before || !strings.Contains(replay.RecoveryNote, test.wantDiagnostic) {
+				t.Fatalf("events=%d note=%q want unchanged source plus %q", len(replay.Events), replay.RecoveryNote, test.wantDiagnostic)
 			}
 		})
 	}

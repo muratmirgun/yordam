@@ -23,6 +23,7 @@ type UpcastState struct {
 
 	activeTaskID   protocol.TaskID
 	turnAnchor     protocol.EventID
+	requestedCalls map[string]bool
 	startedCalls   map[string]uint64
 	uncertainCalls map[string]bool
 }
@@ -43,6 +44,7 @@ func UpcastV1(source protocol.LegacySource, state UpcastState) (protocol.EventRe
 		next.ActiveTurnID = protocol.TurnID(deriveUpcastID("turn", next.SessionID, source.EventID, next.TurnOrdinal, 0))
 		next.activeTaskID = protocol.TaskID(deriveUpcastID("task", next.SessionID, source.EventID, next.TurnOrdinal, 0))
 		clear(next.OpenCalls)
+		clear(next.requestedCalls)
 		clear(next.startedCalls)
 		clear(next.uncertainCalls)
 	}
@@ -98,6 +100,7 @@ func UpcastV1(source protocol.LegacySource, state UpcastState) (protocol.EventRe
 		next.activeTaskID = ""
 		next.turnAnchor = ""
 		clear(next.OpenCalls)
+		clear(next.requestedCalls)
 		clear(next.startedCalls)
 		clear(next.uncertainCalls)
 	}
@@ -177,6 +180,7 @@ func mapLegacyPayload(
 		var payload domain.PreparedToolRequest
 		if decode(&payload) {
 			activityID = beginLegacyActivity(source, state, payload.Request.CallID)
+			state.requestedCalls[legacyCallKey(state.ActiveTurnID, payload.Request.CallID)] = true
 			purpose := strings.TrimSpace(payload.Summary)
 			if purpose == "" {
 				purpose = "legacy tool request"
@@ -217,6 +221,7 @@ func mapLegacyPayload(
 		if len(calls) == 0 {
 			activityID = beginLegacyActivity(source, state, callID)
 			state.startedCalls[key] = 1
+			state.uncertainCalls[key] = true
 			diagnostics = append(diagnostics, migrationDiagnostic(ref, source, "migration.orphan_start", "legacy tool start has no matching request", nil))
 			return &protocol.ActivityProgressV1{Message: "legacy tool start observed"}, activityID, protocol.EventActivityProgress, diagnostics
 		}
@@ -250,8 +255,17 @@ func mapLegacyPayload(
 			diagnostics = append(diagnostics, migrationDiagnostic(ref, source, "migration.duplicate_start", "duplicate legacy tool starts make the terminal uncertain", nil))
 			return &protocol.ActivityOutcomeV1{Status: "uncertain", Reason: "duplicate legacy tool start"}, activityID, protocol.EventActivityUncertain, diagnostics
 		}
+		if !state.requestedCalls[key] || state.startedCalls[key] == 0 {
+			delete(state.OpenCalls, key)
+			delete(state.requestedCalls, key)
+			delete(state.startedCalls, key)
+			delete(state.uncertainCalls, key)
+			diagnostics = append(diagnostics, migrationDiagnostic(ref, source, "migration.out_of_order", "legacy tool terminal requires a matching request followed by a start", nil))
+			return &protocol.ActivityOutcomeV1{Status: "uncertain", Reason: "legacy tool lifecycle is incomplete or out of order"}, activityID, protocol.EventActivityUncertain, diagnostics
+		}
 		uncertain := state.uncertainCalls[key]
 		delete(state.OpenCalls, key)
+		delete(state.requestedCalls, key)
 		delete(state.startedCalls, key)
 		delete(state.uncertainCalls, key)
 		if uncertain {
@@ -279,7 +293,14 @@ func mapLegacyPayload(
 			diagnostics = append(diagnostics, migrationDiagnostic(ref, source, "migration.legacy_evidence", "legacy file diff is historical evidence", nil))
 			before := protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.ToLower(payload.BeforeSHA256)}
 			after := protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.ToLower(payload.AfterSHA256)}
-			return &protocol.FileChangedV1{CallID: payload.CallID, Subject: protocol.SubjectRef{Kind: "file", ID: payload.Path}, Before: before, After: after}, activityID, protocol.EventFileChanged, diagnostics
+			if before.Validate() != nil || after.Validate() != nil {
+				lossy("legacy file change lacked complete before/after digests")
+				return &protocol.ActivityProgressV1{Message: "legacy file changed"}, activityID, protocol.EventActivityProgress, diagnostics
+			}
+			return &protocol.FileChangedV1{
+				CallID: payload.CallID, Subject: protocol.SubjectRef{Kind: "file", ID: payload.Path},
+				Before: before, After: after, EvidenceIDs: []protocol.EvidenceID{},
+			}, activityID, protocol.EventFileChanged, diagnostics
 		}
 	case domain.EventContextCompacted:
 		var payload domain.CompactionPayload
@@ -305,6 +326,10 @@ func cloneUpcastState(state UpcastState) UpcastState {
 	clone.OpenCalls = make(map[string][]protocol.ActivityID, len(state.OpenCalls))
 	for key, calls := range state.OpenCalls {
 		clone.OpenCalls[key] = append([]protocol.ActivityID(nil), calls...)
+	}
+	clone.requestedCalls = make(map[string]bool, len(state.requestedCalls))
+	for key, requested := range state.requestedCalls {
+		clone.requestedCalls[key] = requested
 	}
 	clone.startedCalls = make(map[string]uint64, len(state.startedCalls))
 	for key, count := range state.startedCalls {

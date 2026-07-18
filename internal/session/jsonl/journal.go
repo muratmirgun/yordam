@@ -12,6 +12,8 @@ import (
 	"hash"
 	"io"
 	"os"
+	"reflect"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
@@ -46,6 +48,7 @@ type scannedCommit struct {
 	cursor      protocol.CommittedCursor
 	events      []protocol.EventRecord
 	envelopes   []protocol.EventEnvelope
+	markerTime  time.Time
 	firstOffset int64
 	endOffset   int64
 }
@@ -119,6 +122,8 @@ func (s *Store) scanJournalAfterPrefix(
 	var pendingID protocol.TransactionID
 	var pendingOffset int64
 	hasV2 := scan.hasV2
+	committedV2 := scan.hasV2
+	legacyState := legacyStateAfterScan(scan, protocol.SessionID(ref.ID))
 	offset := scan.sourceSize
 scanLines:
 	for {
@@ -127,10 +132,16 @@ scanLines:
 		}
 		physical, complete, eof, err := readJournalLine(reader)
 		if err != nil {
-			if errors.Is(err, errJournalLineTooLarge) {
+			if errors.Is(err, errJournalCompleteLineTooLarge) {
 				scan.writable = false
 				scan.incompleteTail = true
 				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_known_payload", err.Error(), scan.physicalSeq+1, ""))
+				break
+			}
+			if errors.Is(err, errJournalLineTooLarge) {
+				scan.writable = false
+				scan.incompleteTail = true
+				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "incomplete_final_fragment", err.Error(), scan.physicalSeq+1, ""))
 				break
 			}
 			return scan, err
@@ -203,6 +214,26 @@ scanLines:
 				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_sequence", fmt.Sprintf("v1 sequence=%d want %d", legacy.Seq, scan.physicalSeq+1), scan.physicalSeq+1, protocol.EventID(legacy.EventID)))
 				break scanLines
 			}
+			raw := protocol.CloneRawMessage(line)
+			source := protocol.LegacySource{
+				SchemaVersion: 1, EventID: protocol.EventID(legacy.EventID), SessionID: protocol.SessionID(legacy.SessionID),
+				Seq: legacy.Seq, Time: legacy.Time, Kind: string(legacy.Kind),
+				Payload: protocol.CloneRawMessage(legacy.Payload), RawEnvelope: protocol.CloneRawMessage(raw),
+			}
+			mapped, nextLegacyState, migrationDiagnostics := UpcastV1(source, legacyState)
+			if diagnostic, invalid := diagnosticWithCode(migrationDiagnostics, "migration.invalid_payload"); invalid {
+				scan.writable = false
+				scan.incompleteTail = true
+				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_known_payload", diagnostic.Message, scan.physicalSeq+1, source.EventID))
+				break scanLines
+			}
+			if err := validateMappedLegacyRecord(s.registry, mapped); err != nil {
+				scan.writable = false
+				scan.incompleteTail = true
+				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_known_payload", fmt.Sprintf("validate mapped v1 event: %v", err), scan.physicalSeq+1, source.EventID))
+				break scanLines
+			}
+			legacyState = nextLegacyState
 			eventID := protocol.EventID(legacy.EventID)
 			if _, duplicate := seenEvents[eventID]; duplicate {
 				return scan, fmt.Errorf("duplicate event ID %q", eventID)
@@ -214,14 +245,9 @@ scanLines:
 			if _, duplicate := scan.transactions[transactionID]; duplicate {
 				return scan, fmt.Errorf("duplicate transaction ID %q", transactionID)
 			}
-			raw := protocol.CloneRawMessage(line)
 			record := protocol.EventRecord{
 				RawEnvelope: raw,
-				Legacy: &protocol.LegacySource{
-					SchemaVersion: 1, EventID: eventID, SessionID: protocol.SessionID(legacy.SessionID),
-					Seq: legacy.Seq, Time: legacy.Time, Kind: string(legacy.Kind),
-					Payload: protocol.CloneRawMessage(legacy.Payload), RawEnvelope: protocol.CloneRawMessage(raw),
-				},
+				Legacy:      &source,
 			}
 			cursor := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: legacy.Seq, TransactionID: transactionID}
 			commit := scannedCommit{cursor: cursor, events: []protocol.EventRecord{record}, firstOffset: lineOffset, endOffset: offset}
@@ -299,13 +325,21 @@ scanLines:
 				if marker.Digest != digest {
 					return scan, fmt.Errorf("transaction marker digest mismatch")
 				}
+				if err := validateCompatibilityTransition(scan.hasLegacy, committedV2, scan.head, pendingRecords); err != nil {
+					scan.writable = false
+					scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_transition", err.Error(), pendingEnvelopes[0].Seq, pendingEnvelopes[0].EventID))
+					rollbackPendingEventIDs(&scan, pendingEnvelopes, envelope.EventID)
+					pendingRecords, pendingEnvelopes = nil, nil
+					pendingID = ""
+					break scanLines
+				}
 				if _, duplicate := scan.transactions[pendingID]; duplicate {
 					return scan, fmt.Errorf("duplicate transaction ID %q", pendingID)
 				}
 				cursor := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: envelope.Seq, TransactionID: pendingID}
 				commit := scannedCommit{
 					cursor: cursor, events: cloneRecords(pendingRecords), envelopes: cloneEnvelopes(pendingEnvelopes),
-					firstOffset: pendingOffset, endOffset: offset,
+					markerTime: envelope.Time, firstOffset: pendingOffset, endOffset: offset,
 				}
 				for _, pendingRecord := range pendingRecords {
 					scan.events = append(scan.events, scannedEvent{record: protocol.CloneEventRecord(pendingRecord), cursor: cursor})
@@ -314,6 +348,7 @@ scanLines:
 				scan.transactions[pendingID] = commit
 				scan.head = cursor
 				scan.validPrefixSize = offset
+				committedV2 = true
 				pendingRecords, pendingEnvelopes = nil, nil
 				pendingID = ""
 				continue
@@ -390,6 +425,86 @@ func cloneJournalScan(scan journalScan) journalScan {
 	return clone
 }
 
+func legacyStateAfterScan(scan journalScan, sessionID protocol.SessionID) UpcastState {
+	state := UpcastState{SessionID: sessionID}
+	for _, scanned := range scan.events {
+		if scanned.record.Legacy == nil {
+			continue
+		}
+		_, state, _ = UpcastV1(*scanned.record.Legacy, state)
+	}
+	return state
+}
+
+func diagnosticWithCode(diagnostics []protocol.Diagnostic, code string) (protocol.Diagnostic, bool) {
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Code == code {
+			return diagnostic, true
+		}
+	}
+	return protocol.Diagnostic{}, false
+}
+
+func validateMappedLegacyRecord(registry *eventcodec.Registry, record protocol.EventRecord) error {
+	descriptor, ok := registry.Descriptor(record.Envelope.Kind, record.Envelope.PayloadVersion)
+	if !ok {
+		return fmt.Errorf("mapped legacy event kind %q has no v2 descriptor", record.Envelope.Kind)
+	}
+	if record.Decoded == nil || reflect.TypeOf(record.Decoded) != reflect.TypeOf(descriptor.New()) {
+		return fmt.Errorf("mapped legacy decoded payload type %T is invalid", record.Decoded)
+	}
+	if descriptor.ValidateSemantic != nil {
+		if err := descriptor.ValidateSemantic(record.Decoded); err != nil {
+			return fmt.Errorf("payload semantics %s@%d: %w", descriptor.Kind, descriptor.Version, err)
+		}
+	}
+	return nil
+}
+
+func validateCompatibilityTransition(hasLegacy, committedV2 bool, legacyHead protocol.CommittedCursor, records []protocol.EventRecord) error {
+	declarationCount := 0
+	declarationIndex := -1
+	var declaration *protocol.MigrationCompatibilityDeclaredV1
+	for index, record := range records {
+		if record.Envelope.Kind != protocol.EventMigrationCompatibilityDeclared {
+			continue
+		}
+		declarationCount++
+		declarationIndex = index
+		declaration, _ = record.Decoded.(*protocol.MigrationCompatibilityDeclaredV1)
+	}
+	if !hasLegacy || committedV2 {
+		if declarationCount != 0 {
+			return fmt.Errorf("migration compatibility declaration is only valid as the first event of the first v2 transaction after legacy data")
+		}
+		return nil
+	}
+	if declarationCount != 1 || declarationIndex != 0 || declaration == nil {
+		return fmt.Errorf("first committed v2 transaction after legacy data requires exactly one compatibility declaration as its first event")
+	}
+	if declaration.ReaderVersion != protocol.EnvelopeVersion || declaration.WriterVersion != protocol.EnvelopeVersion {
+		return fmt.Errorf("migration compatibility reader/writer versions must both be %d", protocol.EnvelopeVersion)
+	}
+	if declaration.LegacyHead != legacyHead {
+		return fmt.Errorf("migration compatibility legacy head does not match the exact validated legacy head")
+	}
+	if declaration.DowngradeStatus != "v0.1_read_only_after_v2" {
+		return fmt.Errorf("migration compatibility downgrade status is invalid")
+	}
+	return nil
+}
+
+func rollbackPendingEventIDs(scan *journalScan, pending []protocol.EventEnvelope, markerID protocol.EventID) {
+	for _, envelope := range pending {
+		delete(scan.eventIDs, envelope.EventID)
+	}
+	delete(scan.eventIDs, markerID)
+	remove := len(pending) + 1
+	if remove <= len(scan.eventIDOrder) {
+		scan.eventIDOrder = scan.eventIDOrder[:len(scan.eventIDOrder)-remove]
+	}
+}
+
 func cloneScannedCommit(commit scannedCommit) scannedCommit {
 	commit.events = cloneRecords(commit.events)
 	commit.envelopes = cloneEnvelopes(commit.envelopes)
@@ -397,12 +512,16 @@ func cloneScannedCommit(commit scannedCommit) scannedCommit {
 }
 
 var errJournalLineTooLarge = errors.New("journal line exceeds maximum event size")
+var errJournalCompleteLineTooLarge = errors.New("complete journal line exceeds maximum event size")
 
 func readJournalLine(reader *bufio.Reader) (line []byte, complete, eof bool, err error) {
 	var pending bytes.Buffer
 	for {
 		fragment, readErr := reader.ReadSlice('\n')
 		if pending.Len()+len(fragment) > protocol.MaxEventBytes+1 {
+			if len(fragment) > 0 && fragment[len(fragment)-1] == '\n' {
+				return nil, false, false, fmt.Errorf("%w: %d bytes", errJournalCompleteLineTooLarge, protocol.MaxEventBytes)
+			}
 			return nil, false, false, fmt.Errorf("%w: %d bytes", errJournalLineTooLarge, protocol.MaxEventBytes)
 		}
 		pending.Write(fragment)
@@ -541,7 +660,7 @@ func (s *Store) inspectJournalTransaction(ctx context.Context, transaction *sess
 	if err := s.syncCommittedView(ctx, transaction, ref, scan); err != nil {
 		return scan, err
 	}
-	if scan.validPrefixSize < scan.sourceSize {
+	if recoveryEligible(scan) {
 		details, err := observedRecoveryDetails(ctx, transaction.events, scan.validPrefixSize, scan.sourceSize)
 		if err != nil {
 			return scan, err
@@ -556,6 +675,22 @@ func (s *Store) inspectJournalTransaction(ctx context.Context, transaction *sess
 		})
 	}
 	return scan, nil
+}
+
+func recoveryEligible(scan journalScan) bool {
+	if scan.validPrefixSize < 0 || scan.validPrefixSize >= scan.sourceSize {
+		return false
+	}
+	eligibleFailure := false
+	for _, diagnostic := range scan.diagnostics {
+		switch diagnostic.Code {
+		case "incomplete_final_fragment", "incomplete_transaction":
+			eligibleFailure = true
+		case "unsupported_event", "unsupported_envelope_version", "invalid_known_payload", "invalid_sequence", "invalid_transition":
+			return false
+		}
+	}
+	return eligibleFailure
 }
 
 type recoveryObservation struct {

@@ -655,16 +655,22 @@ func TestInspectScansMixedV1AndV2CommittedTransactions(t *testing.T) {
 	}
 	event := proposed("evt-v2", protocol.EventTaskCreated)
 	event.SessionID = protocol.SessionID(ref.ID)
-	envelope := protocol.EventEnvelope{
-		PayloadVersion: event.PayloadVersion, EventID: event.EventID, Time: event.Time,
-		Kind: event.Kind, SessionID: event.SessionID, TaskID: event.TaskID, Payload: event.Payload,
+	result, err := repo.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: fixture.ref, ExpectedHead: fixture.head, TransactionID: "txn-v2",
+		Compatibility: &journal.CompatibilityDeclaration{
+			ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: fixture.head,
+		},
+		Events: []protocol.ProposedEvent{event},
+	})
+	if err != nil || result.Status != journal.AppendCommitted {
+		t.Fatalf("mixed append result=%+v err=%v", result, err)
 	}
-	_, cursor := appendRawV2Transaction(t, fixture, "txn-v2", envelope, nil)
+	cursor := result.Cursor
 	inspection, err := repo.Inspect(context.Background(), ref)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inspection.Head != cursor || len(inspection.Events) != 2 || inspection.Events[0].Legacy == nil || inspection.Events[1].Envelope.EventID != "evt-v2" {
+	if inspection.Head != cursor || len(inspection.Events) != 3 || inspection.Events[0].Legacy == nil || inspection.Events[1].Envelope.Kind != protocol.EventMigrationCompatibilityDeclared || inspection.Events[2].Envelope.EventID != "evt-v2" {
 		t.Fatalf("mixed inspection=%+v", inspection)
 	}
 	if !bytes.Equal(inspection.Events[0].Legacy.RawEnvelope, legacyLines[0]) {
@@ -785,8 +791,8 @@ func appendPhysicalEnvelopes(t *testing.T, path string, envelopes ...protocol.Ev
 
 func TestLegacyJournalRegressionAcceptsV01NumbersAndTwoMiBPhysicalLimit(t *testing.T) {
 	repo, ref, _, path := newLegacyJournalForRegression(t)
-	floatLine := legacyLineForRegression(ref, "legacy-float", 2, `{"decimal":1.5,"exponent":1e3}`)
-	largeLine := legacyLineForRegression(ref, "legacy-large", 3, `{"padding":"`+strings.Repeat("x", (1<<20)+4096)+`"}`)
+	floatLine := legacyLineForRegression(ref, "legacy-float", 2, `{"content":"numbers","decimal":1.5,"exponent":1e3}`)
+	largeLine := legacyLineForRegression(ref, "legacy-large", 3, `{"content":"`+strings.Repeat("x", (1<<20)+4096)+`"}`)
 	if len(largeLine) <= 1<<20 || len(largeLine) >= 2<<20 {
 		t.Fatalf("legacy line size=%d does not exercise the 1-2 MiB window", len(largeLine))
 	}
