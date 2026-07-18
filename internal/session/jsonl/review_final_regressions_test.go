@@ -11,8 +11,10 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
+	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
@@ -32,6 +34,7 @@ type recoveryAdmissionEncoder struct {
 	calls     []string
 	reject    error
 	transform bool
+	message   string
 }
 
 func (e *recoveryAdmissionEncoder) EncodeProposed(event protocol.ProposedEvent) (json.RawMessage, error) {
@@ -46,8 +49,153 @@ func (e *recoveryAdmissionEncoder) EncodeProposed(event protocol.ProposedEvent) 
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return nil, err
 	}
-	payload.Diagnostic.Message = "admitted redacted recovery diagnostic"
+	payload.Diagnostic.Message = e.message
+	if payload.Diagnostic.Message == "" {
+		payload.Diagnostic.Message = "admitted redacted recovery diagnostic"
+	}
 	return canonicaljson.Marshal(payload)
+}
+
+func TestRecoveryAdmissionUsesValidatedHeadTimeAcrossStaleMetadataRetry(t *testing.T) {
+	fixture := copyFixture(t, "incomplete-batch")
+	metadataPath := filepath.Join(fixture.sessionDir, "metadata.json")
+	metadataRaw, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stale domain.Session
+	if err := json.Unmarshal(metadataRaw, &stale); err != nil {
+		t.Fatal(err)
+	}
+	validatedHeadTime := stale.CreatedAt.UTC()
+	stale.UpdatedAt = stale.CreatedAt.Add(6 * time.Hour)
+	staleRaw, err := json.MarshalIndent(stale, "", "  ")
+	if err != nil || os.WriteFile(metadataPath, staleRaw, 0o600) != nil {
+		t.Fatalf("write stale metadata err=%v", err)
+	}
+	setup := openFixtureStore(fixture)
+	_, request := recoveryRequestForFixture(t, setup, "operation-stale-head-time", "txn-stale-head-time")
+	pause := errors.New("pause after stale-metadata recovery activation")
+	paused := false
+	store := New(fixture.root, Options{Encoder: fixturePassthroughEncoder{}, Fault: func(point FaultPoint) error {
+		if point == FaultRecoveryDiagnosticCommit && !paused {
+			paused = true
+			return pause
+		}
+		return nil
+	}})
+	if _, err := store.RecoverSession(context.Background(), request); !errors.Is(err, pause) {
+		t.Fatalf("initial recovery err=%v", err)
+	}
+	manifest := readOnlyRecoveryManifest(t, fixture)
+	if !manifest.DiagnosticAppend.EventTime.Equal(validatedHeadTime) {
+		t.Fatalf("admission time=%s want validated head time %s", manifest.DiagnosticAppend.EventTime, validatedHeadTime)
+	}
+	result, err := store.RecoverSession(context.Background(), request)
+	if err != nil || result.Status != "recovered" {
+		t.Fatalf("stale-metadata retry result=%+v err=%v", result, err)
+	}
+}
+
+func TestCommittedRecoveryClearsOnlyExactFullMarkerUncertainty(t *testing.T) {
+	for _, faultPoint := range []FaultPoint{FaultMarkerWrite, FaultMarkerSync} {
+		t.Run(string(faultPoint), func(t *testing.T) {
+			fixture := copyFixture(t, "incomplete-batch")
+			setup := openFixtureStore(fixture)
+			_, request := recoveryRequestForFixture(t, setup, protocol.ControlOperationID("operation-full-marker-"+string(faultPoint)), protocol.TransactionID("txn-full-marker-"+string(faultPoint)))
+			markerFault := errors.New("full marker fault")
+			failed := false
+			store := New(fixture.root, Options{Encoder: fixturePassthroughEncoder{}, Fault: func(point FaultPoint) error {
+				if point == faultPoint && !failed {
+					failed = true
+					return markerFault
+				}
+				return nil
+			}})
+			if _, err := store.RecoverSession(context.Background(), request); !errors.Is(err, markerFault) {
+				t.Fatalf("initial recovery err=%v", err)
+			}
+			exactKey := markerUncertaintyKey(request.Journal, request.TransactionID)
+			if _, exists := store.state.markerUncertainty.Load(exactKey); !exists {
+				t.Fatal("full marker fault did not retain exact uncertainty")
+			}
+			eventsInfo, err := os.Stat(filepath.Join(fixture.sessionDir, "events.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			otherRef := protocol.JournalRef{Kind: protocol.JournalSession, ID: "01ARZ3NDEKTSV4RRFFQ69G5FB1"}
+			otherKey := markerUncertaintyKey(otherRef, "txn-other-full-marker")
+			store.state.markerUncertainty.Store(otherKey, eventsInfo)
+
+			recovered, err := store.RecoverSession(context.Background(), request)
+			if err != nil || recovered.Status != "already_recovered" {
+				t.Fatalf("committed retry result=%+v err=%v", recovered, err)
+			}
+			if _, exists := store.state.markerUncertainty.Load(exactKey); exists {
+				t.Fatal("already-recovered path retained exact uncertainty")
+			}
+			if _, exists := store.state.markerUncertainty.Load(otherKey); !exists {
+				t.Fatal("already-recovered path cleared unrelated uncertainty")
+			}
+			inspection, err := store.InspectSession(context.Background(), fixtureSessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, err := canonicaljson.Marshal(protocol.TaskCreatedV1{
+				Goal: "append after resolved marker", OutcomeContractID: "contract-after-marker", ContractVersion: 1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			appendResult, err := store.AppendBatch(context.Background(), journal.AppendRequest{
+				Journal: request.Journal, ExpectedHead: recovered.Cursor, TransactionID: "txn-after-full-marker",
+				Events: []protocol.ProposedEvent{{
+					EventID: "event-after-full-marker", Time: inspection.Session.UpdatedAt.Add(time.Second), PayloadVersion: 1,
+					Kind: protocol.EventTaskCreated, SessionID: fixtureSessionID, TaskID: "task-after-full-marker", Payload: payload,
+				}},
+			})
+			if err != nil || appendResult.Status != journal.AppendCommitted {
+				t.Fatalf("append after already-recovered result=%+v err=%v", appendResult, err)
+			}
+		})
+	}
+}
+
+func TestLargeAdmittedRecoveryManifestLoadsAfterPersistedFailure(t *testing.T) {
+	fixture := copyFixture(t, "incomplete-batch")
+	setup := openFixtureStore(fixture)
+	_, request := recoveryRequestForFixture(t, setup, "operation-large-admission", "txn-large-admission")
+	pause := errors.New("pause after large recovery manifest persistence")
+	paused := false
+	largeMessage := strings.Repeat("m", 128<<10)
+	encoder := &recoveryAdmissionEncoder{transform: true, message: largeMessage}
+	store := New(fixture.root, Options{Encoder: encoder, Fault: func(point FaultPoint) error {
+		if point == FaultRecoveryDiagnosticCommit && !paused {
+			paused = true
+			return pause
+		}
+		return nil
+	}})
+	if _, err := store.RecoverSession(context.Background(), request); !errors.Is(err, pause) {
+		t.Fatalf("initial recovery err=%v", err)
+	}
+	manifestPath := onlyGlob(t, filepath.Join(fixture.sessionDir, ".recovery-request-*.json"))
+	manifestInfo, err := os.Stat(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifestInfo.Size() <= maxSessionMetadataBytes {
+		t.Fatalf("manifest size=%d does not exercise the dedicated loader bound", manifestInfo.Size())
+	}
+	retryEncoder := &recoveryAdmissionEncoder{reject: errors.New("large manifest retry must not re-admit")}
+	retry := New(fixture.root, Options{Encoder: retryEncoder})
+	result, err := retry.RecoverSession(context.Background(), request)
+	if err != nil || result.Status != "recovered" {
+		t.Fatalf("large manifest retry result=%+v err=%v", result, err)
+	}
+	if len(retryEncoder.calls) != 0 || result.Diagnostic.Message != largeMessage {
+		t.Fatalf("large manifest retry calls=%v diagnostic message bytes=%d", retryEncoder.calls, len(result.Diagnostic.Message))
+	}
 }
 
 func TestRecoveryAdmissionRejectsBeforeAnyPersistence(t *testing.T) {

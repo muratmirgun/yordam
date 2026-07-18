@@ -15,6 +15,8 @@ Task 3 is implemented from signed base `45b656d2256c604cbacfce9feeb5704578c195e1
 - Recovery diagnostics use operation-derived compatibility, diagnostic, and marker identities plus the persisted session timestamp, so every operation-owned byte prefix is recognizable and retryable even when the first JSON line was only partly written.
 - Recovery compatibility/diagnostic payloads cross the configured encoder/admission boundary exactly once before manifest persistence; the manifest binds the canonical admitted payloads and exact transaction bytes reused by every retry.
 - A durable diagnostic reset clears only that request transaction's marker-uncertainty latch before reappend; the successfully synced retry clears the same exact latch without touching unrelated journal state.
+- Recovery admission timestamps come from the validated committed head rather than possibly stale session metadata; retries validate against that same rebuilt-head time.
+- Already-committed recovery resolves an exact in-memory marker uncertainty only after syncing and identity-checking the committed journal and repairing metadata. Recovery manifests use a dedicated 24 MiB hard bound sized for capped base64 admission material.
 - Candidate and metadata identities are checked at the final rename boundaries after active handles close; diagnostic reset applies the same fail-closed boundary validation.
 - The exact 11-case fixture matrix contains 33 fixture files plus one sorted lowercase SHA-256 manifest.
 - No config, schema, reload, Task 4+, or progress-ledger semantics were changed.
@@ -69,6 +71,14 @@ The narrow final re-review returned two Important findings. Both were reproduced
 1. The deterministic recovery path's `canonicalPayloads` flag skipped the configured encoder. A rejecting encoder was never called and a transforming encoder recorded no admissions. GREEN: the compatibility and diagnostic proposals each cross the encoder exactly once before any recovery manifest or journal mutation. Their canonical admitted payloads, timestamp, and complete deterministic transaction bytes are persisted in manifest version 2. Retry reconstructs and validates the transaction from that admission record, requires byte equality with the persisted transaction, and never invokes the encoder again. Rejecting admission leaves the complete storage tree unchanged; transforming admission persists and commits only the transformed payload with stable bytes across a partial-prefix retry.
 2. A real short marker write set the exact transaction's in-memory uncertainty latch, but diagnostic reset left it in place and same-Store reappend returned `commit_unknown`. GREEN: only after the replacement prefix is identity-checked, renamed, and directory-synced does recovery clear `markerUncertaintyKey(request.Journal, request.TransactionID)`. The completed, synced retry clears that same exact key again after append resolution. A mid-marker regression explicitly installs the latch, retries on the same Store, and proves success while an unrelated journal latch remains present.
 
+### Final three-finding re-review correction batch
+
+The next narrow re-review returned three Important findings. They were reproduced together before production changes:
+
+1. Admission used the pre-repair `session.UpdatedAt`, while recovery candidate metadata rebuilt `UpdatedAt` from the validated prefix. With stale metadata, retry failed forever because the persisted append time no longer matched the activated session. GREEN: first admission uses `rebuiltRecoveryMetadata(session, scan)`, and every uncommitted retry derives the expected time from the same validated committed scan. A stale-`UpdatedAt` fixture paused after activation and then resumed with the persisted validated-head timestamp.
+2. A full recovery marker fault left the exact `markerUncertainty` key behind even after the next call verified the committed diagnostic and repaired metadata. GREEN: the already-committed path detects only the request transaction's key, requires the retained events identity to match, syncs and re-verifies the committed journal, repairs metadata, and only then deletes that exact key. Both `marker_write` and `marker_sync` same-Store tests return `already_recovered`, preserve an unrelated journal latch, and successfully append a subsequent transaction.
+3. Recovery manifests embedded admitted payloads and transaction bytes but were still loaded with the 64 KiB session-metadata limit. GREEN: manifest read and write now share a dedicated 24 MiB hard limit, calculated to cover base64 expansion of capped admitted payloads and the three-line transaction plus bounded request-string overhead. A valid 128 KiB transformed diagnostic produces a manifest beyond 64 KiB, pauses after persistence, and resumes without re-admission.
+
 ## Implementation and compatibility
 
 ### Inspection and upcasting
@@ -89,6 +99,8 @@ The narrow final re-review returned two Important findings. Both were reproduced
 - Partial operation-owned files and diagnostic append bytes resume safely. Candidate/session/artifacts/quarantine substitution tests fail closed without changing the active source.
 - Even a non-newline-terminated prefix of the first recovery-diagnostic event is preserved and resumed only when it exactly matches the persisted operation's deterministic transaction bytes.
 - Recovery admission rejection occurs before manifest/quarantine/candidate mutation. Admitted canonical payloads and exact transaction bytes are manifest-bound and reused without re-admission.
+- Stale metadata cannot choose the diagnostic timestamp, and exact full-marker uncertainty is resolved before a same-Store subsequent append.
+- Inline admission material remains hard-bounded while valid manifests larger than session metadata load safely.
 - Recovery appends `recovery.diagnostic` in a new committed transaction and automatically includes the first-v2 compatibility declaration for a legacy-only prefix.
 
 ## Test migrations outside the nominal brief list
@@ -121,9 +133,9 @@ gofmt -l internal/session/jsonl
 Latest package results:
 
 ```text
-narrow final two-finding focused regression batch: PASS
-jsonl package: PASS (18.005s final package rerun)
-jsonl race package: PASS (36.477s final rerun)
+final three-finding focused regression batch: PASS
+jsonl package: PASS (18.492s final package rerun)
+jsonl race package: PASS (40.604s final rerun)
 repository-wide go test ./...: PASS (including internal/ptytest)
 go vet ./...: PASS
 diff/gofmt checks: PASS

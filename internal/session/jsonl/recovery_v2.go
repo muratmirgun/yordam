@@ -24,6 +24,9 @@ const (
 	recoveryManifestVersion  = 2
 	maxRecoveryJournalBytes  = 64 << 20
 	recoveryDiagnosticStatus = "recovery.completed"
+	// This covers base64 expansion of two admitted payloads plus a three-line
+	// transaction at protocol event caps, with bounded request-string overhead.
+	maxRecoveryManifestBytes = int64(8*protocol.MaxEventBytes + 8*protocol.MaxStringBytes)
 )
 
 type explicitRecoveryManifest struct {
@@ -130,8 +133,15 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 		if !ok {
 			return journal.RecoveryResult{Status: "conflict", Cursor: committed.cursor}, nil
 		}
+		uncertain, err := s.syncExactRecoveryMarkerUncertainty(ctx, transaction, request, committed)
+		if err != nil {
+			return journal.RecoveryResult{}, err
+		}
 		if err := repairCommittedRecoveryMetadata(ctx, transaction, session, scan); err != nil {
 			return journal.RecoveryResult{}, err
+		}
+		if uncertain {
+			s.clearMarkerUncertainty(request.Journal, request.TransactionID)
 		}
 		return journal.RecoveryResult{
 			Status: "already_recovered", Cursor: committed.cursor,
@@ -169,7 +179,8 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 		}
 		manifest = newExplicitRecoveryManifest(request, manifestName, operationHash, activeRaw, scan.validPrefixSize)
 		diagnostic := recoveryCompletedDiagnostic(request, manifest)
-		admitted, admissionErr := s.admitRecoveryDiagnosticAppend(session, request, diagnostic, scan)
+		validatedHead := rebuiltRecoveryMetadata(session, scan)
+		admitted, admissionErr := s.admitRecoveryDiagnosticAppend(validatedHead, request, diagnostic, scan)
 		if admissionErr != nil {
 			return journal.RecoveryResult{}, admissionErr
 		}
@@ -389,7 +400,8 @@ func (s *Store) buildRecoveryDiagnosticAppend(
 ) (deterministicRecoveryDiagnosticAppend, error) {
 	operationPrefix := "recovery:" + recoveryOperationHash(request.OperationID)
 	eventTime := admitted.EventTime.UTC()
-	if admitted.EventTime.IsZero() || !eventTime.Equal(session.UpdatedAt.UTC()) {
+	validatedHeadTime := rebuiltRecoveryMetadata(session, scan).UpdatedAt.UTC()
+	if admitted.EventTime.IsZero() || !eventTime.Equal(validatedHeadTime) {
 		return deterministicRecoveryDiagnosticAppend{}, fmt.Errorf("persisted recovery diagnostic time does not match the validated session head")
 	}
 	diagnosticPayload, err := canonicalPersistedRecoveryPayload(admitted.DiagnosticPayload)
@@ -752,6 +764,9 @@ func persistExplicitRecoveryManifest(ctx context.Context, transaction *sessionTr
 	if err != nil {
 		return err
 	}
+	if int64(len(raw)) > maxRecoveryManifestBytes {
+		return fmt.Errorf("recovery manifest exceeds %d bytes", maxRecoveryManifestBytes)
+	}
 	if err := ensureRootedContents(ctx, transaction.sessionRoot, manifest.RequestTemporary, raw, 0o600); err != nil {
 		return err
 	}
@@ -777,7 +792,7 @@ func loadExplicitRecoveryManifest(ctx context.Context, transaction *sessionTrans
 	if err != nil {
 		return explicitRecoveryManifest{}, false, err
 	}
-	raw, readErr := readOpenedFile(ctx, file, maxSessionMetadataBytes)
+	raw, readErr := readOpenedFile(ctx, file, maxRecoveryManifestBytes)
 	closeErr := file.Close()
 	if readErr != nil || closeErr != nil {
 		return explicitRecoveryManifest{}, false, errors.Join(readErr, closeErr)
@@ -914,6 +929,34 @@ func rebuiltRecoveryMetadata(session domain.Session, scan journalScan) domain.Se
 		}
 	}
 	return rebuilt
+}
+
+func (s *Store) syncExactRecoveryMarkerUncertainty(
+	ctx context.Context,
+	transaction *sessionTransaction,
+	request journal.RecoveryRequest,
+	committed scannedCommit,
+) (bool, error) {
+	value, uncertain := s.state.markerUncertainty.Load(markerUncertaintyKey(request.Journal, request.TransactionID))
+	if !uncertain {
+		return false, nil
+	}
+	eventsInfo, ok := value.(os.FileInfo)
+	if !ok || eventsInfo == nil || transaction.eventsInfo == nil || !os.SameFile(eventsInfo, transaction.eventsInfo) ||
+		committed.cursor.TransactionID != request.TransactionID || committed.cursor.JournalKind != request.Journal.Kind ||
+		committed.cursor.JournalID != request.Journal.ID {
+		return false, errUnresolvedMarkerDurability
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := transaction.events.Sync(); err != nil {
+		return false, err
+	}
+	if err := errors.Join(ctx.Err(), transaction.verifyEvents()); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func repairCommittedRecoveryMetadata(ctx context.Context, transaction *sessionTransaction, session domain.Session, scan journalScan) error {
