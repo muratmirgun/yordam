@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -156,6 +157,217 @@ func TestRuntimeCompositionUsesOnlyOrchestratedRunner(t *testing.T) {
 	if set.Orchestrator == nil || set.ProviderCatalog == nil || set.ProviderService == nil || set.ToolService == nil || set.AuthorizationService == nil || set.Broker == nil || set.ApplicationService == nil || set.LegacyAdapter == nil {
 		t.Fatalf("foundation composition is incomplete: %+v", set)
 	}
+}
+
+func TestProductionLegacyCommandUsesApplicationProtocolAndRealCursorProjection(t *testing.T) {
+	var providerRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		if providerRequests.Add(1) == 1 {
+			arguments := `{"path":"protocol-evidence.txt","create":true,"new_content":"committed evidence\n"}`
+			fmt.Fprintf(response, "data: {\"id\":\"request-production-tool\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"edit-production\",\"function\":{\"name\":\"edit\",\"arguments\":%q}}]}}]}\n\n", arguments)
+			fmt.Fprintln(response, `data: {"id":"request-production-tool","choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
+			fmt.Fprintln(response)
+			fmt.Fprintln(response, "data: [DONE]")
+			fmt.Fprintln(response)
+			return
+		}
+		fmt.Fprintln(response, `data: {"id":"request-production","choices":[{"delta":{"content":"protocol reply"},"finish_reason":"stop"}]}`)
+		fmt.Fprintln(response)
+		fmt.Fprintln(response, "data: [DONE]")
+		fmt.Fprintln(response)
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.jsonc")
+	configBody := fmt.Sprintf(`{
+  "model": "primary/model-a",
+  "provider": {
+    "primary": {
+      "options": {"baseURL": %q, "apiKeyEnv": "PRIMARY_KEY"},
+      "models": {"model-a": {}}
+    }
+  }
+}`, server.URL)
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PRIMARY_KEY", "production-key")
+	application, bootstrapSnapshot, err := Bootstrap(t.Context(), BootstrapOptions{
+		ConfigPath: configPath, CWD: root, HTTPClient: server.Client(),
+		CLI: cli.Options{Mode: domain.ModeAsk, DataDir: filepath.Join(root, "data"), MaxToolCalls: 32, ShellTimeout: 2 * time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, subscription, err := application.runtimeSet.ApplicationService.SnapshotAndSubscribe(t.Context(), protocol.SnapshotRequest{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(bootstrapSnapshot.Session.ID), Consumer: "production-equivalence", QueueCapacity: 128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Close()
+	if initial.Durable.Task != nil || len(initial.Durable.Activities) != 0 {
+		t.Fatalf("initial projection unexpectedly contains turn state: %+v", initial.Durable)
+	}
+
+	application.runtimeSet.Runtime = forbiddenLegacyRuntime{}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- application.Run(ctx) }()
+	tuiSemantic := []string{}
+	application.Commands() <- Command{Kind: CommandChangeMode, Mode: domain.ModeAuto}
+	for {
+		select {
+		case event := <-application.Events():
+			if event.Kind == EventError || event.Kind == EventRejected {
+				t.Fatalf("production setting command failed: %+v", event)
+			}
+			if event.Kind == EventState && event.Mode == domain.ModeAuto {
+				tuiSemantic = append(tuiSemantic, legacyConsumerSemantic(event)...)
+				goto modeChanged
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatal("timed out waiting for application-protocol setting")
+		}
+	}
+
+modeChanged:
+	store := application.sessions.(*jsonl.Store)
+	workspaceInspection, err := store.Inspect(t.Context(), application.workspaceControl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionInspection, err := store.Inspect(t.Context(), protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(bootstrapSnapshot.Session.ID)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceKinds := inspectionKinds(workspaceInspection.Events)
+	sessionKinds := inspectionKinds(sessionInspection.Events)
+	if !slices.Contains(workspaceKinds, protocol.EventControlOperationAuthorized) || !slices.Contains(workspaceKinds, protocol.EventAuthorizationDecisionConsumed) || !slices.Contains(workspaceKinds, protocol.EventControlOperationStarted) || !slices.Contains(workspaceKinds, protocol.EventCommandCompleted) {
+		t.Fatalf("setting command missed canonical workspace control lifecycle: %v", workspaceKinds)
+	}
+	if countString(sessionKinds, protocol.EventModeChanged) != 1 || slices.Contains(sessionKinds, protocol.EventControlOperationStarted) {
+		t.Fatalf("setting consequence was not isolated to the session journal: %v", sessionKinds)
+	}
+
+	application.Commands() <- Command{Kind: CommandStartTurn, DraftID: 41, Prompt: "through application protocol"}
+	for {
+		select {
+		case event := <-application.Events():
+			if event.Kind == EventError {
+				t.Fatalf("production command failed: %+v", event)
+			}
+			if event.Kind == EventTurnCompleted {
+				tuiSemantic = append(tuiSemantic, legacyConsumerSemantic(event)...)
+				goto completed
+			}
+			tuiSemantic = append(tuiSemantic, legacyConsumerSemantic(event)...)
+		case <-time.After(20 * time.Second):
+			t.Fatal("timed out waiting for application-protocol turn")
+		}
+	}
+
+completed:
+	current, currentSubscription, err := application.runtimeSet.ApplicationService.SnapshotAndSubscribe(t.Context(), protocol.SnapshotRequest{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(bootstrapSnapshot.Session.ID), Consumer: "production-equivalence", QueueCapacity: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = currentSubscription.Close()
+	if current.Durable.Task == nil || len(current.Durable.Activities) < 2 || len(current.Durable.Evidence) == 0 || !strings.Contains(string(current.Durable.Task.Data), "through application protocol") {
+		t.Fatalf("current durable projection is not journal-derived: %+v", current.Durable)
+	}
+	if !strings.Contains(string(current.Durable.Permissions.Data), `"decisions":`) || strings.Contains(string(current.Durable.Permissions.Data), `"decisions":{}`) {
+		t.Fatalf("current durable projection has no committed authorization state: %s", current.Durable.Permissions.Data)
+	}
+	if !strings.Contains(string(current.Durable.Workspace.Data), `"consumed":`) || strings.Contains(string(current.Durable.Workspace.Data), `"consumed":{}`) {
+		t.Fatalf("current durable projection has no committed control authorization state: %s", current.Durable.Workspace.Data)
+	}
+	oldDurable, _, err := (runtimeBrokerSource{Repository: store, Workspace: application.workspaceControl, Generation: application.runtimeSet.RuntimeGenerationID}).Project(t.Context(), SnapshotVector{
+		WorkspaceControl: initial.Cursor.WorkspaceControl, SelectedSession: initial.Cursor.SelectedSession,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldDurable.Task != nil || len(oldDurable.Activities) != 0 {
+		t.Fatalf("projection at old cursor observed later turn: %+v", oldDurable)
+	}
+
+	legacyCompleted := false
+	legacySemantic := []string{}
+	for !legacyCompleted {
+		item, err := subscription.Next(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if item.Event == nil {
+			continue
+		}
+		legacy, err := application.runtimeSet.LegacyAdapter.Event(*item.Event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		legacySemantic = append(legacySemantic, legacyConsumerSemantic(legacy)...)
+		legacyCompleted = legacy.Kind == EventTurnCompleted
+	}
+	raw, err := json.Marshal(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var headless protocol.ApplicationSnapshot
+	if err := json.Unmarshal(raw, &headless); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(current.Durable, headless.Durable) || !reflect.DeepEqual(tuiSemantic, legacySemantic) {
+		t.Fatalf("consumer equivalence tui=%v legacy=%v headless=%+v current=%+v", tuiSemantic, legacySemantic, headless.Durable, current.Durable)
+	}
+	application.Commands() <- Command{Kind: CommandShutdown}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func legacyConsumerSemantic(event Event) []string {
+	switch event.Kind {
+	case EventState:
+		return []string{"state"}
+	case EventTurnAccepted:
+		return []string{"turn.accepted"}
+	case EventTextDelta:
+		return []string{"text:" + event.Runtime.Text}
+	case EventTurnCompleted:
+		return []string{"turn.completed"}
+	default:
+		return nil
+	}
+}
+
+func inspectionKinds(events []protocol.EventRecord) []string {
+	kinds := make([]string, 0, len(events))
+	for _, event := range events {
+		kinds = append(kinds, event.Envelope.Kind)
+	}
+	return kinds
+}
+
+func countString(values []string, target string) int {
+	count := 0
+	for _, value := range values {
+		if value == target {
+			count++
+		}
+	}
+	return count
+}
+
+type forbiddenLegacyRuntime struct{}
+
+func (forbiddenLegacyRuntime) RunTurn(context.Context, agent.RunInput) error {
+	return errors.New("legacy Runtime.RunTurn bypass was invoked")
 }
 
 func TestRuntimeGenerationsKeepImmutableRedactors(t *testing.T) {

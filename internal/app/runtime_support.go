@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/muratmirgun/yordam/internal/activity"
 	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/config"
@@ -17,12 +18,14 @@ import (
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/orchestrator"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/projection"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/provider"
 	"github.com/muratmirgun/yordam/internal/provider/openaicompat"
 	"github.com/muratmirgun/yordam/internal/recovery"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
+	taskprojection "github.com/muratmirgun/yordam/internal/task"
 	"github.com/muratmirgun/yordam/internal/tooling"
 )
 
@@ -381,15 +384,26 @@ func (s runtimeBrokerSource) ReadRange(ctx context.Context, request journal.Read
 	return s.Repository.ReadRange(ctx, request)
 }
 
-func (s runtimeBrokerSource) Project(_ context.Context, vector SnapshotVector) (protocol.DurableProjection, protocol.RuntimeProjection, error) {
-	data := json.RawMessage(`{}`)
-	view := func(id, kind string) protocol.ProjectionView {
-		return protocol.ProjectionView{ID: id, Kind: kind, Status: "ready", State: protocol.ValueKnown, Data: protocol.CloneRawMessage(data)}
+func (s runtimeBrokerSource) Project(ctx context.Context, vector SnapshotVector) (protocol.DurableProjection, protocol.RuntimeProjection, error) {
+	workspaceRef := s.Workspace
+	workspaceAuthorization, err := projection.New[authorization.Projection](s.Repository, authorization.Projector{}, nil).At(ctx, workspaceRef, vector.WorkspaceControl)
+	if err != nil {
+		return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("project workspace control at cursor: %w", err)
+	}
+	workspaceData, err := canonicaljson.Marshal(workspaceAuthorization.State)
+	if err != nil {
+		return protocol.DurableProjection{}, protocol.RuntimeProjection{}, err
+	}
+	unknown := func(id, kind string) protocol.ProjectionView {
+		return protocol.ProjectionView{ID: id, Kind: kind, Status: "unknown", State: protocol.ValueUnknown, Data: json.RawMessage(`{}`)}
+	}
+	known := func(id, kind, status string, data json.RawMessage) protocol.ProjectionView {
+		return protocol.ProjectionView{ID: id, Kind: kind, Status: status, State: protocol.ValueKnown, Data: protocol.CloneRawMessage(data)}
 	}
 	durable := protocol.DurableProjection{
-		Workspace:  view(string(vector.WorkspaceControl.JournalID), "workspace"),
-		Activities: []protocol.ProjectionView{}, Provider: view("provider", "provider"), MCP: []protocol.ProjectionView{},
-		Instructions: []protocol.ProjectionView{}, Permissions: view("permissions", "permissions"), Context: view("context", "context"),
+		Workspace:  known(string(workspaceRef.ID), "workspace", "ready", workspaceData),
+		Activities: []protocol.ProjectionView{}, Provider: unknown("provider", "provider"), MCP: []protocol.ProjectionView{},
+		Instructions: []protocol.ProjectionView{}, Permissions: known("workspace-permissions", "permissions", "ready", workspaceData), Context: unknown("context", "context"),
 		Usage: protocol.ModelUsage{
 			Input: protocol.UsageValue{State: protocol.UsageUnknown}, Output: protocol.UsageValue{State: protocol.UsageUnknown},
 			Cached: protocol.UsageValue{State: protocol.UsageUnknown}, CacheWrite: protocol.UsageValue{State: protocol.UsageUnknown}, Reasoning: protocol.UsageValue{State: protocol.UsageUnknown},
@@ -397,10 +411,74 @@ func (s runtimeBrokerSource) Project(_ context.Context, vector SnapshotVector) (
 		Cost: protocol.CostValue{State: protocol.ValueUnknown}, Checkpoints: []protocol.ProjectionView{}, Evidence: []protocol.ProjectionView{}, Receipts: []protocol.ProjectionView{}, RecoveryDiagnostics: []protocol.Diagnostic{},
 	}
 	if vector.SelectedSession != nil {
-		selected := view(string(vector.SelectedSession.JournalID), "session")
+		ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: vector.SelectedSession.JournalID}
+		tasks, projectErr := projection.New[taskprojection.Projection](s.Repository, taskprojection.Projector{}, nil).At(ctx, ref, *vector.SelectedSession)
+		if projectErr != nil {
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("project tasks at cursor: %w", projectErr)
+		}
+		activities, projectErr := projection.New[activity.Projection](s.Repository, activity.Projector{}, nil).At(ctx, ref, *vector.SelectedSession)
+		if projectErr != nil {
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("project activities at cursor: %w", projectErr)
+		}
+		permissions, projectErr := projection.New[authorization.Projection](s.Repository, authorization.Projector{}, nil).At(ctx, ref, *vector.SelectedSession)
+		if projectErr != nil {
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("project permissions at cursor: %w", projectErr)
+		}
+		taskData, marshalErr := canonicaljson.Marshal(tasks.State)
+		if marshalErr != nil {
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, marshalErr
+		}
+		selected := known(string(ref.ID), "session", "ready", taskData)
 		durable.SelectedSession = &selected
+		permissionData, marshalErr := canonicaljson.Marshal(permissions.State)
+		if marshalErr != nil {
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, marshalErr
+		}
+		durable.Permissions = known(string(ref.ID), "permissions", "ready", permissionData)
+		taskIDs := make([]protocol.TaskID, 0, len(tasks.State.Tasks))
+		for taskID := range tasks.State.Tasks {
+			taskIDs = append(taskIDs, taskID)
+		}
+		slices.Sort(taskIDs)
+		if len(taskIDs) != 0 {
+			record := tasks.State.Tasks[taskIDs[len(taskIDs)-1]]
+			recordData, marshalErr := canonicaljson.Marshal(record)
+			if marshalErr != nil {
+				return protocol.DurableProjection{}, protocol.RuntimeProjection{}, marshalErr
+			}
+			taskView := known(string(record.TaskID), "task", string(record.State), recordData)
+			durable.Task = &taskView
+			outcomeData, marshalErr := canonicaljson.Marshal(record.Outcome)
+			if marshalErr != nil {
+				return protocol.DurableProjection{}, protocol.RuntimeProjection{}, marshalErr
+			}
+			outcomeView := known(string(record.OutcomeContractID), "outcome", record.Outcome.Status, outcomeData)
+			durable.Outcome = &outcomeView
+		}
+		for _, activityID := range activities.State.Order {
+			record := activities.State.Activities[activityID]
+			recordData, marshalErr := canonicaljson.Marshal(record)
+			if marshalErr != nil {
+				return protocol.DurableProjection{}, protocol.RuntimeProjection{}, marshalErr
+			}
+			durable.Activities = append(durable.Activities, known(string(activityID), record.Kind, string(record.State), recordData))
+		}
+		evidenceIDs := make([]protocol.EvidenceID, 0, len(tasks.State.EvidenceAvailability))
+		for evidenceID := range tasks.State.EvidenceAvailability {
+			evidenceIDs = append(evidenceIDs, evidenceID)
+		}
+		slices.Sort(evidenceIDs)
+		for _, evidenceID := range evidenceIDs {
+			availability := tasks.State.EvidenceAvailability[evidenceID]
+			data, marshalErr := canonicaljson.Marshal(availability)
+			if marshalErr != nil {
+				return protocol.DurableProjection{}, protocol.RuntimeProjection{}, marshalErr
+			}
+			durable.Evidence = append(durable.Evidence, known(string(evidenceID), "evidence", string(availability), data))
+		}
+		durable.RecoveryDiagnostics = protocol.DeepCopy(tasks.State.Diagnostics)
 	}
-	runtime := protocol.RuntimeProjection{RuntimeGenerationID: s.Generation, ActiveStreams: []protocol.ProjectionView{}, Connections: []protocol.ProjectionView{}}
+	runtime := protocol.RuntimeProjection{RuntimeGenerationID: s.Generation, ActiveStreams: []protocol.ProjectionView{}, Connections: []protocol.ProjectionView{}, RevocationEpoch: workspaceAuthorization.State.RevocationEpoch}
 	return durable, runtime, nil
 }
 
@@ -408,6 +486,7 @@ type runtimeCommandDispatcher struct {
 	Orchestrator *orchestrator.Service
 	Store        *jsonl.Store
 	Manifest     protocol.RuntimeGenerationManifest
+	Workspace    protocol.JournalRef
 }
 
 func (d runtimeCommandDispatcher) DispatchCommand(ctx context.Context, metadata orchestrator.CommandMetadata, command protocol.Command, decoded any) (protocol.CommandResult, error) {
@@ -429,9 +508,80 @@ func (d runtimeCommandDispatcher) DispatchCommand(ctx context.Context, metadata 
 			Prompt: payload.Prompt, ProviderID: protocol.ProviderID(state.Selection.Profile), ModelID: protocol.ModelID(state.Selection.Model), Runtime: protocol.DeepCopy(d.Manifest),
 		})
 		return result.CommandResult, err
+	case *protocol.ChangeModeCommandV1:
+		mode := domain.PermissionMode(payload.Mode)
+		if err := mode.Validate(); err != nil {
+			return failedCommand(command, codeInvalidPayload, err.Error(), false), nil
+		}
+		return d.runSettingControl(ctx, metadata, command, protocol.EventModeChanged, protocol.ModeChangedV1{Mode: payload.Mode}, "mode", "change permission mode")
+	case *protocol.ChangeModelCommandV1:
+		configured := false
+		for _, model := range d.Manifest.Body.Models {
+			if model.ProviderID == payload.ProviderID && model.ModelID == payload.ModelID {
+				configured = true
+				break
+			}
+		}
+		if !configured {
+			return failedCommand(command, codeInvalidPayload, "model selection is not part of this runtime generation", false), nil
+		}
+		return d.runSettingControl(ctx, metadata, command, protocol.EventModelChanged, protocol.ModelChangedV1{ProviderID: payload.ProviderID, ModelID: payload.ModelID}, "model", "change model selection")
+	case *protocol.TrustedShellCommandV1:
+		return d.runSettingControl(ctx, metadata, command, protocol.EventTrustedExecutionAcknowledged, protocol.TrustedExecutionAcknowledgedV1{Enabled: payload.Enabled, Profile: "unsandboxed"}, "trusted-shell", "acknowledge trusted shell execution")
 	default:
 		return failedCommand(command, codeUnsupportedCommand, "command is not available through this runtime generation", false), nil
 	}
+}
+
+func (d runtimeCommandDispatcher) runSettingControl(ctx context.Context, metadata orchestrator.CommandMetadata, command protocol.Command, eventKind string, eventPayload any, action, purpose string) (protocol.CommandResult, error) {
+	if command.Expected == nil || command.Expected.WorkspaceControl == nil || command.Expected.Session == nil || command.Expected.SelectedSessionID == "" {
+		return failedCommand(command, codeInvalidCommand, "setting command requires workspace and selected-session cursors", false), nil
+	}
+	workspace := d.Workspace
+	if workspace == (protocol.JournalRef{}) {
+		workspace = protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: command.Expected.WorkspaceControl.JournalID}
+	}
+	session := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(command.Expected.SelectedSessionID)}
+	identity := "setting-" + string(command.CommandID)
+	descriptorDigest, err := canonicaljson.Digest(struct {
+		Name string `json:"name"`
+	}{"runtime.setting." + action})
+	if err != nil {
+		return protocol.CommandResult{}, err
+	}
+	body := protocol.ActionPlanBody{
+		CallID: identity, Tool: protocol.ToolIdentity{Source: "runtime", Authority: "yordam", Name: "setting"}, SourceRevision: "runtime-v1",
+		DescriptorDigest: descriptorDigest, Action: "runtime.setting." + action, Purpose: purpose,
+		Resources:            []protocol.ResourceTarget{{Kind: "session_journal", CanonicalID: string(command.Expected.SelectedSessionID)}},
+		ExecutionLocus:       "runtime",
+		Effect:               "mutation",
+		Boundary:             "session",
+		Reversibility:        "exact",
+		VerificationCoverage: "exact",
+		RequestedProfile:     "restricted",
+		EffectiveProfile:     "restricted",
+		RuntimeGenerationID:  d.Manifest.ID,
+	}
+	planDigest, err := canonicaljson.Digest(body)
+	if err != nil {
+		return protocol.CommandResult{}, err
+	}
+	payload, err := canonicaljson.Marshal(eventPayload)
+	if err != nil {
+		return protocol.CommandResult{}, err
+	}
+	actor := protocol.DeepCopy(metadata.Actor)
+	result, err := d.Orchestrator.RunControl(ctx, orchestrator.ControlRequest{
+		Command: metadata, OperationID: protocol.ControlOperationID(identity), Kind: orchestrator.OperationControl,
+		Journal: workspace, ExpectedHead: *command.Expected.WorkspaceControl, TransactionID: protocol.TransactionID(identity + "-terminal"),
+		ConsequentialJournal: session, ConsequentialExpectedHead: *command.Expected.Session,
+		Runtime: protocol.DeepCopy(d.Manifest), Plan: protocol.ActionPlan{Body: body, Digest: planDigest},
+		Event: protocol.ProposedEvent{
+			EventID: protocol.EventID(identity + "-consequence"), Time: time.Now().UTC(), PayloadVersion: 1, Kind: eventKind,
+			SessionID: command.Expected.SelectedSessionID, Actor: &actor, RuntimeGenerationID: d.Manifest.ID, Payload: payload,
+		},
+	})
+	return result.CommandResult, err
 }
 
 func runtimeCommandExpectation(store *jsonl.Store, workspace protocol.JournalRef, active *sessionBinding) func() *protocol.CommandExpectation {

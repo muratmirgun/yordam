@@ -307,7 +307,6 @@ func (b *Broker) PublishCommitted(_ context.Context, ref protocol.JournalRef, cu
 
 func (b *Broker) PublishTransient(event protocol.ApplicationEvent) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.streamSeq++
 	if event.Time.IsZero() {
 		event.Time = time.Now().UTC()
@@ -324,6 +323,10 @@ func (b *Broker) PublishTransient(event protocol.ApplicationEvent) error {
 	if len(event.Payload) == 0 {
 		event.Payload = json.RawMessage(`{}`)
 	}
+	callbacks := make([]struct {
+		consumer string
+		terminal protocol.SubscriptionTerminal
+	}, 0)
 	for _, subscription := range b.subscriptions {
 		if subscription.closed || subscription.terminal {
 			continue
@@ -332,9 +335,23 @@ func (b *Broker) PublishTransient(event protocol.ApplicationEvent) error {
 		copyEvent.Cursor = protocol.DeepCopy(subscription.cursor)
 		copyEvent.Cursor.Stream = protocol.StreamCursor{Epoch: b.epoch, Seq: b.streamSeq}
 		if err := copyEvent.Validate(); err != nil {
+			b.mu.Unlock()
 			return err
 		}
-		subscription.enqueueEventLocked(copyEvent)
+		if !subscription.enqueueEventLocked(copyEvent) {
+			if subscription.consumer == ConsumerFakeHeadless && !subscription.overflowFired && b.nonReconnectableOverflow != nil {
+				subscription.overflowFired = true
+				callbacks = append(callbacks, struct {
+					consumer string
+					terminal protocol.SubscriptionTerminal
+				}{subscription.consumer, *subscription.queue[len(subscription.queue)-1].Terminal})
+			}
+			delete(b.subscriptions, subscription.id)
+		}
+	}
+	b.mu.Unlock()
+	for _, callback := range callbacks {
+		b.nonReconnectableOverflow(callback.consumer, protocol.DeepCopy(callback.terminal))
 	}
 	return nil
 }

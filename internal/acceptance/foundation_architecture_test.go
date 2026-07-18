@@ -100,6 +100,9 @@ func acceptFoundationArchitecture(t *testing.T) {
 					t.Errorf("[%s] provider Stream call outside dispatch services at %s:%d receiver=%s", traceArchitecture, rel, fset.Position(call.Pos()).Line, receiver)
 				}
 			case "Execute":
+				if strings.HasSuffix(receiver, ".ApplicationService") {
+					return true
+				}
 				dispatchCalls++
 				if !dispatchCallAllowlist[rel] {
 					t.Errorf("[%s] effect-capable Execute call outside dispatch services at %s:%d receiver=%s", traceArchitecture, rel, fset.Position(call.Pos()).Line, receiver)

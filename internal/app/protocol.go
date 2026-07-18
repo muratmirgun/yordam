@@ -171,7 +171,7 @@ func validateCommandExpectation(expectation *protocol.CommandExpectation) error 
 		return nil
 	}
 	if expectation.WorkspaceControl != nil {
-		if err := expectation.WorkspaceControl.Validate(); err != nil || expectation.WorkspaceControl.JournalKind != protocol.JournalWorkspaceControl {
+		if *expectation.WorkspaceControl != (protocol.CommittedCursor{}) && (expectation.WorkspaceControl.Validate() != nil || expectation.WorkspaceControl.JournalKind != protocol.JournalWorkspaceControl) {
 			return fmt.Errorf("workspace-control cursor is invalid")
 		}
 	}
@@ -326,12 +326,14 @@ func (s *ProtocolService) Execute(ctx context.Context, command protocol.Command)
 func (s *ProtocolService) commandJournal(command protocol.Command, decoded any) (protocol.JournalRef, error) {
 	workspaceCommand := command.Kind == CommandKindStartControlOperation || command.Kind == string(CommandReloadConfig) ||
 		command.Kind == string(CommandNewSession) || command.Kind == string(CommandOpenSession) ||
+		command.Kind == string(CommandChangeMode) || command.Kind == string(CommandChangeModel) ||
+		command.Kind == string(CommandAcknowledgeAutoShell) ||
 		command.Kind == CommandKindRequestSnapshot || command.Kind == CommandKindSubscribeEvents
 	if cancel, ok := decoded.(*protocol.CancelCommandV1); ok && cancel.ControlOperationID != "" {
 		workspaceCommand = true
 	}
 	if workspaceCommand {
-		if command.Expected != nil && command.Expected.WorkspaceControl != nil && cursorJournal(*command.Expected.WorkspaceControl) != s.workspaceControl {
+		if command.Expected != nil && command.Expected.WorkspaceControl != nil && *command.Expected.WorkspaceControl != (protocol.CommittedCursor{}) && cursorJournal(*command.Expected.WorkspaceControl) != s.workspaceControl {
 			return protocol.JournalRef{}, requestError(codeInvalidCommand, "workspace-control expectation does not match service", nil)
 		}
 		return s.workspaceControl, nil

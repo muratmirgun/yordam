@@ -276,6 +276,11 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 	if appendResult.Status != journal.AppendCommitted || appendResult.Cursor != finalCursor {
 		return protocol.CommittedCursor{}, fmt.Errorf("recovery session terminal append status %q", appendResult.Status)
 	}
+	if s.publisher != nil {
+		if err := s.publisher.PublishCommitted(ctx, request.Storage.Journal, appendResult.Cursor, appendResult.Events); err != nil {
+			return protocol.CommittedCursor{}, err
+		}
+	}
 	return finalCursor, nil
 }
 

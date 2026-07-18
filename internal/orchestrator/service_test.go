@@ -54,7 +54,7 @@ func TestRunTurnProviderLifecycleUsesDurableAuthorizationAndTerminalBarriers(t *
 	wantPrefix := []string{
 		"lane.acquire(turn)", "turn_lease.acquire",
 		"append(command.accepted,task.created,user.message,outcome.contract_declared,turn.accepted)",
-		"append(outcome.contract_amended,task.status_changed)",
+		"append(outcome.contract_amended,task.status_changed,turn.state_changed)",
 		"context.plan", "provider.negotiate", "provider.prepare",
 		"append(context.plan_recorded,provider.capability_decided,activity.planned,authorization.requested)",
 		"authorization.decide", "append(authorization.decided,activity.authorized)",
@@ -327,7 +327,7 @@ func TestConcurrentSameCommandPureAndSessionChangesCommitOneLifecycle(t *testing
 		}
 	})
 
-	t.Run("session_change", func(t *testing.T) {
+	t.Run("pure_session_title", func(t *testing.T) {
 		request := validStartTurnRequest()
 		repository := &recordingRepository{head: request.ExpectedHead}
 		service, err := NewService(Dependencies{Lane: NewOperationLane(), Repository: repository, Admission: passthroughAdmission{}})
@@ -337,8 +337,8 @@ func TestConcurrentSameCommandPureAndSessionChangesCommitOneLifecycle(t *testing
 		change := SessionChangeRequest{
 			Command: request.Command, OperationID: "operation-a",
 			Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(request.SessionID)}, SessionID: request.SessionID,
-			ExpectedHead: request.ExpectedHead, TransactionID: "transaction-session-change", RuntimeGenerationID: "generation-a", Consequential: true,
-			Event: proposedSessionEvent(protocol.EventModeChanged, request.SessionID, protocol.ModeChangedV1{Mode: "safe"}),
+			ExpectedHead: request.ExpectedHead, TransactionID: "transaction-session-change", RuntimeGenerationID: "generation-a",
+			Event: proposedSessionEvent(protocol.EventSessionTitleChanged, request.SessionID, protocol.SessionTitleChangedV1{Title: "renamed"}),
 		}
 		runConcurrent(t, func() error {
 			_, commitErr := service.CommitSessionChange(context.Background(), change)
@@ -378,7 +378,7 @@ func runConcurrent(t *testing.T, call func() error) {
 	}
 }
 
-func TestCommitSessionChangeRoutesModeThroughApplicationControlLaneAndIsIdempotent(t *testing.T) {
+func TestCommitSessionChangeCommitsOnlyPureTitleMetadataAndIsIdempotent(t *testing.T) {
 	log := &recordLog{}
 	request := validStartTurnRequest()
 	repository := &recordingRepository{head: request.ExpectedHead, log: log}
@@ -389,8 +389,8 @@ func TestCommitSessionChangeRoutesModeThroughApplicationControlLaneAndIsIdempote
 	change := SessionChangeRequest{
 		Command: request.Command, OperationID: "operation-a",
 		Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(request.SessionID)}, SessionID: request.SessionID,
-		ExpectedHead: request.ExpectedHead, TransactionID: "transaction-session-change", RuntimeGenerationID: "generation-a", Consequential: true,
-		Event: proposedSessionEvent(protocol.EventModeChanged, request.SessionID, protocol.ModeChangedV1{Mode: "safe"}),
+		ExpectedHead: request.ExpectedHead, TransactionID: "transaction-session-change", RuntimeGenerationID: "generation-a",
+		Event: proposedSessionEvent(protocol.EventSessionTitleChanged, request.SessionID, protocol.SessionTitleChangedV1{Title: "renamed"}),
 	}
 	first, err := service.CommitSessionChange(context.Background(), change)
 	if err != nil {
@@ -403,16 +403,16 @@ func TestCommitSessionChangeRoutesModeThroughApplicationControlLaneAndIsIdempote
 	if first.Status != "completed" || duplicate.Status != first.Status || len(repository.batchKinds()) != 1 {
 		t.Fatalf("first=%+v duplicate=%+v batches=%v", first, duplicate, repository.batchKinds())
 	}
-	if got := log.snapshot(); !containsContiguous(got, []string{"lane.acquire(control)", "append(command.accepted,mode.changed,command.completed)", "lane.release"}) {
-		t.Fatalf("control lane ordering=%v", got)
+	if got := log.snapshot(); !containsContiguous(got, []string{"append(command.accepted,session.title_changed,command.completed)"}) || slices.Contains(got, "lane.acquire(control)") {
+		t.Fatalf("pure title ordering=%v", got)
 	}
 
 	bypass := change
 	bypass.Command.CommandID = "command-b"
 	bypass.Command.RequestDigest = repeatedDigest("8")
-	bypass.Consequential = false
+	bypass.Consequential = true
 	if _, err := service.CommitSessionChange(context.Background(), bypass); err == nil {
-		t.Fatal("mode change bypassed the application control lane")
+		t.Fatal("pure title was misclassified as consequential")
 	}
 }
 

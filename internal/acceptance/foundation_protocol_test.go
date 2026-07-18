@@ -455,44 +455,6 @@ func assertSyntheticSecretSplit(t *testing.T) {
 
 func assertApplicationConsumerEquivalence(t *testing.T) {
 	t.Helper()
-	taskData := json.RawMessage(`{"goal":"foundation","contract":"frozen"}`)
-	activityData := json.RawMessage(`{"purpose":"verify protocol","decision":"allow","evidence":"evidence-a"}`)
-	snapshot := protocol.ApplicationSnapshot{
-		ProtocolVersion: protocol.ApplicationProtocolVersion,
-		Cursor: protocol.ApplicationCursor{
-			WorkspaceControl: protocol.CommittedCursor{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", CommitSeq: 2, TransactionID: "workspace-txn"},
-			SelectedSession:  &protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "session", CommitSeq: 4, TransactionID: "session-txn"},
-			Stream:           protocol.StreamCursor{Epoch: "epoch", Seq: 3},
-		},
-		Durable: protocol.DurableProjection{
-			Task:       &protocol.ProjectionView{ID: "task", Kind: "task", Status: "running", State: protocol.ValueKnown, Data: taskData},
-			Activities: []protocol.ProjectionView{{ID: "activity", Kind: "tool_execution", Status: "succeeded", State: protocol.ValueKnown, Data: activityData}},
-		},
-	}
-	raw, err := json.Marshal(snapshot)
-	if err != nil {
-		t.Fatalf("[%s] fake-headless encode: %v", traceApplication, err)
-	}
-	var fakeHeadless protocol.ApplicationSnapshot
-	if err := json.Unmarshal(raw, &fakeHeadless); err != nil {
-		t.Fatalf("[%s] fake-headless decode: %v", traceApplication, err)
-	}
-	tuiSemantic := durableSemantic(snapshot.Durable)
-	headlessSemantic := durableSemantic(fakeHeadless.Durable)
-	if !reflect.DeepEqual(tuiSemantic, headlessSemantic) {
-		t.Fatalf("[%s] TUI=%v fake-headless=%v", traceApplication, tuiSemantic, headlessSemantic)
-	}
-	t.Logf("trace=%s consumers=tui,fake_headless semantic_state=%v", traceApplication, tuiSemantic)
-}
-
-func durableSemantic(projection protocol.DurableProjection) []string {
-	var result []string
-	if projection.Task != nil {
-		result = append(result, "task:"+projection.Task.ID+":"+projection.Task.Status+":"+string(projection.Task.Data))
-	}
-	for _, activity := range projection.Activities {
-		result = append(result, "activity:"+activity.ID+":"+activity.Status+":"+string(activity.Data))
-	}
-	sort.Strings(result)
-	return result
+	runFoundationGoTest(t, traceApplication, "./internal/app", `^TestProductionLegacyCommandUsesApplicationProtocolAndRealCursorProjection$`)
+	t.Logf("trace=%s consumers=tui,fake_headless source=production_journals cursor=exact", traceApplication)
 }

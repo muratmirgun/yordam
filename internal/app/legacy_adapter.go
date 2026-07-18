@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,6 +42,9 @@ type LegacyAdapter struct {
 	cursor            func() *protocol.CommandExpectation
 	now               func() time.Time
 	sequence          atomic.Uint64
+	pendingMu         sync.Mutex
+	pending           map[protocol.CommandID]Command
+	turns             map[protocol.TurnID]Command
 }
 
 func NewLegacyAdapter(options LegacyAdapterOptions) *LegacyAdapter {
@@ -50,7 +54,10 @@ func NewLegacyAdapter(options LegacyAdapterOptions) *LegacyAdapter {
 	if options.Now == nil {
 		options.Now = func() time.Time { return time.Now().UTC() }
 	}
-	return &LegacyAdapter{actor: options.Actor, selectedSessionID: options.SelectedSessionID, cursor: options.Cursor, now: options.Now}
+	return &LegacyAdapter{
+		actor: options.Actor, selectedSessionID: options.SelectedSessionID, cursor: options.Cursor, now: options.Now,
+		pending: make(map[protocol.CommandID]Command), turns: make(map[protocol.TurnID]Command),
+	}
 }
 
 func (a *LegacyAdapter) Command(command Command) (protocol.Command, error) {
@@ -83,6 +90,11 @@ func (a *LegacyAdapter) Command(command Command) (protocol.Command, error) {
 	applicationCommand.RequestDigest, err = CanonicalRequestDigest(applicationCommand)
 	if err != nil {
 		return protocol.Command{}, err
+	}
+	if command.Kind == CommandStartTurn {
+		a.pendingMu.Lock()
+		a.pending[applicationCommand.CommandID] = command
+		a.pendingMu.Unlock()
 	}
 	return applicationCommand, nil
 }
@@ -164,8 +176,22 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 		legacy.Kind = EventToolOutput
 	case ApplicationEventToolCompleted:
 		legacy.Kind = EventToolCompleted
-	case ApplicationEventTurnAccepted, protocol.EventTurnAccepted:
+	case ApplicationEventTurnAccepted:
 		legacy.Kind = EventTurnAccepted
+	case protocol.EventTurnAccepted:
+		var accepted protocol.TurnAcceptedV1
+		if err := json.Unmarshal(event.Payload, &accepted); err != nil {
+			return Event{}, err
+		}
+		legacy.Kind = EventTurnAccepted
+		a.pendingMu.Lock()
+		command := a.pending[accepted.CommandID]
+		delete(a.pending, accepted.CommandID)
+		if event.Correlation.TurnID != "" {
+			a.turns[event.Correlation.TurnID] = command
+		}
+		a.pendingMu.Unlock()
+		legacy.DraftID, legacy.Draft = command.DraftID, command.Prompt
 	case ApplicationEventTurnCompleted, protocol.EventTurnCompleted:
 		legacy.Kind = EventTurnCompleted
 	case ApplicationEventTurnInterrupted, protocol.EventTurnInterrupted:
@@ -178,6 +204,17 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 		legacy.Kind = EventRejected
 	case ApplicationEventError, protocol.EventTurnFailed:
 		legacy.Kind = EventError
+	case protocol.EventAssistantMessage:
+		var message protocol.AssistantMessageV1
+		if err := json.Unmarshal(event.Payload, &message); err != nil {
+			return Event{}, err
+		}
+		legacy.Kind = EventTextDelta
+		for _, block := range message.Blocks {
+			if block.Kind == protocol.ContentText {
+				legacy.Runtime.Text += block.Text
+			}
+		}
 	case protocol.EventModeChanged:
 		var changed protocol.ModeChangedV1
 		if err := json.Unmarshal(event.Payload, &changed); err != nil {
@@ -192,7 +229,14 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 		legacy.Kind = EventState
 		legacy.Selection = domain.ModelSelection{Profile: string(changed.ProviderID), Model: string(changed.ModelID)}
 	default:
-		legacy.Kind = EventState
+		legacy.Kind = ""
+	}
+	if event.Correlation.TurnID != "" && (legacy.Kind == EventTurnCompleted || legacy.Kind == EventTurnInterrupted || legacy.Kind == EventError) {
+		a.pendingMu.Lock()
+		command := a.turns[event.Correlation.TurnID]
+		delete(a.turns, event.Correlation.TurnID)
+		a.pendingMu.Unlock()
+		legacy.DraftID, legacy.Draft = command.DraftID, command.Prompt
 	}
 	if event.Error != nil {
 		legacy.Code = event.Error.Code

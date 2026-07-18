@@ -25,6 +25,26 @@ import (
 
 var ErrIdempotencyConflict = errors.New("idempotency_conflict")
 
+var ErrCommitUncertain = errors.New("journal commit outcome is uncertain")
+
+type CommitUncertainError struct {
+	Journal       protocol.JournalRef
+	TransactionID protocol.TransactionID
+	Cause         error
+}
+
+func (e *CommitUncertainError) Error() string {
+	return fmt.Sprintf("%s for transaction %q in %s/%s", ErrCommitUncertain, e.TransactionID, e.Journal.Kind, e.Journal.ID)
+}
+
+func (e *CommitUncertainError) Unwrap() []error {
+	if e.Cause == nil {
+		return []error{ErrCommitUncertain}
+	}
+	return []error{ErrCommitUncertain, e.Cause}
+}
+func (e *CommitUncertainError) UncertainCommit() {}
+
 type Service struct {
 	lane       OperationLane
 	repository journal.Repository
@@ -1624,6 +1644,7 @@ func (s *Service) contractFreezeEvents(request StartTurnRequest, state turnState
 			Actor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}, Criteria: []protocol.CriterionV1{criterion}, Frozen: true,
 		}},
 		{protocol.EventTaskStatusChanged, protocol.TaskStatusChangedV1{From: string(protocol.TaskPending), To: string(protocol.TaskRunning), Reason: "compatibility contract frozen"}},
+		{protocol.EventTurnStateChanged, protocol.TurnStateChangedV1{From: string(protocol.TurnAccepted), To: string(protocol.TurnRunning), Reason: "compatibility contract frozen"}},
 	}
 	return s.turnEvents(state, request.Runtime.ID, "contract-frozen", values)
 }
@@ -1847,6 +1868,11 @@ func (s *Service) CommitPureCommand(ctx context.Context, command CommandMetadata
 		if appendResult.Cursor != finalCursor {
 			return protocol.CommandResult{}, fmt.Errorf("pure command cursor prediction mismatch")
 		}
+		if s.publisher != nil {
+			if err := s.publisher.PublishCommitted(ctx, completion.Journal, appendResult.Cursor, appendResult.Events); err != nil {
+				return protocol.CommandResult{}, err
+			}
+		}
 		return result, nil
 	}
 	if appendResult.Status == journal.AppendConflict {
@@ -2030,9 +2056,27 @@ func (s *Service) RunControl(ctx context.Context, request ControlRequest) (resul
 		CallID: authorizationRequest.CallID, PlanDigest: authorizationRequest.PlanDigest, RequestDigest: authorizationRequest.RequestDigest,
 		DispatchDigest: authorizationRequest.DispatchDigest, RuntimeGenerationID: request.Runtime.ID,
 	}
+	settingControl := isSessionSettingEvent(request.Event.Kind)
+	terminalEventCount := uint64(3)
+	if settingControl {
+		terminalEventCount = 2
+	}
 	finalCursor := protocol.CommittedCursor{
 		JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
-		CommitSeq: state.head.CommitSeq + 4, TransactionID: request.TransactionID,
+		CommitSeq: state.head.CommitSeq + terminalEventCount + 1, TransactionID: request.TransactionID,
+	}
+	var consequentialCursor *protocol.CommittedCursor
+	if settingControl {
+		commitAdvance := uint64(2)
+		if strings.HasPrefix(string(request.ConsequentialExpectedHead.TransactionID), "legacy:") {
+			commitAdvance++
+		}
+		cursor := protocol.CommittedCursor{
+			JournalKind: request.ConsequentialJournal.Kind, JournalID: request.ConsequentialJournal.ID,
+			CommitSeq:     request.ConsequentialExpectedHead.CommitSeq + commitAdvance,
+			TransactionID: protocol.TransactionID(stableID("transaction", string(request.Command.CommandID), "control-consequential")),
+		}
+		consequentialCursor = &cursor
 	}
 	payload := mustCanonical(struct {
 		OperationID protocol.ControlOperationID `json:"operation_id"`
@@ -2040,7 +2084,7 @@ func (s *Service) RunControl(ctx context.Context, request ControlRequest) (resul
 	}{request.OperationID, "completed"})
 	commandResult := protocol.CommandResult{
 		ProtocolVersion: protocol.ApplicationProtocolVersion, CommandID: request.Command.CommandID, Status: "completed",
-		RequestDigest: request.Command.RequestDigest, Cursor: applicationCursor(request.Journal, finalCursor), PayloadVersion: 1, Payload: payload,
+		RequestDigest: request.Command.RequestDigest, Cursor: controlApplicationCursor(finalCursor, consequentialCursor), PayloadVersion: 1, Payload: payload,
 	}
 	rawResult, err := canonicaljson.Marshal(commandResult)
 	if err != nil {
@@ -2049,18 +2093,32 @@ func (s *Service) RunControl(ctx context.Context, request ControlRequest) (resul
 	terminal := []struct {
 		kind    string
 		payload any
-	}{
-		{request.Event.Kind, json.RawMessage(request.Event.Payload)},
-		{protocol.EventControlOperationCompleted, protocol.ControlOperationTerminalV1{ControlOperationID: request.OperationID, Status: "completed"}},
-		{protocol.EventCommandCompleted, protocol.CommandCompletedV1{CommandID: request.Command.CommandID, RequestDigest: request.Command.RequestDigest, Status: "completed", Result: rawResult}},
+	}{}
+	if !settingControl {
+		terminal = append(terminal, struct {
+			kind    string
+			payload any
+		}{request.Event.Kind, json.RawMessage(request.Event.Payload)})
 	}
+	terminal = append(terminal,
+		struct {
+			kind    string
+			payload any
+		}{protocol.EventControlOperationCompleted, protocol.ControlOperationTerminalV1{ControlOperationID: request.OperationID, Status: "completed"}},
+		struct {
+			kind    string
+			payload any
+		}{protocol.EventCommandCompleted, protocol.CommandCompletedV1{CommandID: request.Command.CommandID, RequestDigest: request.Command.RequestDigest, Status: "completed", Result: rawResult}},
+	)
 	events, err = s.controlEvents(state, request.Runtime.ID, "control-terminal", terminal)
 	if err != nil {
 		return ControlResult{}, err
 	}
-	// Retain the caller's admitted event identity and actor while keeping the
-	// lifecycle event ordering authored by the orchestrator.
-	events[0] = protocol.CloneProposedEvent(request.Event)
+	if !settingControl {
+		// Retain the caller's admitted event identity and actor while keeping the
+		// lifecycle event ordering authored by the orchestrator.
+		events[0] = protocol.CloneProposedEvent(request.Event)
+	}
 	barrierState := BarrierState{Journal: state.ref, Cursor: state.head, CommandID: request.Command.CommandID, ControlOperationID: request.OperationID, PlanDigest: request.Plan.Digest}
 	if err := s.cross(ctx, BarrierAuthorizationCommitted, barrierState); err != nil {
 		return ControlResult{}, err
@@ -2070,6 +2128,11 @@ func (s *Service) RunControl(ctx context.Context, request ControlRequest) (resul
 	}
 	dispatchHead := state.head
 	if err := s.deps.Authorization.Dispatch(ctx, token, binding, func(runContext context.Context) error {
+		if settingControl {
+			if err := s.appendControlConsequence(runContext, request, *consequentialCursor); err != nil {
+				return err
+			}
+		}
 		appendErr := s.appendControl(runContext, &state, "control-terminal", events, request.TransactionID)
 		if state.head != dispatchHead {
 			state.terminal = true
@@ -2183,7 +2246,50 @@ func (s *Service) appendBatch(ctx context.Context, request journal.AppendRequest
 			ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: request.ExpectedHead,
 		}
 	}
-	return s.repository.AppendBatch(ctx, request)
+	result, appendErr := s.repository.AppendBatch(ctx, request)
+	if result.Status == journal.AppendCommitUnknown {
+		resolved, resolveErr := s.resolveUnknownCommit(context.WithoutCancel(ctx), request, appendErr)
+		if resolveErr != nil {
+			return result, resolveErr
+		}
+		result, appendErr = resolved, nil
+	}
+	if appendErr != nil {
+		return result, appendErr
+	}
+	return result, nil
+}
+
+func (s *Service) resolveUnknownCommit(ctx context.Context, request journal.AppendRequest, appendErr error) (journal.AppendResult, error) {
+	lookup, lookupErr := s.repository.LookupTransaction(ctx, request.Journal, request.TransactionID)
+	if lookupErr != nil || lookup.State == journal.TransactionUnknown {
+		return journal.AppendResult{Status: journal.AppendCommitUnknown}, &CommitUncertainError{
+			Journal: request.Journal, TransactionID: request.TransactionID, Cause: errors.Join(appendErr, lookupErr),
+		}
+	}
+	if lookup.State == journal.TransactionNotCommitted {
+		if appendErr == nil {
+			appendErr = fmt.Errorf("journal rejected transaction before commit")
+		}
+		return journal.AppendResult{Status: journal.AppendCommitUnknown}, appendErr
+	}
+	if lookup.State != journal.TransactionCommitted || lookup.Cursor.Validate() != nil ||
+		lookup.Cursor.JournalKind != request.Journal.Kind || lookup.Cursor.JournalID != request.Journal.ID || lookup.Cursor.TransactionID != request.TransactionID {
+		return journal.AppendResult{Status: journal.AppendCommitUnknown}, fmt.Errorf("invalid transaction lookup result for %q", request.TransactionID)
+	}
+	committed, err := s.repository.ReadCommittedTransaction(ctx, request.Journal, request.TransactionID)
+	if err != nil {
+		return journal.AppendResult{Status: journal.AppendCommitUnknown}, fmt.Errorf("read proven committed transaction %q: %w", request.TransactionID, err)
+	}
+	if committed.Journal != request.Journal || committed.TransactionID != request.TransactionID || committed.Cursor != lookup.Cursor {
+		return journal.AppendResult{Status: journal.AppendCommitUnknown}, fmt.Errorf("committed transaction proof mismatch for %q", request.TransactionID)
+	}
+	for _, event := range committed.Events {
+		if event.JournalKind != request.Journal.Kind || event.JournalID != request.Journal.ID || event.TransactionID != request.TransactionID {
+			return journal.AppendResult{Status: journal.AppendCommitUnknown}, fmt.Errorf("committed transaction event proof mismatch for %q", request.TransactionID)
+		}
+	}
+	return journal.AppendResult{Status: journal.AppendCommitted, Cursor: committed.Cursor, Events: protocol.DeepCopy(committed.Events)}, nil
 }
 
 func (s *Service) appendControl(ctx context.Context, state *controlState, label string, events []protocol.ProposedEvent, explicit protocol.TransactionID) error {
@@ -2209,6 +2315,33 @@ func (s *Service) appendControl(ctx context.Context, state *controlState, label 
 		return ErrIdempotencyConflict
 	}
 	return fmt.Errorf("control append status %q", result.Status)
+}
+
+func (s *Service) appendControlConsequence(ctx context.Context, request ControlRequest, expected protocol.CommittedCursor) error {
+	if err := validateProposedEvent(request.Event, request.ConsequentialJournal); err != nil {
+		return err
+	}
+	transactionID := protocol.TransactionID(stableID("transaction", string(request.Command.CommandID), "control-consequential"))
+	result, err := s.appendBatch(ctx, journal.AppendRequest{
+		Journal: request.ConsequentialJournal, ExpectedHead: request.ConsequentialExpectedHead,
+		TransactionID: transactionID, Events: []protocol.ProposedEvent{protocol.CloneProposedEvent(request.Event)},
+	})
+	if err != nil {
+		return err
+	}
+	if result.Status == journal.AppendCommitted {
+		if result.Cursor != expected {
+			return fmt.Errorf("control consequential cursor prediction mismatch")
+		}
+		if s.publisher != nil {
+			return s.publisher.PublishCommitted(ctx, request.ConsequentialJournal, result.Cursor, result.Events)
+		}
+		return nil
+	}
+	if result.Status == journal.AppendConflict {
+		return ErrIdempotencyConflict
+	}
+	return fmt.Errorf("control consequential append status %q", result.Status)
 }
 
 func (s *Service) authorizeControl(ctx context.Context, request ControlRequest, state *controlState, authorizationRequest protocol.AuthorizationRequest) (authorization.CommittedToken, error) {
@@ -2353,8 +2486,25 @@ func validateControlRequest(request ControlRequest, recovery bool) error {
 	if err := request.Plan.Body.Validate(); err != nil || canonicaljson.ValidateDigest(request.Plan.Body, request.Plan.Digest) != nil || request.Plan.Body.RuntimeGenerationID != request.Runtime.ID {
 		return fmt.Errorf("control action plan is invalid")
 	}
-	if err := validateProposedEvent(request.Event, request.Journal); err != nil {
-		return err
+	settingControl := isSessionSettingEvent(request.Event.Kind)
+	if settingControl {
+		if request.Kind != OperationControl || request.ConsequentialJournal.Kind != protocol.JournalSession || request.ConsequentialJournal.Validate() != nil ||
+			request.Event.SessionID == "" || request.ConsequentialJournal.ID != protocol.JournalID(request.Event.SessionID) {
+			return fmt.Errorf("session setting control journal identity mismatch")
+		}
+		if err := validateExpectedHead(request.ConsequentialExpectedHead, request.ConsequentialJournal); err != nil {
+			return fmt.Errorf("consequential expected cursor: %w", err)
+		}
+		if err := validateProposedEvent(request.Event, request.ConsequentialJournal); err != nil {
+			return err
+		}
+	} else {
+		if request.ConsequentialJournal != (protocol.JournalRef{}) || request.ConsequentialExpectedHead != (protocol.CommittedCursor{}) {
+			return fmt.Errorf("non-setting control carries a consequential session journal")
+		}
+		if err := validateProposedEvent(request.Event, request.Journal); err != nil {
+			return err
+		}
 	}
 	wantEvent := map[OperationKind]string{
 		OperationControl:          protocol.EventMigrationDiagnostic,
@@ -2362,10 +2512,19 @@ func validateControlRequest(request ControlRequest, recovery bool) error {
 		OperationRecovery:         protocol.EventRecoveryDiagnostic,
 		OperationReloadActivation: protocol.EventRuntimeGenerationActivated,
 	}[request.Kind]
-	if request.Event.Kind != wantEvent {
+	if !settingControl && request.Event.Kind != wantEvent {
 		return fmt.Errorf("control kind %q requires event %q", request.Kind, wantEvent)
 	}
 	return nil
+}
+
+func isSessionSettingEvent(kind string) bool {
+	switch kind {
+	case protocol.EventModeChanged, protocol.EventModelChanged, protocol.EventTrustedExecutionAcknowledged:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateSessionChangeRequest(request SessionChangeRequest) error {
@@ -2384,15 +2543,11 @@ func validateSessionChangeRequest(request SessionChangeRequest) error {
 	if err := validateProposedEvent(request.Event, request.Journal); err != nil {
 		return err
 	}
-	consequential := map[string]bool{
-		protocol.EventModeChanged: true, protocol.EventModelChanged: true, protocol.EventTrustedExecutionAcknowledged: true,
-		protocol.EventContextCompacted: true,
-	}[request.Event.Kind]
-	if request.Event.Kind != protocol.EventSessionTitleChanged && !consequential {
+	if request.Event.Kind != protocol.EventSessionTitleChanged {
 		return fmt.Errorf("unsupported session change event %q", request.Event.Kind)
 	}
-	if consequential && !request.Consequential {
-		return fmt.Errorf("session change %q is consequential", request.Event.Kind)
+	if request.Consequential {
+		return fmt.Errorf("session title change is pure metadata")
 	}
 	return nil
 }
@@ -2450,6 +2605,10 @@ func applicationCursor(ref protocol.JournalRef, cursor protocol.CommittedCursor)
 		return protocol.ApplicationCursor{WorkspaceControl: cursor}
 	}
 	return protocol.ApplicationCursor{SelectedSession: &cursor}
+}
+
+func controlApplicationCursor(workspace protocol.CommittedCursor, selected *protocol.CommittedCursor) protocol.ApplicationCursor {
+	return protocol.ApplicationCursor{WorkspaceControl: workspace, SelectedSession: protocol.DeepCopy(selected)}
 }
 
 func mustCanonical(value any) json.RawMessage {

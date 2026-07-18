@@ -198,6 +198,43 @@ func TestSlowConsumerFakeHeadlessCancellationRunsOnce(t *testing.T) {
 	}
 }
 
+func TestTransientOverflowFakeHeadlessCancellationRunsOnceOutsideBrokerLock(t *testing.T) {
+	source := newBrokerSource()
+	var cancellations atomic.Int32
+	callbackReturned := make(chan struct{}, 1)
+	var broker *app.Broker
+	broker = mustBroker(t, source, func(string, protocol.SubscriptionTerminal) {
+		cancellations.Add(1)
+		_ = broker.Epoch() // deadlocks when the callback is invoked under the broker lock
+		callbackReturned <- struct{}{}
+	})
+	_, _, err := broker.SnapshotAndSubscribe(t.Context(), protocol.SnapshotRequest{
+		ProtocolVersion: 1, SelectedSessionID: "session-1", Consumer: app.ConsumerFakeHeadless, QueueCapacity: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"one", "two", "three"} {
+		if err := broker.PublishTransient(protocol.ApplicationEvent{
+			StreamEventID: id,
+			Correlation: protocol.EventCorrelation{
+				JournalKind: protocol.JournalSession, JournalID: "session-1", SessionID: "session-1",
+			},
+			Time: time.Now().UTC(), Kind: app.ApplicationEventNotice, PayloadVersion: 1, Payload: json.RawMessage(`{}`),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-callbackReturned:
+	case <-time.After(time.Second):
+		t.Fatal("transient overflow cancellation callback did not return")
+	}
+	if got := cancellations.Load(); got != 1 {
+		t.Fatalf("cancellations=%d", got)
+	}
+}
+
 type brokerSource struct {
 	mu               sync.Mutex
 	workspace        protocol.JournalRef

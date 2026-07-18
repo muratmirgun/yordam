@@ -399,7 +399,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 			}
 		},
 	}
-	dispatcher := runtimeCommandDispatcher{Orchestrator: service, Store: b.store, Manifest: protocol.DeepCopy(manifest)}
+	dispatcher := runtimeCommandDispatcher{Orchestrator: service, Store: b.store, Manifest: protocol.DeepCopy(manifest), Workspace: workspaceControl}
 	applicationService, err := NewProtocolService(ProtocolServiceOptions{
 		Orchestrator: service, Dispatcher: dispatcher, Broker: broker, WorkspaceControl: workspaceControl,
 	})

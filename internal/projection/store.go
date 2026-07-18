@@ -137,6 +137,53 @@ func (s *Store[T]) Load(ctx context.Context, ref protocol.JournalRef) (Snapshot[
 	return s.Update(ctx, snapshot)
 }
 
+// At rebuilds a projection at one exact committed transaction cursor. It does
+// not consult or mutate the head cache, so callers can safely project a vector
+// captured before later commits became visible.
+func (s *Store[T]) At(ctx context.Context, ref protocol.JournalRef, target protocol.CommittedCursor) (Snapshot[T], error) {
+	if s == nil || s.repository == nil || s.projector == nil {
+		return Snapshot[T]{}, fmt.Errorf("projection store is not configured")
+	}
+	if err := ref.Validate(); err != nil {
+		return Snapshot[T]{}, err
+	}
+	if err := target.Validate(); err != nil || cursorJournal(target) != ref {
+		return Snapshot[T]{}, fmt.Errorf("projection target cursor is invalid")
+	}
+	inspection, err := s.repository.Inspect(ctx, ref)
+	if err != nil {
+		return Snapshot[T]{}, err
+	}
+	if inspection.Journal != ref {
+		return Snapshot[T]{}, fmt.Errorf("projection inspection journal mismatch")
+	}
+	state := s.projector.Zero(ref)
+	head := protocol.CommittedCursor{}
+	for start := 0; start < len(inspection.Events); {
+		end := start + 1
+		for end < len(inspection.Events) && sameCommittedTransaction(inspection.Events[start], inspection.Events[end]) {
+			end++
+		}
+		cursor, cursorErr := committedTransactionCursor(ref, inspection.Events[start:end])
+		if cursorErr != nil {
+			return Snapshot[T]{}, cursorErr
+		}
+		if cursor.CommitSeq > target.CommitSeq {
+			return Snapshot[T]{}, fmt.Errorf("projection target is not a committed transaction boundary")
+		}
+		candidate, projected, applyErr := s.applyCommittedTransactions(ref, state, head, inspection.Events[start:end])
+		if applyErr != nil {
+			return Snapshot[T]{}, applyErr
+		}
+		state, head = candidate, projected
+		if head == target {
+			return s.snapshot(head, state)
+		}
+		start = end
+	}
+	return Snapshot[T]{}, fmt.Errorf("projection target cursor was not found")
+}
+
 func (s *Store[T]) Update(ctx context.Context, current Snapshot[T]) (Snapshot[T], error) {
 	if s == nil || s.repository == nil || s.projector == nil {
 		return current, fmt.Errorf("projection store is not configured")

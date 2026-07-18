@@ -172,7 +172,7 @@ func TestEveryRecoveryDispatchAndTerminalBarrierLeavesDurableControlTerminal(t *
 
 func TestRecoveryCommittedControlPublishFailureDoesNotAppendSecondTerminal(t *testing.T) {
 	service, request, repository, _ := recoveryBarrierFixture(t, NoopBarrierProbe())
-	service.publisher = &nthFailPublisher{failAt: 4}
+	service.publisher = &nthFailPublisher{failAt: 5}
 	if _, err := service.RecoverTurn(context.Background(), request); err == nil {
 		t.Fatal("publisher failure was ignored")
 	}

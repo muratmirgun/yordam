@@ -52,15 +52,17 @@ type SessionChangeRequest struct {
 }
 
 type ControlRequest struct {
-	Command       CommandMetadata
-	OperationID   protocol.ControlOperationID
-	Kind          OperationKind
-	Journal       protocol.JournalRef
-	ExpectedHead  protocol.CommittedCursor
-	TransactionID protocol.TransactionID
-	Runtime       protocol.RuntimeGenerationManifest
-	Plan          protocol.ActionPlan
-	Event         protocol.ProposedEvent
+	Command                   CommandMetadata
+	OperationID               protocol.ControlOperationID
+	Kind                      OperationKind
+	Journal                   protocol.JournalRef
+	ExpectedHead              protocol.CommittedCursor
+	TransactionID             protocol.TransactionID
+	ConsequentialJournal      protocol.JournalRef
+	ConsequentialExpectedHead protocol.CommittedCursor
+	Runtime                   protocol.RuntimeGenerationManifest
+	Plan                      protocol.ActionPlan
+	Event                     protocol.ProposedEvent
 }
 
 type RecoveryControlRequest struct {

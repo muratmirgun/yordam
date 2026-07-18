@@ -124,9 +124,10 @@ const (
 var errPermissionCorrelationUnavailable = errors.New("permission correlation unavailable")
 
 type operationResult struct {
-	kind       operationKind
-	err        error
-	runtimeSet RuntimeSet
+	kind            operationKind
+	err             error
+	runtimeSet      RuntimeSet
+	throughProtocol bool
 }
 
 type operationKind string
@@ -209,6 +210,7 @@ func (a *App) Run(ctx context.Context) error {
 		defer func() { _ = a.close() }()
 	}
 	done := make(chan operationResult, 1)
+	protocolEvents := make(chan Event, 64)
 	runtimeEvents := a.runtimeEvents
 	var activeCancel context.CancelFunc
 	var activeOperation operationKind
@@ -250,6 +252,16 @@ func (a *App) Run(ctx context.Context) error {
 					ctxDone = nil
 				}
 			}
+		case event := <-protocolEvents:
+			if event.Kind != "" && !a.publish(ctx, event) {
+				if activeCancel != nil {
+					activeCancel()
+				}
+				a.clearPending()
+				shutdownRequested = true
+				shutdownErr = ctx.Err()
+				ctxDone = nil
+			}
 		case command := <-a.commands:
 			switch command.Kind {
 			case CommandStartTurn:
@@ -266,11 +278,43 @@ func (a *App) Run(ctx context.Context) error {
 					a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 					continue
 				}
+				turnCtx, cancel := context.WithCancel(ctx)
+				activeCancel = cancel
+				activeOperation = operationTurn
+				if activeSet.ApplicationService != nil && activeSet.LegacyAdapter != nil {
+					applicationCommand, err := activeSet.LegacyAdapter.Command(command)
+					if err != nil {
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
+						continue
+					}
+					_, subscription, err := activeSet.ApplicationService.SnapshotAndSubscribe(ctx, protocol.SnapshotRequest{
+						ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(a.session.ID), Consumer: "legacy_tui", QueueCapacity: 256,
+					})
+					if err != nil {
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
+						continue
+					}
+					go consumeLegacyProtocolEvents(ctx, subscription, activeSet.LegacyAdapter, protocolEvents)
+					go func() {
+						result, executeErr := activeSet.ApplicationService.Execute(turnCtx, applicationCommand)
+						if executeErr == nil && result.Error != nil {
+							executeErr = errors.New(result.Error.Message)
+						}
+						done <- operationResult{kind: operationTurn, err: executeErr, throughProtocol: true}
+					}()
+					continue
+				}
 				input := agent.RunInput{Session: a.session, Replay: a.replay, Prompt: command.Prompt}
 				if a.input != nil {
 					var err error
 					input, err = a.input(command.Prompt)
 					if err != nil {
+						cancel()
+						activeCancel, activeOperation = nil, ""
 						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 						continue
 					}
@@ -278,20 +322,21 @@ func (a *App) Run(ctx context.Context) error {
 				if activeSet.Orchestrator != nil {
 					metadata, head, err := a.prepareTurnCommand(ctx, command.Prompt)
 					if err != nil {
+						cancel()
+						activeCancel, activeOperation = nil, ""
 						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 						continue
 					}
 					input.Command, input.ExpectedHead = metadata, head
 				}
 				if activeSet.Runtime == nil {
+					cancel()
+					activeCancel, activeOperation = nil, ""
 					err := errors.New("runtime is not configured")
 					a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 					continue
 				}
 				a.publish(ctx, Event{Kind: EventTurnAccepted, DraftID: command.DraftID, Draft: command.Prompt})
-				turnCtx, cancel := context.WithCancel(ctx)
-				activeCancel = cancel
-				activeOperation = operationTurn
 				go func() {
 					done <- operationResult{kind: operationTurn, err: activeSet.Runtime.RunTurn(turnCtx, input)}
 				}()
@@ -445,7 +490,10 @@ func (a *App) Run(ctx context.Context) error {
 					event.Session = a.session
 				}
 			}
-			if !a.publish(ctx, event) {
+			if result.throughProtocol && result.err == nil {
+				event.Kind = ""
+			}
+			if event.Kind != "" && !a.publish(ctx, event) {
 				if !shutdownRequested {
 					return ctx.Err()
 				}
@@ -552,14 +600,10 @@ func (a *App) completeReload(ctx context.Context, result operationResult) {
 		}
 		if a.sessions != nil && a.session.ID != "" {
 			changeService := candidate.SessionChanges
-			generation := candidate.RuntimeGenerationID
 			if changeService == nil {
 				changeService = a.sessionChanges
 			}
-			if generation == "" {
-				generation = a.runtimeSet.RuntimeGenerationID
-			}
-			if err := a.commitSessionChangeUsing(ctx, changeService, generation, protocol.EventModelChanged, protocol.ModelChangedV1{ProviderID: protocol.ProviderID(selection.Profile), ModelID: protocol.ModelID(selection.Model)}); err != nil {
+			if err := a.commitSettingUsing(ctx, candidate, changeService, protocol.EventModelChanged, protocol.ModelChangedV1{ProviderID: protocol.ProviderID(selection.Profile), ModelID: protocol.ModelID(selection.Model)}); err != nil {
 				a.publish(ctx, Event{Kind: EventReloadCompleted, Err: err, Message: err.Error()})
 				candidate.retireSecrets()
 				return
@@ -720,10 +764,53 @@ func (a *App) acknowledgeAutoShell(ctx context.Context, callID string, decision 
 }
 
 func (a *App) commitSessionChange(ctx context.Context, kind string, payload any) error {
-	return a.commitSessionChangeUsing(ctx, a.sessionChanges, a.runtimeSet.RuntimeGenerationID, kind, payload)
+	return a.commitSettingUsing(ctx, a.runtimeSet, a.sessionChanges, kind, payload)
 }
 
-func (a *App) commitSessionChangeUsing(ctx context.Context, service sessionChangeService, generation protocol.RuntimeGenerationID, kind string, payload any) error {
+func (a *App) commitSettingUsing(ctx context.Context, runtime RuntimeSet, fallback sessionChangeService, kind string, payload any) error {
+	if runtime.ApplicationService != nil && runtime.LegacyAdapter != nil {
+		var command Command
+		switch value := payload.(type) {
+		case protocol.ModeChangedV1:
+			command = Command{Kind: CommandChangeMode, Mode: domain.PermissionMode(value.Mode)}
+		case protocol.ModelChangedV1:
+			command = Command{Kind: CommandChangeModel, Selection: domain.ModelSelection{Profile: string(value.ProviderID), Model: string(value.ModelID)}}
+		case protocol.TrustedExecutionAcknowledgedV1:
+			command = Command{Kind: CommandAcknowledgeAutoShell}
+		default:
+			return fmt.Errorf("unsupported application setting payload %T", payload)
+		}
+		applicationCommand, err := runtime.LegacyAdapter.Command(command)
+		if err != nil {
+			return err
+		}
+		result, err := runtime.ApplicationService.Execute(ctx, applicationCommand)
+		if err != nil {
+			return err
+		}
+		if result.Error != nil {
+			return fmt.Errorf("%s: %s", result.Error.Code, result.Error.Message)
+		}
+		if result.Status != "completed" || result.Cursor.SelectedSession == nil {
+			return fmt.Errorf("setting command returned status %q without a selected-session cursor", result.Status)
+		}
+		a.session.LastSeq = result.Cursor.SelectedSession.CommitSeq
+		a.session.UpdatedAt = time.Now().UTC()
+		updated, err := a.inspectSession(ctx, a.session.ID)
+		if err != nil {
+			return err
+		}
+		projected := ProjectSessionState(updated)
+		updated.Session.Mode = projected.Mode
+		updated.Session.Selection = projected.Selection
+		a.replay = updated
+		a.replayValid = true
+		return nil
+	}
+	return a.commitSessionChangeCompatibility(ctx, fallback, runtime.RuntimeGenerationID, kind, payload)
+}
+
+func (a *App) commitSessionChangeCompatibility(ctx context.Context, service sessionChangeService, generation protocol.RuntimeGenerationID, kind string, payload any) error {
 	if service == nil {
 		return fmt.Errorf("session change orchestrator is not configured")
 	}
@@ -1086,6 +1173,58 @@ func legacyTerminalEvent(kind EventKind) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription, adapter *LegacyAdapter, destination chan<- Event) {
+	defer subscription.Close()
+	for {
+		item, err := subscription.Next(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				select {
+				case destination <- Event{Kind: EventError, Err: err, Message: err.Error()}:
+				case <-ctx.Done():
+				}
+			}
+			return
+		}
+		if item.Terminal != nil {
+			err := errors.New(item.Terminal.Message)
+			select {
+			case destination <- Event{Kind: EventError, Code: item.Terminal.Code, Err: err, Message: err.Error()}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		if item.Event == nil {
+			continue
+		}
+		// The compatibility TUI receives the admitted execution error from the
+		// command result path. Publishing the durable generic turn failure first
+		// would make legacy consumers stop before that redacted diagnostic arrives.
+		if item.Event.Kind == protocol.EventTurnFailed {
+			return
+		}
+		event, err := adapter.Event(*item.Event)
+		if err != nil {
+			select {
+			case destination <- Event{Kind: EventError, Err: err, Message: err.Error()}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		if event.Kind == "" {
+			continue
+		}
+		select {
+		case destination <- event:
+		case <-ctx.Done():
+			return
+		}
+		if legacyTerminalEvent(event.Kind) {
+			return
+		}
 	}
 }
 
