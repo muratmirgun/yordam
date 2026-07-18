@@ -85,6 +85,41 @@ func TestTaskSixLifecycleRecordsCommitAndProjectFromRepository(t *testing.T) {
 	}
 }
 
+func TestTaskSixV2V1PayloadLegacyTaskRecordsCommitAndProject(t *testing.T) {
+	fixture := newV2Journal(t)
+	events := []protocol.ProposedEvent{
+		taskSixProposed(t, fixture, "evt-v1-payload-created", protocol.EventTaskCreated, &protocol.TaskCreatedV1{
+			Goal: "project compatible v1 payload", OutcomeContractID: "contract-v1-payload", ContractVersion: 1,
+		}),
+		taskSixProposed(t, fixture, "evt-v1-payload-running", protocol.EventTaskStatusChanged, &protocol.TaskStatusChangedV1{From: "pending", To: "running"}),
+		taskSixProposed(t, fixture, "evt-v1-payload-completed", protocol.EventTaskStatusChanged, &protocol.TaskStatusChangedV1{From: "running", To: "completed"}),
+	}
+	result, err := fixture.repo.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: fixture.ref, ExpectedHead: fixture.head, TransactionID: "txn-v1-payload-task", Events: events,
+	})
+	if err != nil || result.Status != journal.AppendCommitted {
+		t.Fatalf("append=%+v err=%v", result, err)
+	}
+	inspection, err := fixture.repo.Inspect(context.Background(), fixture.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projector := taskprojection.Projector{}
+	state := projector.Zero(fixture.ref)
+	for _, record := range inspection.Events {
+		if record.Envelope.TaskID == "task-task6" && record.Legacy != nil {
+			t.Fatal("v2 payload record unexpectedly carried Legacy metadata")
+		}
+		state, err = projector.Apply(state, record)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if record := state.Tasks["task-task6"]; record.State != taskprojection.StateCompleted || !record.Legacy {
+		t.Fatalf("compatible lifecycle=%+v", record)
+	}
+}
+
 func taskSixProposed(t *testing.T, fixture v2JournalFixture, eventID protocol.EventID, kind string, payload any) protocol.ProposedEvent {
 	t.Helper()
 	raw, err := canonicaljson.Marshal(payload)

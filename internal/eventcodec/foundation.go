@@ -283,7 +283,7 @@ func validateFoundationSemantic(kind string, payload any) error {
 	case *protocol.EvidenceRecordedV1:
 		return validateEvidenceRecord(value.Record)
 	case *protocol.EvidenceLinkedV1:
-		if value.EvidenceID == "" || value.Subject.Validate() != nil || !oneOf(value.Relation, "input", "output") {
+		if value.EvidenceID == "" || value.Subject.Validate() != nil || value.Relation == "" {
 			return fmt.Errorf("evidence link is incomplete")
 		}
 	case *protocol.CheckpointPlannedV1:

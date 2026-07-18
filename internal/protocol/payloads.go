@@ -121,7 +121,7 @@ func (s StateChangedV1) ValidateTurn() error {
 	if !validTurnState(from) || !validTurnState(to) || from == to || terminalTurnState(from) {
 		return fmt.Errorf("invalid turn transition %q -> %q", s.From, s.To)
 	}
-	valid := (from == TurnAccepted && (to == TurnRunning || to == TurnContractDrafting)) ||
+	valid := (from == TurnAccepted && (to == TurnRunning || to == TurnContractDrafting || to == TurnFailed || to == TurnInterrupted)) ||
 		(from == TurnContractDrafting && to == TurnFreezingContract) ||
 		(from == TurnFreezingContract && to == TurnPlanningContext) ||
 		(from == TurnPlanningContext && to == TurnWaitingProvider) ||

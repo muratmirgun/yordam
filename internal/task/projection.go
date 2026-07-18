@@ -182,6 +182,9 @@ func (Projector) Apply(current Projection, event protocol.EventRecord) (Projecti
 			return current, fmt.Errorf("task %q is unknown", event.Envelope.TaskID)
 		}
 		from, to := State(payload.From), State(payload.To)
+		if !record.Legacy && record.State == StateDraft && from == StatePending && allowedTaskTransition(true, from, to) {
+			record.State, record.Legacy = StatePending, true
+		}
 		if record.State != from || !allowedTaskTransition(record.Legacy, from, to) {
 			return current, fmt.Errorf("invalid task transition %q -> %q", from, to)
 		}
@@ -324,7 +327,7 @@ func (Projector) Apply(current Projection, event protocol.EventRecord) (Projecti
 		}
 		record, exists := next.Turns[event.Envelope.TurnID]
 		to := turnTerminalState(event.Envelope.Kind)
-		if !exists || (record.State != TurnStateVerifying && record.State != TurnStateRunning) || payload.Status != string(to) {
+		if !exists || !allowedTurnTerminal(record.State, to) || payload.Status != string(to) {
 			return current, fmt.Errorf("invalid turn transition %q -> %q", record.State, to)
 		}
 		record.State, record.Reason, record.ErrorCode = to, payload.Reason, payload.ErrorCode
@@ -403,7 +406,7 @@ func terminalTurnState(state TurnState) bool {
 }
 
 func allowedTurnTransition(from, to TurnState) bool {
-	if from == TurnStateAccepted && to == TurnStateRunning {
+	if from == TurnStateAccepted && (to == TurnStateRunning || to == TurnStateFailed || to == TurnStateInterrupted) {
 		return true
 	}
 	if from == TurnStateVerifying && (to == TurnStateCompleted || to == TurnStateFailed || to == TurnStateInterrupted) {
@@ -418,6 +421,13 @@ func allowedTurnTransition(from, to TurnState) bool {
 		TurnStateRecordingEvidence: TurnStateReturningResult, TurnStateReturningResult: TurnStateVerifying,
 	}
 	return path[from] == to
+}
+
+func allowedTurnTerminal(from, to TurnState) bool {
+	if from == TurnStateAccepted {
+		return to == TurnStateFailed || to == TurnStateInterrupted
+	}
+	return from == TurnStateVerifying || from == TurnStateRunning
 }
 
 func turnTerminalState(kind string) TurnState {

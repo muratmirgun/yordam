@@ -145,9 +145,6 @@ func TestProjectionLegacyTaskLifecycleRebuilds(t *testing.T) {
 
 	projector := taskprojection.Projector{}
 	detailed := applyTask(t, projector, projector.Zero(sessionRef()), taskCreated())
-	if _, err := projector.Apply(detailed, taskChanged("pending", "running")); err == nil {
-		t.Fatal("detailed task entered the legacy pending lane")
-	}
 	for _, transition := range [][2]string{
 		{"draft", "contract_drafting"}, {"contract_drafting", "contract_proposed"},
 		{"contract_proposed", "contract_frozen"}, {"contract_frozen", "running"},
@@ -156,6 +153,27 @@ func TestProjectionLegacyTaskLifecycleRebuilds(t *testing.T) {
 	}
 	if _, err := projector.Apply(detailed, taskChanged("running", "completed")); err == nil {
 		t.Fatal("detailed task used a legacy terminal shortcut")
+	}
+}
+
+func TestProjectionV2V1PayloadTaskLifecycleInfersLegacyLane(t *testing.T) {
+	for _, terminal := range []string{"completed", "failed", "cancelled"} {
+		t.Run(terminal, func(t *testing.T) {
+			projector := taskprojection.Projector{}
+			state := applyTask(t, projector, projector.Zero(sessionRef()), taskCreated())
+			state = applyTask(t, projector, state, taskChanged("pending", "running"))
+			state = applyTask(t, projector, state, taskChanged("running", terminal))
+			if record := state.Tasks["task"]; string(record.State) != terminal || !record.Legacy {
+				t.Fatalf("v1 payload lifecycle=%+v", record)
+			}
+		})
+	}
+
+	projector := taskprojection.Projector{}
+	detailed := applyTask(t, projector, projector.Zero(sessionRef()), taskCreated())
+	detailed = applyTask(t, projector, detailed, taskChanged("draft", "contract_drafting"))
+	if _, err := projector.Apply(detailed, taskChanged("pending", "running")); err == nil {
+		t.Fatal("started detailed task switched to the legacy lane")
 	}
 }
 
@@ -191,6 +209,42 @@ func TestLifecycleTurnRejectsSecondActiveTurn(t *testing.T) {
 	state = applyTask(t, projector, state, turnAcceptedWithID("turn-two"))
 	if state.Turns["turn-two"].State != taskprojection.TurnStateAccepted {
 		t.Fatalf("new turn after terminal=%+v", state.Turns)
+	}
+}
+
+func TestLifecycleTurnRebuildsLegacyAcceptedFailureAndInterruption(t *testing.T) {
+	for _, terminal := range []struct {
+		state taskprojection.TurnState
+		kind  string
+	}{
+		{state: taskprojection.TurnStateFailed, kind: protocol.EventTurnFailed},
+		{state: taskprojection.TurnStateInterrupted, kind: protocol.EventTurnInterrupted},
+	} {
+		t.Run(string(terminal.state)+"_state_changed", func(t *testing.T) {
+			projector := taskprojection.Projector{}
+			state := applyTask(t, projector, projector.Zero(sessionRef()), turnAccepted())
+			state = applyTask(t, projector, state, turnChanged("accepted", string(terminal.state)))
+			if state.Turns["turn"].State != terminal.state {
+				t.Fatalf("legacy turn=%+v", state.Turns["turn"])
+			}
+		})
+		t.Run(string(terminal.state)+"_terminal_event", func(t *testing.T) {
+			projector := taskprojection.Projector{}
+			state := applyTask(t, projector, projector.Zero(sessionRef()), turnAccepted())
+			state = applyTask(t, projector, state, turnTerminal(terminal.kind, string(terminal.state)))
+			if state.Turns["turn"].State != terminal.state {
+				t.Fatalf("legacy terminal turn=%+v", state.Turns["turn"])
+			}
+		})
+	}
+
+	projector := taskprojection.Projector{}
+	accepted := applyTask(t, projector, projector.Zero(sessionRef()), turnAccepted())
+	if _, err := projector.Apply(accepted, turnChanged("accepted", "completed")); err == nil {
+		t.Fatal("accepted turn jumped directly to completed")
+	}
+	if _, err := projector.Apply(accepted, turnTerminal(protocol.EventTurnCompleted, "completed")); err == nil {
+		t.Fatal("accepted turn used a completed terminal event")
 	}
 }
 

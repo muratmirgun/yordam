@@ -211,7 +211,7 @@ func TestFoundationRegistryRejectsDuplicateDescriptorsAndInvalidSemantics(t *tes
 	}
 }
 
-func TestFoundationRegistryRejectsUnknownEvidenceRelation(t *testing.T) {
+func TestFoundationRegistryPreservesNonemptyV1EvidenceRelation(t *testing.T) {
 	t.Parallel()
 	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
 	if err != nil {
@@ -226,8 +226,8 @@ func TestFoundationRegistryRejectsUnknownEvidenceRelation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := registry.Validate(record); err == nil {
-		t.Fatal("unknown evidence relation was accepted")
+	if err := registry.Validate(record); err != nil {
+		t.Fatalf("nonempty v1 evidence relation rejected: %v", err)
 	}
 }
 
@@ -286,7 +286,7 @@ func TestFoundationRegistryValidatesTaskSixLifecycleTransitions(t *testing.T) {
 			t.Fatalf("turn transition %q -> %q: %v", transition[0], transition[1], err)
 		}
 	}
-	for _, legacy := range [][2]string{{"accepted", "running"}, {"running", "completed"}, {"running", "failed"}, {"running", "interrupted"}} {
+	for _, legacy := range [][2]string{{"accepted", "running"}, {"accepted", "failed"}, {"accepted", "interrupted"}, {"running", "completed"}, {"running", "failed"}, {"running", "interrupted"}} {
 		if err := validate(protocol.EventTurnStateChanged, protocol.TurnStateChangedV1{From: legacy[0], To: legacy[1]}, "task", "turn"); err != nil {
 			t.Fatalf("legacy turn transition %q -> %q: %v", legacy[0], legacy[1], err)
 		}
