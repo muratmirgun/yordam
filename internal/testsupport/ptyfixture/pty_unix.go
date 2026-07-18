@@ -134,6 +134,41 @@ func (s *Session) WaitForAfter(t testing.TB, offset int, value string, timeout t
 	}
 }
 
+func (s *Session) WaitForOrderedAfter(t testing.TB, offset int, values []string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		output, valid := s.outputAfter(offset)
+		if !valid {
+			t.Fatal(s.formatDiagnostic("invalid PTY output offset %d", offset))
+		}
+		if containsOrdered(output, values) {
+			return
+		}
+		select {
+		case err := <-s.done:
+			t.Fatal(s.formatDiagnostic("process exited before ordered post-offset markers %q: err=%v output=%q", values, err, output))
+		case <-deadline.C:
+			t.Fatal(s.formatDiagnostic("timed out waiting for ordered post-offset markers %q; output=%q", values, output))
+		case <-ticker.C:
+		}
+	}
+}
+
+func containsOrdered(output string, values []string) bool {
+	for _, value := range values {
+		index := strings.Index(output, value)
+		if index < 0 {
+			return false
+		}
+		output = output[index+len(value):]
+	}
+	return true
+}
+
 func (s *Session) WaitForQuiet(t testing.TB, quiet, timeout time.Duration) {
 	t.Helper()
 	deadline := time.NewTimer(timeout)

@@ -134,8 +134,9 @@ func TestEditAndReloadPreservesSessionAndSecretBoundaries(t *testing.T) {
 	session.write(t, "/reload\r")
 	session.WaitForAfter(t, reloadOffset, "openai/test-model", 3*time.Second)
 	session.WaitForAfter(t, reloadOffset, "configuration reloaded", 3*time.Second)
+	responseOffset := session.OutputOffset()
 	session.write(t, "hello after reload\r")
-	session.waitFor(t, responseText, 3*time.Second)
+	session.WaitForOrderedAfter(t, responseOffset, []string{"ASSISTANT", "assistant response after", "reload"}, 3*time.Second)
 	session.WaitForQuiet(t, 300*time.Millisecond, 3*time.Second)
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("provider requests=%d want=1", got)
