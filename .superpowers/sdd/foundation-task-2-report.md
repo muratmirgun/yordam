@@ -89,7 +89,9 @@ Caller-provided transaction IDs are never replaced or blindly retried after
   hash the unchanged prefix and decode only its tail. Identity, size, digest,
   tail, or validation failure discards the acceleration and performs a full
   authoritative scan. The cache is never shared across registries and never
-  remembers read-only, incomplete, or marker-uncertain state.
+  remembers read-only or incomplete state. A post-write prefix staged while a
+  marker is uncertain is available only to the still-locked append path; no
+  committed-view API consumes or publishes it before durability resolution.
 - Lookup uses a fully physically verified index when possible. It performs an
   authoritative scan and rebuild when the cache cannot prove the complete
   source. `ReadCommittedTransaction` intentionally performs an independent full
@@ -190,7 +192,7 @@ cases). Before production edits, all ten failed for their intended reasons:
 | Unsupported commit-marker version | `transaction.committed` remains structural at unsupported versions, makes the transaction ambiguous/read-only, and can never be accumulated or committed by a later marker. | `TestUnsupportedCommitMarkerRegressionRemainsStructuralAndAmbiguous` |
 | Physical transaction bound | Full and indexed scanners reject the 1001st domain event before pending-slice accumulation. | `TestPhysicalTransactionRegressionRejectsMoreThanOneThousandEvents` |
 | Generated marker collision | The generated marker ID is checked against all durable and proposed IDs before the first event write. | `TestGeneratedMarkerIDRegressionRejectsProposedCollisionBeforeWrite`, `TestGeneratedMarkerIDRegressionRejectsDurableCollisionBeforeWrite` |
-| Marker durability uncertainty | Uncertainty is registered before marker write and cleared only after successful `Sync`. Lookup can prove a complete marker only on the original rooted identity after another `Sync` and rooted re-verification; partial/substituted data remains unknown and cannot publish an index. | `TestUnsyncedMarkerRegressionRequiresOriginalRootedIdentity` plus existing pre/post-marker fault tests |
+| Marker durability uncertainty | Uncertainty is registered before marker write and cleared only after the complete append method succeeds, including close. A committed-view operation can clear it only after another `Sync` and rooted re-verification of the original opened identity; partial/substituted data remains unknown and cannot publish an index. | `TestUnsyncedMarkerRegressionRequiresOriginalRootedIdentity` plus existing pre/post-marker fault tests |
 | Directory-sync substitution | After the fault hook, append checks context and rooted events identity again before returning committed. | `TestDirectorySyncHookRegressionReverifiesEventsBeforeCommitted` |
 | Read/write temporary ownership | Read-only opens never reconcile writer temporaries. Range/lookup index maintenance is serialized by the keyed journal lock; independent committed reads do not write indexes. | `TestConcurrentReadRegressionDoesNotDeleteLiveWriterTemporaries` |
 
@@ -224,3 +226,61 @@ and `gofmt -l` returned no Task 2-owned path.
 
 No Task 3 recovery/upcasting behavior, Task 4 `flock`, config/schema/reload
 semantics, or `.superpowers/sdd/progress.md` content was changed.
+
+## Re-review Closure (2026-07-18)
+
+This re-review started from clean signed commit
+`1c1125685dc075ebd5036cc5555613e8fed0b3e6` (`fix: harden committed
+journal review findings`). `git verify-commit` reported a good signature from
+Murat Mirgün Ercan before the new edits.
+
+Four new regressions were added first and failed for the intended reasons:
+
+- post-marker faults cleared process-local durability uncertainty too early, so
+  replacing the original opened events inode after `marker_sync`,
+  `metadata_write`, `metadata_rename`, or `directory_sync` let lookup report a
+  substituted copy as committed;
+- a copied-root restart lost the process-local uncertainty token, allowing a
+  physically complete but never-proven marker to reach committed views;
+- `Inspect` and `Head` exposed that marker without a successful committed-view
+  sync; and
+- legacy `Append` and v2 `AppendBatch` used disjoint locks, allowing v2 open
+  cleanup to remove a live legacy-writer temporary.
+
+### Re-review finding-to-fix evidence
+
+| Finding | Correction | Permanent regression |
+| --- | --- | --- |
+| Append-method durability boundary | Marker uncertainty remains registered through metadata/index/directory work and transaction close. It is cleared by `AppendBatch` only when the complete method returns `committed` without an operation or close error. | `TestPostSyncFailureRetainsMarkerInodeUntilLookupResolution` covers `marker_sync`, `metadata_write`, `metadata_rename`, and `directory_sync` substitution. |
+| Restart-safe committed views | Every complete committed view performs an actual events-file `Sync` followed by rooted identity verification. The deterministic `FaultCommittedViewSync` hook proves that a restarted store cannot use marker shape alone as durability evidence. | `TestRestartedCommittedViewsRequireSyncAndRootedVerification` |
+| Shared read-surface policy | `LookupTransaction`, `Inspect`, `Head`, `ReadRange`, and `ReadCommittedTransaction` use the same sync-and-root-verify policy before returning a complete committed view. A same-process uncertainty is cleared only when every recorded uncertain marker exists in the scan on the original opened inode. | `TestInspectAndHeadDoNotExposeMarkerWhenDurabilityResolutionFails`, existing range and independent-read suites, and the restart regression above |
+| Legacy/v2 mutation exclusion | Legacy `Append` now takes the same session-keyed journal lock as v2 while holding its pre-existing root-wide lock. The only nested order is root-wide v0.1 lock then keyed journal lock; no path acquires the pair in reverse. | `TestLegacyAndV2MutatorsShareJournalLockBeforeTemporaryCleanup` blocks a legacy sanitizer with a live metadata temporary and proves v2 times out without entering cleanup. |
+
+A post-write verified prefix may be staged while the append retains its
+uncertainty token so the still-locked append can finish without decoding the
+unchanged prefix again. External committed-view paths refuse to consume that
+entry until the sync-and-root-verification policy has resolved uncertainty.
+
+After the focused RED-to-GREEN cycle, the complete re-review verification
+matrix passed from the unstaged diff:
+
+```text
+TASK_GO_FILES=<the exact eleven Task 2-owned Go paths> <mandatory gofmt/full-test/diff/status checkpoint>
+go test ./internal/session/jsonl -run 'Test(AppendBatch|ExpectedHead|CommittedBatch|IncompleteBatch|LookupTransaction|ReadRange|PostSyncFailure|InspectAndHead|RestartedCommittedViews|LegacyAndV2Mutators)' -count=1
+go test ./internal/session/jsonl -run 'Test(PostSyncFailureRetainsMarkerInodeUntilLookupResolution|InspectAndHeadDoNotExposeMarkerWhenDurabilityResolutionFails|RestartedCommittedViewsRequireSyncAndRootedVerification|LegacyAndV2MutatorsShareJournalLockBeforeTemporaryCleanup)$' -count=10
+go test -race ./internal/session/jsonl -run 'Test(AppendBatch|ExpectedHead|ReadRange)' -count=10
+go test -race ./internal/session/jsonl -run 'Test(PostSyncFailureRetainsMarkerInodeUntilLookupResolution|InspectAndHeadDoNotExposeMarkerWhenDurabilityResolutionFails|RestartedCommittedViewsRequireSyncAndRootedVerification|LegacyAndV2MutatorsShareJournalLockBeforeTemporaryCleanup)$' -count=10
+go test ./internal/session/jsonl -run 'Test.*(Substitut|Symlink|Durable|Metadata)' -count=1
+go test ./internal/journal ./internal/session/jsonl -count=1
+go test ./...
+go test -race ./...
+go vet ./...
+git diff --check
+```
+
+Both focused race commands completed with no race report. The repository-wide
+normal and race runs covered every package, `go vet` and `git diff --check`
+were silent, and `gofmt -l` returned no Task 2-owned path.
+
+The re-review changed no Task 3 recovery/upcasting behavior, Task 4 `flock`,
+config/schema/reload semantics, or `.superpowers/sdd/progress.md` content.

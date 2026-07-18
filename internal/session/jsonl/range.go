@@ -46,7 +46,7 @@ type verifiedJournalScan struct {
 }
 
 func (s *Store) rememberVerifiedJournalScan(transaction *sessionTransaction, ref protocol.JournalRef, scan journalScan) {
-	if s.journalHasMarkerUncertainty(ref) || !scan.writable || scan.incompleteTail || scan.sourceSize <= 0 || scan.sourceDigest.Validate() != nil {
+	if !scan.writable || scan.incompleteTail || scan.sourceSize <= 0 || scan.sourceDigest.Validate() != nil {
 		return
 	}
 	s.verifiedScan.Store(journalLockKey(ref), verifiedJournalScan{
@@ -59,7 +59,11 @@ func (s *Store) loadVerifiedJournalScan(
 	ctx context.Context,
 	transaction *sessionTransaction,
 	ref protocol.JournalRef,
+	allowMarkerUncertainty bool,
 ) (journalScan, bool) {
+	if !allowMarkerUncertainty && s.journalHasMarkerUncertainty(ref) {
+		return journalScan{}, false
+	}
 	key := journalLockKey(ref)
 	loaded, ok := s.verifiedScan.Load(key)
 	if !ok {
@@ -99,7 +103,7 @@ func (s *Store) loadJournalScan(
 	transaction *sessionTransaction,
 	ref protocol.JournalRef,
 ) (journalScan, bool, error) {
-	if scan, ok := s.loadVerifiedJournalScan(ctx, transaction, ref); ok {
+	if scan, ok := s.loadVerifiedJournalScan(ctx, transaction, ref, false); ok {
 		return scan, true, nil
 	}
 	if scan, ok := s.loadVerifiedJournalIndex(ctx, transaction, ref); ok {
@@ -418,10 +422,10 @@ func (s *Store) ReadRange(ctx context.Context, request journal.ReadRangeRequest)
 	if err != nil {
 		return journal.EventPage{}, err
 	}
-	if s.journalHasMarkerUncertainty(request.Journal) {
-		return journal.EventPage{}, errors.Join(fmt.Errorf("journal has unresolved marker durability uncertainty"), transaction.close())
-	}
 	scan, rebuildIndex, scanErr := s.loadJournalScan(ctx, transaction, request.Journal)
+	if scanErr == nil && !scan.incompleteTail {
+		scanErr = s.syncCommittedView(ctx, transaction, request.Journal, scan)
+	}
 	if scanErr == nil && rebuildIndex {
 		_ = ensureJournalIndex(ctx, transaction, scan)
 	}
@@ -508,17 +512,16 @@ func (s *Store) LookupTransaction(
 	if scanErr != nil {
 		return journal.TransactionLookup{}, errors.Join(scanErr, transaction.close())
 	}
-	if commit, ok := scan.transactions[transactionID]; ok {
-		if uncertain, exists := s.state.markerUncertainty.Load(markerUncertaintyKey(ref, transactionID)); exists {
-			eventsInfo, valid := uncertain.(os.FileInfo)
-			if !valid || eventsInfo == nil || transaction.eventsInfo == nil || !os.SameFile(eventsInfo, transaction.eventsInfo) {
-				return journal.TransactionLookup{State: journal.TransactionUnknown}, transaction.close()
+	if !scan.incompleteTail {
+		if verifyErr := s.syncCommittedView(ctx, transaction, ref, scan); verifyErr != nil {
+			closeErr := transaction.close()
+			if errors.Is(verifyErr, errUnresolvedMarkerDurability) {
+				return journal.TransactionLookup{State: journal.TransactionUnknown}, closeErr
 			}
-			if transaction.events.Sync() != nil || transaction.verifyEvents() != nil {
-				return journal.TransactionLookup{State: journal.TransactionUnknown}, transaction.close()
-			}
-			s.clearMarkerUncertainty(ref, transactionID)
+			return journal.TransactionLookup{}, errors.Join(verifyErr, closeErr)
 		}
+	}
+	if commit, ok := scan.transactions[transactionID]; ok {
 		s.rememberVerifiedJournalScan(transaction, ref, scan)
 		if rebuildIndex && !s.journalHasMarkerUncertainty(ref) {
 			_ = ensureJournalIndex(ctx, transaction, scan)
@@ -554,9 +557,6 @@ func (s *Store) ReadCommittedTransaction(
 		return journal.CommittedTransaction{}, err
 	}
 	defer lock.unlock()
-	if _, uncertain := s.state.markerUncertainty.Load(markerUncertaintyKey(ref, transactionID)); uncertain {
-		return journal.CommittedTransaction{}, fmt.Errorf("transaction %q has unresolved marker durability uncertainty", transactionID)
-	}
 	// This opens and scans independently on every call. No AppendResult or
 	// in-memory envelope slice participates in the verification decision.
 	transaction, _, err := s.openJournal(ctx, ref, os.O_RDONLY)
@@ -564,6 +564,9 @@ func (s *Store) ReadCommittedTransaction(
 		return journal.CommittedTransaction{}, err
 	}
 	scan, scanErr := s.scanJournal(ctx, transaction, ref)
+	if scanErr == nil && !scan.incompleteTail {
+		scanErr = s.syncCommittedView(ctx, transaction, ref, scan)
+	}
 	closeErr := transaction.close()
 	if scanErr != nil || closeErr != nil {
 		return journal.CommittedTransaction{}, errors.Join(scanErr, closeErr)

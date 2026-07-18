@@ -17,6 +17,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/eventcodec"
 	"github.com/muratmirgun/yordam/internal/journal"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -303,6 +304,14 @@ func (s *Store) Append(ctx context.Context, sessionID string, kind domain.EventK
 	if err := validateSessionID(sessionID); err != nil {
 		return domain.DurableEvent{}, err
 	}
+	// Legacy mutation lock order is the existing root-wide v0.1 lock followed
+	// by the session-keyed journal lock. No path acquires these in reverse.
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(sessionID)}
+	lock := s.journalLock(ref)
+	if err := lock.lock(ctx); err != nil {
+		return domain.DurableEvent{}, err
+	}
+	defer lock.unlock()
 	return s.appendLocked(ctx, domain.Session{ID: sessionID}, kind, payload)
 }
 

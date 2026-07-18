@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -447,5 +448,71 @@ func TestVerifiedPrefixRegressionSkipsOldDecodeForLookupAndAppend(t *testing.T) 
 	secondTailValidations := validations.Load()
 	if firstTailValidations == 0 || secondTailValidations != firstTailValidations {
 		t.Fatalf("append tail validations grew with old prefix: first=%d second=%d", firstTailValidations, secondTailValidations)
+	}
+}
+
+func copyJournalRootForRestart(t *testing.T, source, destination string) {
+	t.Helper()
+	err := filepath.Walk(source, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, relative)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode().Perm())
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, raw, info.Mode().Perm())
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRestartedCommittedViewsRequireSyncAndRootedVerification(t *testing.T) {
+	appendFault := errors.New("marker write unknown")
+	fixture := newV2JournalWithFault(t, func(point jsonl.FaultPoint) error {
+		if point == jsonl.FaultMarkerWrite {
+			return appendFault
+		}
+		return nil
+	})
+	event := proposed("evt-restart-uncertain", protocol.EventTaskCreated)
+	event.SessionID = protocol.SessionID(fixture.ref.ID)
+	result, err := fixture.repo.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: fixture.ref, ExpectedHead: fixture.head,
+		TransactionID: "txn-restart-uncertain", Events: []protocol.ProposedEvent{event},
+	})
+	if !errors.Is(err, appendFault) || result.Status != journal.AppendCommitUnknown {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	restartRoot := filepath.Join(t.TempDir(), "restarted-store")
+	copyJournalRootForRestart(t, fixture.root, restartRoot)
+	viewFault := errors.New("restarted committed view sync unknown")
+	restarted := jsonl.New(restartRoot, jsonl.Options{
+		Encoder: passthroughEncoder{},
+		Fault: func(point jsonl.FaultPoint) error {
+			if point == jsonl.FaultCommittedViewSync {
+				return viewFault
+			}
+			return nil
+		},
+	})
+	lookup, err := restarted.LookupTransaction(context.Background(), fixture.ref, "txn-restart-uncertain")
+	if !errors.Is(err, viewFault) || lookup.State == journal.TransactionCommitted {
+		t.Fatalf("restart lookup returned unverified committed result: lookup=%+v err=%v", lookup, err)
+	}
+	if inspection, err := restarted.Inspect(context.Background(), fixture.ref); !errors.Is(err, viewFault) {
+		t.Fatalf("restart Inspect exposed unverified marker: inspection=%+v err=%v", inspection, err)
+	}
+	if head, err := restarted.Head(context.Background(), fixture.ref); !errors.Is(err, viewFault) {
+		t.Fatalf("restart Head exposed unverified marker: head=%+v err=%v", head, err)
 	}
 }

@@ -79,6 +79,56 @@ func (s *Store) journalHasMarkerUncertainty(ref protocol.JournalRef) bool {
 	return found
 }
 
+var errUnresolvedMarkerDurability = errors.New("unresolved marker durability")
+
+func (s *Store) syncCommittedView(
+	ctx context.Context,
+	transaction *sessionTransaction,
+	ref protocol.JournalRef,
+	scan journalScan,
+) error {
+	if scan.incompleteTail {
+		return errUnresolvedMarkerDurability
+	}
+	prefix := journalLockKey(ref) + "\x00"
+	var uncertaintyKeys []string
+	var uncertaintyErr error
+	s.state.markerUncertainty.Range(func(key, value any) bool {
+		encodedKey, keyOK := key.(string)
+		if !keyOK || !strings.HasPrefix(encodedKey, prefix) {
+			return true
+		}
+		eventsInfo, infoOK := value.(os.FileInfo)
+		transactionID := protocol.TransactionID(strings.TrimPrefix(encodedKey, prefix))
+		_, committed := scan.transactions[transactionID]
+		if !infoOK || eventsInfo == nil || transaction.eventsInfo == nil || !os.SameFile(eventsInfo, transaction.eventsInfo) || !committed {
+			uncertaintyErr = errUnresolvedMarkerDurability
+			return false
+		}
+		uncertaintyKeys = append(uncertaintyKeys, encodedKey)
+		return true
+	})
+	if uncertaintyErr != nil {
+		return uncertaintyErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := transaction.events.Sync(); err != nil {
+		return err
+	}
+	if err := s.injectFault(FaultCommittedViewSync); err != nil {
+		return err
+	}
+	if err := errors.Join(ctx.Err(), transaction.verifyEvents()); err != nil {
+		return err
+	}
+	for _, key := range uncertaintyKeys {
+		s.state.markerUncertainty.Delete(key)
+	}
+	return nil
+}
+
 func (s *Store) AppendBatch(ctx context.Context, request journal.AppendRequest) (journal.AppendResult, error) {
 	if err := validateAppendRequest(request); err != nil {
 		return journal.AppendResult{}, err
@@ -97,7 +147,12 @@ func (s *Store) AppendBatch(ctx context.Context, request journal.AppendRequest) 
 		return journal.AppendResult{}, err
 	}
 	result, operationErr := s.appendBatchLocked(ctx, transaction, session, request)
-	return result, errors.Join(operationErr, transaction.close())
+	closeErr := transaction.close()
+	resultErr := errors.Join(operationErr, closeErr)
+	if resultErr == nil && result.Status == journal.AppendCommitted {
+		s.clearMarkerUncertainty(request.Journal, request.TransactionID)
+	}
+	return result, resultErr
 }
 
 func validateAppendRequest(request journal.AppendRequest) error {
@@ -292,7 +347,6 @@ func (s *Store) appendBatchLocked(
 	if err := transaction.events.Sync(); err != nil {
 		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
 	}
-	s.clearMarkerUncertainty(request.Journal, request.TransactionID)
 	if err := s.injectFault(FaultMarkerSync); err != nil {
 		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
 	}
@@ -311,7 +365,7 @@ func (s *Store) appendBatchLocked(
 	if err := s.injectFault(FaultMetadataRename); err != nil {
 		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
 	}
-	committedScan, accelerated := s.loadVerifiedJournalScan(ctx, transaction, request.Journal)
+	committedScan, accelerated := s.loadVerifiedJournalScan(ctx, transaction, request.Journal, true)
 	if !accelerated {
 		committedScan, err = s.scanJournal(ctx, transaction, request.Journal)
 		if err != nil {

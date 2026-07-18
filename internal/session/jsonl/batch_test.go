@@ -1046,6 +1046,123 @@ func TestDirectorySyncHookRegressionReverifiesEventsBeforeCommitted(t *testing.T
 	}
 }
 
+func TestPostSyncFailureRetainsMarkerInodeUntilLookupResolution(t *testing.T) {
+	for _, point := range []jsonl.FaultPoint{
+		jsonl.FaultMarkerSync,
+		jsonl.FaultMetadataWrite,
+		jsonl.FaultMetadataRename,
+		jsonl.FaultDirectorySync,
+	} {
+		t.Run(string(point), func(t *testing.T) {
+			wantFault := errors.New("post-sync append failure")
+			fixture := newV2JournalWithFault(t, func(got jsonl.FaultPoint) error {
+				if got == point {
+					return wantFault
+				}
+				return nil
+			})
+			event := proposed("evt-post-sync-"+protocol.EventID(point), protocol.EventTaskCreated)
+			event.SessionID = protocol.SessionID(fixture.ref.ID)
+			result, err := fixture.repo.AppendBatch(context.Background(), journal.AppendRequest{
+				Journal: fixture.ref, ExpectedHead: fixture.head,
+				TransactionID: protocol.TransactionID("txn-post-sync-" + point), Events: []protocol.ProposedEvent{event},
+			})
+			if !errors.Is(err, wantFault) || result.Status != journal.AppendCommitUnknown {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			raw, err := os.ReadFile(fixture.eventsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(fixture.eventsPath, fixture.eventsPath+".detached"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(fixture.eventsPath, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			lookup, err := fixture.repo.LookupTransaction(context.Background(), fixture.ref, protocol.TransactionID("txn-post-sync-"+point))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lookup.State != journal.TransactionUnknown {
+				t.Fatalf("substituted inode resolved post-sync uncertainty: %+v", lookup)
+			}
+		})
+	}
+}
+
+func TestInspectAndHeadDoNotExposeMarkerWhenDurabilityResolutionFails(t *testing.T) {
+	appendFault := errors.New("marker write unknown")
+	viewFault := errors.New("committed view sync unknown")
+	fixture := newV2JournalWithFault(t, func(point jsonl.FaultPoint) error {
+		switch point {
+		case jsonl.FaultMarkerWrite:
+			return appendFault
+		case jsonl.FaultCommittedViewSync:
+			return viewFault
+		default:
+			return nil
+		}
+	})
+	event := proposed("evt-inspect-uncertain", protocol.EventTaskCreated)
+	event.SessionID = protocol.SessionID(fixture.ref.ID)
+	result, err := fixture.repo.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: fixture.ref, ExpectedHead: fixture.head,
+		TransactionID: "txn-inspect-uncertain", Events: []protocol.ProposedEvent{event},
+	})
+	if !errors.Is(err, appendFault) || result.Status != journal.AppendCommitUnknown {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if inspection, err := fixture.repo.Inspect(context.Background(), fixture.ref); !errors.Is(err, viewFault) {
+		t.Fatalf("Inspect exposed unresolved marker: inspection=%+v err=%v", inspection, err)
+	}
+	if head, err := fixture.repo.Head(context.Background(), fixture.ref); !errors.Is(err, viewFault) {
+		t.Fatalf("Head exposed unresolved marker: head=%+v err=%v", head, err)
+	}
+}
+
+func TestLegacyAndV2MutatorsShareJournalLockBeforeTemporaryCleanup(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	legacyDone := make(chan error, 1)
+	fixture := newV2JournalWithOptions(t, jsonl.Options{
+		Encoder: passthroughEncoder{},
+		Sanitize: func(value any) (json.RawMessage, error) {
+			entered <- struct{}{}
+			<-release
+			return json.Marshal(value)
+		},
+	})
+	go func() {
+		_, err := fixture.repo.Append(context.Background(), string(fixture.ref.ID), domain.EventUserMessage, map[string]any{"text": "legacy"})
+		legacyDone <- err
+	}()
+	<-entered
+	defer func() {
+		close(release)
+		<-legacyDone
+	}()
+	temporary := filepath.Join(filepath.Dir(fixture.eventsPath), ".metadata-"+strings.Repeat("2", 32)+".tmp")
+	if err := os.WriteFile(temporary, []byte("live legacy writer"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	event := proposed("evt-lock-domain", protocol.EventTaskCreated)
+	event.SessionID = protocol.SessionID(fixture.ref.ID)
+	result, err := fixture.repo.AppendBatch(ctx, journal.AppendRequest{
+		Journal: fixture.ref, ExpectedHead: fixture.head,
+		TransactionID: "txn-lock-domain", Events: []protocol.ProposedEvent{event},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || result.Status != "" {
+		t.Fatalf("AppendBatch bypassed active legacy mutator: result=%+v err=%v", result, err)
+	}
+	raw, err := os.ReadFile(temporary)
+	if err != nil || string(raw) != "live legacy writer" {
+		t.Fatalf("competing mutator deleted live temporary: contents=%q err=%v", raw, err)
+	}
+}
+
 func readJournalLines(t *testing.T, path string) [][]byte {
 	t.Helper()
 	file, err := os.Open(path)
