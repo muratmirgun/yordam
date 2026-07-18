@@ -1,0 +1,212 @@
+package app
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"sync/atomic"
+	"time"
+
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
+	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
+)
+
+const (
+	ApplicationEventState               = "legacy.state"
+	ApplicationEventTextDelta           = "legacy.text_delta"
+	ApplicationEventPermissionRequested = "legacy.permission_requested"
+	ApplicationEventToolStarted         = "legacy.tool_started"
+	ApplicationEventToolOutput          = "legacy.tool_output"
+	ApplicationEventToolCompleted       = "legacy.tool_completed"
+	ApplicationEventTurnAccepted        = "legacy.turn_accepted"
+	ApplicationEventTurnCompleted       = "legacy.turn_completed"
+	ApplicationEventTurnInterrupted     = "legacy.turn_interrupted"
+	ApplicationEventReloadCompleted     = "legacy.reload_completed"
+	ApplicationEventNotice              = "legacy.notice"
+	ApplicationEventError               = "legacy.error"
+	ApplicationEventRejected            = "legacy.rejected"
+)
+
+type LegacyAdapterOptions struct {
+	Actor             protocol.ActorRef
+	SelectedSessionID protocol.SessionID
+	Cursor            func() *protocol.CommandExpectation
+	Now               func() time.Time
+}
+
+type LegacyAdapter struct {
+	actor             protocol.ActorRef
+	selectedSessionID protocol.SessionID
+	cursor            func() *protocol.CommandExpectation
+	now               func() time.Time
+	sequence          atomic.Uint64
+}
+
+func NewLegacyAdapter(options LegacyAdapterOptions) *LegacyAdapter {
+	if options.Actor.ID == "" {
+		options.Actor = protocol.ActorRef{ID: "legacy-user", Kind: protocol.ActorUser}
+	}
+	if options.Now == nil {
+		options.Now = func() time.Time { return time.Now().UTC() }
+	}
+	return &LegacyAdapter{actor: options.Actor, selectedSessionID: options.SelectedSessionID, cursor: options.Cursor, now: options.Now}
+}
+
+func (a *LegacyAdapter) Command(command Command) (protocol.Command, error) {
+	if a == nil || a.actor.Validate() != nil {
+		return protocol.Command{}, fmt.Errorf("legacy adapter actor is invalid")
+	}
+	kind, payload, err := a.commandPayload(command)
+	if err != nil {
+		return protocol.Command{}, err
+	}
+	raw, err := canonicaljson.Marshal(payload)
+	if err != nil {
+		return protocol.Command{}, err
+	}
+	sequence := a.sequence.Add(1)
+	applicationCommand := protocol.Command{
+		ProtocolVersion: protocol.ApplicationProtocolVersion,
+		CommandID:       protocol.CommandID(fmt.Sprintf("legacy-command-%d", sequence)),
+		Actor:           a.actor,
+		IdempotencyKey:  fmt.Sprintf("legacy-%d", sequence),
+		Kind:            kind,
+		PayloadVersion:  1,
+		Payload:         raw,
+	}
+	if a.cursor != nil {
+		applicationCommand.Expected = protocol.DeepCopy(a.cursor())
+	} else if a.selectedSessionID != "" {
+		applicationCommand.Expected = &protocol.CommandExpectation{SelectedSessionID: a.selectedSessionID}
+	}
+	applicationCommand.RequestDigest, err = CanonicalRequestDigest(applicationCommand)
+	if err != nil {
+		return protocol.Command{}, err
+	}
+	return applicationCommand, nil
+}
+
+func (a *LegacyAdapter) commandPayload(command Command) (string, any, error) {
+	switch command.Kind {
+	case CommandStartTurn:
+		return string(CommandStartTurn), protocol.StartTurnCommandV1{Prompt: command.Prompt}, nil
+	case CommandCancelTurn:
+		return CommandKindCancel, protocol.CancelCommandV1{TurnID: "active-turn"}, nil
+	case CommandResolvePermission:
+		scopeDigest, err := canonicaljson.Digest(command.Decision.Scope)
+		if err != nil {
+			return "", nil, err
+		}
+		return string(CommandResolvePermission), protocol.ResolvePermissionCommandV1{Response: protocol.ApprovalResponse{
+			RequestID: command.CallID, Action: string(command.Decision.Action), Lifetime: string(command.Decision.Lifetime),
+			ScopeDigest: scopeDigest, Actor: a.actor, Reason: command.Decision.Reason,
+		}}, nil
+	case CommandChangeMode:
+		return string(CommandChangeMode), protocol.ChangeModeCommandV1{Mode: string(command.Mode)}, nil
+	case CommandChangeModel:
+		return string(CommandChangeModel), protocol.ChangeModelCommandV1{ProviderID: protocol.ProviderID(command.Selection.Profile), ModelID: protocol.ModelID(command.Selection.Model)}, nil
+	case CommandAcknowledgeAutoShell:
+		return string(CommandAcknowledgeAutoShell), protocol.TrustedShellCommandV1{RequestID: "legacy-auto-shell", Enabled: true}, nil
+	case CommandCompact:
+		return string(CommandCompact), protocol.EmptyCommandV1{}, nil
+	case CommandReloadConfig:
+		return string(CommandReloadConfig), protocol.EmptyCommandV1{}, nil
+	case CommandNewSession:
+		return string(CommandNewSession), protocol.EmptyCommandV1{}, nil
+	case CommandOpenSession:
+		return string(CommandOpenSession), protocol.OpenSessionCommandV1{SessionID: protocol.SessionID(command.SessionID)}, nil
+	case CommandShutdown:
+		return string(CommandShutdown), protocol.EmptyCommandV1{}, nil
+	default:
+		return "", nil, fmt.Errorf("unsupported legacy command %q", command.Kind)
+	}
+}
+
+type legacyApplicationPayload struct {
+	Message   string                `json:"message,omitempty"`
+	DraftID   uint64                `json:"draft_id,omitempty"`
+	Draft     string                `json:"draft,omitempty"`
+	State     string                `json:"state,omitempty"`
+	Mode      domain.PermissionMode `json:"mode,omitempty"`
+	Selection domain.ModelSelection `json:"selection,omitempty"`
+	Applied   bool                  `json:"applied,omitempty"`
+}
+
+func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
+	if event.ProtocolVersion != protocol.ApplicationProtocolVersion {
+		return Event{}, requestError(codeInvalidProtocolVersion, "unsupported application protocol version", nil)
+	}
+	if err := event.Validate(); err != nil {
+		return Event{}, requestError(codeInvalidPayload, "invalid application event", err)
+	}
+	var payload legacyApplicationPayload
+	if err := strictUnmarshal(event.Payload, &payload); err != nil {
+		// Durable Foundation payloads are decoded below by kind; they do not use
+		// the private transient legacy shape.
+		if event.Classification != "durable" {
+			return Event{}, requestError(codeInvalidPayload, "invalid legacy event payload", err)
+		}
+	}
+	legacy := Event{DraftID: payload.DraftID, Draft: payload.Draft, Message: payload.Message, Mode: payload.Mode, Selection: payload.Selection, Applied: payload.Applied}
+	switch event.Kind {
+	case ApplicationEventState:
+		legacy.Kind = EventState
+		legacy.Runtime.State = payload.State
+	case ApplicationEventTextDelta:
+		legacy.Kind = EventTextDelta
+		legacy.Runtime.Text = payload.Message
+	case ApplicationEventPermissionRequested:
+		legacy.Kind = EventPermissionRequested
+	case ApplicationEventToolStarted:
+		legacy.Kind = EventToolStarted
+	case ApplicationEventToolOutput:
+		legacy.Kind = EventToolOutput
+	case ApplicationEventToolCompleted:
+		legacy.Kind = EventToolCompleted
+	case ApplicationEventTurnAccepted, protocol.EventTurnAccepted:
+		legacy.Kind = EventTurnAccepted
+	case ApplicationEventTurnCompleted, protocol.EventTurnCompleted:
+		legacy.Kind = EventTurnCompleted
+	case ApplicationEventTurnInterrupted, protocol.EventTurnInterrupted:
+		legacy.Kind = EventTurnInterrupted
+	case ApplicationEventReloadCompleted, protocol.EventRuntimeGenerationActivated:
+		legacy.Kind = EventReloadCompleted
+	case ApplicationEventNotice:
+		legacy.Kind = EventNotice
+	case ApplicationEventRejected:
+		legacy.Kind = EventRejected
+	case ApplicationEventError, protocol.EventTurnFailed:
+		legacy.Kind = EventError
+	case protocol.EventModeChanged:
+		var changed protocol.ModeChangedV1
+		if err := json.Unmarshal(event.Payload, &changed); err != nil {
+			return Event{}, err
+		}
+		legacy.Kind, legacy.Mode = EventState, domain.PermissionMode(changed.Mode)
+	case protocol.EventModelChanged:
+		var changed protocol.ModelChangedV1
+		if err := json.Unmarshal(event.Payload, &changed); err != nil {
+			return Event{}, err
+		}
+		legacy.Kind = EventState
+		legacy.Selection = domain.ModelSelection{Profile: string(changed.ProviderID), Model: string(changed.ModelID)}
+	default:
+		legacy.Kind = EventState
+	}
+	if event.Error != nil {
+		legacy.Code = event.Error.Code
+		legacy.Message = event.Error.Message
+		legacy.Err = nil
+	}
+	return legacy, nil
+}
+
+func strictUnmarshal(raw json.RawMessage, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	return ensureJSONEOF(decoder)
+}

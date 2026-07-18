@@ -33,6 +33,7 @@ const (
 
 type Event struct {
 	Kind        EventKind
+	Code        string
 	DraftID     uint64
 	Runtime     agent.RuntimeEvent
 	Permission  *ports.PermissionPrompt

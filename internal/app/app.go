@@ -33,23 +33,27 @@ type EventLogger interface {
 }
 
 type Options struct {
-	RuntimeSet     RuntimeSet
-	ReloadRuntime  ReloadRuntime
-	Redactors      *secret.Binding
-	Input          TurnInput
-	Compact        func(context.Context) error
-	RuntimeEvents  <-chan agent.RuntimeEvent
-	Sessions       ports.SessionStore
-	Session        domain.Session
-	Replay         domain.SessionReplay
-	Workspace      domain.Workspace
-	Policy         MutablePolicy
-	RestorePolicy  RestorePolicy
-	CommandBuffer  int
-	EventBuffer    int
-	Logger         EventLogger
-	Close          func() error
-	SessionChanged func(string)
+	RuntimeSet    RuntimeSet
+	ReloadRuntime ReloadRuntime
+	Redactors     *secret.Binding
+	Input         TurnInput
+	Compact       func(context.Context) error
+	RuntimeEvents <-chan agent.RuntimeEvent
+	Sessions      ports.SessionStore
+	Session       domain.Session
+	Replay        domain.SessionReplay
+	Workspace     domain.Workspace
+	Policy        MutablePolicy
+	RestorePolicy RestorePolicy
+	CommandBuffer int
+	EventBuffer   int
+	// LegacyQueueCapacity bounds the compatibility TUI consumer. The versioned
+	// broker owns all reconnectable production subscriptions.
+	LegacyQueueCapacity      int
+	NonReconnectableOverflow func()
+	Logger                   EventLogger
+	Close                    func() error
+	SessionChanged           func(string)
 }
 
 type App struct {
@@ -77,7 +81,10 @@ type App struct {
 	pendingInternal        map[string]*pendingPermission
 	permissionCallSequence uint64
 	eventMu                sync.Mutex
-	eventQueue             []Event
+	legacyQueue            []Event
+	legacyQueueCapacity    int
+	overflowOnce           sync.Once
+	nonReconnectableCancel func()
 	eventWake              chan struct{}
 }
 
@@ -123,28 +130,34 @@ func New(options Options) *App {
 	if redactors == nil {
 		redactors = secret.NewBinding(secret.New())
 	}
+	legacyQueueCapacity := options.LegacyQueueCapacity
+	if legacyQueueCapacity <= 0 {
+		legacyQueueCapacity = 256
+	}
 	application := &App{
-		runtimeSet:      runtimeSet,
-		reloadRuntime:   options.ReloadRuntime,
-		redactors:       redactors,
-		input:           options.Input,
-		compact:         options.Compact,
-		runtimeEvents:   options.RuntimeEvents,
-		sessions:        options.Sessions,
-		session:         options.Session,
-		replay:          options.Replay,
-		replayValid:     true,
-		workspace:       workspace,
-		policy:          options.Policy,
-		restorePolicy:   options.RestorePolicy,
-		commands:        make(chan Command, options.CommandBuffer),
-		events:          make(chan Event, options.EventBuffer),
-		logger:          options.Logger,
-		close:           options.Close,
-		sessionChanged:  options.SessionChanged,
-		pending:         make(map[string]*pendingPermission),
-		pendingInternal: make(map[string]*pendingPermission),
-		eventWake:       make(chan struct{}, 1),
+		runtimeSet:             runtimeSet,
+		reloadRuntime:          options.ReloadRuntime,
+		redactors:              redactors,
+		input:                  options.Input,
+		compact:                options.Compact,
+		runtimeEvents:          options.RuntimeEvents,
+		sessions:               options.Sessions,
+		session:                options.Session,
+		replay:                 options.Replay,
+		replayValid:            true,
+		workspace:              workspace,
+		policy:                 options.Policy,
+		restorePolicy:          options.RestorePolicy,
+		commands:               make(chan Command, options.CommandBuffer),
+		events:                 make(chan Event, options.EventBuffer),
+		logger:                 options.Logger,
+		close:                  options.Close,
+		sessionChanged:         options.SessionChanged,
+		legacyQueueCapacity:    legacyQueueCapacity,
+		nonReconnectableCancel: options.NonReconnectableOverflow,
+		pending:                make(map[string]*pendingPermission),
+		pendingInternal:        make(map[string]*pendingPermission),
+		eventWake:              make(chan struct{}, 1),
 	}
 	runtimeSet.BindApprover(application)
 	return application
@@ -819,7 +832,20 @@ func (a *App) enqueuePublishedEvent(ctx context.Context, event Event) bool {
 		return false
 	}
 	a.eventMu.Lock()
-	a.eventQueue = append(a.eventQueue, event)
+	limit := a.legacyQueueCapacity
+	if legacyTerminalEvent(event.Kind) {
+		limit++ // one reserved terminal item
+	}
+	if len(a.legacyQueue) >= limit {
+		a.eventMu.Unlock()
+		a.overflowOnce.Do(func() {
+			if a.nonReconnectableCancel != nil {
+				a.nonReconnectableCancel()
+			}
+		})
+		return false
+	}
+	a.legacyQueue = append(a.legacyQueue, event)
 	a.eventMu.Unlock()
 	select {
 	case a.eventWake <- struct{}{}:
@@ -831,7 +857,7 @@ func (a *App) enqueuePublishedEvent(ctx context.Context, event Event) bool {
 func (a *App) publishEvents(ctx context.Context) {
 	for {
 		a.eventMu.Lock()
-		if len(a.eventQueue) == 0 {
+		if len(a.legacyQueue) == 0 {
 			a.eventMu.Unlock()
 			select {
 			case <-ctx.Done():
@@ -840,7 +866,7 @@ func (a *App) publishEvents(ctx context.Context) {
 			}
 			continue
 		}
-		event := a.eventQueue[0]
+		event := a.legacyQueue[0]
 		a.eventMu.Unlock()
 
 		select {
@@ -848,10 +874,19 @@ func (a *App) publishEvents(ctx context.Context) {
 			return
 		case a.events <- event:
 			a.eventMu.Lock()
-			a.eventQueue[0] = Event{}
-			a.eventQueue = a.eventQueue[1:]
+			a.legacyQueue[0] = Event{}
+			a.legacyQueue = a.legacyQueue[1:]
 			a.eventMu.Unlock()
 		}
+	}
+}
+
+func legacyTerminalEvent(kind EventKind) bool {
+	switch kind {
+	case EventTurnCompleted, EventTurnInterrupted, EventReloadCompleted, EventError, EventRejected:
+		return true
+	default:
+		return false
 	}
 }
 
