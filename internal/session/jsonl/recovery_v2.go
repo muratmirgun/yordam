@@ -129,16 +129,23 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 			QuarantineDigest: request.ObservedTailDigest, Diagnostic: diagnostic,
 		}, nil
 	}
-	if exists && recoveryDiagnosticAppendIsPartial(scan, manifest, request, activeRaw) {
-		if err := preserveAndResetPartialRecoveryDiagnostic(ctx, transaction, manifest, operationHash, activeRaw); err != nil {
-			return journal.RecoveryResult{}, err
+	if exists {
+		diagnostic := recoveryCompletedDiagnostic(request, manifest)
+		deterministic, buildErr := buildDeterministicRecoveryDiagnosticAppend(session, request, diagnostic, scan)
+		if buildErr != nil {
+			return journal.RecoveryResult{}, buildErr
 		}
-		if err := transaction.close(); err != nil {
+		if recoveryDiagnosticAppendIsPartial(scan, manifest, request, activeRaw, deterministic.raw) {
+			if err := s.preserveAndResetPartialRecoveryDiagnostic(ctx, transaction, manifest, operationHash, activeRaw); err != nil {
+				return journal.RecoveryResult{}, err
+			}
+			if err := transaction.close(); err != nil {
+				transactionOpen = false
+				return journal.RecoveryResult{}, err
+			}
 			transactionOpen = false
-			return journal.RecoveryResult{}, err
+			return s.recoverSessionLocked(ctx, request)
 		}
-		transactionOpen = false
-		return s.recoverSessionLocked(ctx, request)
 	}
 	if !exists {
 		if !recoveryEligible(scan) {
@@ -209,7 +216,7 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 			return journal.RecoveryResult{}, err
 		}
 		if err := s.runRecoveryAction(FaultCandidateActivate, func() error {
-			return activateRecoveryCandidate(ctx, transaction, manifest, tail, validated)
+			return s.activateRecoveryCandidate(ctx, transaction, manifest, tail, validated)
 		}); err != nil {
 			return journal.RecoveryResult{}, err
 		}
@@ -247,21 +254,6 @@ func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.Re
 		if err != nil {
 			return err
 		}
-		payload, err := canonicaljson.Marshal(protocol.DiagnosticV1{Diagnostic: diagnostic})
-		if err != nil {
-			return errors.Join(err, transaction.close())
-		}
-		eventTime := s.clock().UTC()
-		if eventTime.Before(session.UpdatedAt) {
-			eventTime = session.UpdatedAt
-		}
-		appendRequest := journal.AppendRequest{
-			Journal: request.Journal, ExpectedHead: request.ExpectedHead, TransactionID: request.TransactionID,
-			Events: []protocol.ProposedEvent{{
-				EventID: protocol.EventID("recovery:" + recoveryOperationHash(request.OperationID)), Time: eventTime, PayloadVersion: 1,
-				Kind: protocol.EventRecoveryDiagnostic, SessionID: protocol.SessionID(request.Journal.ID), Payload: payload,
-			}},
-		}
 		scan, _, scanErr := s.loadJournalScan(ctx, transaction, request.Journal)
 		if scanErr != nil {
 			return errors.Join(scanErr, transaction.close())
@@ -270,12 +262,11 @@ func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.Re
 			result = journal.AppendResult{Status: journal.AppendCommitted, Cursor: committed.cursor, CurrentHead: committed.cursor}
 			return transaction.close()
 		}
-		if scan.hasLegacy && !scan.hasV2 {
-			appendRequest.Compatibility = &journal.CompatibilityDeclaration{
-				ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: request.ExpectedHead,
-			}
+		deterministic, buildErr := buildDeterministicRecoveryDiagnosticAppend(session, request, diagnostic, scan)
+		if buildErr != nil {
+			return errors.Join(buildErr, transaction.close())
 		}
-		result, err = s.appendBatchLocked(ctx, transaction, session, appendRequest)
+		result, err = s.appendBatchLockedWithIdentity(ctx, transaction, session, deterministic.request, deterministic.identity)
 		return errors.Join(err, transaction.close())
 	})
 	if err != nil {
@@ -285,6 +276,117 @@ func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.Re
 		return result, fmt.Errorf("recovery diagnostic append status %q", result.Status)
 	}
 	return result, nil
+}
+
+type deterministicRecoveryDiagnosticAppend struct {
+	request  journal.AppendRequest
+	identity appendGeneratedIdentity
+	raw      []byte
+}
+
+func buildDeterministicRecoveryDiagnosticAppend(
+	session domain.Session,
+	request journal.RecoveryRequest,
+	diagnostic protocol.Diagnostic,
+	scan journalScan,
+) (deterministicRecoveryDiagnosticAppend, error) {
+	operationPrefix := "recovery:" + recoveryOperationHash(request.OperationID)
+	eventTime := session.UpdatedAt.UTC()
+	appendRequest := journal.AppendRequest{
+		Journal: request.Journal, ExpectedHead: request.ExpectedHead, TransactionID: request.TransactionID,
+	}
+	identity := appendGeneratedIdentity{
+		compatibilityEventID: protocol.EventID(operationPrefix + ":compatibility"),
+		compatibilityTime:    eventTime,
+		markerEventID:        protocol.EventID(operationPrefix + ":marker"),
+		markerTime:           eventTime,
+		canonicalPayloads:    true,
+	}
+
+	seq := request.ExpectedHead.CommitSeq + 1
+	envelopes := make([]protocol.EventEnvelope, 0, 2)
+	if scan.hasLegacy && !scanHasCommittedV2(scan) {
+		appendRequest.Compatibility = &journal.CompatibilityDeclaration{
+			ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: request.ExpectedHead,
+		}
+		payload, err := canonicaljson.Marshal(protocol.MigrationCompatibilityDeclaredV1{
+			ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion,
+			LegacyHead: request.ExpectedHead, DowngradeStatus: "v0.1_read_only_after_v2",
+		})
+		if err != nil {
+			return deterministicRecoveryDiagnosticAppend{}, err
+		}
+		envelopes = append(envelopes, protocol.EventEnvelope{
+			SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1,
+			JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
+			EventID: identity.compatibilityEventID, SessionID: protocol.SessionID(request.Journal.ID),
+			Seq: seq, Time: eventTime, Kind: protocol.EventMigrationCompatibilityDeclared,
+			TransactionID: request.TransactionID, Payload: payload,
+		})
+		seq++
+	}
+
+	diagnosticPayload, err := canonicaljson.Marshal(protocol.DiagnosticV1{Diagnostic: diagnostic})
+	if err != nil {
+		return deterministicRecoveryDiagnosticAppend{}, err
+	}
+	diagnosticEvent := protocol.ProposedEvent{
+		EventID: protocol.EventID(operationPrefix + ":diagnostic"), Time: eventTime, PayloadVersion: 1,
+		Kind: protocol.EventRecoveryDiagnostic, SessionID: protocol.SessionID(request.Journal.ID), Payload: diagnosticPayload,
+	}
+	appendRequest.Events = []protocol.ProposedEvent{diagnosticEvent}
+	envelopes = append(envelopes, protocol.EventEnvelope{
+		SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: diagnosticEvent.PayloadVersion,
+		JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
+		EventID: diagnosticEvent.EventID, SessionID: diagnosticEvent.SessionID,
+		Seq: seq, Time: diagnosticEvent.Time, Kind: diagnosticEvent.Kind,
+		TransactionID: request.TransactionID, Payload: diagnosticPayload,
+	})
+
+	digest, err := canonicaljson.TransactionDigest(envelopes)
+	if err != nil {
+		return deterministicRecoveryDiagnosticAppend{}, err
+	}
+	markerPayload, err := canonicaljson.Marshal(protocol.TransactionCommittedV1{
+		TransactionID: request.TransactionID,
+		FirstSeq:      envelopes[0].Seq,
+		LastSeq:       envelopes[len(envelopes)-1].Seq,
+		EventCount:    uint32(len(envelopes)),
+		Digest:        digest,
+	})
+	if err != nil {
+		return deterministicRecoveryDiagnosticAppend{}, err
+	}
+	marker := protocol.EventEnvelope{
+		SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1,
+		JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
+		EventID: identity.markerEventID, SessionID: protocol.SessionID(request.Journal.ID),
+		Seq: envelopes[len(envelopes)-1].Seq + 1, Time: eventTime, Kind: protocol.EventTransactionCommitted,
+		TransactionID: request.TransactionID, Payload: markerPayload,
+	}
+	raw := make([]byte, 0)
+	for _, envelope := range envelopes {
+		line, lineErr := encodeLine(envelope)
+		if lineErr != nil {
+			return deterministicRecoveryDiagnosticAppend{}, lineErr
+		}
+		raw = append(raw, line...)
+	}
+	markerLine, err := encodeLine(marker)
+	if err != nil {
+		return deterministicRecoveryDiagnosticAppend{}, err
+	}
+	raw = append(raw, markerLine...)
+	return deterministicRecoveryDiagnosticAppend{request: appendRequest, identity: identity, raw: raw}, nil
+}
+
+func scanHasCommittedV2(scan journalScan) bool {
+	for _, commit := range scan.commits {
+		if len(commit.envelopes) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) runRecoveryAction(point FaultPoint, action func() error) error {
@@ -391,57 +493,19 @@ func recoveryDiagnosticAppendIsPartial(
 	manifest explicitRecoveryManifest,
 	request journal.RecoveryRequest,
 	active []byte,
+	expected []byte,
 ) bool {
 	prefixSize := manifest.Observation.ValidPrefixBytes
-	if scan.incompleteTransaction != request.TransactionID || scan.head != request.ExpectedHead ||
+	if scan.head != request.ExpectedHead ||
 		scan.validPrefixSize != prefixSize || int64(len(active)) <= prefixSize ||
 		digestBytes(active[:prefixSize]) != manifest.PrefixDigest {
 		return false
 	}
-	return recoveryDiagnosticTailBelongsToRequest(active[prefixSize:], request)
+	tail := active[prefixSize:]
+	return len(tail) < len(expected) && bytes.Equal(tail, expected[:len(tail)])
 }
 
-func recoveryDiagnosticTailBelongsToRequest(tail []byte, request journal.RecoveryRequest) bool {
-	complete := 0
-	for len(tail) > 0 {
-		newline := bytes.IndexByte(tail, '\n')
-		if newline < 0 {
-			break
-		}
-		line := tail[:newline]
-		tail = tail[newline+1:]
-		var envelope protocol.EventEnvelope
-		if json.Unmarshal(line, &envelope) != nil || envelope.SchemaVersion != protocol.EnvelopeVersion ||
-			envelope.JournalKind != request.Journal.Kind || envelope.JournalID != request.Journal.ID ||
-			envelope.TransactionID != request.TransactionID {
-			return false
-		}
-		switch envelope.Kind {
-		case protocol.EventMigrationCompatibilityDeclared:
-			var declaration protocol.MigrationCompatibilityDeclaredV1
-			if json.Unmarshal(envelope.Payload, &declaration) != nil || declaration.ReaderVersion != protocol.EnvelopeVersion ||
-				declaration.WriterVersion != protocol.EnvelopeVersion || declaration.LegacyHead != request.ExpectedHead ||
-				declaration.DowngradeStatus != "v0.1_read_only_after_v2" {
-				return false
-			}
-		case protocol.EventRecoveryDiagnostic:
-			var payload protocol.DiagnosticV1
-			var details struct {
-				OperationID protocol.ControlOperationID `json:"operation_id"`
-			}
-			if json.Unmarshal(envelope.Payload, &payload) != nil || payload.Diagnostic.Code != recoveryDiagnosticStatus ||
-				json.Unmarshal(payload.Diagnostic.Details, &details) != nil || details.OperationID != request.OperationID {
-				return false
-			}
-		default:
-			return false
-		}
-		complete++
-	}
-	return complete > 0
-}
-
-func preserveAndResetPartialRecoveryDiagnostic(
+func (s *Store) preserveAndResetPartialRecoveryDiagnostic(
 	ctx context.Context,
 	transaction *sessionTransaction,
 	manifest explicitRecoveryManifest,
@@ -490,6 +554,15 @@ func preserveAndResetPartialRecoveryDiagnostic(
 		return err
 	}
 	transaction.events = nil
+	if err := s.injectFault(FaultRecoveryDiagnosticResetBoundary); err != nil {
+		return err
+	}
+	if err := transaction.verifyMetadata(); err != nil {
+		return err
+	}
+	if err := verifyRootedRegularFile(transaction.sessionRoot, manifest.CandidateName, candidateInfo); err != nil {
+		return err
+	}
 	if err := transaction.sessionRoot.Rename(manifest.CandidateName, "events.jsonl"); err != nil {
 		return err
 	}
@@ -769,7 +842,7 @@ func validateRecoveryCandidate(
 	return validated, nil
 }
 
-func activateRecoveryCandidate(
+func (s *Store) activateRecoveryCandidate(
 	ctx context.Context,
 	transaction *sessionTransaction,
 	manifest explicitRecoveryManifest,
@@ -805,6 +878,12 @@ func activateRecoveryCandidate(
 		return err
 	}
 	transaction.metadata = nil
+	if err := s.injectFault(FaultRecoveryMetadataRenameBoundary); err != nil {
+		return err
+	}
+	if err := verifyRootedRegularFile(transaction.sessionRoot, manifest.MetadataName, validated.metadata); err != nil {
+		return err
+	}
 	if err := transaction.sessionRoot.Rename(manifest.MetadataName, "metadata.json"); err != nil {
 		return err
 	}
@@ -812,6 +891,12 @@ func activateRecoveryCandidate(
 		return err
 	}
 	transaction.events = nil
+	if err := s.injectFault(FaultRecoveryCandidateRenameBoundary); err != nil {
+		return err
+	}
+	if err := verifyRootedRegularFile(transaction.sessionRoot, manifest.CandidateName, validated.candidate); err != nil {
+		return err
+	}
 	if err := transaction.sessionRoot.Rename(manifest.CandidateName, "events.jsonl"); err != nil {
 		return err
 	}

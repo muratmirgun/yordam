@@ -22,6 +22,10 @@ const (
 	FaultCandidateActivate        FaultPoint = "candidate_activate"
 	FaultRecoveryDirectorySync    FaultPoint = "recovery_directory_sync"
 	FaultRecoveryDiagnosticCommit FaultPoint = "recovery_diagnostic_commit"
+
+	FaultRecoveryMetadataRenameBoundary  FaultPoint = "recovery_metadata_rename_boundary"
+	FaultRecoveryCandidateRenameBoundary FaultPoint = "recovery_candidate_rename_boundary"
+	FaultRecoveryDiagnosticResetBoundary FaultPoint = "recovery_diagnostic_reset_boundary"
 )
 
 type FaultInjector func(FaultPoint) error

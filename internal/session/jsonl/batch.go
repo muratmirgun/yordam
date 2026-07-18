@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
@@ -177,6 +178,24 @@ func (s *Store) appendBatchLocked(
 	session domain.Session,
 	request journal.AppendRequest,
 ) (journal.AppendResult, error) {
+	return s.appendBatchLockedWithIdentity(ctx, transaction, session, request, appendGeneratedIdentity{})
+}
+
+type appendGeneratedIdentity struct {
+	compatibilityEventID protocol.EventID
+	compatibilityTime    time.Time
+	markerEventID        protocol.EventID
+	markerTime           time.Time
+	canonicalPayloads    bool
+}
+
+func (s *Store) appendBatchLockedWithIdentity(
+	ctx context.Context,
+	transaction *sessionTransaction,
+	session domain.Session,
+	request journal.AppendRequest,
+	identity appendGeneratedIdentity,
+) (journal.AppendResult, error) {
 	if s.journalHasMarkerUncertainty(request.Journal) {
 		return journal.AppendResult{Status: journal.AppendCommitUnknown}, fmt.Errorf("journal has unresolved marker durability uncertainty")
 	}
@@ -211,11 +230,18 @@ func (s *Store) appendBatchLocked(
 		if len(request.Events) >= 1000 {
 			return base, fmt.Errorf("first v2 compatibility transaction supports at most 999 caller events")
 		}
-		compatibilityID, err := s.nextID()
-		if err != nil {
-			return base, err
+		compatibilityID := identity.compatibilityEventID
+		if compatibilityID == "" {
+			generated, err := s.nextID()
+			if err != nil {
+				return base, err
+			}
+			compatibilityID = protocol.EventID(generated)
 		}
-		compatibilityTime := s.clock().UTC()
+		compatibilityTime := identity.compatibilityTime.UTC()
+		if identity.compatibilityTime.IsZero() {
+			compatibilityTime = s.clock().UTC()
+		}
 		if compatibilityTime.Before(session.UpdatedAt) {
 			compatibilityTime = session.UpdatedAt
 		}
@@ -227,7 +253,7 @@ func (s *Store) appendBatchLocked(
 			return base, err
 		}
 		declaration := protocol.ProposedEvent{
-			EventID: protocol.EventID(compatibilityID), Time: compatibilityTime, PayloadVersion: 1,
+			EventID: compatibilityID, Time: compatibilityTime, PayloadVersion: 1,
 			Kind: protocol.EventMigrationCompatibilityDeclared, SessionID: protocol.SessionID(request.Journal.ID), Payload: payload,
 		}
 		request.Events = append([]protocol.ProposedEvent{declaration}, request.Events...)
@@ -260,7 +286,7 @@ func (s *Store) appendBatchLocked(
 		}
 		seen[proposed.EventID] = struct{}{}
 		admitted := protocol.CloneRawMessage(proposed.Payload)
-		if s.encoder != nil {
+		if s.encoder != nil && !identity.canonicalPayloads {
 			admitted, err = s.encoder.EncodeProposed(protocol.CloneProposedEvent(proposed))
 			if err != nil {
 				return base, fmt.Errorf("encode proposed event %q: %w", proposed.EventID, err)
@@ -307,18 +333,24 @@ func (s *Store) appendBatchLocked(
 	if err != nil {
 		return base, err
 	}
-	markerID, err := s.nextID()
-	if err != nil {
-		return base, err
+	generatedMarkerID := identity.markerEventID
+	if generatedMarkerID == "" {
+		markerID, err := s.nextID()
+		if err != nil {
+			return base, err
+		}
+		generatedMarkerID = protocol.EventID(markerID)
 	}
-	generatedMarkerID := protocol.EventID(markerID)
 	if _, duplicate := scan.eventIDs[generatedMarkerID]; duplicate {
 		return base, fmt.Errorf("generated marker event ID %q duplicates a durable event", generatedMarkerID)
 	}
 	if _, duplicate := seen[generatedMarkerID]; duplicate {
 		return base, fmt.Errorf("generated marker event ID %q duplicates a proposed event", generatedMarkerID)
 	}
-	markerTime := s.clock().UTC()
+	markerTime := identity.markerTime.UTC()
+	if identity.markerTime.IsZero() {
+		markerTime = s.clock().UTC()
+	}
 	if markerTime.Before(events[len(events)-1].Time) {
 		markerTime = events[len(events)-1].Time
 	}

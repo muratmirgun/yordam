@@ -12,6 +12,8 @@ Task 3 is implemented from signed base `45b656d2256c604cbacfce9feeb5704578c195e1
 - Scanning now validates the semantics of every recognized v1 payload before advancing the committed prefix and validates the exact durable v1-to-v2 compatibility transition at the commit marker.
 - Recovery is advertised and accepted only for eligible incomplete final fragments or incomplete known transactions; unsupported, malformed, and invalid-transition data stays read-only and non-discardable.
 - Persisted recovery manifests, activation candidates, metadata, quarantine artifacts, and their rooted identities are revalidated immediately before mutation. Recovery-diagnostic append retries cover every Task 2 append crash window.
+- Recovery diagnostics use operation-derived compatibility, diagnostic, and marker identities plus the persisted session timestamp, so every operation-owned byte prefix is recognizable and retryable even when the first JSON line was only partly written.
+- Candidate and metadata identities are checked at the final rename boundaries after active handles close; diagnostic reset applies the same fail-closed boundary validation.
 - The exact 11-case fixture matrix contains 33 fixture files plus one sorted lowercase SHA-256 manifest.
 - No config, schema, reload, Task 4+, or progress-ledger semantics were changed.
 
@@ -51,6 +53,13 @@ The independent Task 3 review returned seven Important findings. They were repro
 6. Unsupported envelope, payload, and unknown stateful records could expose discard-style recovery details. GREEN: only supported incomplete fragments/transactions are eligible; unsupported/malformed/invalid-transition scans never emit `recovery.available`, and `RecoverSession` returns conflict without mutation.
 7. Mixed durable journals did not validate the compatibility transition. GREEN: the first committed v2 transaction after legacy data requires exactly one declaration as its first event with reader/writer `2`, the exact legacy head, and `v0.1_read_only_after_v2`; missing, later, duplicate, wrong-field, and repeated declarations stop at `invalid_transition`.
 
+### Final re-review correction batch
+
+The final re-review returned two Important findings. Both were reproduced in one RED batch and corrected together:
+
+1. A true short first diagnostic write, before a complete event or even before `transaction_id`, was not recognizable as operation-owned and conflicted forever. GREEN: recovery constructs the exact deterministic compatibility/diagnostic/marker transaction from the persisted request and session state, recognizes only strict byte prefixes of that transaction, preserves the observed prefix, resets to the validated journal prefix, and retries with the same identities and timestamp. Tests cut before `transaction_id`, midway through the first line, between event lines, and midway through the marker, then require byte-for-byte equality after retry.
+2. Candidate and metadata identities could change after validation/handle close but before final rename. GREEN: normal activation closes the active handle, executes a deterministic boundary probe, revalidates the retained rooted identity, and immediately renames with no intervening work at both metadata and journal-candidate boundaries. Diagnostic reset performs the equivalent metadata/candidate validation immediately before its candidate rename. Deterministic substitutions at every boundary fail without changing the active journal.
+
 ## Implementation and compatibility
 
 ### Inspection and upcasting
@@ -69,6 +78,7 @@ The independent Task 3 review returned seven Important findings. They were repro
 - Journal and metadata candidates are separately written, synced, rooted-identity checked, content validated, activated by replacement, and followed by directory sync.
 - Same-request restart returns `recovered` or `already_recovered`; changed request/head/tail returns `conflict` without mutation.
 - Partial operation-owned files and diagnostic append bytes resume safely. Candidate/session/artifacts/quarantine substitution tests fail closed without changing the active source.
+- Even a non-newline-terminated prefix of the first recovery-diagnostic event is preserved and resumed only when it exactly matches the persisted operation's deterministic transaction bytes.
 - Recovery appends `recovery.diagnostic` in a new committed transaction and automatically includes the first-v2 compatibility declaration for a legacy-only prefix.
 
 ## Test migrations outside the nominal brief list
@@ -101,9 +111,9 @@ gofmt -l internal/session/jsonl
 Latest package results:
 
 ```text
-seven-finding focused regression batch: PASS
-jsonl package: PASS (17.028s final package rerun)
-jsonl race package: PASS (37.541s final rerun)
+final two-finding focused regression batch: PASS
+jsonl package: PASS (16.664s final package rerun)
+jsonl race package: PASS (35.582s final rerun)
 repository-wide go test ./...: PASS (including internal/ptytest)
 go vet ./...: PASS
 diff/gofmt checks: PASS
