@@ -83,15 +83,17 @@ func (p *IncrementalSessionStateProjector) Open(
 	if inspection.Journal != ref {
 		return state, fmt.Errorf("session state inspection journal mismatch")
 	}
-	candidate := state.SessionState
-	for _, record := range inspection.Events {
-		candidate, err = applyCommittedSessionEvent(candidate, record)
-		if err != nil {
-			return state, err
-		}
+	state.Diagnostics = protocol.DeepCopy(inspection.Diagnostics)
+	candidate, projectedHead, failedRecord, projectionErr := applyCommittedSessionTransactions(ref, state.SessionState, protocol.CommittedCursor{}, inspection.Events)
+	if projectionErr != nil {
+		state.SessionState, state.Head, state.Writable = candidate, projectedHead, false
+		state.Diagnostics = append(state.Diagnostics, sessionStateProjectionDiagnostic(ref, failedRecord, projectionErr))
+		return state, errors.Join(ErrSessionStateReadOnly, projectionErr)
+	}
+	if len(inspection.Events) > 0 && projectedHead != inspection.Head {
+		return state, fmt.Errorf("session state inspection head mismatch")
 	}
 	state.SessionState, state.Head, state.Writable = candidate, inspection.Head, inspection.Writable
-	state.Diagnostics = protocol.DeepCopy(inspection.Diagnostics)
 	if !inspection.Writable {
 		return state, ErrSessionStateReadOnly
 	}
@@ -120,18 +122,17 @@ func (p *IncrementalSessionStateProjector) ProjectSessionState(
 		if err != nil {
 			return current, err
 		}
-		candidate := updated.SessionState
-		for _, record := range page.Events {
-			candidate, err = applyCommittedSessionEvent(candidate, record)
-			if err != nil {
-				return current, err
-			}
+		candidate, projectedHead, failedRecord, projectionErr := applyCommittedSessionTransactions(updated.Journal, updated.SessionState, updated.Head, page.Events)
+		if projectionErr != nil {
+			updated.SessionState, updated.Head, updated.Writable = candidate, projectedHead, false
+			updated.Diagnostics = append(updated.Diagnostics, sessionStateProjectionDiagnostic(updated.Journal, failedRecord, projectionErr))
+			return updated, errors.Join(ErrSessionStateReadOnly, projectionErr)
 		}
 		if len(page.Events) > 0 {
 			if err := page.Cursor.Validate(); err != nil {
 				return current, err
 			}
-			if page.Cursor.JournalKind != updated.Journal.Kind || page.Cursor.JournalID != updated.Journal.ID || page.Cursor.CommitSeq <= updated.Head.CommitSeq {
+			if page.Cursor.JournalKind != updated.Journal.Kind || page.Cursor.JournalID != updated.Journal.ID || page.Cursor.CommitSeq <= updated.Head.CommitSeq || projectedHead != page.Cursor {
 				return current, fmt.Errorf("session state cursor did not advance")
 			}
 			updated.SessionState, updated.Head = candidate, page.Cursor
@@ -145,6 +146,83 @@ func (p *IncrementalSessionStateProjector) ProjectSessionState(
 		if len(page.Events) == 0 {
 			return current, fmt.Errorf("session state range reported more without advancing")
 		}
+	}
+}
+
+func applyCommittedSessionTransactions(
+	ref protocol.JournalRef,
+	initial SessionState,
+	initialHead protocol.CommittedCursor,
+	records []protocol.EventRecord,
+) (SessionState, protocol.CommittedCursor, protocol.EventRecord, error) {
+	state, head := initial, initialHead
+	for start := 0; start < len(records); {
+		end := start + 1
+		for end < len(records) && sameSessionTransaction(records[start], records[end]) {
+			end++
+		}
+		candidate := state
+		for _, record := range records[start:end] {
+			var err error
+			candidate, err = applyCommittedSessionEvent(candidate, record)
+			if err != nil {
+				return state, head, record, fmt.Errorf("project session event %q: %w", record.Envelope.Kind, err)
+			}
+		}
+		cursor, err := sessionTransactionCursor(ref, records[start:end])
+		if err != nil {
+			return state, head, records[start], err
+		}
+		if head != (protocol.CommittedCursor{}) && cursor.CommitSeq <= head.CommitSeq {
+			return state, head, records[start], fmt.Errorf("session state transaction cursor did not advance")
+		}
+		state, head = candidate, cursor
+		start = end
+	}
+	return state, head, protocol.EventRecord{}, nil
+}
+
+func sameSessionTransaction(left, right protocol.EventRecord) bool {
+	if left.Legacy != nil || right.Legacy != nil {
+		return left.Legacy != nil && right.Legacy != nil && left.Legacy.EventID == right.Legacy.EventID
+	}
+	return left.Envelope.TransactionID != "" && left.Envelope.TransactionID == right.Envelope.TransactionID
+}
+
+func sessionTransactionCursor(ref protocol.JournalRef, records []protocol.EventRecord) (protocol.CommittedCursor, error) {
+	if len(records) == 0 {
+		return protocol.CommittedCursor{}, fmt.Errorf("session state transaction is empty")
+	}
+	first, last := records[0], records[len(records)-1]
+	if first.Legacy != nil {
+		if len(records) != 1 || first.Legacy.EventID == "" || first.Legacy.Seq == 0 {
+			return protocol.CommittedCursor{}, fmt.Errorf("invalid legacy session state transaction")
+		}
+		return protocol.CommittedCursor{
+			JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: first.Legacy.Seq,
+			TransactionID: protocol.TransactionID("legacy:" + first.Legacy.EventID),
+		}, nil
+	}
+	if first.Envelope.TransactionID == "" || first.Envelope.Seq == 0 || last.Envelope.Seq < first.Envelope.Seq {
+		return protocol.CommittedCursor{}, fmt.Errorf("invalid session state transaction identity")
+	}
+	for index, record := range records {
+		if record.Legacy != nil || record.Envelope.TransactionID != first.Envelope.TransactionID || record.Envelope.Seq != first.Envelope.Seq+uint64(index) {
+			return protocol.CommittedCursor{}, fmt.Errorf("noncontiguous session state transaction")
+		}
+	}
+	return protocol.CommittedCursor{
+		JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: last.Envelope.Seq + 1, TransactionID: first.Envelope.TransactionID,
+	}, nil
+}
+
+func sessionStateProjectionDiagnostic(ref protocol.JournalRef, record protocol.EventRecord, projectionErr error) protocol.Diagnostic {
+	details, _ := json.Marshal(struct {
+		Error string `json:"error"`
+	}{Error: projectionErr.Error()})
+	return protocol.Diagnostic{
+		Code: "session_state.projection_failed", Message: "session state projection stopped at the last complete transaction",
+		Journal: ref, AtSeq: record.Envelope.Seq, EventID: record.Envelope.EventID, Details: details,
 	}
 }
 

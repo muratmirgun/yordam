@@ -24,10 +24,10 @@ func TestSessionStateInitialInspectThenIncrementalReadRange(t *testing.T) {
 	secondHead := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 4, TransactionID: "txn-2"}
 	reader := &sessionStateReader{
 		inspection: journal.Inspection{Journal: ref, Head: firstHead, Writable: true, Events: []protocol.EventRecord{
-			v2SessionEvent(protocol.EventModeChanged, &protocol.ModeChangedV1{Mode: "safe"}),
+			v2SessionEvent(1, "txn-1", protocol.EventModeChanged, &protocol.ModeChangedV1{Mode: "safe"}),
 		}},
 		pages: []journal.EventPage{{Events: []protocol.EventRecord{
-			v2SessionEvent(protocol.EventModelChanged, &protocol.ModelChangedV1{ProviderID: "primary", ModelID: "model-b"}),
+			v2SessionEvent(3, "txn-2", protocol.EventModelChanged, &protocol.ModelChangedV1{ProviderID: "primary", ModelID: "model-b"}),
 		}, Cursor: secondHead, Head: secondHead}},
 	}
 	projector := app.NewIncrementalSessionStateProjector(reader)
@@ -49,13 +49,75 @@ func TestSessionStateInitialInspectThenIncrementalReadRange(t *testing.T) {
 	}
 }
 
+func TestSessionStateOpenReturnsLastCompleteTransactionPrefixReadOnly(t *testing.T) {
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session"}
+	prefix := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 2, TransactionID: "txn-valid"}
+	head := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 5, TransactionID: "txn-unsupported"}
+	reader := &sessionStateReader{inspection: journal.Inspection{
+		Journal: ref, Head: head, Writable: true,
+		Events: []protocol.EventRecord{
+			v2SessionEvent(1, "txn-valid", protocol.EventModeChanged, &protocol.ModeChangedV1{Mode: "safe"}),
+			v2SessionEvent(3, "txn-unsupported", protocol.EventModelChanged, &protocol.ModelChangedV1{ProviderID: "primary", ModelID: "model-b"}),
+			v2SessionEvent(4, "txn-unsupported", "future.session_policy", &struct{}{}),
+		},
+	}}
+
+	state, err := app.NewIncrementalSessionStateProjector(reader).Open(t.Context(), ref, app.SessionState{
+		Mode: domain.ModeAsk, Selection: domain.ModelSelection{Profile: "primary", Model: "model-a"},
+	})
+	if !errors.Is(err, app.ErrSessionStateReadOnly) {
+		t.Fatalf("error=%v", err)
+	}
+	if state.Head != prefix || state.Writable || state.Mode != domain.ModeSafe || state.Selection.Model != "model-a" {
+		t.Fatalf("validated prefix=%+v", state)
+	}
+	if len(state.Diagnostics) != 1 || state.Diagnostics[0].Code != "session_state.projection_failed" {
+		t.Fatalf("diagnostics=%+v", state.Diagnostics)
+	}
+}
+
+func TestSessionStateUpdateReturnsLastCompleteTransactionPrefixReadOnly(t *testing.T) {
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session"}
+	openedHead := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 2, TransactionID: "txn-open"}
+	prefix := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 4, TransactionID: "txn-valid"}
+	head := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 7, TransactionID: "txn-unsupported"}
+	reader := &sessionStateReader{
+		inspection: journal.Inspection{Journal: ref, Head: openedHead, Writable: true, Events: []protocol.EventRecord{
+			v2SessionEvent(1, "txn-open", protocol.EventModeChanged, &protocol.ModeChangedV1{Mode: "safe"}),
+		}},
+		pages: []journal.EventPage{{Events: []protocol.EventRecord{
+			v2SessionEvent(3, "txn-valid", protocol.EventModeChanged, &protocol.ModeChangedV1{Mode: "auto"}),
+			v2SessionEvent(5, "txn-unsupported", protocol.EventModelChanged, &protocol.ModelChangedV1{ProviderID: "primary", ModelID: "model-b"}),
+			v2SessionEvent(6, "txn-unsupported", "future.session_policy", &struct{}{}),
+		}, Cursor: head, Head: head}},
+	}
+	projector := app.NewIncrementalSessionStateProjector(reader)
+	state, err := projector.Open(t.Context(), ref, app.SessionState{
+		Mode: domain.ModeAsk, Selection: domain.ModelSelection{Profile: "primary", Model: "model-a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := projector.ProjectSessionState(t.Context(), state)
+	if !errors.Is(err, app.ErrSessionStateReadOnly) {
+		t.Fatalf("error=%v", err)
+	}
+	if updated.Head != prefix || updated.Writable || updated.Mode != domain.ModeAuto || updated.Selection.Model != "model-a" {
+		t.Fatalf("validated prefix=%+v", updated)
+	}
+	if len(updated.Diagnostics) != 1 || updated.Diagnostics[0].Code != "session_state.projection_failed" {
+		t.Fatalf("diagnostics=%+v", updated.Diagnostics)
+	}
+}
+
 func TestSessionStateRejectsUnknownStatefulIncrementWithoutAdvancingCursor(t *testing.T) {
 	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session"}
 	head := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 2, TransactionID: "txn-1"}
 	next := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 4, TransactionID: "txn-2"}
 	reader := &sessionStateReader{
 		inspection: journal.Inspection{Journal: ref, Head: head, Writable: true},
-		pages:      []journal.EventPage{{Events: []protocol.EventRecord{{Envelope: protocol.EventEnvelope{Kind: "future.session_policy", PayloadVersion: 1}, Decoded: &struct{}{}}}, Cursor: next, Head: next}},
+		pages:      []journal.EventPage{{Events: []protocol.EventRecord{v2SessionEvent(3, "txn-2", "future.session_policy", &struct{}{})}, Cursor: next, Head: next}},
 	}
 	projector := app.NewIncrementalSessionStateProjector(reader)
 	state, err := projector.Open(t.Context(), ref, app.SessionState{Mode: domain.ModeAsk})
@@ -76,7 +138,7 @@ func TestSessionStateRejectsFinalRangeThatDoesNotReachReportedHead(t *testing.T)
 	reader := &sessionStateReader{
 		inspection: journal.Inspection{Journal: ref, Head: head, Writable: true},
 		pages: []journal.EventPage{{Events: []protocol.EventRecord{
-			v2SessionEvent(protocol.EventModelChanged, &protocol.ModelChangedV1{ProviderID: "primary", ModelID: "model-b"}),
+			v2SessionEvent(3, "txn-2", protocol.EventModelChanged, &protocol.ModelChangedV1{ProviderID: "primary", ModelID: "model-b"}),
 		}, Cursor: next, Head: reported}},
 	}
 	projector := app.NewIncrementalSessionStateProjector(reader)
@@ -112,14 +174,15 @@ func (r *sessionStateReader) ReadRange(_ context.Context, request journal.ReadRa
 	return page, nil
 }
 
-func v2SessionEvent(kind string, decoded any) protocol.EventRecord {
+func v2SessionEvent(seq uint64, transactionID protocol.TransactionID, kind string, decoded any) protocol.EventRecord {
 	raw, err := json.Marshal(decoded)
 	if err != nil {
 		panic(err)
 	}
 	return protocol.EventRecord{Envelope: protocol.EventEnvelope{
 		JournalKind: protocol.JournalSession, JournalID: "session", SessionID: "session",
-		EventID: protocol.EventID("event-" + kind), Time: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC), Kind: kind, PayloadVersion: 1, Payload: raw,
+		EventID: protocol.EventID("event-" + kind), Seq: seq, TransactionID: transactionID,
+		Time: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC), Kind: kind, PayloadVersion: 1, Payload: raw,
 	}, Decoded: decoded}
 }
 

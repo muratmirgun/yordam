@@ -14,6 +14,7 @@ type State string
 
 const (
 	StateDraft                State = "draft"
+	StatePending              State = "pending"
 	StateContractDrafting     State = "contract_drafting"
 	StateContractProposed     State = "contract_proposed"
 	StateContractFrozen       State = "contract_frozen"
@@ -26,6 +27,7 @@ const (
 	StateUnknown              State = "unknown"
 	StateCancelled            State = "cancelled"
 	StateReopened             State = "reopened"
+	StateCompleted            State = "completed"
 )
 
 type TurnState string
@@ -110,6 +112,7 @@ type Record struct {
 	VerificationState protocol.ValueState        `json:"verification_state"`
 	Outcome           Outcome                    `json:"outcome"`
 	OutcomeHistory    []Outcome                  `json:"outcome_history,omitempty"`
+	Legacy            bool                       `json:"legacy,omitempty"`
 }
 
 type TurnRecord struct {
@@ -159,11 +162,15 @@ func (Projector) Apply(current Projection, event protocol.EventRecord) (Projecti
 		if _, exists := next.Tasks[event.Envelope.TaskID]; exists {
 			return current, fmt.Errorf("task %q already exists", event.Envelope.TaskID)
 		}
+		initialState := StateDraft
+		if event.Legacy != nil {
+			initialState = StatePending
+		}
 		next.Tasks[event.Envelope.TaskID] = Record{
-			TaskID: event.Envelope.TaskID, Goal: payload.Goal, State: StateDraft,
+			TaskID: event.Envelope.TaskID, Goal: payload.Goal, State: initialState,
 			OutcomeContractID: payload.OutcomeContractID, ContractVersion: payload.ContractVersion,
 			Criteria: make(map[string]Criterion), Contracts: make(map[uint32]ContractVersion), VerificationState: protocol.ValueUnknown,
-			Outcome: Outcome{State: protocol.ValueUnknown},
+			Outcome: Outcome{State: protocol.ValueUnknown}, Legacy: event.Legacy != nil,
 		}
 	case protocol.EventTaskStatusChanged:
 		payload, ok := event.Decoded.(*protocol.TaskStatusChangedV1)
@@ -175,7 +182,7 @@ func (Projector) Apply(current Projection, event protocol.EventRecord) (Projecti
 			return current, fmt.Errorf("task %q is unknown", event.Envelope.TaskID)
 		}
 		from, to := State(payload.From), State(payload.To)
-		if record.State != from || !allowedTaskTransition(from, to) {
+		if record.State != from || !allowedTaskTransition(record.Legacy, from, to) {
 			return current, fmt.Errorf("invalid task transition %q -> %q", from, to)
 		}
 		record.State = to
@@ -188,6 +195,9 @@ func (Projector) Apply(current Projection, event protocol.EventRecord) (Projecti
 		record, exists := next.Tasks[event.Envelope.TaskID]
 		if !exists || payload.OutcomeContractID != record.OutcomeContractID || payload.Version != record.ContractVersion {
 			return current, fmt.Errorf("outcome contract binding mismatch")
+		}
+		if _, exists := record.Contracts[payload.Version]; exists {
+			return current, fmt.Errorf("outcome contract version %d is already declared", payload.Version)
 		}
 		criteria, err := newCriteria(payload.Criteria)
 		if err != nil {
@@ -286,6 +296,11 @@ func (Projector) Apply(current Projection, event protocol.EventRecord) (Projecti
 		if _, exists := next.Turns[event.Envelope.TurnID]; exists {
 			return current, fmt.Errorf("turn %q already exists", event.Envelope.TurnID)
 		}
+		for _, existing := range next.Turns {
+			if !terminalTurnState(existing.State) {
+				return current, fmt.Errorf("turn %q is still active", existing.TurnID)
+			}
+		}
 		next.Turns[event.Envelope.TurnID] = TurnRecord{
 			TurnID: event.Envelope.TurnID, TaskID: event.Envelope.TaskID, CommandID: payload.CommandID, Goal: payload.Goal,
 			OutcomeContractID: payload.OutcomeContractID, ContractVersion: payload.ContractVersion, State: TurnStateAccepted,
@@ -356,7 +371,11 @@ func ensureMaps(state *Projection) {
 	}
 }
 
-func allowedTaskTransition(from, to State) bool {
+func allowedTaskTransition(legacy bool, from, to State) bool {
+	if legacy {
+		return (from == StatePending && (to == StateRunning || to == StateCancelled)) ||
+			(from == StateRunning && (to == StateCompleted || to == StateFailed || to == StateCancelled))
+	}
 	switch from {
 	case StateDraft:
 		return to == StateContractDrafting
@@ -377,6 +396,10 @@ func allowedTaskTransition(from, to State) bool {
 	default:
 		return false
 	}
+}
+
+func terminalTurnState(state TurnState) bool {
+	return state == TurnStateCompleted || state == TurnStateFailed || state == TurnStateInterrupted
 }
 
 func allowedTurnTransition(from, to TurnState) bool {
@@ -456,8 +479,12 @@ func invalidateEvidence(state *Projection, evidenceID protocol.EvidenceID, diagn
 					contract.Criteria[criterionID] = protocol.DeepCopy(criterion)
 					record.Contracts[record.ContractVersion] = contract
 				}
+				wasVerified := record.State == StateVerified || (record.Outcome.State == protocol.ValueKnown && record.Outcome.Status == "verified")
 				record.VerificationState = protocol.ValueUnknown
 				record.Outcome = Outcome{State: protocol.ValueUnknown}
+				if wasVerified {
+					record.State = StateUnknown
+				}
 				changed = true
 			}
 		}

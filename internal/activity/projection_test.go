@@ -121,6 +121,17 @@ func TestLifecycleActivityStartedMustMatchDurableAuthorization(t *testing.T) {
 	}
 }
 
+func TestProjectionActivityRejectsUnknownEvidenceRelation(t *testing.T) {
+	projector := activity.Projector{}
+	state := applyActivity(t, projector, projector.Zero(sessionRef()), planned("activity", ""))
+	record := activityRecord("activity", "", protocol.EventEvidenceLinked, &protocol.EvidenceLinkedV1{
+		EvidenceID: "evidence", Subject: protocol.SubjectRef{Kind: "activity", ID: "activity"}, Relation: "derived",
+	})
+	if _, err := projector.Apply(state, record); err == nil {
+		t.Fatal("unknown evidence relation was classified as output")
+	}
+}
+
 func applyActivity(t *testing.T, projector activity.Projector, state activity.Projection, record protocol.EventRecord) activity.Projection {
 	t.Helper()
 	next, err := projector.Apply(state, record)

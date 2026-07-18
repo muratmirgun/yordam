@@ -128,6 +128,86 @@ func TestProjectionLegacyLeavesAbsentFactsExplicitlyUnknown(t *testing.T) {
 	}
 }
 
+func TestProjectionLegacyTaskLifecycleRebuilds(t *testing.T) {
+	for _, terminal := range []string{"completed", "failed", "cancelled"} {
+		t.Run(terminal, func(t *testing.T) {
+			projector := taskprojection.Projector{}
+			created := taskCreated()
+			created.Legacy = &protocol.LegacySource{SchemaVersion: 1, EventID: "legacy-created", SessionID: "session", Seq: 1}
+			state := applyTask(t, projector, projector.Zero(sessionRef()), created)
+			state = applyTask(t, projector, state, taskChanged("pending", "running"))
+			state = applyTask(t, projector, state, taskChanged("running", terminal))
+			if string(state.Tasks["task"].State) != terminal {
+				t.Fatalf("legacy task state=%q", state.Tasks["task"].State)
+			}
+		})
+	}
+
+	projector := taskprojection.Projector{}
+	detailed := applyTask(t, projector, projector.Zero(sessionRef()), taskCreated())
+	if _, err := projector.Apply(detailed, taskChanged("pending", "running")); err == nil {
+		t.Fatal("detailed task entered the legacy pending lane")
+	}
+	for _, transition := range [][2]string{
+		{"draft", "contract_drafting"}, {"contract_drafting", "contract_proposed"},
+		{"contract_proposed", "contract_frozen"}, {"contract_frozen", "running"},
+	} {
+		detailed = applyTask(t, projector, detailed, taskChanged(transition[0], transition[1]))
+	}
+	if _, err := projector.Apply(detailed, taskChanged("running", "completed")); err == nil {
+		t.Fatal("detailed task used a legacy terminal shortcut")
+	}
+}
+
+func TestOutcomeEvidenceInvalidationDowngradesVerifiedTaskLifecycle(t *testing.T) {
+	projector := taskprojection.Projector{}
+	state := applyTask(t, projector, projector.Zero(sessionRef()), taskCreated())
+	state = applyTask(t, projector, state, contractDeclared())
+	state = applyTask(t, projector, state, evidenceRecorded(protocol.ContentAvailable))
+	state = applyTask(t, projector, state, criterionAssessed("required", "verified", []protocol.EvidenceID{"evidence"}))
+	state = applyTask(t, projector, state, finalAssessed("verified"))
+	for _, transition := range [][2]string{
+		{"draft", "contract_drafting"}, {"contract_drafting", "contract_proposed"}, {"contract_proposed", "contract_frozen"},
+		{"contract_frozen", "running"}, {"running", "verifying"}, {"verifying", "verified"},
+	} {
+		state = applyTask(t, projector, state, taskChanged(transition[0], transition[1]))
+	}
+
+	state = applyTask(t, projector, state, evidenceDiagnostic("evidence.missing"))
+	record := state.Tasks["task"]
+	if record.State != taskprojection.StateUnknown || record.VerificationState != protocol.ValueUnknown || record.Outcome.State != protocol.ValueUnknown {
+		t.Fatalf("invalidated verified task=%+v", record)
+	}
+}
+
+func TestLifecycleTurnRejectsSecondActiveTurn(t *testing.T) {
+	projector := taskprojection.Projector{}
+	state := applyTask(t, projector, projector.Zero(sessionRef()), turnAcceptedWithID("turn-one"))
+	if _, err := projector.Apply(state, turnAcceptedWithID("turn-two")); err == nil {
+		t.Fatal("second active turn was accepted")
+	}
+	state = applyTask(t, projector, state, turnChangedWithID("turn-one", "accepted", "running"))
+	state = applyTask(t, projector, state, turnTerminalWithID("turn-one", protocol.EventTurnCompleted, "completed"))
+	state = applyTask(t, projector, state, turnAcceptedWithID("turn-two"))
+	if state.Turns["turn-two"].State != taskprojection.TurnStateAccepted {
+		t.Fatalf("new turn after terminal=%+v", state.Turns)
+	}
+}
+
+func TestOutcomeContractDeclarationIsImmutable(t *testing.T) {
+	projector := taskprojection.Projector{}
+	state := applyTask(t, projector, projector.Zero(sessionRef()), taskCreated())
+	state = applyTask(t, projector, state, contractDeclared())
+	if _, err := projector.Apply(state, contractDeclared()); err == nil {
+		t.Fatal("identical contract redeclaration was accepted")
+	}
+	changed := contractDeclared()
+	changed.Decoded.(*protocol.OutcomeContractDeclaredV1).Goal = "changed history"
+	if _, err := projector.Apply(state, changed); err == nil {
+		t.Fatal("changed contract redeclaration was accepted")
+	}
+}
+
 func TestProjectionTaskRejectsUnknownStatefulEvent(t *testing.T) {
 	projector := taskprojection.Projector{}
 	unknown := taskRecord("future.outcome_policy", &struct{}{})
@@ -205,12 +285,30 @@ func turnAccepted() protocol.EventRecord {
 	return taskRecord(protocol.EventTurnAccepted, &protocol.TurnAcceptedV1{CommandID: "command", Goal: "ship v0.2", OutcomeContractID: "contract", ContractVersion: 1})
 }
 
+func turnAcceptedWithID(id protocol.TurnID) protocol.EventRecord {
+	record := turnAccepted()
+	record.Envelope.TurnID = id
+	return record
+}
+
 func turnChanged(from, to string) protocol.EventRecord {
 	return taskRecord(protocol.EventTurnStateChanged, &protocol.TurnStateChangedV1{From: from, To: to})
 }
 
+func turnChangedWithID(id protocol.TurnID, from, to string) protocol.EventRecord {
+	record := turnChanged(from, to)
+	record.Envelope.TurnID = id
+	return record
+}
+
 func turnTerminal(kind, status string) protocol.EventRecord {
 	return taskRecord(kind, &protocol.TurnTerminalV1{Status: status, Reason: "done"})
+}
+
+func turnTerminalWithID(id protocol.TurnID, kind, status string) protocol.EventRecord {
+	record := turnTerminal(kind, status)
+	record.Envelope.TurnID = id
+	return record
 }
 
 func evidenceRecorded(availability protocol.ContentAvailability) protocol.EventRecord {

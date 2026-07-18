@@ -211,6 +211,26 @@ func TestFoundationRegistryRejectsDuplicateDescriptorsAndInvalidSemantics(t *tes
 	}
 }
 
+func TestFoundationRegistryRejectsUnknownEvidenceRelation(t *testing.T) {
+	t.Parallel()
+	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := registry.Decode(envelopeFor(t, protocol.EventEnvelope{
+		JournalKind: protocol.JournalSession, JournalID: "session", SessionID: "session",
+		Kind: protocol.EventEvidenceLinked, ActivityID: "activity",
+	}, protocol.EvidenceLinkedV1{
+		EvidenceID: "evidence", Subject: protocol.SubjectRef{Kind: "activity", ID: "activity"}, Relation: "derived",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Validate(record); err == nil {
+		t.Fatal("unknown evidence relation was accepted")
+	}
+}
+
 func TestFoundationRegistryValidatesTaskSixLifecycleTransitions(t *testing.T) {
 	t.Parallel()
 	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())

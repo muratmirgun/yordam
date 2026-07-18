@@ -168,10 +168,13 @@ func (Projector) Apply(current Projection, event protocol.EventRecord) (Projecti
 		if !exists {
 			return current, fmt.Errorf("activity %q is unknown", event.Envelope.ActivityID)
 		}
-		if payload.Relation == "input" {
+		switch payload.Relation {
+		case "input":
 			record.InputEvidenceIDs = appendUniqueEvidence(record.InputEvidenceIDs, payload.EvidenceID)
-		} else {
+		case "output":
 			record.OutputEvidenceIDs = appendUniqueEvidence(record.OutputEvidenceIDs, payload.EvidenceID)
+		default:
+			return current, fmt.Errorf("invalid activity evidence relation %q", payload.Relation)
 		}
 		next.Activities[record.ActivityID] = record
 		return next, nil
