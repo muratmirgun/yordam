@@ -3,9 +3,11 @@ package permission_test
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/permission"
 	"github.com/muratmirgun/yordam/internal/ports"
@@ -54,6 +56,164 @@ func TestAuthorizationPolicyPrecedenceCrossProduct(t *testing.T) {
 	}
 }
 
+func TestAuthorizationResolvedReasonAndSourceFollowTerminalRule(t *testing.T) {
+	decision, err := permission.ResolvePolicy(permission.PolicyInput{
+		Platform: permission.PolicyRule{Action: domain.PermissionDeny, Source: "platform-policy", Reason: "platform network prohibition"},
+		User:     permission.PolicyRule{Action: domain.PermissionAllow, Source: "compatibility", Reason: "configured provider compatibility policy"},
+		Project:  permission.PolicyRule{Action: domain.PermissionAllow, Source: "project", Reason: "project allow"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Action != domain.PermissionDeny || decision.PolicySource != "platform-policy" || decision.Reason != "platform network prohibition" {
+		t.Fatalf("terminal rule provenance was lost: %#v", decision)
+	}
+}
+
+func TestPermissionStructuredFactCrossProductDoesNotBroadenAuthority(t *testing.T) {
+	tests := []struct {
+		name       string
+		mode       domain.PermissionMode
+		mutation   string
+		effect     string
+		locus      string
+		boundary   string
+		source     protocol.ToolIdentity
+		resources  []protocol.ResourceTarget
+		ackShell   bool
+		wantAction string
+	}{
+		{name: "safe process observation stays denied", mode: domain.ModeSafe, mutation: "process", effect: "observation", locus: "process", boundary: "workspace", source: builtinIdentity("renamed_process"), resources: shellResources("/workspace"), wantAction: "deny"},
+		{name: "ask process observation still asks", mode: domain.ModeAsk, mutation: "process", effect: "observation", locus: "process", boundary: "workspace", source: builtinIdentity("renamed_process"), resources: shellResources("/workspace"), wantAction: "ask"},
+		{name: "auto process observation is not shell acknowledgement", mode: domain.ModeAuto, mutation: "process", effect: "observation", locus: "process", boundary: "workspace", source: builtinIdentity("renamed_process"), resources: shellResources("/workspace"), ackShell: true, wantAction: "ask"},
+		{name: "trusted local process inside workspace", mode: domain.ModeAuto, mutation: "process", effect: "mutation", locus: "process", boundary: "process", source: builtinIdentity("renamed_process"), resources: shellResources("/workspace"), ackShell: true, wantAction: "allow"},
+		{name: "trusted process outside workspace never broadens", mode: domain.ModeAuto, mutation: "process", effect: "mutation", locus: "process", boundary: "process", source: builtinIdentity("renamed_process"), resources: shellResources("/outside"), ackShell: true, wantAction: "ask"},
+		{name: "built-in file mutation inside workspace", mode: domain.ModeAuto, mutation: "file", effect: "mutation", locus: "builtin", boundary: "workspace", source: builtinIdentity("renamed_file_mutator"), resources: []protocol.ResourceTarget{{Kind: "file", CanonicalID: "/workspace/a"}}, wantAction: "allow"},
+		{name: "built-in mutation must target filesystem", mode: domain.ModeAuto, mutation: "file", effect: "mutation", locus: "builtin", boundary: "workspace", source: builtinIdentity("renamed_file_mutator"), resources: []protocol.ResourceTarget{{Kind: "record", CanonicalID: "record-1"}}, wantAction: "ask"},
+		{name: "built-in file mutation outside cannot spoof boundary", mode: domain.ModeAuto, mutation: "file", effect: "mutation", locus: "builtin", boundary: "workspace", source: builtinIdentity("renamed_file_mutator"), resources: []protocol.ResourceTarget{{Kind: "file", CanonicalID: "/outside/a"}}, wantAction: "ask"},
+		{name: "untrusted source cannot claim built-in file facts", mode: domain.ModeAuto, mutation: "file", effect: "mutation", locus: "builtin", boundary: "workspace", source: protocol.ToolIdentity{Source: "mcp", Authority: "server", Name: "edit"}, resources: []protocol.ResourceTarget{{Kind: "file", CanonicalID: "/workspace/a"}}, wantAction: "ask"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := structuredRequest("capability", test.source)
+			request.Effect, request.ExecutionLocus, request.Boundary, request.Resources = test.effect, test.locus, test.boundary, test.resources
+			input := structuredEvaluationInput(t, request, test.mutation, "trusted_adapter", nil)
+			policy := permission.NewSession(test.mode)
+			if test.ackShell {
+				policy.AcknowledgeAutoShell()
+			}
+			decision, err := policy.EvaluateAuthorization(context.Background(), input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision.Action != test.wantAction {
+				t.Fatalf("action=%s want=%s decision=%#v", decision.Action, test.wantAction, decision)
+			}
+		})
+	}
+}
+
+func TestPermissionConfiguredProviderCompatibilityBindsExactModelDescriptor(t *testing.T) {
+	request := structuredRequest("model_egress", protocol.ToolIdentity{Source: "provider", Authority: "openai", Name: "model-a"})
+	request.Effect, request.Boundary, request.ExecutionLocus = "egress", "network", "remote"
+	configured := ports.ConfiguredProviderBinding{Identity: request.Source, SourceRevision: request.SourceRevision, DescriptorDigest: request.DescriptorDigest}
+	base := ports.EvaluationInput{Permission: ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAsk, ConfiguredProvider: &configured}, Request: request}
+	decision, err := permission.NewSession(domain.ModeAsk).EvaluateAuthorization(context.Background(), base)
+	if err != nil || decision.Action != "allow" || decision.Lifetime != protocol.AuthorizationLifetimeSession || decision.PolicySource != "compatibility" {
+		t.Fatalf("matching configured provider decision=%#v err=%v", decision, err)
+	}
+	mutations := map[string]func(*ports.EvaluationInput){
+		"provider source":    func(in *ports.EvaluationInput) { in.Request.Source.Source = "extension" },
+		"provider authority": func(in *ports.EvaluationInput) { in.Request.Source.Authority = "other" },
+		"model":              func(in *ports.EvaluationInput) { in.Request.Source.Name = "model-b" },
+		"source revision":    func(in *ports.EvaluationInput) { in.Request.SourceRevision = "revision-2" },
+		"descriptor digest":  func(in *ports.EvaluationInput) { in.Request.DescriptorDigest = permissionDigest("d") },
+		"effect":             func(in *ports.EvaluationInput) { in.Request.Effect = "observation" },
+		"boundary":           func(in *ports.EvaluationInput) { in.Request.Boundary = "workspace" },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			changed := protocol.DeepCopy(base)
+			mutate(&changed)
+			got, evaluateErr := permission.NewSession(domain.ModeAsk).EvaluateAuthorization(context.Background(), changed)
+			if evaluateErr != nil {
+				t.Fatal(evaluateErr)
+			}
+			if got.Action != "ask" || got.PolicySource == "compatibility" {
+				t.Fatalf("changed identity inherited compatibility allow: %#v", got)
+			}
+		})
+	}
+}
+
+func TestSessionGrantConstraintsUseExactApplicableCanonicalSet(t *testing.T) {
+	policy := permission.NewSession(domain.ModeAsk)
+	request := structuredRequest("write", protocol.ToolIdentity{Source: "mcp", Authority: "server", Name: "write"})
+	constraints := []protocol.AuthorizationConstraint{
+		{Name: "path_prefix", Operator: "equals", Value: json.RawMessage(`"/workspace"`)},
+		{Name: "size", Operator: "less_than", Value: json.RawMessage(`1024`)},
+	}
+	if err := policy.GrantAuthorizationSession(request, constraints); err != nil {
+		t.Fatal(err)
+	}
+	input := ports.EvaluationInput{Permission: ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAsk}, Request: request, Constraints: protocol.DeepCopy(constraints)}
+	allowed, err := policy.EvaluateAuthorization(context.Background(), input)
+	if err != nil || allowed.Action != "allow" || !reflect.DeepEqual(allowed.Constraints, constraints) || !reflect.DeepEqual(allowed.Scope.Constraints, constraints) {
+		t.Fatalf("exact constraints decision=%#v err=%v", allowed, err)
+	}
+	for name, changedConstraints := range map[string][]protocol.AuthorizationConstraint{
+		"missing": constraints[:1],
+		"changed": {{Name: "path_prefix", Operator: "equals", Value: json.RawMessage(`"/other"`)}, {Name: "size", Operator: "less_than", Value: json.RawMessage(`1024`)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := input
+			changed.Constraints = protocol.DeepCopy(changedConstraints)
+			decision, evaluateErr := policy.EvaluateAuthorization(context.Background(), changed)
+			if evaluateErr != nil || decision.Action != "ask" {
+				t.Fatalf("changed constraints decision=%#v err=%v", decision, evaluateErr)
+			}
+		})
+	}
+	unsorted := []protocol.AuthorizationConstraint{constraints[1], constraints[0]}
+	input.Constraints = unsorted
+	if _, err := policy.EvaluateAuthorization(context.Background(), input); err == nil {
+		t.Fatal("unsorted applicable constraints were accepted")
+	}
+	if err := policy.GrantAuthorizationSession(request, unsorted); err == nil {
+		t.Fatal("unsorted grant constraints were accepted")
+	}
+}
+
+func builtinIdentity(name string) protocol.ToolIdentity {
+	return protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: name}
+}
+
+func shellResources(cwd string) []protocol.ResourceTarget {
+	return []protocol.ResourceTarget{{Kind: "directory", CanonicalID: cwd}, {Kind: "executable", CanonicalID: "/bin/sh"}}
+}
+
+func structuredEvaluationInput(t *testing.T, request protocol.AuthorizationRequest, mutation, classificationSource string, constraints []protocol.AuthorizationConstraint) ports.EvaluationInput {
+	t.Helper()
+	if mutation == "process" {
+		request.RequestedProfile = "unsandboxed"
+		request.EffectiveProfile = "unsandboxed"
+	}
+	body := protocol.ToolDescriptorBody{
+		Identity: request.Source, SourceRevision: request.SourceRevision, DisplayName: "capability", Description: "test capability",
+		InputSchema: json.RawMessage(`{"type":"object"}`), Effect: request.Effect, Mutation: mutation, ExecutionLoci: []string{request.ExecutionLocus},
+		ClassificationSource: classificationSource, Idempotency: "unknown", Retry: "never_after_dispatch",
+	}
+	digest, err := canonicaljson.Digest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.DescriptorDigest = digest
+	return ports.EvaluationInput{
+		Permission: ports.PermissionContext{SessionID: string(request.SessionID), Mode: domain.ModeAsk, Workspace: "/workspace"},
+		Request:    request, Descriptor: protocol.ToolDescriptor{Body: body, DescriptorDigest: digest}, Constraints: protocol.DeepCopy(constraints),
+	}
+}
+
 func TestPermissionModeUsesStructuredDescriptorAndResourceFactsNotNames(t *testing.T) {
 	policy := permission.NewSession(domain.ModeAuto)
 	builtinRenamed := structuredRequest("not_edit", protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "renamed_mutator"})
@@ -63,11 +223,15 @@ func TestPermissionModeUsesStructuredDescriptorAndResourceFactsNotNames(t *testi
 	externalSpoof.Effect = "mutation"
 	externalSpoof.Boundary = "workspace"
 
-	allowed, err := policy.EvaluateAuthorization(context.Background(), ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAuto}, builtinRenamed)
+	builtinInput := structuredEvaluationInput(t, builtinRenamed, "file", "trusted_adapter", nil)
+	builtinInput.Permission.Mode = domain.ModeAuto
+	allowed, err := policy.EvaluateAuthorization(context.Background(), builtinInput)
 	if err != nil {
 		t.Fatal(err)
 	}
-	asked, err := policy.EvaluateAuthorization(context.Background(), ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAuto}, externalSpoof)
+	externalInput := structuredEvaluationInput(t, externalSpoof, "file", "trusted_adapter", nil)
+	externalInput.Permission.Mode = domain.ModeAuto
+	asked, err := policy.EvaluateAuthorization(context.Background(), externalInput)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +246,7 @@ func TestSessionGrantBindsStructuredAuthorizationScopeAndResolvesOnlyAsk(t *test
 	if err := policy.GrantAuthorizationSession(request, nil); err != nil {
 		t.Fatal(err)
 	}
-	allowed, err := policy.EvaluateAuthorization(context.Background(), ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAsk}, request)
+	allowed, err := policy.EvaluateAuthorization(context.Background(), ports.EvaluationInput{Permission: ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAsk, Workspace: "/workspace"}, Request: request})
 	if err != nil || allowed.Action != "allow" || allowed.Lifetime != protocol.AuthorizationLifetimeSession {
 		t.Fatalf("allowed=%#v err=%v", allowed, err)
 	}
@@ -101,7 +265,7 @@ func TestSessionGrantBindsStructuredAuthorizationScopeAndResolvesOnlyAsk(t *test
 		t.Run(name, func(t *testing.T) {
 			changed := protocol.DeepCopy(request)
 			mutate(&changed)
-			decision, evaluateErr := policy.EvaluateAuthorization(context.Background(), ports.PermissionContext{SessionID: string(changed.SessionID), Mode: domain.ModeAsk}, changed)
+			decision, evaluateErr := policy.EvaluateAuthorization(context.Background(), ports.EvaluationInput{Permission: ports.PermissionContext{SessionID: string(changed.SessionID), Mode: domain.ModeAsk, Workspace: "/workspace"}, Request: changed})
 			if evaluateErr != nil {
 				t.Fatal(evaluateErr)
 			}
@@ -113,29 +277,9 @@ func TestSessionGrantBindsStructuredAuthorizationScopeAndResolvesOnlyAsk(t *test
 
 	deniedRequest := protocol.DeepCopy(request)
 	deniedRequest.PolicyProvenance[0].HardDeny = true
-	denied, err := policy.EvaluateAuthorization(context.Background(), ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAsk, PlatformAction: domain.PermissionDeny}, deniedRequest)
+	denied, err := policy.EvaluateAuthorization(context.Background(), ports.EvaluationInput{Permission: ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAsk, Workspace: "/workspace", PlatformAction: domain.PermissionDeny}, Request: deniedRequest})
 	if err != nil || denied.Action != "deny" {
 		t.Fatalf("grant overrode deny: %#v err=%v", denied, err)
-	}
-}
-
-func TestPermissionConfiguredProviderCompatibilityPolicyIsDurableAllow(t *testing.T) {
-	request := structuredRequest("model_egress", protocol.ToolIdentity{Source: "provider", Authority: "openai", Name: "model-a"})
-	request.Effect = "egress"
-	request.Boundary = "network"
-	decision, err := permission.NewSession(domain.ModeAsk).EvaluateAuthorization(context.Background(), ports.PermissionContext{
-		SessionID: "session-1", Mode: domain.ModeAsk, ConfiguredProvider: true,
-	}, request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if decision.Action != "allow" || decision.Lifetime != protocol.AuthorizationLifetimeSession || decision.PolicySource != "compatibility" {
-		t.Fatalf("decision=%#v", decision)
-	}
-	request.Source.Authority = "unconfigured"
-	unconfigured, err := permission.NewSession(domain.ModeAsk).EvaluateAuthorization(context.Background(), ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAsk}, request)
-	if err != nil || unconfigured.Action != "ask" {
-		t.Fatalf("unconfigured=%#v err=%v", unconfigured, err)
 	}
 }
 

@@ -164,6 +164,120 @@ func TestPreviewDispatchRejectionOpensNoResourceAndReturnsObservationAuthority(t
 	if tool.plans.Load() != plansBeforeMutation {
 		t.Fatalf("mutation discarded observed prepared state and replanned: before=%d after=%d", plansBeforeMutation, tool.plans.Load())
 	}
+	allowed.mu.Lock()
+	actionsBeforeRepeat := len(allowed.actions)
+	allowed.mu.Unlock()
+	if _, _, err := allowed.PlanMutation(context.Background(), preview, mutationRequest); err == nil {
+		t.Fatal("consumed preview result created a second mutation plan")
+	}
+	allowed.mu.Lock()
+	actionsAfterRepeat := len(allowed.actions)
+	allowed.mu.Unlock()
+	if actionsAfterRepeat != actionsBeforeRepeat || tool.effects.Load() != 0 {
+		t.Fatalf("repeated preview changed state or executed: actions=%d want=%d effects=%d", actionsAfterRepeat, actionsBeforeRepeat, tool.effects.Load())
+	}
+}
+
+func TestPreviewMutationRejectsUnrelatedObservationWithoutFallback(t *testing.T) {
+	observationClassification := domain.ToolClassification{
+		Effect: "observation", Mutation: "read_only", ExecutionLoci: []string{"remote"}, Boundary: "remote",
+		Reversibility: "not_applicable", VerificationCoverage: "provider_reported", Idempotency: "idempotent",
+		Retry: "safe_before_dispatch", RequestedProfile: "networked", EffectiveProfile: "networked",
+	}
+	observe := newDispatchTool("observe", observationClassification)
+	mutate := newDispatchTool("mutate", trustedRemoteClassification())
+	catalog, err := NewCatalog("revision-1", observe, mutate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(catalog)
+	handle, plan, err := service.PlanPreviewInspection(context.Background(), planRequest("observe", `{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plansBefore := mutate.plans.Load()
+	if _, _, err := service.PlanMutation(context.Background(), PreviewResult{handleID: handle.id, observationDigest: plan.Digest}, planRequest("mutate", `{}`)); err == nil {
+		t.Fatal("unrelated observation fell back to a fresh mutation plan")
+	}
+	if mutate.plans.Load() != plansBefore || mutate.effects.Load() != 0 {
+		t.Fatalf("rejected observation replanned or executed: plans=%d effects=%d", mutate.plans.Load(), mutate.effects.Load())
+	}
+}
+
+func TestPreviewMutationRequiresExactHandleRequestPreparedStateAndEvidence(t *testing.T) {
+	classification := domain.ToolClassification{Effect: "mutation", Mutation: "file", ExecutionLoci: []string{"builtin"}, Boundary: "workspace", Reversibility: "preimage", VerificationCoverage: "full", Idempotency: "conditional", Retry: "never_after_dispatch", RequestedProfile: "restricted", EffectiveProfile: "restricted"}
+	for name, mutate := range map[string]func(*PreviewResult, *PlanRequest){
+		"handle": func(preview *PreviewResult, _ *PlanRequest) { preview.handleID = "other" },
+		"observation": func(preview *PreviewResult, _ *PlanRequest) {
+			preview.observationDigest = protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)}
+		},
+		"evidence": func(preview *PreviewResult, _ *PlanRequest) {
+			preview.evidenceDigests = []protocol.Digest{{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("b", 64)}}
+		},
+		"alias": func(_ *PreviewResult, request *PlanRequest) { request.Alias = "other" },
+		"input": func(_ *PreviewResult, request *PlanRequest) { request.Arguments = json.RawMessage(`{"changed":true}`) },
+		"call":  func(_ *PreviewResult, request *PlanRequest) { request.CallID = "other-call" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			tool := newDispatchTool("edit_preview", classification)
+			other := newDispatchTool("other", classification)
+			catalog, err := NewCatalog("revision-1", tool, other)
+			if err != nil {
+				t.Fatal(err)
+			}
+			service := NewService(catalog, &countingDispatchGate{})
+			request := planRequest("edit_preview", `{}`)
+			handle, _, err := service.PlanPreviewInspection(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			preview, _, _, err := service.PreparePreview(context.Background(), handle, authorization.CommittedToken{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(&preview, &request)
+			plansBefore := tool.plans.Load() + other.plans.Load()
+			if _, _, err := service.PlanMutation(context.Background(), preview, request); err == nil {
+				t.Fatal("mismatched preview mutation was accepted")
+			}
+			if got := tool.plans.Load() + other.plans.Load(); got != plansBefore || tool.effects.Load()+other.effects.Load() != 0 {
+				t.Fatalf("mismatch replanned or executed: plans=%d want=%d effects=%d", got, plansBefore, tool.effects.Load()+other.effects.Load())
+			}
+		})
+	}
+	for _, mismatch := range []string{"prepared", "effect"} {
+		t.Run(mismatch, func(t *testing.T) {
+			tool := newDispatchTool("edit_preview", classification)
+			catalog, err := NewCatalog("revision-1", tool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			service := NewService(catalog, &countingDispatchGate{})
+			request := planRequest("edit_preview", `{}`)
+			handle, _, err := service.PlanPreviewInspection(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			preview, _, _, err := service.PreparePreview(context.Background(), handle, authorization.CommittedToken{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			service.mu.Lock()
+			if mismatch == "prepared" {
+				service.actions[handle.id].prepared.(*dispatchPrepared).request.Input = json.RawMessage(`{"changed":true}`)
+			} else {
+				service.actions[handle.id].entry.classification.Effect = "observation"
+			}
+			service.mu.Unlock()
+			plansBefore := tool.plans.Load()
+			if _, _, err := service.PlanMutation(context.Background(), preview, request); err == nil {
+				t.Fatal("mutated preview state was accepted")
+			}
+			if tool.plans.Load() != plansBefore || tool.effects.Load() != 0 {
+				t.Fatalf("state mismatch replanned or executed: plans=%d want=%d effects=%d", tool.plans.Load(), plansBefore, tool.effects.Load())
+			}
+		})
+	}
 }
 
 type countingDispatchGate struct {
@@ -379,7 +493,7 @@ func TestPlanDigestUsesCanonicalActionAndExternalBoundary(t *testing.T) {
 	}
 }
 
-func TestPlanMutationConcurrentRevalidateHasConsistentSnapshot(t *testing.T) {
+func TestPreviewMutationConcurrentRevalidateRejectsUnrelatedObservation(t *testing.T) {
 	observationClassification := domain.ToolClassification{
 		Effect: "observation", Mutation: "read_only", ExecutionLoci: []string{"remote"}, Boundary: "remote",
 		Reversibility: "not_applicable", VerificationCoverage: "provider_reported", Idempotency: "idempotent",
@@ -419,8 +533,8 @@ func TestPlanMutationConcurrentRevalidateHasConsistentSnapshot(t *testing.T) {
 		}()
 		close(start)
 		wait.Wait()
-		if mutationErr != nil || mutationPlan.Body.Tool != mutate.canonical.Body.Identity {
-			t.Fatalf("iteration %d observed inconsistent preview snapshot: plan=%#v err=%v", index, mutationPlan, mutationErr)
+		if mutationErr == nil || !reflect.DeepEqual(mutationPlan, protocol.ActionPlan{}) {
+			t.Fatalf("iteration %d unrelated preview created mutation plan: plan=%#v err=%v", index, mutationPlan, mutationErr)
 		}
 	}
 }

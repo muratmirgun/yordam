@@ -103,6 +103,50 @@ func TestAuthorizationInteractiveResponseCannotAuthorBindings(t *testing.T) {
 	}
 }
 
+func TestAuthorizationInteractivePreservesPendingExpiry(t *testing.T) {
+	request := boundRequest(t)
+	pending := allowOnce(request)
+	pending.Action = "ask"
+	expires := time.Now().UTC().Add(250 * time.Millisecond)
+	pending.ExpiresAt = &expires
+	scopeDigest, err := canonicaljson.Digest(pending.Scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := protocol.ApprovalResponse{
+		RequestID: request.RequestID, Action: "allow", Lifetime: protocol.AuthorizationLifetimeOnce,
+		ScopeDigest: scopeDigest, Actor: protocol.ActorRef{ID: "user-1", Kind: protocol.ActorUser}, Reason: "approved",
+	}
+	resolved, err := authorization.NewService(nil).ResolveInteractive(request, pending, response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ExpiresAt == nil || !resolved.ExpiresAt.Equal(expires) {
+		t.Fatalf("pending expiry was broadened: pending=%v resolved=%v", pending.ExpiresAt, resolved.ExpiresAt)
+	}
+	time.Sleep(time.Until(expires) + 20*time.Millisecond)
+	if err := authorization.ValidateBinding(request, resolved); !errors.Is(err, authorization.ErrExpiredDecision) {
+		t.Fatalf("resolved near-expiry decision remained valid: %v", err)
+	}
+}
+
+func TestAuthorizationInteractiveRejectsAlreadyExpiredPendingDecision(t *testing.T) {
+	request := boundRequest(t)
+	pending := allowOnce(request)
+	pending.Action = "ask"
+	expires := time.Now().UTC().Add(-time.Millisecond)
+	pending.DecidedAt = expires.Add(-time.Second)
+	pending.ExpiresAt = &expires
+	scopeDigest, err := canonicaljson.Digest(pending.Scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := protocol.ApprovalResponse{RequestID: request.RequestID, Action: "allow", Lifetime: protocol.AuthorizationLifetimeOnce, ScopeDigest: scopeDigest, Actor: protocol.ActorRef{ID: "user-1", Kind: protocol.ActorUser}, Reason: "late"}
+	if _, err := authorization.NewService(nil).ResolveInteractive(request, pending, response); !errors.Is(err, authorization.ErrExpiredDecision) {
+		t.Fatalf("expired pending decision err=%v", err)
+	}
+}
+
 func TestAuthorizationIssuerReadsNamedCommittedTransactions(t *testing.T) {
 	fixture := committedFixture(t)
 	service := authorization.NewService(fixture.reader)
@@ -249,6 +293,66 @@ func TestAuthorizationIssuerRejectsUncommittedAmbiguousAndMismatchedRecords(t *t
 			}
 		})
 	}
+}
+
+func TestAuthorizationIssuerRequiresOrderedDistinctCommittedCursors(t *testing.T) {
+	tests := map[string]func(*committedAuthorizationFixture){
+		"zero decision cursor": func(f *committedAuthorizationFixture) {
+			tx := f.reader.transactions[f.reference.DecisionTransactionID]
+			tx.Cursor = protocol.CommittedCursor{}
+			f.reader.transactions[f.reference.DecisionTransactionID] = tx
+		},
+		"zero start cursor": func(f *committedAuthorizationFixture) {
+			tx := f.reader.transactions[f.reference.StartTransactionID]
+			tx.Cursor = protocol.CommittedCursor{}
+			f.reader.transactions[f.reference.StartTransactionID] = tx
+		},
+		"decision cursor journal": func(f *committedAuthorizationFixture) {
+			tx := f.reader.transactions[f.reference.DecisionTransactionID]
+			tx.Cursor.JournalID = "other-session"
+			f.reader.transactions[f.reference.DecisionTransactionID] = tx
+		},
+		"start cursor transaction": func(f *committedAuthorizationFixture) {
+			tx := f.reader.transactions[f.reference.StartTransactionID]
+			tx.Cursor.TransactionID = "other-start"
+			f.reader.transactions[f.reference.StartTransactionID] = tx
+		},
+		"equal commit sequence": func(f *committedAuthorizationFixture) {
+			tx := f.reader.transactions[f.reference.StartTransactionID]
+			tx.Cursor.CommitSeq = f.reader.transactions[f.reference.DecisionTransactionID].Cursor.CommitSeq
+			f.reader.transactions[f.reference.StartTransactionID] = tx
+		},
+		"reversed commit sequence": func(f *committedAuthorizationFixture) {
+			tx := f.reader.transactions[f.reference.StartTransactionID]
+			tx.Cursor.CommitSeq = f.reader.transactions[f.reference.DecisionTransactionID].Cursor.CommitSeq - 1
+			f.reader.transactions[f.reference.StartTransactionID] = tx
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture := committedFixture(t)
+			mutate(&fixture)
+			if _, err := authorization.NewService(fixture.reader).Issue(context.Background(), fixture.reference); err == nil {
+				t.Fatal("invalid committed cursor issued a token")
+			}
+		})
+	}
+
+	t.Run("same transaction", func(t *testing.T) {
+		fixture := committedFixture(t)
+		decisionTx := fixture.reader.transactions[fixture.reference.DecisionTransactionID]
+		startTx := fixture.reader.transactions[fixture.reference.StartTransactionID]
+		for index := range startTx.Events {
+			startTx.Events[index].TransactionID = decisionTx.TransactionID
+		}
+		decisionTx.Events = append(decisionTx.Events, startTx.Events...)
+		fixture.reader.transactions[decisionTx.TransactionID] = decisionTx
+		delete(fixture.reader.transactions, fixture.reference.StartTransactionID)
+		fixture.reference.StartTransactionID = fixture.reference.DecisionTransactionID
+		if _, err := authorization.NewService(fixture.reader).Issue(context.Background(), fixture.reference); err == nil {
+			t.Fatal("same transaction was accepted for decision and start")
+		}
+	})
 }
 
 func TestDispatchGateRejectsZeroRepeatedRevokedAndConcurrentUseBeforeCallback(t *testing.T) {
@@ -453,6 +557,7 @@ func (f *committedAuthorizationFixture) replaceDecision(t *testing.T) {
 	payload := mustJSON(t, protocol.AuthorizationDecidedV1{Decision: f.decision})
 	f.reader.transactions[f.reference.DecisionTransactionID] = journal.CommittedTransaction{
 		Journal: f.reference.Journal, TransactionID: f.reference.DecisionTransactionID,
+		Cursor: protocol.CommittedCursor{JournalKind: f.reference.Journal.Kind, JournalID: f.reference.Journal.ID, CommitSeq: 10, TransactionID: f.reference.DecisionTransactionID},
 		Events: []protocol.EventEnvelope{{EventID: f.reference.DecisionEventID, TransactionID: f.reference.DecisionTransactionID, Kind: protocol.EventAuthorizationDecided, Payload: payload}},
 	}
 }
@@ -461,6 +566,7 @@ func (f *committedAuthorizationFixture) replaceStarted(t *testing.T) {
 	t.Helper()
 	f.reader.transactions[f.reference.StartTransactionID] = journal.CommittedTransaction{
 		Journal: f.reference.Journal, TransactionID: f.reference.StartTransactionID,
+		Cursor: protocol.CommittedCursor{JournalKind: f.reference.Journal.Kind, JournalID: f.reference.Journal.ID, CommitSeq: 11, TransactionID: f.reference.StartTransactionID},
 		Events: []protocol.EventEnvelope{
 			{EventID: f.reference.ConsumedEventID, TransactionID: f.reference.StartTransactionID, Kind: protocol.EventAuthorizationDecisionConsumed, Payload: mustJSON(t, f.consumed)},
 			{EventID: f.reference.StartedEventID, TransactionID: f.reference.StartTransactionID, Kind: protocol.EventActivityStarted, Payload: mustJSON(t, f.started)},

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 
@@ -22,6 +23,9 @@ type PreviewResult struct {
 	handleID          string
 	observationDigest protocol.Digest
 	evidenceDigests   []protocol.Digest
+	requestDigest     protocol.Digest
+	preparedDigest    protocol.Digest
+	effect            string
 }
 
 type PlanRequest struct {
@@ -43,6 +47,10 @@ type plannedAction struct {
 	requestDigest   protocol.Digest
 	dispatchDigest  protocol.Digest
 	evidenceDigests []protocol.Digest
+	previewReady    bool
+	previewConsumed bool
+	previewPrepared protocol.Digest
+	previewEvidence []protocol.Digest
 	revalidated     bool
 	operationMu     *sync.Mutex
 }
@@ -76,68 +84,77 @@ func (s *Service) PlanPreviewInspection(ctx context.Context, request PlanRequest
 	return s.plan(ctx, request, "observation")
 }
 
-func (s *Service) PlanMutation(ctx context.Context, preview PreviewResult, request PlanRequest) (ActionHandle, protocol.ActionPlan, error) {
-	if preview.handleID == "" || preview.observationDigest.IsZero() {
+func (s *Service) PlanMutation(_ context.Context, preview PreviewResult, request PlanRequest) (ActionHandle, protocol.ActionPlan, error) {
+	if preview.handleID == "" || preview.observationDigest.IsZero() || preview.requestDigest.IsZero() || preview.preparedDigest.IsZero() || preview.effect == "" {
 		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("preview result is invalid")
 	}
 	s.mu.Lock()
 	observed, ok := s.actions[preview.handleID]
-	var observedTurnID protocol.TurnID
-	var observedActivityID protocol.ActivityID
-	var observedDigest protocol.Digest
-	var observedRequest PlanRequest
-	var observedEntry catalogEntry
-	var observedPrepared ports.PreparedTool
-	var observedRequestDigest protocol.Digest
-	var observedOperationMu *sync.Mutex
+	var snapshot plannedAction
 	if ok {
-		observedTurnID = observed.turnID
-		observedActivityID = observed.activityID
-		observedDigest = observed.plan.Digest
-		observedRequest = clonePlanRequest(observed.request)
-		observedEntry = observed.entry
-		observedPrepared = observed.prepared
-		observedRequestDigest = observed.requestDigest
-		observedOperationMu = observed.operationMu
+		snapshot = *observed
+		snapshot.request = clonePlanRequest(observed.request)
+		snapshot.previewEvidence = append([]protocol.Digest(nil), observed.previewEvidence...)
 	}
 	s.mu.Unlock()
-	if !ok || observedTurnID != request.TurnID || observedActivityID != request.ActivityID || observedDigest != preview.observationDigest {
-		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("preview result does not match turn and activity")
+	if !ok || !snapshot.previewReady || snapshot.turnID != request.TurnID || snapshot.activityID != request.ActivityID || snapshot.plan.Digest != preview.observationDigest || snapshot.plan.Body.Effect != "observation" {
+		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("preview result does not match the prepared observation")
+	}
+	if snapshot.entry.classification.Effect == "observation" || preview.effect != snapshot.entry.classification.Effect {
+		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("preview is not bound to a mutation-capable effect")
+	}
+	if err := validatePlanRequest(request); err != nil {
+		return ActionHandle{}, protocol.ActionPlan{}, err
+	}
+	requestDigest, err := canonicalDigest(request)
+	if err != nil {
+		return ActionHandle{}, protocol.ActionPlan{}, err
+	}
+	if requestDigest != snapshot.requestDigest || preview.requestDigest != snapshot.requestDigest || snapshot.request.Alias != request.Alias {
+		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("mutation request does not match the observed preview input")
+	}
+	if preview.preparedDigest != snapshot.previewPrepared || !reflect.DeepEqual(preview.evidenceDigests, snapshot.previewEvidence) {
+		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("preview state or evidence binding changed")
 	}
 	for _, digest := range preview.evidenceDigests {
 		if err := digest.Validate(); err != nil {
 			return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("preview evidence digest: %w", err)
 		}
 	}
-	if observedRequest.Alias == request.Alias && observedEntry.classification.Effect != "observation" {
-		if err := validatePlanRequest(request); err != nil {
-			return ActionHandle{}, protocol.ActionPlan{}, err
-		}
-		requestDigest, err := canonicalDigest(request)
-		if err != nil {
-			return ActionHandle{}, protocol.ActionPlan{}, err
-		}
-		if requestDigest != observedRequestDigest {
-			return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("mutation request does not match the observed preview input")
-		}
-		plan, err := buildActionPlan(request, observedEntry, observedPrepared.Preview(), "")
-		if err != nil {
-			return ActionHandle{}, protocol.ActionPlan{}, err
-		}
-		dispatchDigest, err := toolDispatchDigest(plan, requestDigest, preview.evidenceDigests)
-		if err != nil {
-			return ActionHandle{}, protocol.ActionPlan{}, err
-		}
-		id, err := newHandleID()
-		if err != nil {
-			return ActionHandle{}, protocol.ActionPlan{}, err
-		}
-		s.mu.Lock()
-		s.actions[id] = &plannedAction{turnID: request.TurnID, activityID: request.ActivityID, request: clonePlanRequest(request), entry: observedEntry, prepared: observedPrepared, plan: plan, requestDigest: requestDigest, dispatchDigest: dispatchDigest, evidenceDigests: append([]protocol.Digest(nil), preview.evidenceDigests...), operationMu: observedOperationMu}
-		s.mu.Unlock()
-		return ActionHandle{id: id}, plan, nil
+	snapshot.operationMu.Lock()
+	defer snapshot.operationMu.Unlock()
+	prepared := snapshot.prepared.Preview()
+	preparedDigest, err := canonicalDigest(prepared)
+	if err != nil {
+		return ActionHandle{}, protocol.ActionPlan{}, err
 	}
-	return s.plan(ctx, request, "mutation")
+	if preparedDigest != snapshot.previewPrepared {
+		return ActionHandle{}, protocol.ActionPlan{}, authorization.ErrStaleDecision
+	}
+	s.mu.Lock()
+	stored, exists := s.actions[preview.handleID]
+	if !exists || stored.previewConsumed || !stored.previewReady || stored.previewPrepared != snapshot.previewPrepared || !reflect.DeepEqual(stored.previewEvidence, snapshot.previewEvidence) {
+		s.mu.Unlock()
+		return ActionHandle{}, protocol.ActionPlan{}, authorization.ErrStaleDecision
+	}
+	stored.previewConsumed = true
+	s.mu.Unlock()
+	plan, err := buildActionPlan(request, snapshot.entry, prepared, "")
+	if err != nil {
+		return ActionHandle{}, protocol.ActionPlan{}, err
+	}
+	dispatchDigest, err := toolDispatchDigest(plan, requestDigest, preview.evidenceDigests)
+	if err != nil {
+		return ActionHandle{}, protocol.ActionPlan{}, err
+	}
+	id, err := newHandleID()
+	if err != nil {
+		return ActionHandle{}, protocol.ActionPlan{}, err
+	}
+	s.mu.Lock()
+	s.actions[id] = &plannedAction{turnID: request.TurnID, activityID: request.ActivityID, request: clonePlanRequest(request), entry: snapshot.entry, prepared: snapshot.prepared, plan: plan, requestDigest: requestDigest, dispatchDigest: dispatchDigest, evidenceDigests: append([]protocol.Digest(nil), preview.evidenceDigests...), operationMu: snapshot.operationMu}
+	s.mu.Unlock()
+	return ActionHandle{id: id}, plan, nil
 }
 
 func (s *Service) plan(ctx context.Context, request PlanRequest, requiredEffect string) (ActionHandle, protocol.ActionPlan, error) {
@@ -362,8 +379,9 @@ func (s *Service) PreparePreview(ctx context.Context, handle ActionHandle, token
 		return PreviewResult{}, protocol.ActionPlan{}, nil, fmt.Errorf("action handle is not an observation preview")
 	}
 	type previewOutput struct {
-		result domain.ToolResult
-		err    error
+		result   domain.ToolResult
+		prepared domain.PreparedToolRequest
+		err      error
 	}
 	output := make(chan previewOutput, 1)
 	runContext, cancel := context.WithCancel(ctx)
@@ -384,10 +402,10 @@ func (s *Service) PreparePreview(ctx context.Context, handle ActionHandle, token
 					return
 				}
 				preview := action.prepared.Preview()
-				output <- previewOutput{result: domain.ToolResult{CallID: action.request.CallID, Status: domain.ToolSucceeded, Content: preview.ProposedDiff}}
+				output <- previewOutput{result: domain.ToolResult{CallID: action.request.CallID, Status: domain.ToolSucceeded, Content: preview.ProposedDiff}, prepared: preview}
 				return
 			}
-			output <- previewOutput{result: action.prepared.Execute(runContext)}
+			output <- previewOutput{result: action.prepared.Execute(runContext), prepared: action.prepared.Preview()}
 		}()
 		return nil
 	})
@@ -412,7 +430,25 @@ func (s *Service) PreparePreview(ctx context.Context, handle ActionHandle, token
 	if err != nil {
 		return PreviewResult{}, protocol.ActionPlan{}, nil, err
 	}
-	return PreviewResult{handleID: handle.id, observationDigest: action.plan.Digest, evidenceDigests: []protocol.Digest{evidenceDigest}}, action.plan, []protocol.EvidenceCandidate{evidence}, nil
+	preparedDigest, err := canonicalDigest(completed.prepared)
+	if err != nil {
+		return PreviewResult{}, protocol.ActionPlan{}, nil, err
+	}
+	evidenceDigests := []protocol.Digest{evidenceDigest}
+	s.mu.Lock()
+	stored, exists := s.actions[handle.id]
+	if !exists || stored.previewReady {
+		s.mu.Unlock()
+		return PreviewResult{}, protocol.ActionPlan{}, nil, authorization.ErrStaleDecision
+	}
+	stored.previewReady = true
+	stored.previewPrepared = preparedDigest
+	stored.previewEvidence = append([]protocol.Digest(nil), evidenceDigests...)
+	s.mu.Unlock()
+	return PreviewResult{
+		handleID: handle.id, observationDigest: action.plan.Digest, evidenceDigests: evidenceDigests,
+		requestDigest: action.requestDigest, preparedDigest: preparedDigest, effect: action.entry.classification.Effect,
+	}, action.plan, []protocol.EvidenceCandidate{evidence}, nil
 }
 
 func (s *Service) actionForDispatch(_ context.Context, handle ActionHandle) (*plannedAction, error) {

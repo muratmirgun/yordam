@@ -121,7 +121,6 @@ func (s *Service) ResolveInteractive(request protocol.AuthorizationRequest, pend
 	actor := response.Actor
 	resolved.ResolvedActor = &actor
 	resolved.DecidedAt = time.Now().UTC()
-	resolved.ExpiresAt = nil
 	resolved.DecisionNonce = nonce
 	if err := ValidateBinding(request, resolved); err != nil {
 		return protocol.AuthorizationDecision{}, err
@@ -142,6 +141,9 @@ func (s *Service) Issue(ctx context.Context, reference CommitReference) (Committ
 	}
 	if decisionTransaction.Journal != reference.Journal {
 		return CommittedToken{}, fmt.Errorf("committed decision journal mismatch")
+	}
+	if err := validateCommittedTransactionIdentity(decisionTransaction, reference.Journal, reference.DecisionTransactionID); err != nil {
+		return CommittedToken{}, err
 	}
 	decisionEnvelope, err := namedEvent(decisionTransaction, reference.DecisionTransactionID, reference.DecisionEventID, protocol.EventAuthorizationDecided)
 	if err != nil {
@@ -169,6 +171,12 @@ func (s *Service) Issue(ctx context.Context, reference CommitReference) (Committ
 	}
 	if startTransaction.Journal != reference.Journal {
 		return CommittedToken{}, fmt.Errorf("committed start journal mismatch")
+	}
+	if err := validateCommittedTransactionIdentity(startTransaction, reference.Journal, reference.StartTransactionID); err != nil {
+		return CommittedToken{}, err
+	}
+	if decisionTransaction.Cursor.CommitSeq >= startTransaction.Cursor.CommitSeq {
+		return CommittedToken{}, fmt.Errorf("committed authorization decision must precede start transaction")
 	}
 	consumedEnvelope, err := namedEvent(startTransaction, reference.StartTransactionID, reference.ConsumedEventID, protocol.EventAuthorizationDecisionConsumed)
 	if err != nil {
@@ -299,6 +307,22 @@ func (r CommitReference) validate() error {
 	}
 	if r.DecisionTransactionID == "" || r.DecisionEventID == "" || r.StartTransactionID == "" || r.ConsumedEventID == "" || r.StartedEventID == "" {
 		return fmt.Errorf("commit reference is incomplete")
+	}
+	if r.DecisionTransactionID == r.StartTransactionID {
+		return fmt.Errorf("decision and start transactions must be distinct")
+	}
+	return nil
+}
+
+func validateCommittedTransactionIdentity(transaction journal.CommittedTransaction, ref protocol.JournalRef, transactionID protocol.TransactionID) error {
+	if transaction.Journal != ref || transaction.TransactionID != transactionID {
+		return fmt.Errorf("committed transaction identity mismatch")
+	}
+	if err := transaction.Cursor.Validate(); err != nil {
+		return fmt.Errorf("invalid committed cursor: %w", err)
+	}
+	if transaction.Cursor.JournalKind != ref.Kind || transaction.Cursor.JournalID != ref.ID || transaction.Cursor.TransactionID != transactionID {
+		return fmt.Errorf("committed cursor identity mismatch")
 	}
 	return nil
 }
