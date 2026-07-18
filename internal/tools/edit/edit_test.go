@@ -91,6 +91,22 @@ func TestEditPrepareDefersFileInspectionUntilAuthorizedPreview(t *testing.T) {
 	}
 }
 
+func TestPlanDigestResourceCarriesExpectedPreimage(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "target.txt")
+	writeFile(t, path, "before\n", 0o600)
+	tool := newTool(t, root, output.Options{})
+	expected := hashString([]byte("before\n"))
+	prepared, err := tool.Plan(context.Background(), request(fmt.Sprintf(`{"path":"target.txt","expected_sha256":"%s","replacements":[{"old":"before","new":"after"}]}`, expected), root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview := prepared.Preview()
+	if len(preview.Resources) != 1 || preview.Resources[0].Digest != expected || preview.FilePlan != nil {
+		t.Fatalf("planning read content or omitted preimage identity: %#v", preview)
+	}
+}
+
 func TestEditPreviewsAndRejectsStalePreimage(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "a.txt")

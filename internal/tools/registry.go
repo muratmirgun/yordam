@@ -20,11 +20,6 @@ var builtInRank = map[string]int{
 	"shell":  3,
 }
 
-var builtInMutation = map[string]domain.MutationKind{
-	"read": domain.MutationReadOnly, "search": domain.MutationReadOnly,
-	"edit": domain.MutationFile, "shell": domain.MutationProcess,
-}
-
 func NewRegistry(items ...ports.Tool) *Registry {
 	registry := &Registry{byName: make(map[string]ports.Tool, len(items))}
 	for _, item := range items {
@@ -35,12 +30,6 @@ func NewRegistry(items ...ports.Tool) *Registry {
 		if descriptor.ScopeDescription == "" {
 			panic(fmt.Sprintf("built-in tool %s has no scope description", descriptor.Name))
 		}
-		if _, known := builtInRank[descriptor.Name]; !known {
-			panic(fmt.Sprintf("unknown built-in tool %s", descriptor.Name))
-		}
-		if descriptor.Mutation != builtInMutation[descriptor.Name] {
-			panic(fmt.Sprintf("built-in tool %s has mutation %s, want %s", descriptor.Name, descriptor.Mutation, builtInMutation[descriptor.Name]))
-		}
 		descriptor.InputSchema = append([]byte(nil), descriptor.InputSchema...)
 		if _, exists := registry.byName[descriptor.Name]; exists {
 			panic(fmt.Sprintf("duplicate tool %s", descriptor.Name))
@@ -48,11 +37,16 @@ func NewRegistry(items ...ports.Tool) *Registry {
 		registry.byName[descriptor.Name] = item
 		registry.ordered = append(registry.ordered, descriptor)
 	}
-	if len(registry.byName) != len(builtInRank) {
-		panic("registry requires read, search, edit, and shell")
-	}
 	sort.Slice(registry.ordered, func(left, right int) bool {
-		return builtInRank[registry.ordered[left].Name] < builtInRank[registry.ordered[right].Name]
+		leftRank, leftBuiltin := builtInRank[registry.ordered[left].Name]
+		rightRank, rightBuiltin := builtInRank[registry.ordered[right].Name]
+		if leftBuiltin != rightBuiltin {
+			return leftBuiltin
+		}
+		if leftBuiltin {
+			return leftRank < rightRank
+		}
+		return registry.ordered[left].Name < registry.ordered[right].Name
 	})
 	return registry
 }

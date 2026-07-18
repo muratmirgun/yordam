@@ -43,6 +43,23 @@ func TestReadFailsClosedWhenTargetBecomesSymlinkBeforeOpen(t *testing.T) {
 	}
 }
 
+func TestDescriptorPlanningDoesNotOpenReadContent(t *testing.T) {
+	workspace := t.TempDir()
+	target := filepath.Join(workspace, "target.txt")
+	if err := os.WriteFile(target, []byte("not opened while planning\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	tool := New(Options{Workspace: workspace, Output: output.Options{SessionID: "s", Artifacts: readDiscardStore{}}})
+	planned, err := tool.Plan(context.Background(), domain.ToolRequest{CallID: "c", Name: "read", Workspace: workspace, Input: json.RawMessage(`{"path":"target.txt"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview := planned.Preview()
+	if len(preview.Resources) != 1 || preview.Resources[0].Kind != "file" || preview.Resources[0].CanonicalID == "" {
+		t.Fatalf("preview=%#v", preview)
+	}
+}
+
 type readDiscardStore struct{}
 
 func (readDiscardStore) Put(_ context.Context, sessionID, mediaType string, source io.Reader, limit int64) (domain.Artifact, error) {

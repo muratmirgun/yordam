@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 	"github.com/muratmirgun/yordam/internal/tools/shell"
@@ -47,6 +48,53 @@ func TestShellDescriptorAndPreparation(t *testing.T) {
 	}
 	if !preview.InsideWorkspace || preview.Summary != "  echo ok  " || preview.Request.CallID != "call-1" {
 		t.Fatalf("preview=%#v", preview)
+	}
+}
+
+func TestDescriptorPlanningCanonicalizesExecutableWithoutSpawn(t *testing.T) {
+	root := t.TempDir()
+	link := filepath.Join(root, "shell-link")
+	if err := os.Symlink("/bin/sh", link); err != nil {
+		t.Fatal(err)
+	}
+	tool := newTool(t, shell.Options{Workspace: root, ShellPath: link, Timeout: time.Second})
+	planned, err := tool.Plan(context.Background(), request(`{"command":"touch should-not-exist","cwd":"."}`, root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := filepath.EvalSymlinks(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := planned.Preview().Resources
+	if len(resources) != 2 || resources[1].CanonicalID != canonical {
+		t.Fatalf("resources=%#v want executable %q", resources, canonical)
+	}
+	if _, err := os.Stat(filepath.Join(root, "should-not-exist")); !os.IsNotExist(err) {
+		t.Fatalf("planning spawned shell: %v", err)
+	}
+}
+
+func TestDescriptorRevalidationRejectsReplacedExecutableIdentity(t *testing.T) {
+	root := t.TempDir()
+	executable := filepath.Join(root, "tool-shell")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexec /bin/sh \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tool := newTool(t, shell.Options{Workspace: root, ShellPath: executable, Timeout: time.Second})
+	planned, err := tool.Plan(context.Background(), request(`{"command":"true","cwd":"."}`, root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(executable); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err = planned.(ports.ResourceRevalidator).Revalidate(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("revalidation error=%v", err)
 	}
 }
 

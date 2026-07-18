@@ -44,6 +44,23 @@ func TestSearchFailsClosedWhenRootBecomesSymlinkBeforeOpen(t *testing.T) {
 	}
 }
 
+func TestDescriptorPlanningProducesCanonicalSearchResource(t *testing.T) {
+	workspace := t.TempDir()
+	root := filepath.Join(workspace, "root")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tool := New(Options{Workspace: workspace, LookPath: func(string) (string, error) { return "", exec.ErrNotFound }, Output: output.Options{SessionID: "s", Artifacts: searchDiscardStore{}}})
+	planned, err := tool.Plan(context.Background(), domain.ToolRequest{CallID: "c", Name: "search", Workspace: workspace, Input: json.RawMessage(`{"query":"needle","path":"root"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview := planned.Preview()
+	if len(preview.Resources) != 1 || preview.Resources[0].Kind != "directory" || preview.Resources[0].CanonicalID == "" {
+		t.Fatalf("preview=%#v", preview)
+	}
+}
+
 type searchDiscardStore struct{}
 
 func (searchDiscardStore) Put(_ context.Context, sessionID, mediaType string, source io.Reader, limit int64) (domain.Artifact, error) {

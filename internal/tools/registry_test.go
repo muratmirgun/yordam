@@ -45,28 +45,24 @@ func TestRegistryDescriptorsAreStable(t *testing.T) {
 	}
 }
 
-func TestRegistryRejectsIncompleteDuplicateAndUnknownDescriptors(t *testing.T) {
+func TestRegistryAcceptsArbitraryToolsAndRejectsDuplicateAliases(t *testing.T) {
 	readTool := registryTool("read")
 	searchTool := registryTool("search")
 	editTool := registryTool("edit")
 	shellTool := registryTool("shell")
 
-	tests := []struct {
-		name  string
-		items []ports.Tool
-		want  string
-	}{
-		{name: "missing", items: []ports.Tool{readTool, searchTool, editTool}, want: "registry requires read, search, edit, and shell"},
-		{name: "duplicate", items: []ports.Tool{readTool, searchTool, editTool, shellTool, readTool}, want: "duplicate tool read"},
-		{name: "unknown", items: []ports.Tool{readTool, searchTool, editTool, registryTool("write")}, want: "unknown built-in tool write"},
+	registry := tools.NewRegistry(shellTool, registryTool("inspect"), editTool, readTool, searchTool)
+	got := registry.Descriptors()
+	names := make([]string, 0, len(got))
+	for _, descriptor := range got {
+		names = append(names, descriptor.Name)
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			assertPanicsWith(t, test.want, func() {
-				tools.NewRegistry(test.items...)
-			})
-		})
+	if !slices.Equal(names, []string{"read", "search", "edit", "shell", "inspect"}) {
+		t.Fatalf("names=%v", names)
 	}
+	assertPanicsWith(t, "duplicate tool read", func() {
+		tools.NewRegistry(readTool, readTool)
+	})
 }
 
 func registryTool(name string) *descriptorTool {

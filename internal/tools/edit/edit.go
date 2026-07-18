@@ -19,6 +19,8 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/recovery"
 	"github.com/muratmirgun/yordam/internal/safefile"
 	"github.com/muratmirgun/yordam/internal/scope"
 	"github.com/muratmirgun/yordam/internal/tools/output"
@@ -104,6 +106,10 @@ func (t *Tool) Prepare(_ context.Context, request domain.ToolRequest) (ports.Pre
 		return t.prepareCreate(request, input)
 	}
 	return t.prepareExisting(request, input)
+}
+
+func (t *Tool) Plan(ctx context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
+	return t.Prepare(ctx, request)
 }
 
 func (t *Tool) prepareCreate(request domain.ToolRequest, input Input) (ports.PreparedTool, error) {
@@ -238,12 +244,46 @@ func (p *prepared) Preview() domain.PreparedToolRequest {
 		CanonicalScope:  p.target.Path,
 		InsideWorkspace: p.target.Inside,
 		Summary:         p.summary(),
+		Resources:       p.resources(),
 	}
 	if p.previewReady {
 		preview.ProposedDiff = p.plan.Diff
 		preview.FilePlan = &plan
 	}
 	return preview
+}
+
+func (p *prepared) resources() []protocol.ResourceTarget {
+	resource := protocol.ResourceTarget{Kind: "file", CanonicalID: p.target.Path}
+	if p.input.Create {
+		resource.ParentID = filepath.Dir(p.target.Path)
+		resource.Attributes = []protocol.ResourceAttribute{{Name: "create", Value: "true"}}
+	} else {
+		resource.Digest = p.input.ExpectedSHA256
+	}
+	return []protocol.ResourceTarget{resource}
+}
+
+func (p *prepared) Revalidate(_ context.Context) (domain.PreparedToolRequest, error) {
+	current, err := scope.Resolve(p.workspace, p.input.Path, p.input.Create)
+	if err != nil {
+		return domain.PreparedToolRequest{}, fmt.Errorf("re-resolve edit path: %w", err)
+	}
+	p.previewMu.Lock()
+	p.target = current
+	p.previewMu.Unlock()
+	return p.Preview(), nil
+}
+
+func (p *prepared) RecoveryMaterial(_ context.Context) (recovery.Candidate, bool, error) {
+	p.previewMu.Lock()
+	defer p.previewMu.Unlock()
+	if !p.previewReady || p.input.Create {
+		return recovery.Candidate{}, false, nil
+	}
+	preimageDigest := protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hashBytes(p.before)}
+	postimageDigest := protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hashBytes(p.after)}
+	return recovery.Candidate{Preimage: bytes.Clone(p.before), PreimageDigest: preimageDigest, ExpectedPostimageDigest: postimageDigest, Mode: uint32(p.mode.Perm())}, true, nil
 }
 
 func (p *prepared) summary() string {
