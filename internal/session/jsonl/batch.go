@@ -140,14 +140,21 @@ func (s *Store) AppendBatch(ctx context.Context, request journal.AppendRequest) 
 		return journal.AppendResult{}, err
 	}
 	defer lock.unlock()
-
-	transaction, session, err := s.openJournal(ctx, request.Journal, os.O_RDWR|os.O_APPEND)
+	guard, err := s.acquireJournalMutation(ctx, request.Journal)
 	if err != nil {
 		return journal.AppendResult{}, err
 	}
+
+	transaction, session, err := s.openJournal(ctx, request.Journal, os.O_RDWR|os.O_APPEND)
+	if err != nil {
+		return journal.AppendResult{}, errors.Join(err, guard.release())
+	}
+	if err := guard.bind(ctx, transaction); err != nil {
+		return journal.AppendResult{}, errors.Join(err, transaction.close(), guard.release())
+	}
 	result, operationErr := s.appendBatchLocked(ctx, transaction, session, request)
 	closeErr := transaction.close()
-	resultErr := errors.Join(operationErr, closeErr)
+	resultErr := errors.Join(operationErr, closeErr, guard.release())
 	if resultErr == nil && result.Status == journal.AppendCommitted {
 		s.clearMarkerUncertainty(request.Journal, request.TransactionID)
 	}
@@ -158,11 +165,17 @@ func validateAppendRequest(request journal.AppendRequest) error {
 	if err := request.Journal.Validate(); err != nil {
 		return err
 	}
-	if err := request.ExpectedHead.Validate(); err != nil {
-		return fmt.Errorf("invalid expected head: %w", err)
-	}
-	if request.ExpectedHead.JournalKind != request.Journal.Kind || request.ExpectedHead.JournalID != request.Journal.ID {
-		return fmt.Errorf("expected head journal identity mismatch")
+	if zeroCursor(request.ExpectedHead) {
+		if request.Journal.Kind != protocol.JournalWorkspaceControl {
+			return fmt.Errorf("only a new workspace-control journal accepts an empty expected head")
+		}
+	} else {
+		if err := request.ExpectedHead.Validate(); err != nil {
+			return fmt.Errorf("invalid expected head: %w", err)
+		}
+		if request.ExpectedHead.JournalKind != request.Journal.Kind || request.ExpectedHead.JournalID != request.Journal.ID {
+			return fmt.Errorf("expected head journal identity mismatch")
+		}
 	}
 	if request.TransactionID == "" {
 		return fmt.Errorf("transaction ID is required")
@@ -442,7 +455,13 @@ func (s *Store) appendBatchLockedWithIdentity(
 	if err := s.injectFault(FaultMetadataWrite); err != nil {
 		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
 	}
-	if err := writeJSONAtomicRooted(ctx, transaction, session); err != nil {
+	metadata := any(session)
+	if transaction.control {
+		transaction.controlState.LastSeq = cursor.CommitSeq
+		transaction.controlState.UpdatedAt = marker.Time
+		metadata = transaction.controlState
+	}
+	if err := writeJSONAtomicRooted(ctx, transaction, metadata); err != nil {
 		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
 	}
 	if err := s.injectFault(FaultMetadataRename); err != nil {

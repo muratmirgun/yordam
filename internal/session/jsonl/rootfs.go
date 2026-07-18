@@ -162,6 +162,8 @@ type workspaceLayout struct {
 	workspaceID    string
 	sessionsRoot   *os.Root
 	sessionsInfo   os.FileInfo
+	controlRoot    *os.Root
+	controlInfo    os.FileInfo
 }
 
 func (s *Store) openWorkspaceLayout(ctx context.Context, workspace domain.Workspace, create bool) (*workspaceLayout, error) {
@@ -204,6 +206,20 @@ func (s *Store) openWorkspaceLayout(ctx context.Context, workspace domain.Worksp
 			return fail(errWorkspaceNotFound)
 		}
 		return fail(err)
+	}
+	if create {
+		layout.controlRoot, layout.controlInfo, err = openOrCreateRootedDirectory(ctx, layout.workspaceRoot, "control", true)
+		if err != nil {
+			return fail(err)
+		}
+		if err := s.ensureControlJournalFiles(ctx, layout); err != nil {
+			return fail(err)
+		}
+	} else {
+		layout.controlRoot, layout.controlInfo, err = openRootedDirectory(layout.workspaceRoot, "control")
+		if err != nil && !os.IsNotExist(err) {
+			return fail(err)
+		}
 	}
 	if err := layout.verify(); err != nil {
 		return fail(err)
@@ -294,11 +310,16 @@ func openOrCreateRootedDirectory(ctx context.Context, parent *os.Root, name stri
 	if err == nil || !os.IsNotExist(err) || !create {
 		return root, info, err
 	}
-	if err := parent.Mkdir(name, 0o700); err != nil {
+	created := false
+	if err := parent.Mkdir(name, 0o700); err == nil {
+		created = true
+	} else if !os.IsExist(err) {
 		return nil, nil, err
 	}
-	if err := syncRootDir(parent, "."); err != nil {
-		return nil, nil, err
+	if created {
+		if err := syncRootDir(parent, "."); err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
@@ -312,7 +333,7 @@ func ensureWorkspaceIdentity(ctx context.Context, layout *workspaceLayout, works
 	}
 	file, info, err := openRootedRegularFile(ctx, layout.workspaceRoot, "workspace.json", os.O_RDONLY, 0)
 	if os.IsNotExist(err) && create {
-		return writeJSONAtomicInRoot(
+		writeErr := writeJSONAtomicInRoot(
 			ctx,
 			layout.workspaceRoot,
 			layout.verifyWorkspace,
@@ -321,6 +342,13 @@ func ensureWorkspaceIdentity(ctx context.Context, layout *workspaceLayout, works
 			workspace,
 			maxWorkspaceMetadataBytes,
 		)
+		if writeErr == nil {
+			return nil
+		}
+		file, info, err = openRootedRegularFile(ctx, layout.workspaceRoot, "workspace.json", os.O_RDONLY, 0)
+		if err != nil {
+			return writeErr
+		}
 	}
 	if err != nil {
 		return err
@@ -399,14 +427,21 @@ func (l *workspaceLayout) verifyWorkspace() error {
 }
 
 func (l *workspaceLayout) verify() error {
-	return errors.Join(
+	err := errors.Join(
 		l.verifyWorkspace(),
 		verifyRootedDirectory(l.workspaceRoot, "sessions", l.sessionsInfo),
 	)
+	if l.controlRoot != nil {
+		err = errors.Join(err, verifyRootedDirectory(l.workspaceRoot, "control", l.controlInfo))
+	}
+	return err
 }
 
 func (l *workspaceLayout) close() error {
 	var closeErrs []error
+	if l.controlRoot != nil {
+		closeErrs = append(closeErrs, l.controlRoot.Close())
+	}
 	if l.sessionsRoot != nil {
 		closeErrs = append(closeErrs, l.sessionsRoot.Close())
 	}
@@ -423,23 +458,27 @@ func (l *workspaceLayout) close() error {
 }
 
 type sessionTransaction struct {
-	storeRoot      *os.Root
-	workspacesRoot *os.Root
-	workspacesInfo os.FileInfo
-	workspaceRoot  *os.Root
-	workspaceInfo  os.FileInfo
-	workspaceID    string
-	sessionsRoot   *os.Root
-	sessionsInfo   os.FileInfo
-	sessionID      string
-	sessionRoot    *os.Root
-	directoryInfo  os.FileInfo
-	metadata       *os.File
-	metadataInfo   os.FileInfo
-	events         *os.File
-	eventsInfo     os.FileInfo
-	artifactsRoot  *os.Root
-	artifactsInfo  os.FileInfo
+	storeRoot       *os.Root
+	workspacesRoot  *os.Root
+	workspacesInfo  os.FileInfo
+	workspaceRoot   *os.Root
+	workspaceInfo   os.FileInfo
+	workspaceID     string
+	sessionsRoot    *os.Root
+	sessionsInfo    os.FileInfo
+	sessionID       string
+	sessionRoot     *os.Root
+	directoryInfo   os.FileInfo
+	metadata        *os.File
+	metadataInfo    os.FileInfo
+	events          *os.File
+	eventsInfo      os.FileInfo
+	artifactsRoot   *os.Root
+	artifactsInfo   os.FileInfo
+	control         bool
+	controlState    controlMetadata
+	journalLock     *os.File
+	journalLockInfo os.FileInfo
 }
 
 func (s *Store) openSessionTransaction(
@@ -638,6 +677,12 @@ func (t *sessionTransaction) openArtifacts() error {
 }
 
 func (t *sessionTransaction) verifySession() error {
+	if t.control {
+		return errors.Join(
+			t.verifyWorkspace(),
+			verifyRootedDirectory(t.workspaceRoot, "control", t.directoryInfo),
+		)
+	}
 	return errors.Join(
 		t.verifyWorkspace(),
 		verifyRootedDirectory(t.workspaceRoot, "sessions", t.sessionsInfo),
@@ -660,10 +705,14 @@ func (t *sessionTransaction) verifyMetadata() error {
 }
 
 func (t *sessionTransaction) verifyEvents() error {
-	return errors.Join(
+	err := errors.Join(
 		t.verifyMetadata(),
 		verifyRootedRegularFile(t.sessionRoot, "events.jsonl", t.eventsInfo),
 	)
+	if t.journalLock != nil {
+		err = errors.Join(err, verifyRootedRegularFile(t.sessionRoot, journalLockName, t.journalLockInfo))
+	}
+	return err
 }
 
 func (t *sessionTransaction) verifyArtifacts() error {
@@ -683,6 +732,9 @@ func (t *sessionTransaction) closeWithoutStoreRoot() error {
 	}
 	if t.events != nil {
 		closeErrs = append(closeErrs, t.events.Close())
+	}
+	if t.journalLock != nil {
+		closeErrs = append(closeErrs, t.journalLock.Close())
 	}
 	if t.metadata != nil {
 		closeErrs = append(closeErrs, t.metadata.Close())

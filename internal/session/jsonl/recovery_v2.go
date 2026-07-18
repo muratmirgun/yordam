@@ -59,7 +59,15 @@ func (s *Store) RecoverSession(ctx context.Context, request journal.RecoveryRequ
 		return journal.RecoveryResult{}, err
 	}
 	defer lock.unlock()
-	return s.recoverSessionLocked(ctx, request)
+	guard, err := s.acquireJournalMutation(ctx, request.Journal)
+	if errors.Is(err, errJournalLockInitializationRequired) {
+		guard, err = s.acquireLegacyRecoveryMutation(ctx, request.Journal)
+	}
+	if err != nil {
+		return journal.RecoveryResult{}, err
+	}
+	result, recoveryErr := s.recoverSessionLocked(ctx, request, guard)
+	return result, errors.Join(recoveryErr, guard.release())
 }
 
 func validateRecoveryRequest(request journal.RecoveryRequest) error {
@@ -87,7 +95,7 @@ func validateRecoveryRequest(request journal.RecoveryRequest) error {
 	return nil
 }
 
-func (s *Store) recoverSessionLocked(ctx context.Context, request journal.RecoveryRequest) (result journal.RecoveryResult, resultErr error) {
+func (s *Store) recoverSessionLocked(ctx context.Context, request journal.RecoveryRequest, guard *journalMutationGuard) (result journal.RecoveryResult, resultErr error) {
 	transaction, session, err := s.openJournal(ctx, request.Journal, os.O_RDONLY)
 	if err != nil {
 		return journal.RecoveryResult{}, err
@@ -98,6 +106,11 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 			resultErr = errors.Join(resultErr, transaction.close())
 		}
 	}()
+	if !guard.fallback {
+		if err := guard.bind(ctx, transaction); err != nil {
+			return journal.RecoveryResult{}, err
+		}
+	}
 
 	operationHash := recoveryOperationHash(request.OperationID)
 	manifestName := ".recovery-request-" + operationHash + ".json"
@@ -163,7 +176,7 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 				return journal.RecoveryResult{}, err
 			}
 			transactionOpen = false
-			return s.recoverSessionLocked(ctx, request)
+			return s.recoverSessionLocked(ctx, request, guard)
 		}
 	}
 	if !exists {
@@ -185,6 +198,12 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 			return journal.RecoveryResult{}, admissionErr
 		}
 		manifest.DiagnosticAppend = admitted
+		if err := guard.ensureInitialized(ctx); err != nil {
+			return journal.RecoveryResult{}, err
+		}
+		if err := guard.bind(ctx, transaction); err != nil {
+			return journal.RecoveryResult{}, err
+		}
 		if err := persistExplicitRecoveryManifest(ctx, transaction, manifest); err != nil {
 			return journal.RecoveryResult{}, err
 		}

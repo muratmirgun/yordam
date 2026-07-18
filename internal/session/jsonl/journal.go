@@ -81,10 +81,28 @@ func (s *Store) openJournal(
 	if err := ref.Validate(); err != nil {
 		return nil, domain.Session{}, err
 	}
-	if ref.Kind != protocol.JournalSession {
-		return nil, domain.Session{}, fmt.Errorf("workspace-control journal creation is a Task 4 boundary")
+	if ref.Kind == protocol.JournalWorkspaceControl {
+		transaction, session, err := s.openControlTransaction(ctx, string(ref.ID), flags)
+		return s.bindKnownJournalLock(ctx, transaction, session, ref, flags, err)
 	}
-	return s.openSessionTransaction(ctx, string(ref.ID), flags, 0)
+	transaction, session, err := s.openSessionTransaction(ctx, string(ref.ID), flags, 0)
+	return s.bindKnownJournalLock(ctx, transaction, session, ref, flags, err)
+}
+
+func (s *Store) bindKnownJournalLock(ctx context.Context, transaction *sessionTransaction, session domain.Session, ref protocol.JournalRef, flags int, openErr error) (*sessionTransaction, domain.Session, error) {
+	if openErr != nil || flags&(os.O_WRONLY|os.O_RDWR) == 0 {
+		return transaction, session, openErr
+	}
+	if _, known := s.state.lockIdentities.Load(journalLockKey(ref) + "\x00" + journalLockName); !known {
+		return transaction, session, nil
+	}
+	file, info, err := s.openStableLock(ctx, transaction, ref, journalLockName)
+	if err != nil {
+		return nil, domain.Session{}, errors.Join(err, transaction.close())
+	}
+	transaction.journalLock = file
+	transaction.journalLockInfo = info
+	return transaction, session, nil
 }
 
 func (s *Store) scanJournal(ctx context.Context, transaction *sessionTransaction, ref protocol.JournalRef) (journalScan, error) {
@@ -657,6 +675,7 @@ func (s *Store) inspectJournalTransaction(ctx context.Context, transaction *sess
 	if err != nil {
 		return scan, err
 	}
+	s.applyJournalLockHealth(ctx, transaction, ref, &scan)
 	if err := s.syncCommittedView(ctx, transaction, ref, scan); err != nil {
 		return scan, err
 	}
@@ -675,6 +694,39 @@ func (s *Store) inspectJournalTransaction(ctx context.Context, transaction *sess
 		})
 	}
 	return scan, nil
+}
+
+func (s *Store) applyJournalLockHealth(ctx context.Context, transaction *sessionTransaction, ref protocol.JournalRef, scan *journalScan) {
+	file, info, err := openRootedRegularFile(ctx, transaction.sessionRoot, journalLockName, os.O_RDONLY, 0)
+	if err == nil {
+		healthErr := errors.Join(
+			verifyRootedRegularFile(transaction.sessionRoot, journalLockName, info),
+			s.rememberLockIdentity(ref, journalLockName, info),
+		)
+		if info.Mode().Perm() != 0o600 {
+			healthErr = errors.Join(healthErr, fmt.Errorf("journal lock mode is %04o, want 0600", info.Mode().Perm()))
+		}
+		healthErr = errors.Join(healthErr, file.Close())
+		if healthErr == nil {
+			return
+		}
+		err = healthErr
+	} else if os.IsNotExist(err) && !transaction.control {
+		turnFile, turnInfo, turnErr := openRootedRegularFile(ctx, transaction.sessionRoot, turnLockName, os.O_RDONLY, 0)
+		if turnErr == nil {
+			turnErr = errors.Join(verifyRootedRegularFile(transaction.sessionRoot, turnLockName, turnInfo), turnFile.Close())
+			if turnErr == nil {
+				err = fmt.Errorf("initialized journal lock is missing")
+			}
+		} else if os.IsNotExist(turnErr) {
+			scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "lock.initialization_required", "pre-lock journal requires explicit create-once initialization before mutation", scan.head.CommitSeq, ""))
+			return
+		} else {
+			err = turnErr
+		}
+	}
+	scan.writable = false
+	scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "lock.invalid", err.Error(), scan.head.CommitSeq, ""))
 }
 
 func recoveryEligible(scan journalScan) bool {

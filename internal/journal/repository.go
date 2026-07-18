@@ -3,10 +3,66 @@ package journal
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
+
+var (
+	ErrLineageParentMissing = errors.New("lineage parent missing")
+	ErrLineageCycle         = errors.New("lineage cycle")
+	ErrLineageDepthExceeded = errors.New("lineage depth exceeds 64")
+	ErrTurnLeaseHeld        = errors.New("turn lease held")
+	ErrTurnRecoveryRequired = errors.New("turn recovery required")
+	ErrTurnHeadConflict     = errors.New("turn lease expected-head conflict")
+	ErrTurnNotTerminal      = errors.New("turn is not terminal at supplied cursor")
+)
+
+type SessionLineage struct {
+	ParentSessionID  protocol.SessionID       `json:"parent_session_id"`
+	ParentCursor     protocol.CommittedCursor `json:"parent_cursor"`
+	CheckpointDigest protocol.Digest          `json:"checkpoint_digest"`
+}
+
+type LineageCursor struct {
+	ViewSessionID   protocol.SessionID       `json:"view_session_id"`
+	OriginSessionID protocol.SessionID       `json:"origin_session_id"`
+	OriginCursor    protocol.CommittedCursor `json:"origin_cursor"`
+}
+
+type ComposedReadRequest struct {
+	SessionID protocol.SessionID
+	After     LineageCursor
+	Limit     int
+}
+
+type LineageEvent struct {
+	Cursor LineageCursor
+	Record protocol.EventRecord
+}
+
+type ComposedEventPage struct {
+	Events []LineageEvent
+	Cursor LineageCursor
+	Head   LineageCursor
+	More   bool
+}
+
+type TurnLease interface {
+	SessionID() protocol.SessionID
+	TurnID() protocol.TurnID
+	Release(context.Context, protocol.CommittedCursor) error
+}
+
+type TurnLeaseManager interface {
+	AcquireTurnLease(context.Context, protocol.SessionID, protocol.TurnID, protocol.CommittedCursor) (TurnLease, error)
+	AcquireTurnRecoveryLease(context.Context, protocol.SessionID, protocol.TurnID, protocol.CommittedCursor) (TurnLease, error)
+}
+
+type ActiveTurnInspector interface {
+	ActiveTurn(context.Context, protocol.SessionID, protocol.CommittedCursor) (turnID protocol.TurnID, terminal bool, err error)
+}
 
 type AppendStatus string
 

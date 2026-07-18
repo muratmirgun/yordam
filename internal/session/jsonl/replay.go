@@ -28,7 +28,7 @@ func (s *Store) Load(ctx context.Context, sessionID string) (domain.SessionRepla
 	if err := s.state.lockContext(ctx); err != nil {
 		return domain.SessionReplay{}, err
 	}
-	defer s.state.unlock()
+	s.state.unlock()
 	if err := validateSessionID(sessionID); err != nil {
 		return domain.SessionReplay{}, err
 	}
