@@ -1,17 +1,22 @@
 package jsonl_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/muratmirgun/yordam/internal/eventcodec"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/session/jsonl"
 	"golang.org/x/sys/unix"
 )
 
@@ -311,5 +316,136 @@ func TestExactSourceDigestForgedIndexCannotChangeDuplicateDecision(t *testing.T)
 	}
 	if string(after) != string(before) {
 		t.Fatal("forged event index caused a partial journal write")
+	}
+}
+
+type regressionIndexEntry struct {
+	transactionID protocol.TransactionID
+	cursor        protocol.CommittedCursor
+	firstOffset   int64
+	endOffset     int64
+}
+
+func writeRegressionIndex(t *testing.T, path string, source []byte, eventIDs []protocol.EventID, entries []regressionIndexEntry) {
+	t.Helper()
+	sum := sha256.Sum256(source)
+	transactions := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		transactions = append(transactions, map[string]any{
+			"transaction_id": entry.transactionID,
+			"cursor":         entry.cursor,
+			"first_offset":   entry.firstOffset,
+			"end_offset":     entry.endOffset,
+		})
+	}
+	index := map[string]any{
+		"version":       uint32(1),
+		"source_size":   int64(len(source)),
+		"source_digest": protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hex.EncodeToString(sum[:])},
+		"event_ids":     eventIDs,
+		"transactions":  transactions,
+	}
+	raw, err := json.Marshal(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIndexedScannerRegressionEnforcesGlobalV2BeforeV1Invariant(t *testing.T) {
+	fixture := newV2Journal(t)
+	source, err := os.ReadFile(fixture.eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEnd := int64(len(source))
+	source = append(source, legacyLineForRegression(fixture.ref, "legacy-after-v2", 3, `{"value":1}`)...)
+	if err := os.WriteFile(fixture.eventsPath, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyCursor := protocol.CommittedCursor{
+		JournalKind: fixture.ref.Kind, JournalID: fixture.ref.ID, CommitSeq: 3,
+		TransactionID: "legacy:legacy-after-v2",
+	}
+	writeRegressionIndex(t, filepath.Join(filepath.Dir(fixture.eventsPath), "journal.index.json"), source,
+		[]protocol.EventID{"evt-bootstrap", "evt-bootstrap-marker", "legacy-after-v2"},
+		[]regressionIndexEntry{
+			{transactionID: fixture.head.TransactionID, cursor: fixture.head, firstOffset: 0, endOffset: firstEnd},
+			{transactionID: legacyCursor.TransactionID, cursor: legacyCursor, firstOffset: firstEnd, endOffset: int64(len(source))},
+		},
+	)
+	if _, err := fixture.repo.LookupTransaction(context.Background(), fixture.ref, legacyCursor.TransactionID); err == nil {
+		t.Fatal("exact-digest index bypassed the global v2-to-v1 scanner invariant")
+	}
+}
+
+func TestIndexedScannerRegressionPreservesPureV1TransitionState(t *testing.T) {
+	repo, ref, head, path := newLegacyJournalForRegression(t)
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID := protocol.EventID(strings.TrimPrefix(string(head.TransactionID), "legacy:"))
+	writeRegressionIndex(t, filepath.Join(filepath.Dir(path), "journal.index.json"), source,
+		[]protocol.EventID{eventID},
+		[]regressionIndexEntry{{transactionID: head.TransactionID, cursor: head, firstOffset: 0, endOffset: int64(len(source))}},
+	)
+	event := proposed("evt-v2-regression", protocol.EventTaskCreated)
+	event.SessionID = protocol.SessionID(ref.ID)
+	before := bytes.Clone(source)
+	_, err = repo.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: ref, ExpectedHead: head, TransactionID: "txn-v2-regression", Events: []protocol.ProposedEvent{event},
+	})
+	if err == nil || !strings.Contains(err.Error(), "legacy") {
+		t.Fatalf("verified pure-v1 index lost compatibility state: %v", err)
+	}
+	after, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("pure-v1 index allowed a first-v2 mutation before Task 3")
+	}
+}
+
+func TestVerifiedPrefixRegressionSkipsOldDecodeForLookupAndAppend(t *testing.T) {
+	var validations atomic.Int64
+	descriptors := eventcodec.FoundationDescriptors()
+	for index := range descriptors {
+		structural := descriptors[index].ValidateStructural
+		descriptors[index].ValidateStructural = func(value any) error {
+			validations.Add(1)
+			if structural != nil {
+				return structural(value)
+			}
+			return nil
+		}
+	}
+	registry, err := eventcodec.New(descriptors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newV2JournalWithOptions(t, jsonl.Options{Encoder: passthroughEncoder{}, Registry: registry})
+	first := appendCommitted(t, fixture, fixture.head, "txn-prefix-a", "evt-prefix-a")
+	validations.Store(0)
+	for range 3 {
+		lookup, err := fixture.repo.LookupTransaction(context.Background(), fixture.ref, "txn-prefix-a")
+		if err != nil || lookup.State != journal.TransactionCommitted || lookup.Cursor != first.Cursor {
+			t.Fatalf("lookup=%+v err=%v", lookup, err)
+		}
+	}
+	if got := validations.Load(); got != 0 {
+		t.Fatalf("unchanged verified prefix decoded %d times", got)
+	}
+	validations.Store(0)
+	second := appendCommitted(t, fixture, first.Cursor, "txn-prefix-b", "evt-prefix-b")
+	firstTailValidations := validations.Load()
+	validations.Store(0)
+	_ = appendCommitted(t, fixture, second.Cursor, "txn-prefix-c", "evt-prefix-c")
+	secondTailValidations := validations.Load()
+	if firstTailValidations == 0 || secondTailValidations != firstTailValidations {
+		t.Fatalf("append tail validations grew with old prefix: first=%d second=%d", firstTailValidations, secondTailValidations)
 	}
 }

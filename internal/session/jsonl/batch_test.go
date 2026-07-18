@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
+	"github.com/oklog/ulid/v2"
 )
 
 type passthroughEncoder struct{}
@@ -722,6 +724,325 @@ func TestRecoverRemainsFailClosedTask3Boundary(t *testing.T) {
 	}
 	if !bytes.Equal(after, before) {
 		t.Fatal("fail-closed recovery boundary mutated the journal")
+	}
+}
+
+func newLegacyJournalForRegression(t *testing.T) (*jsonl.Store, protocol.JournalRef, protocol.CommittedCursor, string) {
+	t.Helper()
+	root := t.TempDir()
+	repo := jsonl.New(root, jsonl.Options{Encoder: passthroughEncoder{}})
+	workspace, err := jsonl.WorkspaceFromPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := repo.Create(context.Background(), workspace, domain.ModeAsk, domain.ModelSelection{Profile: "p", Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(session.ID)}
+	path := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID, "events.jsonl")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var event domain.DurableEvent
+	if err := json.Unmarshal(bytes.TrimSuffix(raw, []byte("\n")), &event); err != nil {
+		t.Fatal(err)
+	}
+	head := protocol.CommittedCursor{
+		JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: event.Seq,
+		TransactionID: protocol.TransactionID("legacy:" + event.EventID),
+	}
+	return repo, ref, head, path
+}
+
+func legacyLineForRegression(ref protocol.JournalRef, eventID string, seq uint64, payload string) []byte {
+	return []byte(fmt.Sprintf(
+		`{"schema_version":1,"event_id":%q,"session_id":%q,"seq":%d,"time":"2026-07-18T10:00:00Z","kind":"user.message","payload":%s}`+"\n",
+		eventID, ref.ID, seq, payload,
+	))
+}
+
+func appendPhysicalEnvelopes(t *testing.T, path string, envelopes ...protocol.EventEnvelope) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, envelope := range envelopes {
+		line, err := canonicaljson.Marshal(envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.Write(append(line, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLegacyJournalRegressionAcceptsV01NumbersAndTwoMiBPhysicalLimit(t *testing.T) {
+	repo, ref, _, path := newLegacyJournalForRegression(t)
+	floatLine := legacyLineForRegression(ref, "legacy-float", 2, `{"decimal":1.5,"exponent":1e3}`)
+	largeLine := legacyLineForRegression(ref, "legacy-large", 3, `{"padding":"`+strings.Repeat("x", (1<<20)+4096)+`"}`)
+	if len(largeLine) <= 1<<20 || len(largeLine) >= 2<<20 {
+		t.Fatalf("legacy line size=%d does not exercise the 1-2 MiB window", len(largeLine))
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(append(floatLine, largeLine...)); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := repo.Inspect(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inspection.Events) != 3 || !inspection.Writable {
+		t.Fatalf("legacy inspection events=%d writable=%v", len(inspection.Events), inspection.Writable)
+	}
+}
+
+func TestUnsupportedCommitMarkerRegressionRemainsStructuralAndAmbiguous(t *testing.T) {
+	fixture := newV2Journal(t)
+	event := protocol.EventEnvelope{
+		SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1,
+		JournalKind: fixture.ref.Kind, JournalID: fixture.ref.ID, SessionID: protocol.SessionID(fixture.ref.ID),
+		EventID: "evt-future-data", Seq: 3, Time: time.Date(2026, 7, 18, 10, 2, 0, 0, time.UTC),
+		Kind: protocol.EventTaskCreated, TaskID: "task-future", TransactionID: "txn-future",
+		Payload: proposed("unused", protocol.EventTaskCreated).Payload,
+	}
+	unknownPayload, err := canonicaljson.Marshal(protocol.TransactionCommittedV1{
+		TransactionID: "txn-future", FirstSeq: 3, LastSeq: 3, EventCount: 1,
+		Digest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownMarker := protocol.EventEnvelope{
+		SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 99,
+		JournalKind: fixture.ref.Kind, JournalID: fixture.ref.ID, SessionID: protocol.SessionID(fixture.ref.ID),
+		EventID: "evt-future-marker", Seq: 4, Time: event.Time,
+		Kind: protocol.EventTransactionCommitted, TransactionID: "txn-future", Payload: unknownPayload,
+	}
+	digest, err := canonicaljson.TransactionDigest([]protocol.EventEnvelope{event, unknownMarker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	laterPayload, err := canonicaljson.Marshal(protocol.TransactionCommittedV1{
+		TransactionID: "txn-future", FirstSeq: 3, LastSeq: 4, EventCount: 2, Digest: digest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	laterMarker := unknownMarker
+	laterMarker.PayloadVersion = 1
+	laterMarker.EventID = "evt-later-marker"
+	laterMarker.Seq = 5
+	laterMarker.Payload = laterPayload
+	appendPhysicalEnvelopes(t, fixture.eventsPath, event, unknownMarker, laterMarker)
+	inspection, err := fixture.repo.Inspect(context.Background(), fixture.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Writable || inspection.IncompleteTransaction != "txn-future" || len(inspection.Events) != 1 || inspection.Head != fixture.head {
+		t.Fatalf("unsupported marker changed domain visibility: %+v", inspection)
+	}
+}
+
+func TestPhysicalTransactionRegressionRejectsMoreThanOneThousandEvents(t *testing.T) {
+	fixture := newV2Journal(t)
+	events := make([]protocol.EventEnvelope, 1001)
+	for index := range events {
+		events[index] = protocol.EventEnvelope{
+			SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1,
+			JournalKind: fixture.ref.Kind, JournalID: fixture.ref.ID, SessionID: protocol.SessionID(fixture.ref.ID),
+			EventID: protocol.EventID(fmt.Sprintf("evt-physical-%04d", index)), Seq: uint64(index + 3),
+			Time: time.Date(2026, 7, 18, 10, 3, 0, 0, time.UTC), Kind: protocol.EventTaskCreated,
+			TaskID: protocol.TaskID(fmt.Sprintf("task-%04d", index)), TransactionID: "txn-oversized",
+			Payload: proposed("unused", protocol.EventTaskCreated).Payload,
+		}
+	}
+	digest, err := canonicaljson.TransactionDigest(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerPayload, err := canonicaljson.Marshal(protocol.TransactionCommittedV1{
+		TransactionID: "txn-oversized", FirstSeq: 3, LastSeq: 1003, EventCount: 1001, Digest: digest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := protocol.EventEnvelope{
+		SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1,
+		JournalKind: fixture.ref.Kind, JournalID: fixture.ref.ID, SessionID: protocol.SessionID(fixture.ref.ID),
+		EventID: "evt-oversized-marker", Seq: 1004, Time: events[0].Time,
+		Kind: protocol.EventTransactionCommitted, TransactionID: "txn-oversized", Payload: markerPayload,
+	}
+	appendPhysicalEnvelopes(t, fixture.eventsPath, append(events, marker)...)
+	if _, err := fixture.repo.Inspect(context.Background(), fixture.ref); err == nil || !strings.Contains(err.Error(), "1000") {
+		t.Fatalf("physical 1001-event transaction accepted: %v", err)
+	}
+}
+
+func TestGeneratedMarkerIDRegressionRejectsProposedCollisionBeforeWrite(t *testing.T) {
+	fixture := newV2Journal(t)
+	clock := time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
+	markerID, err := ulid.New(ulid.Timestamp(clock), strings.NewReader(strings.Repeat("e", 16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerID[15] += 2
+	event := proposed(protocol.EventID(markerID.String()), protocol.EventTaskCreated)
+	event.SessionID = protocol.SessionID(fixture.ref.ID)
+	before, err := os.ReadFile(fixture.eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: fixture.ref, ExpectedHead: fixture.head, TransactionID: "txn-collision", Events: []protocol.ProposedEvent{event},
+	}); err == nil {
+		t.Fatal("generated marker ID collision accepted")
+	}
+	after, err := os.ReadFile(fixture.eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("marker ID collision wrote journal bytes")
+	}
+}
+
+func TestGeneratedMarkerIDRegressionRejectsDurableCollisionBeforeWrite(t *testing.T) {
+	fixture := newV2Journal(t)
+	clock := time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
+	markerID, err := ulid.New(ulid.Timestamp(clock), strings.NewReader(strings.Repeat("e", 16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerID[15] += 2
+	lines := readJournalLines(t, fixture.eventsPath)
+	var event protocol.EventEnvelope
+	var marker protocol.EventEnvelope
+	if err := json.Unmarshal(lines[0], &event); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(lines[1], &marker); err != nil {
+		t.Fatal(err)
+	}
+	event.EventID = protocol.EventID(markerID.String())
+	digest, err := canonicaljson.TransactionDigest([]protocol.EventEnvelope{event})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker.Payload, err = canonicaljson.Marshal(protocol.TransactionCommittedV1{
+		TransactionID: event.TransactionID, FirstSeq: event.Seq, LastSeq: event.Seq, EventCount: 1, Digest: digest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventLine, err := canonicaljson.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerLine, err := canonicaljson.Marshal(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := append(append(eventLine, '\n'), append(markerLine, '\n')...)
+	if err := os.WriteFile(fixture.eventsPath, before, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proposedEvent := proposed("evt-unique-collision-regression", protocol.EventTaskCreated)
+	proposedEvent.SessionID = protocol.SessionID(fixture.ref.ID)
+	if _, err := fixture.repo.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: fixture.ref, ExpectedHead: fixture.head, TransactionID: "txn-durable-collision", Events: []protocol.ProposedEvent{proposedEvent},
+	}); err == nil {
+		t.Fatal("generated marker ID durable collision accepted")
+	}
+	after, err := os.ReadFile(fixture.eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("durable marker ID collision wrote journal bytes")
+	}
+}
+
+func TestUnsyncedMarkerRegressionRequiresOriginalRootedIdentity(t *testing.T) {
+	wantFault := errors.New("marker write result unknown")
+	fixture := newV2JournalWithFault(t, func(point jsonl.FaultPoint) error {
+		if point == jsonl.FaultMarkerWrite {
+			return wantFault
+		}
+		return nil
+	})
+	event := proposed("evt-unsynced-regression", protocol.EventTaskCreated)
+	event.SessionID = protocol.SessionID(fixture.ref.ID)
+	result, err := fixture.repo.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: fixture.ref, ExpectedHead: fixture.head, TransactionID: "txn-unsynced-regression", Events: []protocol.ProposedEvent{event},
+	})
+	if !errors.Is(err, wantFault) || result.Status != journal.AppendCommitUnknown {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	raw, err := os.ReadFile(fixture.eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(fixture.eventsPath, fixture.eventsPath+".detached"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fixture.eventsPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lookup, err := fixture.repo.LookupTransaction(context.Background(), fixture.ref, "txn-unsynced-regression")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lookup.State != journal.TransactionUnknown {
+		t.Fatalf("substituted bytes proved unsynced marker: %+v", lookup)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(fixture.eventsPath), "journal.index.json")); !os.IsNotExist(err) {
+		t.Fatalf("unresolved marker uncertainty published a disposable index: %v", err)
+	}
+}
+
+func TestDirectorySyncHookRegressionReverifiesEventsBeforeCommitted(t *testing.T) {
+	var armed atomic.Bool
+	var eventsPath string
+	var substitutionErr error
+	fixture := newV2JournalWithFault(t, func(point jsonl.FaultPoint) error {
+		if point != jsonl.FaultDirectorySync || !armed.Load() {
+			return nil
+		}
+		raw, err := os.ReadFile(eventsPath)
+		if err == nil {
+			err = os.Rename(eventsPath, eventsPath+".detached")
+		}
+		if err == nil {
+			err = os.WriteFile(eventsPath, raw, 0o600)
+		}
+		substitutionErr = err
+		return nil
+	})
+	eventsPath = fixture.eventsPath
+	armed.Store(true)
+	event := proposed("evt-directory-regression", protocol.EventTaskCreated)
+	event.SessionID = protocol.SessionID(fixture.ref.ID)
+	result, err := fixture.repo.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: fixture.ref, ExpectedHead: fixture.head, TransactionID: "txn-directory-regression", Events: []protocol.ProposedEvent{event},
+	})
+	if substitutionErr != nil {
+		t.Fatal(substitutionErr)
+	}
+	if err == nil || result.Status != journal.AppendCommitUnknown {
+		t.Fatalf("substituted events leaf returned committed: result=%+v err=%v", result, err)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
@@ -43,9 +44,39 @@ func (l *keyedJournalLock) lock(ctx context.Context) error {
 func (l *keyedJournalLock) unlock() { l.token <- struct{}{} }
 
 func (s *Store) journalLock(ref protocol.JournalRef) *keyedJournalLock {
-	key := string(ref.Kind) + "\x00" + string(ref.ID)
+	key := journalLockKey(ref)
 	loaded, _ := s.state.journalLocks.LoadOrStore(key, newKeyedJournalLock())
 	return loaded.(*keyedJournalLock)
+}
+
+func journalLockKey(ref protocol.JournalRef) string {
+	return string(ref.Kind) + "\x00" + string(ref.ID)
+}
+
+func markerUncertaintyKey(ref protocol.JournalRef, transactionID protocol.TransactionID) string {
+	return journalLockKey(ref) + "\x00" + string(transactionID)
+}
+
+func (s *Store) markMarkerUncertain(transaction *sessionTransaction, ref protocol.JournalRef, transactionID protocol.TransactionID) {
+	s.state.markerUncertainty.Store(markerUncertaintyKey(ref, transactionID), transaction.eventsInfo)
+}
+
+func (s *Store) clearMarkerUncertainty(ref protocol.JournalRef, transactionID protocol.TransactionID) {
+	s.state.markerUncertainty.Delete(markerUncertaintyKey(ref, transactionID))
+}
+
+func (s *Store) journalHasMarkerUncertainty(ref protocol.JournalRef) bool {
+	prefix := journalLockKey(ref) + "\x00"
+	found := false
+	s.state.markerUncertainty.Range(func(key, _ any) bool {
+		value, ok := key.(string)
+		if ok && strings.HasPrefix(value, prefix) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func (s *Store) AppendBatch(ctx context.Context, request journal.AppendRequest) (journal.AppendResult, error) {
@@ -94,13 +125,12 @@ func (s *Store) appendBatchLocked(
 	session domain.Session,
 	request journal.AppendRequest,
 ) (journal.AppendResult, error) {
-	scan, indexed := s.loadVerifiedJournalIndex(ctx, transaction, request.Journal)
-	if !indexed {
-		var err error
-		scan, err = s.scanJournal(ctx, transaction, request.Journal)
-		if err != nil {
-			return journal.AppendResult{}, err
-		}
+	if s.journalHasMarkerUncertainty(request.Journal) {
+		return journal.AppendResult{Status: journal.AppendCommitUnknown}, fmt.Errorf("journal has unresolved marker durability uncertainty")
+	}
+	scan, _, err := s.loadJournalScan(ctx, transaction, request.Journal)
+	if err != nil {
+		return journal.AppendResult{}, err
 	}
 	base := journal.AppendResult{CurrentHead: scan.head}
 	if scan.incompleteTail {
@@ -194,6 +224,13 @@ func (s *Store) appendBatchLocked(
 	if err != nil {
 		return base, err
 	}
+	generatedMarkerID := protocol.EventID(markerID)
+	if _, duplicate := scan.eventIDs[generatedMarkerID]; duplicate {
+		return base, fmt.Errorf("generated marker event ID %q duplicates a durable event", generatedMarkerID)
+	}
+	if _, duplicate := seen[generatedMarkerID]; duplicate {
+		return base, fmt.Errorf("generated marker event ID %q duplicates a proposed event", generatedMarkerID)
+	}
 	markerTime := s.clock().UTC()
 	if markerTime.Before(events[len(events)-1].Time) {
 		markerTime = events[len(events)-1].Time
@@ -204,7 +241,7 @@ func (s *Store) appendBatchLocked(
 	marker := protocol.EventEnvelope{
 		SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1,
 		JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
-		EventID: protocol.EventID(markerID), Seq: events[len(events)-1].Seq + 1,
+		EventID: generatedMarkerID, Seq: events[len(events)-1].Seq + 1,
 		Time: markerTime, Kind: protocol.EventTransactionCommitted,
 		TransactionID: request.TransactionID, Payload: markerPayload,
 	}
@@ -245,6 +282,7 @@ func (s *Store) appendBatchLocked(
 	if err := transaction.verifyEvents(); err != nil {
 		return appendFailure(journal.AppendRecoveryRequired, scan.head, err)
 	}
+	s.markMarkerUncertain(transaction, request.Journal, request.TransactionID)
 	if err := writeFull(transaction.events, markerLine); err != nil {
 		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
 	}
@@ -254,6 +292,7 @@ func (s *Store) appendBatchLocked(
 	if err := transaction.events.Sync(); err != nil {
 		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
 	}
+	s.clearMarkerUncertainty(request.Journal, request.TransactionID)
 	if err := s.injectFault(FaultMarkerSync); err != nil {
 		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
 	}
@@ -272,17 +311,24 @@ func (s *Store) appendBatchLocked(
 	if err := s.injectFault(FaultMetadataRename); err != nil {
 		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
 	}
-	committedScan, err := s.scanJournal(ctx, transaction, request.Journal)
-	if err != nil {
-		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
+	committedScan, accelerated := s.loadVerifiedJournalScan(ctx, transaction, request.Journal)
+	if !accelerated {
+		committedScan, err = s.scanJournal(ctx, transaction, request.Journal)
+		if err != nil {
+			return appendFailure(journal.AppendCommitUnknown, scan.head, err)
+		}
 	}
 	// The index is a disposable accelerator. A failure leaves the committed
 	// marker authoritative and merely forces the next operation to rescan.
 	_ = writeJournalIndex(ctx, transaction, committedScan)
+	s.rememberVerifiedJournalScan(transaction, request.Journal, committedScan)
 	if err := syncRootDir(transaction.sessionRoot, "."); err != nil {
 		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
 	}
 	if err := s.injectFault(FaultDirectorySync); err != nil {
+		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
+	}
+	if err := errors.Join(ctx.Err(), transaction.verifyEvents()); err != nil {
 		return appendFailure(journal.AppendCommitUnknown, scan.head, err)
 	}
 	return journal.AppendResult{

@@ -40,6 +40,80 @@ type journalIndex struct {
 	Transactions []journalIndexTransaction `json:"transactions"`
 }
 
+type verifiedJournalScan struct {
+	eventsInfo os.FileInfo
+	scan       journalScan
+}
+
+func (s *Store) rememberVerifiedJournalScan(transaction *sessionTransaction, ref protocol.JournalRef, scan journalScan) {
+	if s.journalHasMarkerUncertainty(ref) || !scan.writable || scan.incompleteTail || scan.sourceSize <= 0 || scan.sourceDigest.Validate() != nil {
+		return
+	}
+	s.verifiedScan.Store(journalLockKey(ref), verifiedJournalScan{
+		eventsInfo: transaction.eventsInfo,
+		scan:       cloneJournalScan(scan),
+	})
+}
+
+func (s *Store) loadVerifiedJournalScan(
+	ctx context.Context,
+	transaction *sessionTransaction,
+	ref protocol.JournalRef,
+) (journalScan, bool) {
+	key := journalLockKey(ref)
+	loaded, ok := s.verifiedScan.Load(key)
+	if !ok {
+		return journalScan{}, false
+	}
+	prefix, ok := loaded.(verifiedJournalScan)
+	if !ok || prefix.eventsInfo == nil || transaction.eventsInfo == nil || !os.SameFile(prefix.eventsInfo, transaction.eventsInfo) || prefix.scan.incompleteTail {
+		s.verifiedScan.Delete(key)
+		return journalScan{}, false
+	}
+	info, err := transaction.events.Stat()
+	if err != nil || info.Size() < prefix.scan.sourceSize {
+		s.verifiedScan.Delete(key)
+		return journalScan{}, false
+	}
+	hash := sha256.New()
+	count, err := io.Copy(hash, io.NewSectionReader(transaction.events, 0, prefix.scan.sourceSize))
+	if err != nil || count != prefix.scan.sourceSize {
+		return journalScan{}, false
+	}
+	gotDigest := protocol.Digest{Algorithm: protocol.DigestSHA256, Value: fmt.Sprintf("%x", hash.Sum(nil))}
+	if gotDigest != prefix.scan.sourceDigest || transaction.verifyEvents() != nil {
+		s.verifiedScan.Delete(key)
+		return journalScan{}, false
+	}
+	scan, err := s.scanJournalAfterPrefix(ctx, transaction, ref, prefix.scan, hash)
+	if err != nil {
+		s.verifiedScan.Delete(key)
+		return journalScan{}, false
+	}
+	s.rememberVerifiedJournalScan(transaction, ref, scan)
+	return scan, true
+}
+
+func (s *Store) loadJournalScan(
+	ctx context.Context,
+	transaction *sessionTransaction,
+	ref protocol.JournalRef,
+) (journalScan, bool, error) {
+	if scan, ok := s.loadVerifiedJournalScan(ctx, transaction, ref); ok {
+		return scan, true, nil
+	}
+	if scan, ok := s.loadVerifiedJournalIndex(ctx, transaction, ref); ok {
+		s.rememberVerifiedJournalScan(transaction, ref, scan)
+		return scan, false, nil
+	}
+	scan, err := s.scanJournal(ctx, transaction, ref)
+	if err != nil {
+		return journalScan{}, false, err
+	}
+	s.rememberVerifiedJournalScan(transaction, ref, scan)
+	return scan, true, nil
+}
+
 func buildJournalIndex(scan journalScan) journalIndex {
 	index := journalIndex{
 		Version: journalIndexVersion, SourceSize: scan.sourceSize,
@@ -103,11 +177,21 @@ func (s *Store) loadVerifiedJournalIndex(
 	}
 	var eventOffset int
 	var expectedSeq uint64 = 1
+	hasLegacy := false
+	hasV2 := false
 	verifiedCommits := make([]scannedCommit, 0, len(index.Transactions))
 	for _, entry := range index.Transactions {
-		commit, physicalIDs, ok := s.verifyIndexedCommit(ctx, transaction, ref, entry, expectedSeq)
+		commit, physicalIDs, legacy, ok := s.verifyIndexedCommit(ctx, transaction, ref, entry, expectedSeq)
 		if !ok || eventOffset+len(physicalIDs) > len(index.EventIDs) || !reflect.DeepEqual(physicalIDs, index.EventIDs[eventOffset:eventOffset+len(physicalIDs)]) {
 			return seed, false
+		}
+		if legacy {
+			if hasV2 {
+				return seed, false
+			}
+			hasLegacy = true
+		} else {
+			hasV2 = true
 		}
 		verifiedCommits = append(verifiedCommits, commit)
 		eventOffset += len(physicalIDs)
@@ -122,7 +206,8 @@ func (s *Store) loadVerifiedJournalIndex(
 	last := index.Transactions[len(index.Transactions)-1]
 	seed = journalScan{
 		ref: ref, head: last.Cursor, physicalSeq: last.Cursor.CommitSeq,
-		writable: true, transactions: make(map[protocol.TransactionID]scannedCommit, len(index.Transactions)),
+		writable: true, hasLegacy: hasLegacy, hasV2: hasV2,
+		transactions: make(map[protocol.TransactionID]scannedCommit, len(index.Transactions)),
 		eventIDs:     make(map[protocol.EventID]struct{}, len(index.EventIDs)),
 		eventIDOrder: append([]protocol.EventID(nil), index.EventIDs...),
 		sourceSize:   index.SourceSize, sourceDigest: index.SourceDigest,
@@ -189,8 +274,8 @@ func (s *Store) verifyIndexedCommit(
 	ref protocol.JournalRef,
 	entry journalIndexTransaction,
 	expectedSeq uint64,
-) (scannedCommit, []protocol.EventID, bool) {
-	failed := func() (scannedCommit, []protocol.EventID, bool) { return scannedCommit{}, nil, false }
+) (scannedCommit, []protocol.EventID, bool, bool) {
+	failed := func() (scannedCommit, []protocol.EventID, bool, bool) { return scannedCommit{}, nil, false, false }
 	length := entry.EndOffset - entry.FirstOffset
 	if length <= 0 {
 		return failed()
@@ -225,7 +310,7 @@ func (s *Store) verifyIndexedCommit(
 				return failed()
 			}
 			var legacy domain.DurableEvent
-			if protocol.ValidateRawJSON(line) != nil || json.Unmarshal(line, &legacy) != nil || legacy.Validate() != nil || legacy.Seq != expectedSeq || protocol.JournalID(legacy.SessionID) != ref.ID {
+			if ref.Kind != protocol.JournalSession || json.Unmarshal(line, &legacy) != nil || legacy.Validate() != nil || legacy.Seq != expectedSeq || protocol.JournalID(legacy.SessionID) != ref.ID {
 				return failed()
 			}
 			valid := entry.Cursor == (protocol.CommittedCursor{
@@ -242,7 +327,7 @@ func (s *Store) verifyIndexedCommit(
 				},
 			}
 			commit := scannedCommit{cursor: entry.Cursor, events: []protocol.EventRecord{record}, firstOffset: entry.FirstOffset, endOffset: entry.EndOffset}
-			return commit, []protocol.EventID{protocol.EventID(legacy.EventID)}, valid
+			return commit, []protocol.EventID{protocol.EventID(legacy.EventID)}, true, valid
 		}
 		record, err := s.registry.Decode(protocol.CloneRawMessage(line))
 		if err != nil {
@@ -257,6 +342,9 @@ func (s *Store) verifyIndexedCommit(
 			return failed()
 		}
 		if envelope.Kind != protocol.EventTransactionCommitted {
+			if len(envelopes) >= 1000 {
+				return failed()
+			}
 			envelopes = append(envelopes, envelope)
 			records = append(records, protocol.CloneEventRecord(record))
 			if lastLine {
@@ -279,7 +367,7 @@ func (s *Store) verifyIndexedCommit(
 			cursor: entry.Cursor, events: records, envelopes: cloneEnvelopes(envelopes),
 			firstOffset: entry.FirstOffset, endOffset: entry.EndOffset,
 		}
-		return commit, eventIDs, true
+		return commit, eventIDs, false, true
 	}
 }
 
@@ -321,17 +409,21 @@ func (s *Store) ReadRange(ctx context.Context, request journal.ReadRangeRequest)
 	if err := validateRangeCursor(request.Journal, request.After); err != nil {
 		return journal.EventPage{}, err
 	}
+	lock := s.journalLock(request.Journal)
+	if err := lock.lock(ctx); err != nil {
+		return journal.EventPage{}, err
+	}
+	defer lock.unlock()
 	transaction, _, err := s.openJournal(ctx, request.Journal, os.O_RDONLY)
 	if err != nil {
 		return journal.EventPage{}, err
 	}
-	scan, indexed := s.loadVerifiedJournalIndex(ctx, transaction, request.Journal)
-	var scanErr error
-	if !indexed {
-		scan, scanErr = s.scanJournal(ctx, transaction, request.Journal)
-		if scanErr == nil {
-			_ = ensureJournalIndex(ctx, transaction, scan)
-		}
+	if s.journalHasMarkerUncertainty(request.Journal) {
+		return journal.EventPage{}, errors.Join(fmt.Errorf("journal has unresolved marker durability uncertainty"), transaction.close())
+	}
+	scan, rebuildIndex, scanErr := s.loadJournalScan(ctx, transaction, request.Journal)
+	if scanErr == nil && rebuildIndex {
+		_ = ensureJournalIndex(ctx, transaction, scan)
 	}
 	closeErr := transaction.close()
 	if scanErr != nil || closeErr != nil {
@@ -403,29 +495,47 @@ func (s *Store) LookupTransaction(
 	if transactionID == "" {
 		return journal.TransactionLookup{}, fmt.Errorf("transaction ID is required")
 	}
+	lock := s.journalLock(ref)
+	if err := lock.lock(ctx); err != nil {
+		return journal.TransactionLookup{}, err
+	}
+	defer lock.unlock()
 	transaction, _, err := s.openJournal(ctx, ref, os.O_RDONLY)
 	if err != nil {
 		return journal.TransactionLookup{}, err
 	}
-	scan, indexed := s.loadVerifiedJournalIndex(ctx, transaction, ref)
-	var scanErr error
-	if !indexed {
-		scan, scanErr = s.scanJournal(ctx, transaction, ref)
-		if scanErr == nil {
-			_ = ensureJournalIndex(ctx, transaction, scan)
-		}
-	}
-	closeErr := transaction.close()
-	if scanErr != nil || closeErr != nil {
-		return journal.TransactionLookup{}, errors.Join(scanErr, closeErr)
+	scan, rebuildIndex, scanErr := s.loadJournalScan(ctx, transaction, ref)
+	if scanErr != nil {
+		return journal.TransactionLookup{}, errors.Join(scanErr, transaction.close())
 	}
 	if commit, ok := scan.transactions[transactionID]; ok {
-		return journal.TransactionLookup{State: journal.TransactionCommitted, Cursor: commit.cursor}, nil
+		if uncertain, exists := s.state.markerUncertainty.Load(markerUncertaintyKey(ref, transactionID)); exists {
+			eventsInfo, valid := uncertain.(os.FileInfo)
+			if !valid || eventsInfo == nil || transaction.eventsInfo == nil || !os.SameFile(eventsInfo, transaction.eventsInfo) {
+				return journal.TransactionLookup{State: journal.TransactionUnknown}, transaction.close()
+			}
+			if transaction.events.Sync() != nil || transaction.verifyEvents() != nil {
+				return journal.TransactionLookup{State: journal.TransactionUnknown}, transaction.close()
+			}
+			s.clearMarkerUncertainty(ref, transactionID)
+		}
+		s.rememberVerifiedJournalScan(transaction, ref, scan)
+		if rebuildIndex && !s.journalHasMarkerUncertainty(ref) {
+			_ = ensureJournalIndex(ctx, transaction, scan)
+		}
+		return journal.TransactionLookup{State: journal.TransactionCommitted, Cursor: commit.cursor}, transaction.close()
 	}
 	if scan.incompleteTail {
-		return journal.TransactionLookup{State: journal.TransactionUnknown}, nil
+		return journal.TransactionLookup{State: journal.TransactionUnknown}, transaction.close()
 	}
-	return journal.TransactionLookup{State: journal.TransactionNotCommitted}, nil
+	if _, uncertain := s.state.markerUncertainty.Load(markerUncertaintyKey(ref, transactionID)); uncertain {
+		return journal.TransactionLookup{State: journal.TransactionUnknown}, transaction.close()
+	}
+	s.rememberVerifiedJournalScan(transaction, ref, scan)
+	if rebuildIndex && !s.journalHasMarkerUncertainty(ref) {
+		_ = ensureJournalIndex(ctx, transaction, scan)
+	}
+	return journal.TransactionLookup{State: journal.TransactionNotCommitted}, transaction.close()
 }
 
 func (s *Store) ReadCommittedTransaction(
@@ -439,6 +549,14 @@ func (s *Store) ReadCommittedTransaction(
 	if transactionID == "" {
 		return journal.CommittedTransaction{}, fmt.Errorf("transaction ID is required")
 	}
+	lock := s.journalLock(ref)
+	if err := lock.lock(ctx); err != nil {
+		return journal.CommittedTransaction{}, err
+	}
+	defer lock.unlock()
+	if _, uncertain := s.state.markerUncertainty.Load(markerUncertaintyKey(ref, transactionID)); uncertain {
+		return journal.CommittedTransaction{}, fmt.Errorf("transaction %q has unresolved marker durability uncertainty", transactionID)
+	}
 	// This opens and scans independently on every call. No AppendResult or
 	// in-memory envelope slice participates in the verification decision.
 	transaction, _, err := s.openJournal(ctx, ref, os.O_RDONLY)
@@ -446,9 +564,6 @@ func (s *Store) ReadCommittedTransaction(
 		return journal.CommittedTransaction{}, err
 	}
 	scan, scanErr := s.scanJournal(ctx, transaction, ref)
-	if scanErr == nil {
-		_ = ensureJournalIndex(ctx, transaction, scan)
-	}
 	closeErr := transaction.close()
 	if scanErr != nil || closeErr != nil {
 		return journal.CommittedTransaction{}, errors.Join(scanErr, closeErr)

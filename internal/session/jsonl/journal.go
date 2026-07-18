@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 
@@ -83,26 +84,42 @@ func (s *Store) openJournal(
 }
 
 func (s *Store) scanJournal(ctx context.Context, transaction *sessionTransaction, ref protocol.JournalRef) (journalScan, error) {
-	scan := journalScan{
-		ref: ref, writable: true,
-		transactions: make(map[protocol.TransactionID]scannedCommit),
-		eventIDs:     make(map[protocol.EventID]struct{}),
+	return s.scanJournalAfterPrefix(ctx, transaction, ref, journalScan{}, sha256.New())
+}
+
+func (s *Store) scanJournalAfterPrefix(
+	ctx context.Context,
+	transaction *sessionTransaction,
+	ref protocol.JournalRef,
+	prefix journalScan,
+	prefixHash hash.Hash,
+) (journalScan, error) {
+	scan := cloneJournalScan(prefix)
+	if scan.transactions == nil {
+		scan = journalScan{
+			ref: ref, writable: true,
+			transactions: make(map[protocol.TransactionID]scannedCommit),
+			eventIDs:     make(map[protocol.EventID]struct{}),
+		}
 	}
 	if err := transaction.verifyEvents(); err != nil {
 		return scan, err
 	}
-	if _, err := transaction.events.Seek(0, io.SeekStart); err != nil {
+	if _, err := transaction.events.Seek(scan.sourceSize, io.SeekStart); err != nil {
 		return scan, err
 	}
 	reader := bufio.NewReaderSize(transaction.events, 64*1024)
-	hash := sha256.New()
-	seenEvents := make(map[protocol.EventID]struct{})
+	seenEvents := make(map[protocol.EventID]struct{}, len(scan.eventIDs))
+	for eventID := range scan.eventIDs {
+		seenEvents[eventID] = struct{}{}
+	}
 	var pendingRecords []protocol.EventRecord
 	var pendingEnvelopes []protocol.EventEnvelope
 	var pendingID protocol.TransactionID
 	var pendingOffset int64
-	hasV2 := false
-	var offset int64
+	hasV2 := scan.hasV2
+	offset := scan.sourceSize
+scanLines:
 	for {
 		if err := ctx.Err(); err != nil {
 			return scan, err
@@ -114,7 +131,7 @@ func (s *Store) scanJournal(ctx context.Context, transaction *sessionTransaction
 		if len(physical) == 0 && eof {
 			break
 		}
-		_, _ = hash.Write(physical)
+		_, _ = prefixHash.Write(physical)
 		scan.sourceSize += int64(len(physical))
 		lineOffset := offset
 		offset += int64(len(physical))
@@ -147,9 +164,6 @@ func (s *Store) scanJournal(ctx context.Context, transaction *sessionTransaction
 			scan.hasLegacy = true
 			if hasV2 || pendingID != "" {
 				return scan, fmt.Errorf("v1 event follows v2 journal data")
-			}
-			if err := protocol.ValidateRawJSON(line); err != nil {
-				return scan, fmt.Errorf("invalid v1 event JSON: %w", err)
 			}
 			var legacy domain.DurableEvent
 			if err := json.Unmarshal(line, &legacy); err != nil {
@@ -221,6 +235,11 @@ func (s *Store) scanJournal(ctx context.Context, transaction *sessionTransaction
 			scan.eventIDs[envelope.EventID] = struct{}{}
 			scan.eventIDOrder = append(scan.eventIDOrder, envelope.EventID)
 			scan.physicalSeq = envelope.Seq
+			if envelope.Kind == protocol.EventTransactionCommitted && unknown {
+				scan.incompleteTail = true
+				scan.incompleteTransaction = envelope.TransactionID
+				break scanLines
+			}
 			if envelope.Kind == protocol.EventTransactionCommitted && !unknown {
 				if pendingID == "" || len(pendingEnvelopes) == 0 {
 					return scan, fmt.Errorf("transaction marker has no events")
@@ -260,6 +279,9 @@ func (s *Store) scanJournal(ctx context.Context, transaction *sessionTransaction
 				pendingID = ""
 				continue
 			}
+			if len(pendingEnvelopes) >= 1000 {
+				return scan, fmt.Errorf("physical transaction exceeds 1000 events")
+			}
 			if pendingID == "" {
 				if _, duplicate := scan.transactions[envelope.TransactionID]; duplicate {
 					return scan, fmt.Errorf("duplicate transaction ID %q", envelope.TransactionID)
@@ -290,11 +312,46 @@ func (s *Store) scanJournal(ctx context.Context, transaction *sessionTransaction
 		scan.incompleteTransaction = pendingID
 		scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "incomplete_transaction", "transaction has no durable commit marker", scan.physicalSeq, pendingEnvelopes[len(pendingEnvelopes)-1].EventID))
 	}
-	scan.sourceDigest = protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hex.EncodeToString(hash.Sum(nil))}
+	scan.sourceDigest = protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hex.EncodeToString(prefixHash.Sum(nil))}
 	if err := transaction.verifyEvents(); err != nil {
 		return scan, err
 	}
 	return scan, nil
+}
+
+func cloneJournalScan(scan journalScan) journalScan {
+	clone := scan
+	clone.events = make([]scannedEvent, len(scan.events))
+	for index := range scan.events {
+		clone.events[index] = scannedEvent{
+			record: protocol.CloneEventRecord(scan.events[index].record),
+			cursor: scan.events[index].cursor,
+		}
+	}
+	clone.commits = make([]scannedCommit, len(scan.commits))
+	if scan.transactions != nil {
+		clone.transactions = make(map[protocol.TransactionID]scannedCommit, len(scan.transactions))
+	}
+	for index := range scan.commits {
+		commit := cloneScannedCommit(scan.commits[index])
+		clone.commits[index] = commit
+		clone.transactions[commit.cursor.TransactionID] = commit
+	}
+	if scan.eventIDs != nil {
+		clone.eventIDs = make(map[protocol.EventID]struct{}, len(scan.eventIDs))
+		for eventID := range scan.eventIDs {
+			clone.eventIDs[eventID] = struct{}{}
+		}
+	}
+	clone.eventIDOrder = append([]protocol.EventID(nil), scan.eventIDOrder...)
+	clone.diagnostics = cloneDiagnostics(scan.diagnostics)
+	return clone
+}
+
+func cloneScannedCommit(commit scannedCommit) scannedCommit {
+	commit.events = cloneRecords(commit.events)
+	commit.envelopes = cloneEnvelopes(commit.envelopes)
+	return commit
 }
 
 func readJournalLine(reader *bufio.Reader) (line []byte, complete, eof bool, err error) {
@@ -345,6 +402,11 @@ func cloneDiagnostics(diagnostics []protocol.Diagnostic) []protocol.Diagnostic {
 }
 
 func (s *Store) Inspect(ctx context.Context, ref protocol.JournalRef) (journal.Inspection, error) {
+	lock := s.journalLock(ref)
+	if err := lock.lock(ctx); err != nil {
+		return journal.Inspection{}, err
+	}
+	defer lock.unlock()
 	transaction, _, err := s.openJournal(ctx, ref, os.O_RDONLY)
 	if err != nil {
 		return journal.Inspection{}, err

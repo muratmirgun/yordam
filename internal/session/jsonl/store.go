@@ -30,22 +30,24 @@ type Options struct {
 }
 
 type Store struct {
-	root     string
-	clock    func() time.Time
-	entropy  io.Reader
-	sanitize func(any) (json.RawMessage, error)
-	encoder  journal.Encoder
-	registry *eventcodec.Registry
-	fault    FaultInjector
-	state    *rootState
+	root         string
+	clock        func() time.Time
+	entropy      io.Reader
+	sanitize     func(any) (json.RawMessage, error)
+	encoder      journal.Encoder
+	registry     *eventcodec.Registry
+	fault        FaultInjector
+	state        *rootState
+	verifiedScan sync.Map
 }
 
 type rootState struct {
-	lock         chan struct{}
-	idMu         sync.Mutex
-	lastID       ulid.ULID
-	hasLast      bool
-	journalLocks sync.Map
+	lock              chan struct{}
+	idMu              sync.Mutex
+	lastID            ulid.ULID
+	hasLast           bool
+	journalLocks      sync.Map
+	markerUncertainty sync.Map
 }
 
 var rootStates sync.Map

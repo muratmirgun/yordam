@@ -519,6 +519,7 @@ func (s *Store) openSessionAtWorkspace(
 	eventFlags int,
 	eventMode os.FileMode,
 ) (*sessionTransaction, domain.Session, error) {
+	writeOwned := eventFlags&(os.O_WRONLY|os.O_RDWR) != 0
 	storeRoot, err := os.OpenRoot(s.root)
 	if err != nil {
 		return nil, domain.Session{}, err
@@ -535,8 +536,10 @@ func (s *Store) openSessionAtWorkspace(
 	if err != nil {
 		return fail(err)
 	}
-	if err := cleanupRootTemporaries(transaction.workspaceRoot, validWorkspaceTemporaryName); err != nil {
-		return fail(err)
+	if writeOwned {
+		if err := cleanupRootTemporaries(transaction.workspaceRoot, validWorkspaceTemporaryName); err != nil {
+			return fail(err)
+		}
 	}
 	transaction.sessionsRoot, transaction.sessionsInfo, err = openRootedDirectory(transaction.workspaceRoot, "sessions")
 	if err != nil {
@@ -546,8 +549,10 @@ func (s *Store) openSessionAtWorkspace(
 	if err != nil {
 		return fail(err)
 	}
-	if err := cleanupRootTemporaries(transaction.sessionRoot, validSessionTemporaryName); err != nil {
-		return fail(err)
+	if writeOwned {
+		if err := cleanupRootTemporaries(transaction.sessionRoot, validSessionTemporaryName); err != nil {
+			return fail(err)
+		}
 	}
 	transaction.metadata, transaction.metadataInfo, err = openRootedRegularFile(ctx, transaction.sessionRoot, "metadata.json", os.O_RDONLY, 0)
 	if err != nil {

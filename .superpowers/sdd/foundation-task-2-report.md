@@ -68,7 +68,7 @@ Focused negative RED/GREEN cycles then covered:
 | incomplete physical tail before append | no new bytes written | `recovery_required` | target/absent state remains `unknown` |
 | `event_write` | event bytes may exist without marker | `recovery_required` | `unknown` |
 | `event_sync` | events may be durable without marker | `recovery_required` | `unknown` |
-| `marker_write` | marker may be partially or fully present | `commit_unknown` | physical rescan decides committed/unknown |
+| `marker_write` | marker may be partially or fully present and is tracked as not yet durable | `commit_unknown` | a complete marker is committed only after `Sync` plus rooted identity re-verification; partial/substituted data remains unknown |
 | `marker_sync` | marker is present but durability result is ambiguous | `commit_unknown` | committed when marker validates |
 | `metadata_write` | marker already durable; metadata may lag | `commit_unknown` | committed |
 | `metadata_rename` | marker already durable; metadata result ambiguous | `commit_unknown` | committed |
@@ -84,6 +84,12 @@ Caller-provided transaction IDs are never replaced or blindly retried after
   authentication of index fields: all indexed ranges are re-read, decoded,
   registry-validated, sequence-checked, marker-checked, and compared with the
   index before a seed is accepted.
+- A store-local in-memory verified prefix is bound to the opened rooted events
+  identity, verified byte count, and SHA-256 source digest. Repeated operations
+  hash the unchanged prefix and decode only its tail. Identity, size, digest,
+  tail, or validation failure discards the acceleration and performs a full
+  authoritative scan. The cache is never shared across registries and never
+  remembers read-only, incomplete, or marker-uncertain state.
 - Lookup uses a fully physically verified index when possible. It performs an
   authoritative scan and rebuild when the cache cannot prove the complete
   source. `ReadCommittedTransaction` intentionally performs an independent full
@@ -152,3 +158,69 @@ control/flock behavior, or SDD progress ledger was changed.
 `Recover` deliberately returns the explicit Task 3 boundary error. First-v2
 legacy compatibility declaration insertion and deterministic v1 upcasting also
 remain Task 3 work. Cross-process journal locks remain Task 4 work.
+
+## Independent Review-Fix Closure (2026-07-18)
+
+The review-fix base was the clean signed Task 2 commit
+`2e394b37848e13baeb22097bd8d0586ac7f9d952`; its GPG signature was verified as
+good before editing. The independent review supplied ten focused regressions
+for nine findings (indexed scanning had separate mixed-order and pure-v1
+cases). Before production edits, all ten failed for their intended reasons:
+
+- legacy float/exponent and valid 1-2 MiB lines hit the v2 canonical-number
+  validator;
+- exact-source indexes bypassed the global v2-to-v1 rule and erased pure-v1
+  transition state;
+- three unchanged lookups decoded the verified prefix 24 times;
+- an unsupported-version commit marker became domain data in a later commit;
+- a physical 1001-event transaction was accepted;
+- a generated marker-ID collision wrote bytes;
+- substituted bytes proved an unsynced complete marker;
+- a nil-returning directory-sync hook substituted `events.jsonl` before a
+  committed return; and
+- a read open deleted live metadata/index writer temporaries.
+
+### Finding-to-fix and permanent evidence
+
+| Finding | Correction | Permanent regression |
+| --- | --- | --- |
+| Indexed scanner equivalence | Index verification carries private `hasLegacy`/`hasV2` state across segments, rejects v1 after v2, preserves pure-v1 transition state, and mirrors full-scan session/legacy validation. | `TestIndexedScannerRegressionEnforcesGlobalV2BeforeV1Invariant`, `TestIndexedScannerRegressionPreservesPureV1TransitionState` |
+| Verified-prefix acceleration | A deep-cloned store-local prefix is bound to rooted file identity, exact byte count, and SHA-256; unchanged bytes are hashed and only the tail is decoded. Any mismatch falls back to verified index/full scan. Memory hits still inspect/rebuild the disposable disk index. | `TestVerifiedPrefixRegressionSkipsOldDecodeForLookupAndAppend` plus existing stale/corrupt/exact-source index tests |
+| Exact v1 compatibility | Full and indexed v1 branches use legacy `json.Unmarshal` and `domain.DurableEvent.Validate`; only the 2 MiB physical-line bound applies. | `TestLegacyJournalRegressionAcceptsV01NumbersAndTwoMiBPhysicalLimit` |
+| Unsupported commit-marker version | `transaction.committed` remains structural at unsupported versions, makes the transaction ambiguous/read-only, and can never be accumulated or committed by a later marker. | `TestUnsupportedCommitMarkerRegressionRemainsStructuralAndAmbiguous` |
+| Physical transaction bound | Full and indexed scanners reject the 1001st domain event before pending-slice accumulation. | `TestPhysicalTransactionRegressionRejectsMoreThanOneThousandEvents` |
+| Generated marker collision | The generated marker ID is checked against all durable and proposed IDs before the first event write. | `TestGeneratedMarkerIDRegressionRejectsProposedCollisionBeforeWrite`, `TestGeneratedMarkerIDRegressionRejectsDurableCollisionBeforeWrite` |
+| Marker durability uncertainty | Uncertainty is registered before marker write and cleared only after successful `Sync`. Lookup can prove a complete marker only on the original rooted identity after another `Sync` and rooted re-verification; partial/substituted data remains unknown and cannot publish an index. | `TestUnsyncedMarkerRegressionRequiresOriginalRootedIdentity` plus existing pre/post-marker fault tests |
+| Directory-sync substitution | After the fault hook, append checks context and rooted events identity again before returning committed. | `TestDirectorySyncHookRegressionReverifiesEventsBeforeCommitted` |
+| Read/write temporary ownership | Read-only opens never reconcile writer temporaries. Range/lookup index maintenance is serialized by the keyed journal lock; independent committed reads do not write indexes. | `TestConcurrentReadRegressionDoesNotDeleteLiveWriterTemporaries` |
+
+Each finding was run individually RED then GREEN. The complete temporary review
+matrix subsequently passed, was removed, and its durable equivalents remained
+in Task 2-owned test files. A fresh permanent package gate passed:
+
+```text
+go test ./internal/session/jsonl -count=1
+ok github.com/muratmirgun/yordam/internal/session/jsonl 12.644s
+```
+
+The final review-fix checkpoint and delivery gates were then rerun from the
+still-unstaged diff and all exited 0:
+
+```text
+TASK_GO_FILES=<the exact eleven Task 2-owned Go paths> <mandatory format/test/diff/status checkpoint>
+go test ./internal/session/jsonl -run 'Test(AppendBatch|ExpectedHead|CommittedBatch|IncompleteBatch|LookupTransaction|ReadRange)' -count=1
+go test -race ./internal/session/jsonl -run 'Test(AppendBatch|ExpectedHead|ReadRange)' -count=10
+go test ./internal/session/jsonl -run 'Test.*(Substitut|Symlink|Durable|Metadata)' -count=1
+go test ./internal/journal ./internal/session/jsonl -count=1
+go test ./...
+go test -race ./...
+go vet ./...
+git diff --check
+```
+
+The focused race repetition completed with no race report, the repository-wide
+race run covered every package, `go vet` and `git diff --check` were silent,
+and `gofmt -l` returned no Task 2-owned path.
+
+No Task 3 recovery/upcasting behavior, Task 4 `flock`, config/schema/reload
+semantics, or `.superpowers/sdd/progress.md` content was changed.

@@ -3,6 +3,9 @@ package jsonl_test
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/muratmirgun/yordam/internal/journal"
@@ -114,4 +117,59 @@ func TestReadRangeClearsMoreAfterConsumingAllCommits(t *testing.T) {
 	if page.More || page.Cursor != second.Cursor {
 		t.Fatalf("page more=%v cursor=%+v want final cursor=%+v", page.More, page.Cursor, second.Cursor)
 	}
+}
+
+func TestConcurrentReadRegressionDoesNotDeleteLiveWriterTemporaries(t *testing.T) {
+	fixture := newV2Journal(t)
+	sessionDir := filepath.Dir(fixture.eventsPath)
+	paths := []string{
+		filepath.Join(sessionDir, ".metadata-"+strings.Repeat("0", 32)+".tmp"),
+		filepath.Join(sessionDir, ".journal-index-"+strings.Repeat("1", 32)+".tmp"),
+	}
+	ready := make(chan error, 1)
+	release := make(chan struct{})
+	writerDone := make(chan error, 1)
+	go func() {
+		for _, path := range paths {
+			if err := os.WriteFile(path, []byte("live writer sentinel"), 0o600); err != nil {
+				ready <- err
+				return
+			}
+		}
+		ready <- nil
+		<-release
+		for _, path := range paths {
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				writerDone <- err
+				return
+			}
+			if string(raw) != "live writer sentinel" {
+				writerDone <- &temporaryChangedError{path: path, contents: string(raw)}
+				return
+			}
+		}
+		writerDone <- nil
+	}()
+	if err := <-ready; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.LookupTransaction(context.Background(), fixture.ref, "txn-bootstrap"); err != nil {
+		close(release)
+		<-writerDone
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-writerDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type temporaryChangedError struct {
+	path     string
+	contents string
+}
+
+func (e *temporaryChangedError) Error() string {
+	return "live temporary changed: " + e.path + " contents=" + e.contents
 }
