@@ -10,17 +10,17 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
 )
 
-func TestLoadRecoversDistinctTailGenerations(t *testing.T) {
+func TestExplicitRecoveryPreservesDistinctTailGenerations(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
 	sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
@@ -28,36 +28,49 @@ func TestLoadRecoversDistinctTailGenerations(t *testing.T) {
 	artifactsDir := filepath.Join(sessionDir, "artifacts")
 	tails := [][]byte{[]byte(`{"first":`), []byte(`{"second":`)}
 
-	for _, tail := range tails {
+	for index, tail := range tails {
 		appendFile(t, eventsPath, tail)
-		replay, err := store.Load(context.Background(), session.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.Contains(replay.RecoveryNote, "incomplete final line") {
-			t.Fatalf("recovery note=%q", replay.RecoveryNote)
+		request := recoveryRequestFromInspection(t, store, session.ID,
+			protocol.ControlOperationID(fmt.Sprintf("operation-generation-%d", index)),
+			protocol.TransactionID(fmt.Sprintf("txn-generation-%d", index)))
+		result, err := store.RecoverSession(context.Background(), request)
+		if err != nil || result.Status != "recovered" {
+			t.Fatalf("generation %d result=%+v err=%v", index, result, err)
 		}
 	}
 
-	wantNames := make([]string, 0, len(tails))
-	for _, tail := range tails {
-		final, _ := recoveryGenerationNames(tail)
-		wantNames = append(wantNames, final)
-		contents, err := os.ReadFile(filepath.Join(artifactsDir, final))
+	var recovered [][]byte
+	entries, err := os.ReadDir(artifactsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wantNames []string
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "recovery-tail-") {
+			continue
+		}
+		wantNames = append(wantNames, entry.Name())
+		contents, err := os.ReadFile(filepath.Join(artifactsDir, entry.Name()))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(contents, tail) {
-			t.Fatalf("generation %q=%q want %q", final, contents, tail)
-		}
+		recovered = append(recovered, contents)
 	}
-	sort.Strings(wantNames)
-	if got := directoryNames(t, artifactsDir); strings.Join(got, "\x00") != strings.Join(wantNames, "\x00") {
-		t.Fatalf("recovery generations=%v want %v", got, wantNames)
+	if len(wantNames) != len(tails) {
+		t.Fatalf("recovery generations=%v want %d", wantNames, len(tails))
+	}
+	for _, tail := range tails {
+		found := false
+		for _, contents := range recovered {
+			found = found || bytes.Equal(contents, tail)
+		}
+		if !found {
+			t.Fatalf("tail %q was not preserved exactly", tail)
+		}
 	}
 }
 
-func TestLoadDistinguishesTailsThatDifferBeyondRetentionCap(t *testing.T) {
+func TestExplicitRecoveryPreservesTailsThatDifferBeyondLegacyRetentionCap(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
 	sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
@@ -69,13 +82,22 @@ func TestLoadDistinguishesTailsThatDifferBeyondRetentionCap(t *testing.T) {
 		append(append([]byte(nil), prefix...), 'b'),
 	}
 
-	for _, tail := range tails {
+	for index, tail := range tails {
 		appendFile(t, eventsPath, tail)
-		if _, err := store.Load(context.Background(), session.ID); err != nil {
-			t.Fatal(err)
+		request := recoveryRequestFromInspection(t, store, session.ID,
+			protocol.ControlOperationID(fmt.Sprintf("operation-large-generation-%d", index)),
+			protocol.TransactionID(fmt.Sprintf("txn-large-generation-%d", index)))
+		result, err := store.RecoverSession(context.Background(), request)
+		if err != nil || result.Status != "recovered" {
+			t.Fatalf("generation %d result=%+v err=%v", index, result, err)
 		}
 	}
-	names := directoryNames(t, artifactsDir)
+	var names []string
+	for _, name := range directoryNames(t, artifactsDir) {
+		if strings.HasPrefix(name, "recovery-tail-") {
+			names = append(names, name)
+		}
+	}
 	if len(names) != 2 || names[0] == names[1] {
 		t.Fatalf("recovery generations=%v want two distinct capped generations", names)
 	}
@@ -84,20 +106,20 @@ func TestLoadDistinguishesTailsThatDifferBeyondRetentionCap(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.Size() != jsonl.MaxArtifactBytes {
-			t.Fatalf("generation %q size=%d want %d", name, info.Size(), jsonl.MaxArtifactBytes)
+		if info.Size() != jsonl.MaxArtifactBytes+1 {
+			t.Fatalf("generation %q size=%d want %d", name, info.Size(), jsonl.MaxArtifactBytes+1)
 		}
 	}
 }
 
-func TestLoadReconcilesStaleRecoveryTemporary(t *testing.T) {
+func TestLoadLeavesStaleLegacyRecoveryTemporaryUnchanged(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
 	sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
 	eventsPath := filepath.Join(sessionDir, "events.jsonl")
 	artifactsDir := filepath.Join(sessionDir, "artifacts")
 	tail := []byte(`{"stale-temp":`)
-	final, temporary := recoveryGenerationNames(tail)
+	_, temporary := recoveryGenerationNames(tail)
 	if err := os.WriteFile(filepath.Join(artifactsDir, temporary), []byte("partial stale bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -107,22 +129,22 @@ func TestLoadReconcilesStaleRecoveryTemporary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(replay.RecoveryNote, "incomplete final line") {
+	if !strings.Contains(replay.RecoveryNote, "incomplete_final_fragment") {
 		t.Fatalf("recovery note=%q", replay.RecoveryNote)
 	}
-	if got := directoryNames(t, artifactsDir); len(got) != 1 || got[0] != final {
-		t.Fatalf("reconciled artifacts=%v want [%s]", got, final)
+	if got := directoryNames(t, artifactsDir); len(got) != 1 || got[0] != temporary {
+		t.Fatalf("pure Load changed artifacts=%v want [%s]", got, temporary)
 	}
-	contents, err := os.ReadFile(filepath.Join(artifactsDir, final))
+	contents, err := os.ReadFile(filepath.Join(artifactsDir, temporary))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(contents, tail) {
-		t.Fatalf("recovered contents=%q want %q", contents, tail)
+	if string(contents) != "partial stale bytes" {
+		t.Fatalf("pure Load changed temporary contents=%q", contents)
 	}
 }
 
-func TestLoadReconcilesRecoveryFinalAndTemporary(t *testing.T) {
+func TestLoadLeavesLegacyRecoveryFinalAndTemporaryUnchanged(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
 	sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
@@ -147,8 +169,8 @@ func TestLoadReconcilesRecoveryFinalAndTemporary(t *testing.T) {
 	if _, err := store.Load(context.Background(), session.ID); err != nil {
 		t.Fatal(err)
 	}
-	if got := directoryNames(t, artifactsDir); len(got) != 1 || got[0] != final {
-		t.Fatalf("reconciled artifacts=%v want [%s]", got, final)
+	if got := directoryNames(t, artifactsDir); len(got) != 2 || got[0] != temporary || got[1] != final {
+		t.Fatalf("pure Load changed artifacts=%v want [%s %s]", got, temporary, final)
 	}
 	after, err := os.Stat(finalPath)
 	if err != nil {
@@ -159,7 +181,7 @@ func TestLoadReconcilesRecoveryFinalAndTemporary(t *testing.T) {
 	}
 }
 
-func TestLoadReportsOnlyValidDurableRecoveryGenerations(t *testing.T) {
+func TestLoadIgnoresLegacyRecoveryArtifactsWithoutMutatingThem(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
 	sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
@@ -192,268 +214,8 @@ func TestLoadReportsOnlyValidDurableRecoveryGenerations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(replay.RecoveryNote, "earlier restart") {
-		t.Fatalf("durable recovery generation note=%q", replay.RecoveryNote)
-	}
-}
-
-func TestLoadKeepsRecoveryTransactionOnOpenedSessionRoot(t *testing.T) {
-	tests := []struct {
-		name      string
-		prepare   func(t *testing.T, root string, store *jsonl.Store, workspace domain.Workspace, session domain.Session)
-		condition func(sessionDir string) bool
-		minChecks int
-	}{
-		{
-			name: "before recovery truncation",
-			prepare: func(t *testing.T, root string, _ *jsonl.Store, workspace domain.Workspace, session domain.Session) {
-				t.Helper()
-				appendFile(t, filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID, "events.jsonl"), []byte(`{"tail":`))
-			},
-			condition: func(sessionDir string) bool {
-				entries, _ := os.ReadDir(filepath.Join(sessionDir, "artifacts"))
-				for _, entry := range entries {
-					if strings.HasPrefix(entry.Name(), "recovery-") && strings.HasSuffix(entry.Name(), ".bin") {
-						return true
-					}
-				}
-				return false
-			},
-		},
-		{
-			name: "before rooted metadata replacement",
-			prepare: func(t *testing.T, root string, store *jsonl.Store, workspace domain.Workspace, session domain.Session) {
-				t.Helper()
-				if _, err := store.Append(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "durable"}); err != nil {
-					t.Fatal(err)
-				}
-				metadataPath := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID, "metadata.json")
-				var metadata domain.Session
-				raw, err := os.ReadFile(metadataPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := json.Unmarshal(raw, &metadata); err != nil {
-					t.Fatal(err)
-				}
-				metadata.LastSeq--
-				writeJSONFile(t, metadataPath, metadata)
-			},
-			condition: metadataTemporaryExists,
-		},
-		{
-			name: "before interruption append",
-			prepare: func(t *testing.T, _ string, store *jsonl.Store, _ domain.Workspace, session domain.Session) {
-				t.Helper()
-				if _, err := store.Append(context.Background(), session.ID, domain.EventToolStarted, map[string]string{"call_id": "open"}); err != nil {
-					t.Fatal(err)
-				}
-			},
-			condition: func(sessionDir string) bool {
-				return descriptorForPathIsOpen(filepath.Join(sessionDir, "events.jsonl"))
-			},
-			minChecks: 4,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			root := t.TempDir()
-			store, workspace, session := createTestSession(t, root)
-			test.prepare(t, root, store, workspace, session)
-			sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
-			movedDir := sessionDir + "-opened"
-			var replacementEvents, replacementMetadata []byte
-			ctx := &conditionalContext{
-				Context:   context.Background(),
-				minChecks: test.minChecks,
-				condition: func() bool { return test.condition(sessionDir) },
-				callback: func() error {
-					var err error
-					replacementEvents, err = os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
-					if err != nil {
-						return err
-					}
-					replacementMetadata, err = os.ReadFile(filepath.Join(sessionDir, "metadata.json"))
-					if err != nil {
-						return err
-					}
-					if err := os.Rename(sessionDir, movedDir); err != nil {
-						return err
-					}
-					if err := os.MkdirAll(filepath.Join(sessionDir, "artifacts"), 0o700); err != nil {
-						return err
-					}
-					if err := os.WriteFile(filepath.Join(sessionDir, "events.jsonl"), replacementEvents, 0o600); err != nil {
-						return err
-					}
-					return os.WriteFile(filepath.Join(sessionDir, "metadata.json"), replacementMetadata, 0o600)
-				},
-			}
-
-			if _, err := store.Load(ctx, session.ID); err == nil {
-				t.Fatal("Load continued after the opened session directory was substituted")
-			}
-			if !ctx.triggered {
-				t.Fatal("session substitution boundary was not reached")
-			}
-			if ctx.callbackErr != nil {
-				t.Fatal(ctx.callbackErr)
-			}
-			afterEvents, err := os.ReadFile(filepath.Join(sessionDir, "events.jsonl"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			afterMetadata, err := os.ReadFile(filepath.Join(sessionDir, "metadata.json"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(afterEvents, replacementEvents) || !bytes.Equal(afterMetadata, replacementMetadata) {
-				t.Fatal("Load mutated the substituted session directory")
-			}
-		})
-	}
-}
-
-func TestLoadReverifiesRecoveryLeavesImmediatelyBeforeTruncate(t *testing.T) {
-	tests := []struct {
-		name string
-		swap func(sessionDir, final string) error
-	}{
-		{
-			name: "artifacts directory",
-			swap: func(sessionDir, _ string) error {
-				artifactsDir := filepath.Join(sessionDir, "artifacts")
-				if err := os.Rename(artifactsDir, filepath.Join(sessionDir, "artifacts-opened")); err != nil {
-					return err
-				}
-				return os.Mkdir(artifactsDir, 0o700)
-			},
-		},
-		{
-			name: "recovery generation leaf",
-			swap: func(sessionDir, final string) error {
-				path := filepath.Join(sessionDir, "artifacts", final)
-				if err := os.Rename(path, path+"-opened"); err != nil {
-					return err
-				}
-				return os.WriteFile(path, []byte("substitute"), 0o600)
-			},
-		},
-		{
-			name: "events leaf",
-			swap: func(sessionDir, _ string) error {
-				path := filepath.Join(sessionDir, "events.jsonl")
-				if err := os.Rename(path, path+"-opened"); err != nil {
-					return err
-				}
-				return os.WriteFile(path, []byte("substitute events"), 0o600)
-			},
-		},
-		{
-			name: "metadata leaf",
-			swap: func(sessionDir, _ string) error {
-				path := filepath.Join(sessionDir, "metadata.json")
-				if err := os.Rename(path, path+"-opened"); err != nil {
-					return err
-				}
-				return os.WriteFile(path, []byte("substitute metadata"), 0o600)
-			},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			root := t.TempDir()
-			store, workspace, session := createTestSession(t, root)
-			sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
-			eventsPath := filepath.Join(sessionDir, "events.jsonl")
-			tail := []byte(`{"boundary":`)
-			final, _ := recoveryGenerationNames(tail)
-			appendFile(t, eventsPath, tail)
-			ctx := &conditionalContext{
-				Context: context.Background(),
-				condition: func() bool {
-					_, err := os.Stat(filepath.Join(sessionDir, "artifacts", final))
-					return err == nil
-				},
-				callback: func() error { return test.swap(sessionDir, final) },
-			}
-
-			if _, err := store.Load(ctx, session.ID); err == nil {
-				t.Fatal("Load truncated after a recovery transaction leaf was substituted")
-			}
-			if !ctx.triggered {
-				t.Fatal("pre-truncate verification boundary was not reached")
-			}
-			if ctx.callbackErr != nil {
-				t.Fatal(ctx.callbackErr)
-			}
-			openedEvents := eventsPath
-			if test.name == "events leaf" {
-				openedEvents += "-opened"
-			}
-			after, err := os.ReadFile(openedEvents)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.HasSuffix(after, tail) {
-				t.Fatal("Load truncated the opened event descriptor after substitution")
-			}
-		})
-	}
-}
-
-func TestLoadRootedMetadataReplacementRejectsLeafSubstitution(t *testing.T) {
-	root := t.TempDir()
-	store, workspace, session := createTestSession(t, root)
-	sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
-	metadataPath := filepath.Join(sessionDir, "metadata.json")
-	if _, err := store.Append(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "durable"}); err != nil {
-		t.Fatal(err)
-	}
-	var metadata domain.Session
-	raw, err := os.ReadFile(metadataPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(raw, &metadata); err != nil {
-		t.Fatal(err)
-	}
-	metadata.LastSeq--
-	writeJSONFile(t, metadataPath, metadata)
-	substitute := []byte(`{"substitute":true}`)
-	ctx := &conditionalContext{
-		Context:   context.Background(),
-		condition: func() bool { return metadataTemporaryExists(sessionDir) },
-		callback: func() error {
-			if err := os.Rename(metadataPath, metadataPath+"-opened"); err != nil {
-				return err
-			}
-			return os.WriteFile(metadataPath, substitute, 0o600)
-		},
-	}
-
-	if _, err := store.Load(ctx, session.ID); err == nil {
-		t.Fatal("Load replaced a substituted metadata leaf")
-	}
-	if !ctx.triggered {
-		t.Fatal("rooted metadata replacement boundary was not reached")
-	}
-	if ctx.callbackErr != nil {
-		t.Fatal(ctx.callbackErr)
-	}
-	after, err := os.ReadFile(metadataPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(after, substitute) {
-		t.Fatalf("substituted metadata=%q want %q", after, substitute)
-	}
-	for _, name := range directoryNames(t, sessionDir) {
-		if strings.HasPrefix(name, ".metadata-") && strings.HasSuffix(name, ".tmp") {
-			t.Fatalf("failed metadata replacement left temporary %q", name)
-		}
+	if replay.RecoveryNote != "" {
+		t.Fatalf("legacy recovery artifact changed pure inspection note=%q", replay.RecoveryNote)
 	}
 }
 

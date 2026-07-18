@@ -336,8 +336,13 @@ func TestPersistentJSONReadsAreBounded(t *testing.T) {
 		if err := os.WriteFile(path, contents, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.Load(context.Background(), session.ID); err == nil || !strings.Contains(err.Error(), "exceeds") {
-			t.Fatalf("Load error=%v want bounded recovery artifact error", err)
+		replay, err := store.Load(context.Background(), session.ID)
+		if err != nil || replay.RecoveryNote != "" {
+			t.Fatalf("pure Load inspected unrelated legacy artifact: replay=%+v err=%v", replay, err)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(after, contents) {
+			t.Fatalf("pure Load changed legacy artifact: size=%d err=%v", len(after), err)
 		}
 	})
 }

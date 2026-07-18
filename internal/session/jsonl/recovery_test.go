@@ -12,10 +12,42 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/journal"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
 )
 
-func TestLoadRecoversOnlyIncompleteFinalLine(t *testing.T) {
+type explicitRecoveryDetails struct {
+	ObservedTailDigest protocol.Digest `json:"observed_tail_digest"`
+	ValidPrefixBytes   int64           `json:"valid_prefix_bytes"`
+	SourceBytes        int64           `json:"source_bytes"`
+}
+
+func recoveryRequestFromInspection(t *testing.T, store *jsonl.Store, sessionID string, operationID protocol.ControlOperationID, transactionID protocol.TransactionID) journal.RecoveryRequest {
+	t.Helper()
+	inspection, err := store.InspectSession(context.Background(), protocol.SessionID(sessionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, diagnostic := range inspection.Journal.Diagnostics {
+		if diagnostic.Code != "recovery.available" {
+			continue
+		}
+		var details explicitRecoveryDetails
+		if err := json.Unmarshal(diagnostic.Details, &details); err != nil {
+			t.Fatal(err)
+		}
+		return journal.RecoveryRequest{
+			OperationID: operationID, Journal: inspection.Journal.Journal,
+			ExpectedHead: inspection.Journal.Head, ObservedTailDigest: details.ObservedTailDigest,
+			TransactionID: transactionID,
+		}
+	}
+	t.Fatal("inspection did not expose recovery.available")
+	return journal.RecoveryRequest{}
+}
+
+func TestLoadInspectsAndExplicitRecoveryPreservesIncompleteFinalLine(t *testing.T) {
 	root := t.TempDir()
 	store := jsonl.New(root, jsonl.Options{
 		Clock:   func() time.Time { return time.Unix(1, 0).UTC() },
@@ -59,27 +91,36 @@ func TestLoadRecoversOnlyIncompleteFinalLine(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	before, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	replay, err := store.Load(context.Background(), session.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replay.ReadOnly {
-		t.Fatal("recoverable tail opened read-only")
+	if !replay.ReadOnly {
+		t.Fatal("incomplete tail opened writable before explicit recovery")
 	}
-	if !strings.Contains(replay.RecoveryNote, "incomplete final line") {
+	if !strings.Contains(replay.RecoveryNote, "incomplete_final_fragment") {
 		t.Fatalf("note=%q", replay.RecoveryNote)
 	}
-	if len(replay.Events) != 3 {
-		t.Fatalf("events=%d want 3", len(replay.Events))
+	if len(replay.Events) != 2 {
+		t.Fatalf("events=%d want validated prefix of 2", len(replay.Events))
 	}
-	last := replay.Events[len(replay.Events)-1]
-	if last.Kind != domain.EventTurnInterrupted || last.Seq != 3 {
-		t.Fatalf("last=%s seq=%d want turn.interrupted seq=3", last.Kind, last.Seq)
+	unchanged, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if replay.Session.LastSeq != last.Seq {
-		t.Fatalf("replay last_seq=%d want %d", replay.Session.LastSeq, last.Seq)
+	if !bytes.Equal(unchanged, before) {
+		t.Fatal("Load mutated the incomplete source journal")
 	}
 
+	request := recoveryRequestFromInspection(t, store, session.ID, "operation-incomplete-tail", "txn-incomplete-tail")
+	result, err := store.RecoverSession(context.Background(), request)
+	if err != nil || result.Status != "recovered" {
+		t.Fatalf("explicit recovery result=%+v err=%v", result, err)
+	}
 	recoveredLog, err := os.ReadFile(eventsPath)
 	if err != nil {
 		t.Fatal(err)
@@ -87,16 +128,16 @@ func TestLoadRecoversOnlyIncompleteFinalLine(t *testing.T) {
 	if !bytes.HasSuffix(recoveredLog, []byte{'\n'}) {
 		t.Fatal("recovered event log is not newline terminated")
 	}
-	if bytes.Contains(recoveredLog, append(append([]byte(nil), tail...), '\n')) {
-		t.Fatal("incomplete tail remains as an event-log line")
+	if bytes.HasSuffix(recoveredLog, tail) {
+		t.Fatal("incomplete tail remains in the active journal")
 	}
 	artifactsDir := filepath.Join(filepath.Dir(eventsPath), "artifacts")
 	entries, err := os.ReadDir(artifactsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("recovery artifacts=%d want 1", len(entries))
+	if len(entries) != 1 || !strings.HasPrefix(entries[0].Name(), "recovery-tail-") {
+		t.Fatalf("recovery artifacts=%v want one explicit tail artifact", entries)
 	}
 	recoveredTail, err := os.ReadFile(filepath.Join(artifactsDir, entries[0].Name()))
 	if err != nil {
@@ -113,19 +154,9 @@ func TestLoadRecoversOnlyIncompleteFinalLine(t *testing.T) {
 		t.Fatalf("replay mutated tool target: %q", contents)
 	}
 
-	again, err := store.Load(context.Background(), session.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(again.Events) != 3 || again.Events[2].Kind != domain.EventTurnInterrupted {
-		t.Fatalf("second replay events=%v want one durable interruption", again.Events)
-	}
-	entries, err = os.ReadDir(artifactsDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("second replay recovery artifacts=%d want 1", len(entries))
+	again, err := store.RecoverSession(context.Background(), request)
+	if err != nil || again.Status != "already_recovered" || again.Cursor != result.Cursor {
+		t.Fatalf("restarted explicit recovery result=%+v err=%v", again, err)
 	}
 }
 
@@ -288,7 +319,7 @@ func TestLoadTreatsNewlineTerminatedInvalidFinalLineAsCorruption(t *testing.T) {
 	}
 }
 
-func TestLoadRepairsLaggingMetadataBeforeNextAppend(t *testing.T) {
+func TestLoadReportsLaggingMetadataWithoutRepair(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
 	if _, err := store.Append(
@@ -329,7 +360,7 @@ func TestLoadRepairsLaggingMetadataBeforeNextAppend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replay.ReadOnly || replay.Session.LastSeq != 2 || len(replay.Events) != 2 {
+	if !replay.ReadOnly || replay.Session.LastSeq != 2 || len(replay.Events) != 2 || !strings.Contains(replay.RecoveryNote, "metadata_lags_journal") {
 		t.Fatalf("replay=%+v", replay)
 	}
 	raw, err = os.ReadFile(metadataPath)
@@ -339,20 +370,17 @@ func TestLoadRepairsLaggingMetadataBeforeNextAppend(t *testing.T) {
 	if err := json.Unmarshal(raw, &metadata); err != nil {
 		t.Fatal(err)
 	}
-	if metadata.LastSeq != 2 {
-		t.Fatalf("repaired metadata last_seq=%d want 2", metadata.LastSeq)
+	if metadata.LastSeq != 1 {
+		t.Fatalf("pure Load repaired metadata last_seq=%d want persisted 1", metadata.LastSeq)
 	}
-	next, err := store.Append(
+	_, err = store.Append(
 		context.Background(),
 		session.ID,
 		domain.EventUserMessage,
 		map[string]string{"content": "next"},
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if next.Seq != 3 {
-		t.Fatalf("next sequence=%d want 3", next.Seq)
+	if err == nil || !strings.Contains(err.Error(), "session sequence mismatch") {
+		t.Fatalf("append error=%v want unresolved metadata mismatch", err)
 	}
 }
 
@@ -502,7 +530,7 @@ func assertSessionTreeUnchanged(t *testing.T, sessionDir string, before []byte) 
 	}
 }
 
-func TestLoadMarksUnmatchedToolStartOnce(t *testing.T) {
+func TestLoadReportsUnmatchedToolStartWithoutAppending(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
 	target := filepath.Join(workspace.CanonicalPath, "target.txt")
@@ -523,11 +551,8 @@ func TestLoadMarksUnmatchedToolStartOnce(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if replay.ReadOnly || len(replay.Events) != 3 {
+		if replay.ReadOnly || len(replay.Events) != 2 || !strings.Contains(replay.RecoveryNote, "migration.unmatched_activity") {
 			t.Fatalf("attempt %d replay=%+v", attempt+1, replay)
-		}
-		if replay.Events[2].Kind != domain.EventTurnInterrupted || replay.Events[2].Seq != 3 {
-			t.Fatalf("attempt %d last=%+v", attempt+1, replay.Events[2])
 		}
 	}
 	contents, err := os.ReadFile(target)
@@ -538,8 +563,8 @@ func TestLoadMarksUnmatchedToolStartOnce(t *testing.T) {
 		t.Fatalf("replay re-executed mutation: %q", contents)
 	}
 	eventsPath := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID, "events.jsonl")
-	if events := readEvents(t, eventsPath); len(events) != 3 {
-		t.Fatalf("durable events=%d want 3", len(events))
+	if events := readEvents(t, eventsPath); len(events) != 2 {
+		t.Fatalf("durable events=%d want unchanged source with 2", len(events))
 	}
 }
 

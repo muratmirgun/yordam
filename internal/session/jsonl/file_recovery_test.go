@@ -173,7 +173,7 @@ func TestLoadDoesNotReportCompletedFilePlan(t *testing.T) {
 	}
 }
 
-func TestLoadCleansRecognizedAbandonedTemporaries(t *testing.T) {
+func TestLoadLeavesRecognizedAbandonedTemporariesForExplicitMutation(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
 	workspaceDir := filepath.Join(root, "workspaces", workspace.ID)
@@ -198,8 +198,9 @@ func TestLoadCleansRecognizedAbandonedTemporaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, path := range paths {
-		if _, err := os.Lstat(path); !os.IsNotExist(err) {
-			t.Fatalf("abandoned temporary remains at %s: %v", path, err)
+		raw, err := os.ReadFile(path)
+		if err != nil || string(raw) != "stale" {
+			t.Fatalf("pure Load changed abandoned temporary at %s: contents=%q err=%v", path, raw, err)
 		}
 	}
 	if _, err := os.Stat(lookalike); err != nil {

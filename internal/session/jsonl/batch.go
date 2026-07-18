@@ -192,15 +192,47 @@ func (s *Store) appendBatchLocked(
 	if !scan.writable {
 		return base, fmt.Errorf("journal is read-only because its validated prefix contains unsupported data")
 	}
+	if request.ExpectedHead != scan.head {
+		base.Status = journal.AppendConflict
+		return base, nil
+	}
+	for _, event := range request.Events {
+		if event.Kind == protocol.EventMigrationCompatibilityDeclared {
+			return base, fmt.Errorf("caller must not propose a compatibility declaration")
+		}
+	}
 	if scan.hasLegacy && !scan.hasV2 {
 		if request.Compatibility == nil {
 			return base, fmt.Errorf("first v2 append to a legacy journal requires a compatibility declaration")
 		}
-		return base, fmt.Errorf("legacy compatibility transition is a Task 3 boundary")
-	}
-	if request.ExpectedHead != scan.head {
-		base.Status = journal.AppendConflict
-		return base, nil
+		if request.Compatibility.ReaderVersion != protocol.EnvelopeVersion || request.Compatibility.WriterVersion != protocol.EnvelopeVersion || request.Compatibility.LegacyHead != scan.head {
+			return base, fmt.Errorf("invalid legacy compatibility declaration")
+		}
+		if len(request.Events) >= 1000 {
+			return base, fmt.Errorf("first v2 compatibility transaction supports at most 999 caller events")
+		}
+		compatibilityID, err := s.nextID()
+		if err != nil {
+			return base, err
+		}
+		compatibilityTime := s.clock().UTC()
+		if compatibilityTime.Before(session.UpdatedAt) {
+			compatibilityTime = session.UpdatedAt
+		}
+		payload, err := canonicaljson.Marshal(protocol.MigrationCompatibilityDeclaredV1{
+			ReaderVersion: request.Compatibility.ReaderVersion, WriterVersion: request.Compatibility.WriterVersion,
+			LegacyHead: request.Compatibility.LegacyHead, DowngradeStatus: "v0.1_read_only_after_v2",
+		})
+		if err != nil {
+			return base, err
+		}
+		declaration := protocol.ProposedEvent{
+			EventID: protocol.EventID(compatibilityID), Time: compatibilityTime, PayloadVersion: 1,
+			Kind: protocol.EventMigrationCompatibilityDeclared, SessionID: protocol.SessionID(request.Journal.ID), Payload: payload,
+		}
+		request.Events = append([]protocol.ProposedEvent{declaration}, request.Events...)
+	} else if request.Compatibility != nil {
+		return base, fmt.Errorf("compatibility declaration is invalid after the first v2 transaction")
 	}
 	if _, duplicate := scan.transactions[request.TransactionID]; duplicate {
 		return base, fmt.Errorf("duplicate transaction ID %q", request.TransactionID)
@@ -227,9 +259,12 @@ func (s *Store) appendBatchLocked(
 			return base, fmt.Errorf("duplicate durable event ID %q", proposed.EventID)
 		}
 		seen[proposed.EventID] = struct{}{}
-		admitted, err := s.encoder.EncodeProposed(protocol.CloneProposedEvent(proposed))
-		if err != nil {
-			return base, fmt.Errorf("encode proposed event %q: %w", proposed.EventID, err)
+		admitted := protocol.CloneRawMessage(proposed.Payload)
+		if s.encoder != nil {
+			admitted, err = s.encoder.EncodeProposed(protocol.CloneProposedEvent(proposed))
+			if err != nil {
+				return base, fmt.Errorf("encode proposed event %q: %w", proposed.EventID, err)
+			}
 		}
 		canonicalPayload, err := canonicaljson.Marshal(admitted)
 		if err != nil {

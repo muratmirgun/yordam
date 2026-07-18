@@ -67,6 +67,7 @@ type journalScan struct {
 	hasV2                 bool
 	sourceSize            int64
 	sourceDigest          protocol.Digest
+	validPrefixSize       int64
 }
 
 func (s *Store) openJournal(
@@ -126,6 +127,12 @@ scanLines:
 		}
 		physical, complete, eof, err := readJournalLine(reader)
 		if err != nil {
+			if errors.Is(err, errJournalLineTooLarge) {
+				scan.writable = false
+				scan.incompleteTail = true
+				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_known_payload", err.Error(), scan.physicalSeq+1, ""))
+				break
+			}
 			return scan, err
 		}
 		if len(physical) == 0 && eof {
@@ -151,13 +158,19 @@ scanLines:
 		}
 		line := physical[:len(physical)-1]
 		if len(line) == 0 {
-			return scan, fmt.Errorf("empty journal line at sequence %d", scan.physicalSeq+1)
+			scan.writable = false
+			scan.incompleteTail = true
+			scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_known_payload", fmt.Sprintf("empty journal line at sequence %d", scan.physicalSeq+1), scan.physicalSeq+1, ""))
+			break
 		}
 		var identity struct {
 			SchemaVersion uint32 `json:"schema_version"`
 		}
 		if err := json.Unmarshal(line, &identity); err != nil {
-			return scan, fmt.Errorf("decode journal line %d: %w", scan.physicalSeq+1, err)
+			scan.writable = false
+			scan.incompleteTail = true
+			scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_known_payload", fmt.Sprintf("decode journal line %d: %v", scan.physicalSeq+1, err), scan.physicalSeq+1, ""))
+			break
 		}
 		switch identity.SchemaVersion {
 		case 1:
@@ -167,16 +180,28 @@ scanLines:
 			}
 			var legacy domain.DurableEvent
 			if err := json.Unmarshal(line, &legacy); err != nil {
-				return scan, fmt.Errorf("decode v1 event: %w", err)
+				scan.writable = false
+				scan.incompleteTail = true
+				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_known_payload", fmt.Sprintf("decode v1 event: %v", err), scan.physicalSeq+1, ""))
+				break scanLines
 			}
 			if err := legacy.Validate(); err != nil {
-				return scan, err
+				scan.writable = false
+				scan.incompleteTail = true
+				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_known_payload", err.Error(), scan.physicalSeq+1, protocol.EventID(legacy.EventID)))
+				break scanLines
 			}
 			if ref.Kind != protocol.JournalSession || protocol.JournalID(legacy.SessionID) != ref.ID {
-				return scan, fmt.Errorf("v1 journal identity mismatch")
+				scan.writable = false
+				scan.incompleteTail = true
+				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_known_payload", "v1 journal identity mismatch", scan.physicalSeq+1, protocol.EventID(legacy.EventID)))
+				break scanLines
 			}
 			if legacy.Seq != scan.physicalSeq+1 {
-				return scan, fmt.Errorf("v1 sequence=%d want %d", legacy.Seq, scan.physicalSeq+1)
+				scan.writable = false
+				scan.incompleteTail = true
+				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_sequence", fmt.Sprintf("v1 sequence=%d want %d", legacy.Seq, scan.physicalSeq+1), scan.physicalSeq+1, protocol.EventID(legacy.EventID)))
+				break scanLines
 			}
 			eventID := protocol.EventID(legacy.EventID)
 			if _, duplicate := seenEvents[eventID]; duplicate {
@@ -205,6 +230,7 @@ scanLines:
 			scan.transactions[transactionID] = commit
 			scan.head = cursor
 			scan.physicalSeq = legacy.Seq
+			scan.validPrefixSize = offset
 		case protocol.EnvelopeVersion:
 			scan.hasV2 = true
 			hasV2 = true
@@ -217,16 +243,28 @@ scanLines:
 				scan.writable = false
 				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "unsupported_event", decodeErr.Error(), record.Envelope.Seq, record.Envelope.EventID))
 			} else if decodeErr != nil {
-				return scan, fmt.Errorf("decode v2 event: %w", decodeErr)
+				scan.writable = false
+				scan.incompleteTail = true
+				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_known_payload", fmt.Sprintf("decode v2 event: %v", decodeErr), scan.physicalSeq+1, record.Envelope.EventID))
+				break scanLines
 			} else if err := s.registry.Validate(record); err != nil {
-				return scan, fmt.Errorf("validate v2 event: %w", err)
+				scan.writable = false
+				scan.incompleteTail = true
+				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_known_payload", fmt.Sprintf("validate v2 event: %v", err), scan.physicalSeq+1, record.Envelope.EventID))
+				break scanLines
 			}
 			envelope := record.Envelope
 			if envelope.JournalKind != ref.Kind || envelope.JournalID != ref.ID {
-				return scan, fmt.Errorf("v2 journal identity mismatch")
+				scan.writable = false
+				scan.incompleteTail = true
+				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_known_payload", "v2 journal identity mismatch", scan.physicalSeq+1, envelope.EventID))
+				break scanLines
 			}
 			if envelope.Seq != scan.physicalSeq+1 {
-				return scan, fmt.Errorf("v2 sequence=%d want %d", envelope.Seq, scan.physicalSeq+1)
+				scan.writable = false
+				scan.incompleteTail = true
+				scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "invalid_sequence", fmt.Sprintf("v2 sequence=%d want %d", envelope.Seq, scan.physicalSeq+1), scan.physicalSeq+1, envelope.EventID))
+				break scanLines
 			}
 			if _, duplicate := seenEvents[envelope.EventID]; duplicate {
 				return scan, fmt.Errorf("duplicate event ID %q", envelope.EventID)
@@ -275,6 +313,7 @@ scanLines:
 				scan.commits = append(scan.commits, commit)
 				scan.transactions[pendingID] = commit
 				scan.head = cursor
+				scan.validPrefixSize = offset
 				pendingRecords, pendingEnvelopes = nil, nil
 				pendingID = ""
 				continue
@@ -313,6 +352,9 @@ scanLines:
 		scan.diagnostics = append(scan.diagnostics, journalDiagnostic(ref, "incomplete_transaction", "transaction has no durable commit marker", scan.physicalSeq, pendingEnvelopes[len(pendingEnvelopes)-1].EventID))
 	}
 	scan.sourceDigest = protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hex.EncodeToString(prefixHash.Sum(nil))}
+	if info, err := transaction.events.Stat(); err == nil {
+		scan.sourceSize = info.Size()
+	}
 	if err := transaction.verifyEvents(); err != nil {
 		return scan, err
 	}
@@ -354,12 +396,14 @@ func cloneScannedCommit(commit scannedCommit) scannedCommit {
 	return commit
 }
 
+var errJournalLineTooLarge = errors.New("journal line exceeds maximum event size")
+
 func readJournalLine(reader *bufio.Reader) (line []byte, complete, eof bool, err error) {
 	var pending bytes.Buffer
 	for {
 		fragment, readErr := reader.ReadSlice('\n')
 		if pending.Len()+len(fragment) > protocol.MaxEventBytes+1 {
-			return nil, false, false, fmt.Errorf("journal line exceeds %d bytes", protocol.MaxEventBytes)
+			return nil, false, false, fmt.Errorf("%w: %d bytes", errJournalLineTooLarge, protocol.MaxEventBytes)
 		}
 		pending.Write(fragment)
 		if errors.Is(readErr, bufio.ErrBufferFull) {
@@ -411,22 +455,167 @@ func (s *Store) Inspect(ctx context.Context, ref protocol.JournalRef) (journal.I
 	if err != nil {
 		return journal.Inspection{}, err
 	}
-	scan, scanErr := s.scanJournal(ctx, transaction, ref)
-	if scanErr == nil {
-		scanErr = s.syncCommittedView(ctx, transaction, ref, scan)
-	}
+	scan, scanErr := s.inspectJournalTransaction(ctx, transaction, ref)
 	closeErr := transaction.close()
 	if scanErr != nil || closeErr != nil {
 		return journal.Inspection{}, errors.Join(scanErr, closeErr)
 	}
-	events := make([]protocol.EventRecord, len(scan.events))
-	for index := range scan.events {
-		events[index] = protocol.CloneEventRecord(scan.events[index].record)
+	if diagnostic, ok := fatalLegacyInspectDiagnostic(scan.diagnostics); ok {
+		return journal.Inspection{}, fmt.Errorf("%s: %s", diagnostic.Code, diagnostic.Message)
 	}
+	events, migrationDiagnostics := upcastScannedEvents(scan, protocol.SessionID(ref.ID))
 	return journal.Inspection{
 		Journal: ref, Head: scan.head, Events: events, Writable: scan.writable,
-		Diagnostics: cloneDiagnostics(scan.diagnostics), IncompleteTransaction: scan.incompleteTransaction,
+		Diagnostics: append(cloneDiagnostics(scan.diagnostics), migrationDiagnostics...), IncompleteTransaction: scan.incompleteTransaction,
 	}, nil
+}
+
+func fatalLegacyInspectDiagnostic(diagnostics []protocol.Diagnostic) (protocol.Diagnostic, bool) {
+	for _, diagnostic := range diagnostics {
+		switch diagnostic.Code {
+		case "invalid_known_payload", "invalid_sequence", "invalid_transition":
+			return diagnostic, true
+		}
+	}
+	return protocol.Diagnostic{}, false
+}
+
+func (s *Store) InspectSession(ctx context.Context, sessionID protocol.SessionID) (journal.SessionInspection, error) {
+	if err := validateSessionID(string(sessionID)); err != nil {
+		return journal.SessionInspection{}, err
+	}
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(sessionID)}
+	lock := s.journalLock(ref)
+	if err := lock.lock(ctx); err != nil {
+		return journal.SessionInspection{}, err
+	}
+	defer lock.unlock()
+	transaction, session, err := s.openJournal(ctx, ref, os.O_RDONLY)
+	var missingLog *missingEventLogError
+	if errors.As(err, &missingLog) && session.LastSeq > 0 {
+		return journal.SessionInspection{
+			Session: session,
+			Journal: journal.Inspection{
+				Journal:  ref,
+				Writable: false,
+				Diagnostics: []protocol.Diagnostic{{
+					Code: "missing_event_log", Message: missingLog.Error(), Journal: ref,
+				}},
+			},
+		}, nil
+	}
+	if err != nil {
+		return journal.SessionInspection{}, err
+	}
+	scan, scanErr := s.inspectJournalTransaction(ctx, transaction, ref)
+	closeErr := transaction.close()
+	if scanErr != nil || closeErr != nil {
+		return journal.SessionInspection{}, errors.Join(scanErr, closeErr)
+	}
+	events, migrationDiagnostics := upcastScannedEvents(scan, sessionID)
+	diagnostics := append(cloneDiagnostics(scan.diagnostics), migrationDiagnostics...)
+	if session.LastSeq != scan.head.CommitSeq {
+		scan.writable = false
+		code := "metadata_lags_journal"
+		message := fmt.Sprintf("metadata last sequence %d is behind validated journal head %d", session.LastSeq, scan.head.CommitSeq)
+		if session.LastSeq > scan.head.CommitSeq {
+			code = "metadata_leads_journal"
+			message = fmt.Sprintf("metadata last sequence %d exceeds validated journal head %d", session.LastSeq, scan.head.CommitSeq)
+		}
+		diagnostics = append(diagnostics, protocol.Diagnostic{Code: code, Message: message, Journal: ref, AtSeq: scan.head.CommitSeq})
+	}
+	return journal.SessionInspection{
+		Session: session,
+		Journal: journal.Inspection{
+			Journal: ref, Head: scan.head, Events: events, Writable: scan.writable,
+			Diagnostics: diagnostics, IncompleteTransaction: scan.incompleteTransaction,
+		},
+	}, nil
+}
+
+func (s *Store) inspectJournalTransaction(ctx context.Context, transaction *sessionTransaction, ref protocol.JournalRef) (journalScan, error) {
+	scan, err := s.scanJournal(ctx, transaction, ref)
+	if err != nil {
+		return scan, err
+	}
+	if err := s.syncCommittedView(ctx, transaction, ref, scan); err != nil {
+		return scan, err
+	}
+	if scan.validPrefixSize < scan.sourceSize {
+		details, err := observedRecoveryDetails(ctx, transaction.events, scan.validPrefixSize, scan.sourceSize)
+		if err != nil {
+			return scan, err
+		}
+		raw, err := json.Marshal(details)
+		if err != nil {
+			return scan, err
+		}
+		scan.diagnostics = append(scan.diagnostics, protocol.Diagnostic{
+			Code: "recovery.available", Message: "journal has bytes beyond its validated committed prefix",
+			Journal: ref, AtSeq: scan.physicalSeq + 1, Details: raw,
+		})
+	}
+	return scan, nil
+}
+
+type recoveryObservation struct {
+	ObservedTailDigest protocol.Digest `json:"observed_tail_digest"`
+	ValidPrefixBytes   int64           `json:"valid_prefix_bytes"`
+	SourceBytes        int64           `json:"source_bytes"`
+}
+
+func observedRecoveryDetails(ctx context.Context, file *os.File, prefixSize, sourceSize int64) (recoveryObservation, error) {
+	if prefixSize < 0 || sourceSize <= prefixSize {
+		return recoveryObservation{}, fmt.Errorf("invalid recovery byte range %d..%d", prefixSize, sourceSize)
+	}
+	hasher := sha256.New()
+	reader := io.NewSectionReader(file, prefixSize, sourceSize-prefixSize)
+	buffer := make([]byte, 64*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return recoveryObservation{}, err
+		}
+		count, readErr := reader.Read(buffer)
+		if count > 0 {
+			_, _ = hasher.Write(buffer[:count])
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return recoveryObservation{}, readErr
+		}
+		if count == 0 {
+			return recoveryObservation{}, io.ErrNoProgress
+		}
+	}
+	return recoveryObservation{
+		ObservedTailDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hex.EncodeToString(hasher.Sum(nil))},
+		ValidPrefixBytes:   prefixSize, SourceBytes: sourceSize,
+	}, nil
+}
+
+func upcastScannedEvents(scan journalScan, sessionID protocol.SessionID) ([]protocol.EventRecord, []protocol.Diagnostic) {
+	events := make([]protocol.EventRecord, 0, len(scan.events))
+	state := UpcastState{SessionID: sessionID}
+	var diagnostics []protocol.Diagnostic
+	var lastLegacy protocol.LegacySource
+	for _, scanned := range scan.events {
+		if scanned.record.Legacy == nil {
+			events = append(events, protocol.CloneEventRecord(scanned.record))
+			continue
+		}
+		record, next, emitted := UpcastV1(*scanned.record.Legacy, state)
+		state = next
+		lastLegacy = *scanned.record.Legacy
+		events = append(events, record)
+		diagnostics = append(diagnostics, emitted...)
+	}
+	if len(state.OpenCalls) > 0 {
+		ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(sessionID)}
+		diagnostics = append(diagnostics, unmatchedCallDiagnostics(ref, lastLegacy, state)...)
+	}
+	return cloneRecords(events), cloneDiagnostics(diagnostics)
 }
 
 func (s *Store) Head(ctx context.Context, ref protocol.JournalRef) (protocol.CommittedCursor, error) {
@@ -434,6 +623,6 @@ func (s *Store) Head(ctx context.Context, ref protocol.JournalRef) (protocol.Com
 	return inspection.Head, err
 }
 
-func (s *Store) Recover(context.Context, journal.RecoveryRequest) (journal.RecoveryResult, error) {
-	return journal.RecoveryResult{}, fmt.Errorf("explicit journal recovery is a Task 3 boundary")
+func (s *Store) Recover(ctx context.Context, request journal.RecoveryRequest) (journal.RecoveryResult, error) {
+	return s.RecoverSession(ctx, request)
 }
