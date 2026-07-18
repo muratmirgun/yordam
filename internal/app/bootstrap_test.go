@@ -189,6 +189,39 @@ func TestBootstrapStartsWithoutValidConfiguration(t *testing.T) {
 	assertTreeOmits(t, filepath.Dir(debugLog), secret)
 }
 
+func TestBootstrapReloadFromInvalidConfigurationUsesCandidateSessionChangeService(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.jsonc")
+	if err := os.WriteFile(configPath, []byte(`{"model":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BOOTSTRAP_KEY", "reload-key")
+	application, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
+		ConfigPath: configPath,
+		CLI:        bootstrapCLI(t.TempDir()),
+		CWD:        t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.ConfigurationError == nil || snapshot.Session.Selection != (domain.ModelSelection{}) {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+	if err := config.SaveGlobal(configPath, bootstrapConfig("https://llm.example/v1")); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- application.Run(context.Background()) }()
+	application.Commands() <- app.Command{Kind: app.CommandReloadConfig}
+	event := receiveEvent(t, application.Events())
+	if event.Kind != app.EventReloadCompleted || !event.Applied || event.Err != nil || event.Selection != (domain.ModelSelection{Profile: "default", Model: "test-model"}) {
+		t.Fatalf("reload event=%+v", event)
+	}
+	application.Commands() <- app.Command{Kind: app.CommandShutdown}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBootstrapLoadsModelsWithoutCredential(t *testing.T) {
 	configPath := writeBootstrapConfig(t, bootstrapConfig("https://llm.example/v1"))
 	application, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
@@ -311,13 +344,13 @@ func TestBootstrapKeepsCredentialsBoundToNamedProfiles(t *testing.T) {
 	primary := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		primaryAuth = request.Header.Get("Authorization")
 		response.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(response, "data: [DONE]\n\n")
+		fmt.Fprint(response, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer primary.Close()
 	secondary := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		secondaryAuth = request.Header.Get("Authorization")
 		response.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(response, "data: [DONE]\n\n")
+		fmt.Fprint(response, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer secondary.Close()
 	t.Setenv("PRIMARY_KEY", "primary-key")
@@ -365,19 +398,19 @@ func TestBootstrapAppliesEnvironmentAndBaseURLOverridesToResumedSelection(t *tes
 	primary := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		primaryRequests <- request.Header.Get("Authorization")
 		response.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(response, "data: [DONE]\n\n")
+		fmt.Fprint(response, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer primary.Close()
 	secondary := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		response.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(response, "data: [DONE]\n\n")
+		fmt.Fprint(response, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer secondary.Close()
 	overrideRequests := make(chan string, 1)
 	override := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		overrideRequests <- request.Header.Get("Authorization")
 		response.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(response, "data: [DONE]\n\n")
+		fmt.Fprint(response, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer override.Close()
 	t.Setenv("PRIMARY_KEY", "primary-key")

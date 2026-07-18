@@ -25,6 +25,8 @@ type StartTurnRequest struct {
 	SessionID    protocol.SessionID
 	ExpectedHead protocol.CommittedCursor
 	Prompt       string
+	ProviderID   protocol.ProviderID
+	ModelID      protocol.ModelID
 	Runtime      protocol.RuntimeGenerationManifest
 }
 
@@ -34,6 +36,7 @@ type RunResult struct {
 	Cursor        protocol.CommittedCursor
 	Status        string
 	CommandResult protocol.CommandResult
+	Assistant     protocol.AssistantMessageV1
 }
 
 type SessionChangeRequest struct {

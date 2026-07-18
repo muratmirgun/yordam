@@ -256,7 +256,7 @@ func TestAppendKeepsEventAndMetadataOnOneSessionRoot(t *testing.T) {
 		},
 	}
 
-	if _, err := store.Append(ctx, session.ID, domain.EventUserMessage, map[string]string{"content": "anchored"}); err == nil {
+	if _, err := store.WriteLegacyFixture(ctx, session.ID, domain.EventUserMessage, map[string]string{"content": "anchored"}); err == nil {
 		t.Fatal("Append advanced metadata through a substituted session path")
 	}
 	if !ctx.triggered {

@@ -2,18 +2,23 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/agent"
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/cli"
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/logging"
+	"github.com/muratmirgun/yordam/internal/orchestrator"
 	"github.com/muratmirgun/yordam/internal/permission"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
@@ -83,6 +88,10 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 	if err != nil {
 		return nil, Snapshot{}, err
 	}
+	workspaceControl, err := store.EnsureWorkspaceControl(ctx, workspace)
+	if err != nil {
+		return nil, Snapshot{}, fmt.Errorf("initialize workspace-control journal: %w", err)
+	}
 	cfg, configPath, configErr := loadBootstrapConfig(options)
 	initialSelection := domain.ModelSelection{}
 	if configErr == nil && !options.CLI.Continue && options.CLI.Session == "" {
@@ -104,27 +113,22 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 	state := ProjectSessionState(replay)
 	session.Mode = state.Mode
 	session.Selection = state.Selection
-	if options.CLI.ModeSet {
-		event, appendErr := store.Append(ctx, session.ID, domain.EventModeChanged, domain.ModeChangedPayload{Mode: options.CLI.Mode})
-		if appendErr != nil {
-			return nil, Snapshot{}, fmt.Errorf("persist CLI mode override: %w", appendErr)
-		}
-		replay.Events = append(replay.Events, event)
-		session.Mode = options.CLI.Mode
-	}
 	runtimeEvents := make(chan agent.RuntimeEvent, 64)
 	activeSession := &sessionBinding{id: session.ID}
 	policy := newPolicyBinding(permission.Restore(replay))
 	builder := runtimeBuilder{
-		configPath:    configPath,
-		cli:           options.CLI,
-		workspace:     workspace,
-		store:         store,
-		policy:        policy,
-		activeSession: activeSession,
-		runtimeEvents: runtimeEvents,
-		httpClient:    options.HTTPClient,
-		secrets:       secretRegistry,
+		configPath:       configPath,
+		cli:              options.CLI,
+		workspace:        workspace,
+		store:            store,
+		policy:           policy,
+		activeSession:    activeSession,
+		runtimeEvents:    runtimeEvents,
+		httpClient:       options.HTTPClient,
+		secrets:          secretRegistry,
+		lane:             orchestrator.NewOperationLane(),
+		dataDir:          dataDir,
+		workspaceControl: workspaceControl,
 	}
 	runtimeSet := RuntimeSet{ConfigurationError: configErr, configPath: configPath, Admission: bootstrapAdmission, Redactor: bootstrapAdmission, RuntimeGenerationID: bootstrapGeneration, retire: bootstrapRetire}
 	if configErr == nil {
@@ -134,6 +138,21 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 			runtimeSet = RuntimeSet{Models: cfg.Models(), DefaultSelection: cfg.DefaultSelection(), ConfigurationError: buildErr, configPath: configPath, Admission: bootstrapAdmission, Redactor: bootstrapAdmission, RuntimeGenerationID: bootstrapGeneration, retire: bootstrapRetire}
 		} else {
 			runtimeSet = candidate
+			bootstrapApplication := &App{runtimeSet: RuntimeSet{}, sessions: store, workspaceControl: workspaceControl}
+			if err := bootstrapApplication.activateRuntimeGeneration(ctx, candidate); err != nil {
+				candidate.retireSecrets()
+				return nil, Snapshot{}, fmt.Errorf("activate initial runtime generation: %w", err)
+			}
+			if err := recoverBootstrapSession(ctx, store, candidate, workspaceControl, protocol.SessionID(session.ID)); err != nil {
+				candidate.retireSecrets()
+				return nil, Snapshot{}, fmt.Errorf("recover selected session: %w", err)
+			}
+			if options.CLI.ModeSet && session.Mode != options.CLI.Mode {
+				if err := appendBootstrapMode(ctx, candidate, store, &session, &replay, options.CLI.Mode); err != nil {
+					return nil, Snapshot{}, fmt.Errorf("persist CLI mode override: %w", err)
+				}
+				policy.SetMode(options.CLI.Mode)
+			}
 			if options.CLI.ProfileSet || options.CLI.ModelSet {
 				resolved, resolveErr := cfg.Resolve(config.ResolveOptions{
 					Profile:        options.CLI.Profile,
@@ -147,13 +166,13 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 				}
 				override := domain.ModelSelection{Profile: resolved.Name, Model: resolved.Model}
 				if session.Selection != override {
-					if err := appendBootstrapSelection(ctx, store, &session, &replay, override); err != nil {
+					if err := appendBootstrapSelection(ctx, candidate, store, &session, &replay, override); err != nil {
 						return nil, Snapshot{}, fmt.Errorf("persist CLI model override: %w", err)
 					}
 				}
 			}
 			if !slices.Contains(candidate.Models, session.Selection) {
-				if err := appendBootstrapSelection(ctx, store, &session, &replay, candidate.DefaultSelection); err != nil {
+				if err := appendBootstrapSelection(ctx, candidate, store, &session, &replay, candidate.DefaultSelection); err != nil {
 					return nil, Snapshot{}, fmt.Errorf("persist default model: %w", err)
 				}
 			}
@@ -162,7 +181,14 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 			configErr = candidate.Ready(session.Selection)
 		}
 	}
-	replay.Session = session
+	replay, err = inspectBootstrapSession(ctx, store, session.ID)
+	if err != nil {
+		return nil, Snapshot{}, fmt.Errorf("inspect selected session after bootstrap controls: %w", err)
+	}
+	state = ProjectSessionState(replay)
+	replay.Session.Mode = state.Mode
+	replay.Session.Selection = state.Selection
+	session = replay.Session
 	sessions, err := store.List(ctx, workspace)
 	if err != nil {
 		return nil, Snapshot{}, fmt.Errorf("list sessions: %w", err)
@@ -178,21 +204,22 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 		}
 	}
 	application := New(Options{
-		RuntimeSet:     runtimeSet,
-		ReloadRuntime:  reload,
-		Redactors:      redactors,
-		RuntimeEvents:  runtimeEvents,
-		Sessions:       store,
-		Session:        session,
-		Replay:         replay,
-		Workspace:      workspace,
-		Policy:         policy,
-		RestorePolicy:  policy.restore,
-		CommandBuffer:  16,
-		EventBuffer:    64,
-		Logger:         logger,
-		Close:          closeDebugLog,
-		SessionChanged: activeSession.set,
+		RuntimeSet:       runtimeSet,
+		ReloadRuntime:    reload,
+		Redactors:        redactors,
+		RuntimeEvents:    runtimeEvents,
+		Sessions:         store,
+		Session:          session,
+		Replay:           replay,
+		Workspace:        workspace,
+		Policy:           policy,
+		RestorePolicy:    policy.restore,
+		CommandBuffer:    16,
+		EventBuffer:      64,
+		Logger:           logger,
+		Close:            closeDebugLog,
+		SessionChanged:   activeSession.set,
+		WorkspaceControl: workspaceControl,
 	})
 	debugLogOwned = false
 	bootstrapHandedOff = true
@@ -216,6 +243,98 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 	}, nil
 }
 
+func recoverBootstrapSession(ctx context.Context, store *jsonl.Store, runtime RuntimeSet, workspaceControl protocol.JournalRef, sessionID protocol.SessionID) error {
+	if store == nil || runtime.Orchestrator == nil || sessionID == "" {
+		return nil
+	}
+	inspection, err := store.InspectSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	var observedTail protocol.Digest
+	for _, diagnostic := range inspection.Journal.Diagnostics {
+		if diagnostic.Code != "recovery.available" {
+			continue
+		}
+		var details struct {
+			ObservedTailDigest protocol.Digest `json:"observed_tail_digest"`
+		}
+		if err := json.Unmarshal(diagnostic.Details, &details); err != nil {
+			return fmt.Errorf("decode recovery observation: %w", err)
+		}
+		observedTail = details.ObservedTailDigest
+		break
+	}
+	if observedTail.IsZero() {
+		return nil
+	}
+	controlHead, err := store.Head(ctx, workspaceControl)
+	if err != nil {
+		return err
+	}
+	identityDigest, err := canonicaljson.Digest(struct {
+		SessionID    protocol.SessionID       `json:"session_id"`
+		ExpectedHead protocol.CommittedCursor `json:"expected_head"`
+		ObservedTail protocol.Digest          `json:"observed_tail"`
+	}{sessionID, inspection.Journal.Head, observedTail})
+	if err != nil {
+		return err
+	}
+	identity := "recovery-" + identityDigest.Value[:32]
+	operationID := protocol.ControlOperationID(identity)
+	storage := journal.RecoveryRequest{
+		OperationID: operationID, Journal: inspection.Journal.Journal, ExpectedHead: inspection.Journal.Head,
+		ObservedTailDigest: observedTail, TransactionID: protocol.TransactionID(identity + "-storage"), RuntimeGenerationID: runtime.RuntimeGenerationID,
+	}
+	descriptorDigest, err := canonicaljson.Digest(struct {
+		Name string `json:"name"`
+	}{"runtime.recovery"})
+	if err != nil {
+		return err
+	}
+	body := protocol.ActionPlanBody{
+		CallID: identity, Tool: protocol.ToolIdentity{Source: "runtime", Authority: "yordam", Name: "recovery"}, SourceRevision: "runtime-v1",
+		DescriptorDigest: descriptorDigest, Action: "runtime.recovery", Purpose: "recover eligible session journal tail",
+		Resources:      []protocol.ResourceTarget{{Kind: "session_journal", CanonicalID: string(sessionID)}},
+		ExecutionLocus: "runtime", Effect: "mutation", Boundary: "process", Reversibility: "exact", VerificationCoverage: "exact",
+		RequestedProfile: "restricted", EffectiveProfile: "restricted", RuntimeGenerationID: runtime.RuntimeGenerationID,
+	}
+	planDigest, err := canonicaljson.Digest(body)
+	if err != nil {
+		return err
+	}
+	diagnostic := protocol.Diagnostic{Code: "recovery.requested", Message: "recover eligible session journal tail", Journal: workspaceControl}
+	payload, err := canonicaljson.Marshal(protocol.DiagnosticV1{Diagnostic: diagnostic})
+	if err != nil {
+		return err
+	}
+	requestDigest, err := canonicaljson.Digest(struct {
+		OperationID protocol.ControlOperationID `json:"operation_id"`
+		Storage     journal.RecoveryRequest     `json:"storage"`
+		Plan        protocol.Digest             `json:"plan"`
+	}{operationID, storage, planDigest})
+	if err != nil {
+		return err
+	}
+	actor := protocol.ActorRef{ID: "bootstrap-user", Kind: protocol.ActorUser}
+	result, err := runtime.Orchestrator.RecoverTurn(ctx, orchestrator.RecoveryControlRequest{
+		Control: orchestrator.ControlRequest{
+			Command:     orchestrator.CommandMetadata{CommandID: protocol.CommandID(identity), IdempotencyKey: identity, RequestDigest: requestDigest, Actor: actor},
+			OperationID: operationID, Kind: orchestrator.OperationRecovery, Journal: workspaceControl, ExpectedHead: controlHead,
+			TransactionID: protocol.TransactionID(identity + "-control"), Runtime: protocol.DeepCopy(runtime.Manifest), Plan: protocol.ActionPlan{Body: body, Digest: planDigest},
+			Event: protocol.ProposedEvent{EventID: protocol.EventID(identity), Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventRecoveryDiagnostic, Actor: &actor, RuntimeGenerationID: runtime.RuntimeGenerationID, Payload: payload},
+		},
+		Storage: storage,
+	})
+	if err != nil {
+		return err
+	}
+	if result.Recovery.Status != "recovered" {
+		return fmt.Errorf("recovery status %q", result.Recovery.Status)
+	}
+	return nil
+}
+
 func loadBootstrapConfig(options BootstrapOptions) (config.Config, string, error) {
 	cfg, err := config.Load(config.LoadOptions{ConfigPath: options.ConfigPath})
 	if err != nil {
@@ -224,15 +343,27 @@ func loadBootstrapConfig(options BootstrapOptions) (config.Config, string, error
 	return cfg, options.ConfigPath, nil
 }
 
-func appendBootstrapSelection(ctx context.Context, store ports.SessionStore, session *domain.Session, replay *domain.SessionReplay, selection domain.ModelSelection) error {
-	event, err := store.Append(ctx, session.ID, domain.EventModelChanged, domain.ModelChangedPayload{Selection: selection})
-	if err != nil {
+func appendBootstrapSelection(ctx context.Context, runtime RuntimeSet, store sessionStore, session *domain.Session, replay *domain.SessionReplay, selection domain.ModelSelection) error {
+	application := &App{runtimeSet: runtime, sessions: store, session: *session, sessionChanges: runtime.SessionChanges}
+	if err := application.commitSessionChange(ctx, protocol.EventModelChanged, protocol.ModelChangedV1{ProviderID: protocol.ProviderID(selection.Profile), ModelID: protocol.ModelID(selection.Model)}); err != nil {
 		return err
 	}
-	replay.Events = append(replay.Events, event)
 	session.Selection = selection
-	session.LastSeq = event.Seq
-	session.UpdatedAt = event.Time
+	session.LastSeq = application.session.LastSeq
+	session.UpdatedAt = application.session.UpdatedAt
+	replay.Session = *session
+	return nil
+}
+
+func appendBootstrapMode(ctx context.Context, runtime RuntimeSet, store sessionStore, session *domain.Session, replay *domain.SessionReplay, mode domain.PermissionMode) error {
+	application := &App{runtimeSet: runtime, sessions: store, session: *session, sessionChanges: runtime.SessionChanges}
+	if err := application.commitSessionChange(ctx, protocol.EventModeChanged, protocol.ModeChangedV1{Mode: string(mode)}); err != nil {
+		return err
+	}
+	session.Mode = mode
+	session.LastSeq = application.session.LastSeq
+	session.UpdatedAt = application.session.UpdatedAt
+	replay.Session = *session
 	return nil
 }
 
@@ -274,7 +405,7 @@ func selectSession(
 	var err error
 	switch {
 	case options.Session != "":
-		replay, err = store.Load(ctx, options.Session)
+		replay, err = inspectBootstrapSession(ctx, store, options.Session)
 		if err == nil && replay.Session.Workspace != workspace {
 			return domain.Session{}, domain.SessionReplay{}, fmt.Errorf("session belongs to a different workspace")
 		}
@@ -286,13 +417,13 @@ func selectSession(
 			err = fmt.Errorf("no session exists for the current workspace")
 		}
 		if err == nil {
-			replay, err = store.Load(ctx, sessions[0].ID)
+			replay, err = inspectBootstrapSession(ctx, store, sessions[0].ID)
 			session = replay.Session
 		}
 	default:
 		session, err = store.Create(ctx, workspace, options.Mode, selection)
 		if err == nil {
-			replay, err = store.Load(ctx, session.ID)
+			replay, err = inspectBootstrapSession(ctx, store, session.ID)
 			session = replay.Session
 		}
 	}
@@ -300,6 +431,14 @@ func selectSession(
 		return domain.Session{}, domain.SessionReplay{}, fmt.Errorf("select session: %w", err)
 	}
 	return session, replay, nil
+}
+
+func inspectBootstrapSession(ctx context.Context, store *jsonl.Store, sessionID string) (domain.SessionReplay, error) {
+	inspection, err := store.InspectSession(ctx, protocol.SessionID(sessionID))
+	if err != nil {
+		return domain.SessionReplay{}, err
+	}
+	return LegacyReplayFromInspection(inspection), nil
 }
 
 func openDebugLogger(path string, redactor *secret.Binding) (*logging.Logger, func() error, error) {
@@ -366,6 +505,18 @@ func (p *policyBinding) Evaluate(ctx context.Context, permissionContext ports.Pe
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.current.Evaluate(ctx, permissionContext, request)
+}
+
+func (p *policyBinding) EvaluateAuthorization(ctx context.Context, input ports.EvaluationInput) (protocol.AuthorizationDecision, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.current.EvaluateAuthorization(ctx, input)
+}
+
+func (p *policyBinding) GrantAuthorizationSession(request protocol.AuthorizationRequest, constraints []protocol.AuthorizationConstraint) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.current.GrantAuthorizationSession(request, constraints)
 }
 
 func (p *policyBinding) SetMode(mode domain.PermissionMode) {

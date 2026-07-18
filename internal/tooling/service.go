@@ -15,6 +15,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/recovery"
 )
 
 type ActionHandle struct{ id string }
@@ -62,6 +63,46 @@ type Service struct {
 	gate    authorization.DispatchGate
 }
 
+type RecoverySink interface {
+	Put(context.Context, recovery.Candidate) (protocol.RecoveryMaterialRecord, error)
+}
+
+// PrepareAndPutRecovery deliberately keeps raw preimage bytes behind the
+// tooling boundary. Callers receive only the durable material metadata.
+func (s *Service) PrepareAndPutRecovery(ctx context.Context, preview PreviewResult, activityID protocol.ActivityID, checkpoint protocol.CheckpointBody, plan protocol.ActionPlan, sink RecoverySink) (protocol.RecoveryMaterialRecord, error) {
+	if s == nil || preview.handleID == "" || activityID == "" || checkpoint.ID == "" || checkpoint.SessionID == "" || len(checkpoint.Coverage) == 0 || sink == nil {
+		return protocol.RecoveryMaterialRecord{}, fmt.Errorf("recovery material binding is incomplete")
+	}
+	if err := plan.Digest.Validate(); err != nil {
+		return protocol.RecoveryMaterialRecord{}, fmt.Errorf("recovery plan digest: %w", err)
+	}
+	s.mu.Lock()
+	action, ok := s.actions[preview.handleID]
+	s.mu.Unlock()
+	if !ok || !action.previewReady {
+		return protocol.RecoveryMaterialRecord{}, fmt.Errorf("recovery preview is stale")
+	}
+	provider, ok := action.prepared.(ports.RecoveryMaterialProvider)
+	if !ok {
+		return protocol.RecoveryMaterialRecord{}, fmt.Errorf("tool does not provide recovery material")
+	}
+	action.operationMu.Lock()
+	candidate, available, err := provider.RecoveryMaterial(ctx)
+	action.operationMu.Unlock()
+	if err != nil {
+		return protocol.RecoveryMaterialRecord{}, err
+	}
+	if !available {
+		return protocol.RecoveryMaterialRecord{}, fmt.Errorf("recovery material is unavailable")
+	}
+	candidate.WorkspaceID = string(checkpoint.SessionID)
+	candidate.ActivityID = activityID
+	candidate.CheckpointID = checkpoint.ID
+	candidate.Subject = checkpoint.Coverage[0].Subject
+	candidate.PlanDigest = plan.Digest
+	return sink.Put(ctx, candidate)
+}
+
 func NewService(catalog *Catalog, gates ...authorization.DispatchGate) *Service {
 	if catalog == nil {
 		panic("tooling: catalog is nil")
@@ -97,7 +138,7 @@ func (s *Service) PlanMutation(_ context.Context, preview PreviewResult, request
 		snapshot.previewEvidence = append([]protocol.Digest(nil), observed.previewEvidence...)
 	}
 	s.mu.Unlock()
-	if !ok || !snapshot.previewReady || snapshot.turnID != request.TurnID || snapshot.activityID != request.ActivityID || snapshot.plan.Digest != preview.observationDigest || snapshot.plan.Body.Effect != "observation" {
+	if !ok || !snapshot.previewReady || snapshot.turnID != request.TurnID || snapshot.plan.Digest != preview.observationDigest || snapshot.plan.Body.Effect != "observation" {
 		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("preview result does not match the prepared observation")
 	}
 	if snapshot.entry.classification.Effect == "observation" || preview.effect != snapshot.entry.classification.Effect {
@@ -110,7 +151,13 @@ func (s *Service) PlanMutation(_ context.Context, preview PreviewResult, request
 	if err != nil {
 		return ActionHandle{}, protocol.ActionPlan{}, err
 	}
-	if requestDigest != snapshot.requestDigest || preview.requestDigest != snapshot.requestDigest || snapshot.request.Alias != request.Alias {
+	observedRequest := clonePlanRequest(request)
+	observedRequest.ActivityID = snapshot.request.ActivityID
+	observedRequestDigest, err := canonicalDigest(observedRequest)
+	if err != nil {
+		return ActionHandle{}, protocol.ActionPlan{}, err
+	}
+	if observedRequestDigest != snapshot.requestDigest || preview.requestDigest != snapshot.requestDigest || snapshot.request.Alias != request.Alias {
 		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("mutation request does not match the observed preview input")
 	}
 	if preview.preparedDigest != snapshot.previewPrepared || !reflect.DeepEqual(preview.evidenceDigests, snapshot.previewEvidence) {
@@ -361,6 +408,8 @@ func (s *Service) Execute(ctx context.Context, handle ActionHandle, token author
 	defer cancel()
 	select {
 	case <-ctx.Done():
+		cancel()
+		<-resultChannel
 		return protocol.ExecutionResult{}, ctx.Err()
 	case completed := <-resultChannel:
 		if completed.err != nil {

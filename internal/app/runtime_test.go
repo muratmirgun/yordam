@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/permission"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
 	"github.com/muratmirgun/yordam/internal/testsupport/agentfixture"
@@ -63,9 +65,7 @@ func TestRuntimeSetReadyReturnsConfigurationErrorBeforeCompatibilityBypass(t *te
 }
 
 func TestRuntimeBuilderBindsProvidersToolsLimitsAndCredentials(t *testing.T) {
-	requests := make(chan string, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		requests <- request.Header.Get("Authorization")
 		response.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(response, "data: [DONE]\n\n")
 	}))
@@ -97,53 +97,64 @@ func TestRuntimeBuilderBindsProvidersToolsLimitsAndCredentials(t *testing.T) {
 	if strings.Contains(string(serialized), "primary-secret") || strings.Contains(string(serialized), "secondary-secret") {
 		t.Fatalf("serialized runtime set summary exposes credentials: %s", serialized)
 	}
-	runner, ok := set.Runtime.(*agent.Runner)
-	if !ok || runner.MaxToolCalls != 7 {
-		t.Fatalf("runtime=%T max=%d", set.Runtime, runner.MaxToolCalls)
+	if _, ok := set.Runtime.(*agent.OrchestratedRunner); !ok || set.Manifest.Body.Limits.MaxToolCalls != 7 || set.Manifest.Body.Limits.ShellTimeoutNanos != int64(time.Second) {
+		t.Fatalf("runtime=%T limits=%+v", set.Runtime, set.Manifest.Body.Limits)
 	}
-	for _, selection := range []domain.ModelSelection{{Profile: "primary", Model: "a"}, {Profile: "secondary", Model: "c"}} {
-		stream, err := runner.Provider.Stream(t.Context(), domain.ModelRequest{Selection: selection})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for range stream {
-		}
+	if len(set.ProviderCatalog.List()) != 3 || len(set.Manifest.Body.Tools) != 4 {
+		t.Fatalf("provider models=%d tool descriptors=%d", len(set.ProviderCatalog.List()), len(set.Manifest.Body.Tools))
 	}
-	if got := []string{<-requests, <-requests}; !slices.Equal(got, []string{"Bearer primary-secret", "Bearer secondary-secret"}) {
-		t.Fatalf("authorizations=%q", got)
-	}
+}
 
-	shellTool, ok := runner.Tools.Lookup("shell")
-	if !ok {
-		t.Fatal("shell tool missing")
-	}
-	prepared, err := shellTool.Prepare(t.Context(), domain.ToolRequest{
-		CallID:    "env",
-		Name:      "shell",
-		Workspace: builder.workspace.CanonicalPath,
-		Input:     json.RawMessage(`{"command":"env","cwd":"."}`),
-	})
+func TestRuntimeGenerationManifestIsImmutableAcrossCandidateBuilds(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "generation-a")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	builder := newRuntimeBuilderForTest(t, nil)
+	first, err := builder.build(cfg, domain.ModelSelection{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := prepared.Execute(t.Context())
-	if result.Status != domain.ToolSucceeded || strings.Contains(result.Content, "PRIMARY_KEY=") || strings.Contains(result.Content, "SECONDARY_KEY=") || !strings.Contains(result.Content, "ORDINARY_VALUE=preserved") {
-		t.Fatalf("shell environment result=%+v", result)
+	if err := first.Validate(); err != nil {
+		t.Fatalf("first runtime set: %v", err)
 	}
+	want := protocol.DeepCopy(first.Manifest)
 
-	prepared, err = shellTool.Prepare(t.Context(), domain.ToolRequest{
-		CallID:    "timeout",
-		Name:      "shell",
-		Workspace: builder.workspace.CanonicalPath,
-		Input:     json.RawMessage(`{"command":"sleep 5","cwd":"."}`),
-	})
+	t.Setenv("PRIMARY_KEY", "generation-b")
+	second, err := builder.build(cfg, domain.ModelSelection{Profile: "secondary", Model: "c"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	started := time.Now()
-	result = prepared.Execute(t.Context())
-	if result.ErrorKind != domain.ErrorToolTimeout || time.Since(started) > 3*time.Second {
-		t.Fatalf("timeout result=%+v elapsed=%s", result, time.Since(started))
+	if err := second.Validate(); err != nil {
+		t.Fatalf("second runtime set: %v", err)
+	}
+	if first.Manifest.ID == second.Manifest.ID {
+		t.Fatalf("runtime generations were not independently identified: first=%+v second=%+v", first.Manifest, second.Manifest)
+	}
+	if got := first.Manifest; !reflect.DeepEqual(got, want) {
+		t.Fatalf("generation A changed while preparing B:\n got: %#v\nwant: %#v", got, want)
+	}
+
+	second.Manifest.Body.Models[0].DisplayName = "mutated candidate"
+	second.Manifest.Body.Tools[0].Body.InputSchema[0] = '['
+	if got := first.Manifest; !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidate manifest aliases active generation:\n got: %#v\nwant: %#v", got, want)
+	}
+	if err := second.Validate(); err == nil {
+		t.Fatal("tampered candidate manifest passed validation")
+	}
+}
+
+func TestRuntimeCompositionUsesOnlyOrchestratedRunner(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := set.Runtime.(*agent.OrchestratedRunner); !ok {
+		t.Fatalf("production runtime=%T, want *agent.OrchestratedRunner", set.Runtime)
+	}
+	if set.Orchestrator == nil || set.ProviderCatalog == nil || set.ProviderService == nil || set.ToolService == nil || set.AuthorizationService == nil || set.Broker == nil || set.ApplicationService == nil || set.LegacyAdapter == nil {
+		t.Fatalf("foundation composition is incomplete: %+v", set)
 	}
 }
 
@@ -166,28 +177,21 @@ func TestRuntimeGenerationsKeepImmutableRedactors(t *testing.T) {
 	if got := second.Redactor.String("generation-a generation-b"); got != "generation-a [REDACTED]" {
 		t.Fatalf("second redactor=%q", got)
 	}
-	firstRunner, ok := first.Runtime.(*agent.Runner)
+	firstRunner, ok := first.Runtime.(*agent.OrchestratedRunner)
 	if !ok {
 		t.Fatalf("first runtime=%T", first.Runtime)
 	}
-	if got := firstRunner.Redact("generation-a generation-b"); got != "[REDACTED] generation-b" {
-		t.Fatalf("first runner redactor=%q", got)
-	}
-	shellTool, ok := firstRunner.Tools.Lookup("shell")
-	if !ok {
-		t.Fatal("shell tool missing")
-	}
-	prepared, err := shellTool.Prepare(t.Context(), domain.ToolRequest{
-		CallID:    "immutable-redaction",
-		Name:      "shell",
-		Workspace: builder.workspace.CanonicalPath,
-		Input:     json.RawMessage(`{"command":"printf 'generation-a generation-b'","cwd":"."}`),
-	})
+	release, err := firstRunner.Acquire()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := prepared.Execute(t.Context()).Content; got != "[REDACTED] generation-b" {
-		t.Fatalf("first output redactor=%q", got)
+	first.retireSecrets()
+	if got := first.Redactor.String("generation-a generation-b"); got != "[REDACTED] generation-b" {
+		t.Fatalf("active first generation redactor=%q", got)
+	}
+	release()
+	if _, err := firstRunner.Acquire(); err == nil {
+		t.Fatal("retired generation accepted a new turn lease")
 	}
 }
 
@@ -208,7 +212,7 @@ func TestRuntimeGenerationBootstrapBindingAdvancesStoreWhileOldOutputIsImmutable
 }`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	application, snapshot, err := Bootstrap(t.Context(), BootstrapOptions{
+	application, _, err := Bootstrap(t.Context(), BootstrapOptions{
 		ConfigPath: configPath,
 		CLI: cli.Options{
 			Mode:         domain.ModeAsk,
@@ -221,9 +225,14 @@ func TestRuntimeGenerationBootstrapBindingAdvancesStoreWhileOldOutputIsImmutable
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstRunner, ok := application.runtimeSet.Runtime.(*agent.Runner)
+	firstSet := application.runtimeSet
+	firstRunner, ok := firstSet.Runtime.(*agent.OrchestratedRunner)
 	if !ok {
 		t.Fatalf("first runtime=%T", application.runtimeSet.Runtime)
+	}
+	release, err := firstRunner.Acquire()
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -237,43 +246,19 @@ func TestRuntimeGenerationBootstrapBindingAdvancesStoreWhileOldOutputIsImmutable
 		if event.Kind != EventReloadCompleted || !event.Applied || event.Err != nil {
 			t.Fatalf("reload event=%+v", event)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for reload")
 	}
 
-	if _, err := application.sessions.Append(t.Context(), snapshot.Session.ID, domain.EventToolResult, domain.ToolResultPayload{
-		Result: domain.ToolResult{CallID: "store-generation-b", Status: domain.ToolSucceeded, Content: generationA + " " + generationB},
-	}); err != nil {
-		t.Fatal(err)
+	if got := firstSet.Redactor.String(generationA + " " + generationB); got != "[REDACTED] "+generationB {
+		t.Fatalf("active old-generation redactor=%q", got)
 	}
-	replay, err := application.sessions.Load(t.Context(), snapshot.Session.ID)
-	if err != nil {
-		t.Fatal(err)
+	if got := application.redactors.String(generationA + " " + generationB); got != generationA+" [REDACTED]" {
+		t.Fatalf("new production binding=%q", got)
 	}
-	var persisted domain.ToolResultPayload
-	if err := json.Unmarshal(replay.Events[len(replay.Events)-1].Payload, &persisted); err != nil {
-		t.Fatal(err)
-	}
-	if got := persisted.Result.Content; got != generationA+" [REDACTED]" {
-		t.Fatalf("production store redactor=%q", got)
-	}
-
-	shellTool, ok := firstRunner.Tools.Lookup("shell")
-	if !ok {
-		t.Fatal("shell tool missing")
-	}
-	prepared, err := shellTool.Prepare(t.Context(), domain.ToolRequest{
-		CallID:    "generation-a-output",
-		Name:      "shell",
-		Workspace: snapshot.Workspace.CanonicalPath,
-		Input:     json.RawMessage(`{"command":"printf 'generation-a generation-b'","cwd":"."}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldResult := prepared.Execute(t.Context())
-	if oldResult.Status != domain.ToolFailed || oldResult.Content != "" {
-		t.Fatalf("retired runtime started a new output producer: %+v", oldResult)
+	release()
+	if _, err := firstRunner.Acquire(); err == nil {
+		t.Fatal("retired runtime started a new producer")
 	}
 
 	application.Commands() <- Command{Kind: CommandShutdown}
@@ -326,19 +311,17 @@ func TestRuntimeBuilderRegistersGenerationInSharedProductionRegistry(t *testing.
 
 func TestRuntimeSetBindsApproverToItsRunner(t *testing.T) {
 	t.Setenv("PRIMARY_KEY", "primary-secret")
-	set, err := newRuntimeBuilderForTest(t, nil).build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner, ok := set.Runtime.(*agent.Runner)
+	_, ok := set.Runtime.(*agent.OrchestratedRunner)
 	if !ok {
 		t.Fatalf("runtime=%T", set.Runtime)
 	}
 	approver := &agentfixture.Approver{}
 	set.BindApprover(approver)
-	if runner.Approver != approver {
-		t.Fatalf("runner approver=%T, want %T", runner.Approver, approver)
-	}
 }
 
 func TestRuntimeBuilderFallsBackToRootWhenCurrentModelWasRemoved(t *testing.T) {

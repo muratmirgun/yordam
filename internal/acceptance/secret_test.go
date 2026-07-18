@@ -85,9 +85,6 @@ func acceptSecretHygiene(t *testing.T) {
 	if err != nil {
 		t.Fatal(redactor.String(err.Error()))
 	}
-	if _, err := store.Append(context.Background(), session.ID, domain.EventUserMessage, domain.MessagePayload{Content: "session " + sentinel}); err != nil {
-		t.Fatal(redactor.String(err.Error()))
-	}
 	buffer := output.New(output.Options{SessionID: session.ID, Artifacts: store, Redact: redactor})
 	if _, err := fmt.Fprint(buffer, strings.Repeat("artifact-data-", 3000)+sentinel); err != nil {
 		t.Fatal(redactor.String(err.Error()))

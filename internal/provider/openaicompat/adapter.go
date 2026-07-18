@@ -134,14 +134,16 @@ func normalizeMessage(message protocol.ModelMessage) (wireMessage, error) {
 			}
 			toolResults++
 			result := block.ToolResult
-			if (result.Text == "") == (result.JSON == nil) {
-				return wireMessage{}, fmt.Errorf("tool result requires exactly one text or JSON value")
+			if result.Text != "" && result.JSON != nil {
+				return wireMessage{}, fmt.Errorf("tool result cannot contain both text and JSON values")
 			}
 			wire.ToolCallID = result.CallID
 			if result.Text != "" {
 				wire.Content = result.Text
-			} else {
+			} else if result.JSON != nil {
 				wire.Content = string(result.JSON)
+			} else {
+				wire.Content = result.Status
 			}
 		default:
 			return wireMessage{}, capabilityError(block.Kind)

@@ -204,6 +204,9 @@ func (p *SessionPolicy) EvaluateAuthorization(_ context.Context, evaluation port
 
 func modeAuthorizationAction(mode domain.PermissionMode, evaluation ports.EvaluationInput, autoShell bool) (domain.PermissionAction, string) {
 	facts := deriveAuthorizationFacts(evaluation)
+	if facts.trustedMutationPreview {
+		return domain.PermissionAllow, "trusted mutation preview inside workspace"
+	}
 	switch mode {
 	case domain.ModeSafe:
 		if facts.process || facts.outside {
@@ -247,6 +250,7 @@ type authorizationFacts struct {
 	process                    bool
 	outside                    bool
 	observation                bool
+	trustedMutationPreview     bool
 	trustedLocalProcess        bool
 	trustedBuiltinFileMutation bool
 }
@@ -268,9 +272,12 @@ func deriveAuthorizationFacts(evaluation ports.EvaluationInput) authorizationFac
 		outside = true
 	}
 	observation := trustedDescriptor && descriptor.Body.Effect == "observation" && descriptor.Body.Mutation == "read_only" && request.Effect == "observation" && request.Boundary == "workspace" && filesystemInside
+	trustedPreviewDescriptor := descriptorMatchesPreviewRequest(descriptor, request) && descriptor.Body.ClassificationSource == "trusted_adapter" && trustedSource
+	trustedMutationPreview := trustedPreviewDescriptor && ((descriptor.Body.Mutation == "process" && request.ExecutionLocus == "process" && request.RequestedProfile == "unsandboxed" && request.EffectiveProfile == "unsandboxed" && shellShape && shellInside) ||
+		(descriptor.Body.Mutation == "file" && (request.ExecutionLocus == "builtin" || request.ExecutionLocus == "local") && request.Boundary == "workspace" && filesystemOnly && filesystemInside))
 	trustedLocalProcess := trustedDescriptor && trustedSource && descriptor.Body.Effect == "mutation" && descriptor.Body.Mutation == "process" && request.Effect == "mutation" && request.ExecutionLocus == "process" && request.RequestedProfile == "unsandboxed" && request.EffectiveProfile == "unsandboxed" && shellShape && shellInside
 	trustedBuiltinFileMutation := trustedDescriptor && trustedSource && descriptor.Body.Effect == "mutation" && descriptor.Body.Mutation == "file" && request.Effect == "mutation" && (request.ExecutionLocus == "builtin" || request.ExecutionLocus == "local") && request.Boundary == "workspace" && filesystemOnly && filesystemInside
-	return authorizationFacts{process: process, outside: outside, observation: observation, trustedLocalProcess: trustedLocalProcess, trustedBuiltinFileMutation: trustedBuiltinFileMutation}
+	return authorizationFacts{process: process, outside: outside, observation: observation, trustedMutationPreview: trustedMutationPreview, trustedLocalProcess: trustedLocalProcess, trustedBuiltinFileMutation: trustedBuiltinFileMutation}
 }
 
 func descriptorMatchesRequest(descriptor protocol.ToolDescriptor, request protocol.AuthorizationRequest) bool {
@@ -281,6 +288,24 @@ func descriptorMatchesRequest(descriptor protocol.ToolDescriptor, request protoc
 		return false
 	}
 	if descriptor.Body.Identity != request.Source || descriptor.Body.SourceRevision != request.SourceRevision || descriptor.DescriptorDigest != request.DescriptorDigest || descriptor.Body.Effect != request.Effect {
+		return false
+	}
+	for _, locus := range descriptor.Body.ExecutionLoci {
+		if locus == request.ExecutionLocus {
+			return true
+		}
+	}
+	return false
+}
+
+func descriptorMatchesPreviewRequest(descriptor protocol.ToolDescriptor, request protocol.AuthorizationRequest) bool {
+	if descriptor.Body.Identity == (protocol.ToolIdentity{}) || descriptor.Body.Validate() != nil || descriptor.DescriptorDigest.Validate() != nil {
+		return false
+	}
+	if canonicaljson.ValidateDigest(descriptor.Body, descriptor.DescriptorDigest) != nil {
+		return false
+	}
+	if descriptor.Body.Identity != request.Source || descriptor.Body.SourceRevision != request.SourceRevision || descriptor.DescriptorDigest != request.DescriptorDigest || descriptor.Body.Effect != "mutation" || request.Effect != "observation" || request.Reversibility != "not_applicable" || request.Action != descriptor.Body.Identity.Name+".preview" {
 		return false
 	}
 	for _, locus := range descriptor.Body.ExecutionLoci {
@@ -382,6 +407,9 @@ func authorizationGrantKey(request protocol.AuthorizationRequest, constraints []
 
 func canonicalConstraints(constraints []protocol.AuthorizationConstraint) ([]protocol.AuthorizationConstraint, error) {
 	result := protocol.DeepCopy(constraints)
+	if result == nil {
+		result = []protocol.AuthorizationConstraint{}
+	}
 	previous := ""
 	for index := range result {
 		constraint := &result[index]

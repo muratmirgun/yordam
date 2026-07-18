@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -150,7 +151,7 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 			return RunResult{}, err
 		}
 		if len(assistant.ToolIntents) == 0 {
-			return s.completeTurn(ctx, request, &state, terminal)
+			return s.completeTurn(ctx, request, &state, assistant, terminal)
 		}
 		if completedTools+len(assistant.ToolIntents) > request.Runtime.Body.Limits.MaxToolCalls {
 			return RunResult{}, fmt.Errorf("tool call limit %d reached", request.Runtime.Body.Limits.MaxToolCalls)
@@ -168,7 +169,10 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 			results = append(results, protocol.ContentBlock{Kind: protocol.ContentToolResult, ToolResult: &resultCopy})
 			completedTools++
 		}
-		extraMessages = []protocol.ModelMessage{{Role: "user", Blocks: results}}
+		extraMessages = make([]protocol.ModelMessage, 0, len(results))
+		for _, result := range results {
+			extraMessages = append(extraMessages, protocol.ModelMessage{Role: "tool", Blocks: []protocol.ContentBlock{result}})
+		}
 	}
 }
 
@@ -180,7 +184,10 @@ func commandResultCursor(result protocol.CommandResult) protocol.CommittedCursor
 }
 
 func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequest, state *turnState, attempt int, extra []protocol.ModelMessage) (protocol.AssistantMessageV1, protocol.ProviderAttemptTerminalV1, error) {
-	model := request.Runtime.Body.Models[0]
+	model, ok := selectedRuntimeModel(request)
+	if !ok {
+		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("selected model %q/%q is not in runtime generation %q", request.ProviderID, request.ModelID, request.Runtime.ID)
+	}
 	requirements := []protocol.CapabilityRequirement{}
 	history, err := s.readFullHistory(ctx, state.ref)
 	if err != nil {
@@ -318,7 +325,7 @@ func (s *Service) readFullHistory(ctx context.Context, ref protocol.JournalRef) 
 	var projectionHead protocol.CommittedCursor
 	events := make([]protocol.EventRecord, 0)
 	for {
-		page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: ref, After: after, Limit: protocol.MaxCollectionMembers})
+		page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: ref, After: after, Limit: 1000})
 		if err != nil {
 			return nil, err
 		}
@@ -1004,7 +1011,7 @@ func (s *Service) authorizeActivity(ctx context.Context, request StartTurnReques
 	})
 }
 
-func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, state *turnState, _ protocol.ProviderAttemptTerminalV1) (RunResult, error) {
+func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, state *turnState, assistant protocol.AssistantMessageV1, _ protocol.ProviderAttemptTerminalV1) (RunResult, error) {
 	verificationActivityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "verification"))
 	assessment, err := s.deps.Verification.Assess(ctx, verification.Request{
 		TaskID: state.taskID, OutcomeContractID: state.contractID, ContractVersion: 2,
@@ -1083,7 +1090,7 @@ func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, st
 	if err := s.cross(ctx, BarrierCommandCompleted, state.barrierState()); err != nil {
 		return RunResult{}, err
 	}
-	return RunResult{TaskID: state.taskID, TurnID: state.turnID, Cursor: state.head, Status: "completed", CommandResult: commandResult}, nil
+	return RunResult{TaskID: state.taskID, TurnID: state.turnID, Cursor: state.head, Status: "completed", CommandResult: commandResult, Assistant: protocol.DeepCopy(assistant)}, nil
 }
 
 func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnRequest, state *turnState, cause error) (RunResult, error) {
@@ -1233,7 +1240,7 @@ func providerAuthorizationRequest(request StartTurnRequest, state *turnState, ac
 		Source:         protocol.ToolIdentity{Source: "provider", Authority: string(modelRequest.ProviderID), Name: string(modelRequest.ModelID)},
 		SourceRevision: modelRequest.Plan.Body.Descriptor.SourceRevision, DescriptorDigest: descriptorDigest, Action: "provider.stream",
 		Resources: []protocol.ResourceTarget{resource}, ExecutionLocus: "remote", RequestedProfile: "network", EffectiveProfile: "network",
-		Effect: "external", Boundary: "network", Reversibility: "not_reversible", VerificationCoverage: "provider_terminal",
+		Effect: "egress", Boundary: "network", Reversibility: "not_reversible", VerificationCoverage: "provider_terminal",
 		RuntimeGenerationID: request.Runtime.ID, PolicyGeneration: request.Runtime.Body.PolicyGeneration,
 		PolicyProvenance: []protocol.PolicyProvenance{{Source: "runtime", Revision: request.Runtime.Body.ProviderCatalogRevision, Generation: request.Runtime.Body.PolicyGeneration}},
 		PlanDigest:       modelRequest.Plan.Digest, RequestDigest: requestDigest, DispatchDigest: dispatchDigest,
@@ -1416,7 +1423,9 @@ func (s *Service) collectProviderStream(ctx context.Context, generation protocol
 				if err != nil {
 					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 				}
-				message.Blocks = append(message.Blocks, block)
+				if len(message.Blocks) == 0 || !reflect.DeepEqual(message.Blocks[len(message.Blocks)-1], block) {
+					message.Blocks = append(message.Blocks, block)
+				}
 			case protocol.ModelEventToolIntent:
 				intent := protocol.DeepCopy(*event.ToolIntent)
 				intent.CallID, err = s.deps.Admission.SanitizeText(ctx, generation, intent.CallID)
@@ -1663,7 +1672,7 @@ func (s *Service) append(ctx context.Context, state *turnState, label string, ev
 		return err
 	}
 	transactionID := protocol.TransactionID(stableID("transaction", string(state.command.CommandID), label))
-	result, err := s.repository.AppendBatch(ctx, journal.AppendRequest{
+	result, err := s.appendBatch(ctx, journal.AppendRequest{
 		Journal: state.ref, ExpectedHead: state.head, TransactionID: transactionID, Events: events,
 	})
 	if err != nil {
@@ -1717,7 +1726,7 @@ func (s *Service) LookupCommand(ctx context.Context, ref protocol.JournalRef, co
 	after := protocol.CommittedCursor{}
 	var projectionHead protocol.CommittedCursor
 	for {
-		page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: ref, After: after, Limit: protocol.MaxCollectionMembers})
+		page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: ref, After: after, Limit: 1000})
 		if err != nil {
 			return protocol.CommandResult{}, false, err
 		}
@@ -1828,7 +1837,7 @@ func (s *Service) CommitPureCommand(ctx context.Context, command CommandMetadata
 			Payload: mustCanonical(protocol.CommandCompletedV1{CommandID: command.CommandID, RequestDigest: command.RequestDigest, Status: status, Result: rawResult, Error: protocol.DeepCopy(completion.Error)}),
 		},
 	}
-	appendResult, err := s.repository.AppendBatch(ctx, journal.AppendRequest{
+	appendResult, err := s.appendBatch(ctx, journal.AppendRequest{
 		Journal: completion.Journal, ExpectedHead: completion.ExpectedHead, TransactionID: transactionID, Events: events,
 	})
 	if err != nil {
@@ -1882,9 +1891,13 @@ func (s *Service) CommitSessionChange(ctx context.Context, request SessionChange
 	} else if ok {
 		return durable, nil
 	}
+	commitDelta := uint64(4)
+	if strings.HasPrefix(string(request.ExpectedHead.TransactionID), "legacy:") {
+		commitDelta++
+	}
 	finalCursor := protocol.CommittedCursor{
 		JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
-		CommitSeq: request.ExpectedHead.CommitSeq + 4, TransactionID: request.TransactionID,
+		CommitSeq: request.ExpectedHead.CommitSeq + commitDelta, TransactionID: request.TransactionID,
 	}
 	payload, err := canonicaljson.Marshal(struct {
 		OperationID protocol.ControlOperationID `json:"operation_id"`
@@ -1918,7 +1931,7 @@ func (s *Service) CommitSessionChange(ctx context.Context, request SessionChange
 	if err := validateProposedEvents(events, request.Journal); err != nil {
 		return protocol.CommandResult{}, err
 	}
-	appendResult, err := s.repository.AppendBatch(ctx, journal.AppendRequest{Journal: request.Journal, ExpectedHead: request.ExpectedHead, TransactionID: request.TransactionID, Events: events})
+	appendResult, err := s.appendBatch(ctx, journal.AppendRequest{Journal: request.Journal, ExpectedHead: request.ExpectedHead, TransactionID: request.TransactionID, Events: events})
 	if err != nil {
 		return protocol.CommandResult{}, err
 	}
@@ -2164,6 +2177,15 @@ func (s *Service) controlEvents(state controlState, generation protocol.RuntimeG
 	return events, nil
 }
 
+func (s *Service) appendBatch(ctx context.Context, request journal.AppendRequest) (journal.AppendResult, error) {
+	if request.Compatibility == nil && request.Journal.Kind == protocol.JournalSession && strings.HasPrefix(string(request.ExpectedHead.TransactionID), "legacy:") {
+		request.Compatibility = &journal.CompatibilityDeclaration{
+			ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: request.ExpectedHead,
+		}
+	}
+	return s.repository.AppendBatch(ctx, request)
+}
+
 func (s *Service) appendControl(ctx context.Context, state *controlState, label string, events []protocol.ProposedEvent, explicit protocol.TransactionID) error {
 	if err := validateProposedEvents(events, state.ref); err != nil {
 		return err
@@ -2172,7 +2194,7 @@ func (s *Service) appendControl(ctx context.Context, state *controlState, label 
 	if transactionID == "" {
 		transactionID = protocol.TransactionID(stableID("transaction", string(state.command.CommandID), label))
 	}
-	result, err := s.repository.AppendBatch(ctx, journal.AppendRequest{Journal: state.ref, ExpectedHead: state.head, TransactionID: transactionID, Events: events})
+	result, err := s.appendBatch(ctx, journal.AppendRequest{Journal: state.ref, ExpectedHead: state.head, TransactionID: transactionID, Events: events})
 	if err != nil {
 		return err
 	}
@@ -2460,7 +2482,19 @@ func validateStartTurnRequest(request StartTurnRequest) error {
 	if err := validateRuntimeManifest(request.Runtime); err != nil {
 		return fmt.Errorf("runtime generation: %w", err)
 	}
+	if _, ok := selectedRuntimeModel(request); !ok {
+		return fmt.Errorf("selected model %q/%q is not in runtime generation", request.ProviderID, request.ModelID)
+	}
 	return nil
+}
+
+func selectedRuntimeModel(request StartTurnRequest) (protocol.ModelDescriptor, bool) {
+	for _, model := range request.Runtime.Body.Models {
+		if model.ProviderID == request.ProviderID && model.ModelID == request.ModelID {
+			return protocol.DeepCopy(model), true
+		}
+	}
+	return protocol.ModelDescriptor{}, false
 }
 
 func validateRuntimeManifest(manifest protocol.RuntimeGenerationManifest) error {
@@ -2489,6 +2523,9 @@ func validateCommandMetadata(command CommandMetadata) error {
 }
 
 func validateExpectedHead(cursor protocol.CommittedCursor, journalRef protocol.JournalRef) error {
+	if cursor == (protocol.CommittedCursor{}) && journalRef.Kind == protocol.JournalWorkspaceControl {
+		return nil
+	}
 	if err := cursor.Validate(); err != nil {
 		return err
 	}

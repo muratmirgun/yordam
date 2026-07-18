@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/journal"
@@ -58,6 +59,111 @@ type IncrementalSessionState struct {
 
 type IncrementalSessionStateProjector struct {
 	journal SessionStateJournal
+}
+
+// LegacyReplayFromInspection is a presentation-only compatibility projection.
+// It never participates in authorization, recovery, or journal decisions.
+func LegacyReplayFromInspection(inspection journal.SessionInspection) domain.SessionReplay {
+	replay := domain.SessionReplay{Session: inspection.Session, ReadOnly: !inspection.Journal.Writable}
+	notes := make([]string, 0, len(inspection.Journal.Diagnostics))
+	for _, diagnostic := range inspection.Journal.Diagnostics {
+		switch diagnostic.Code {
+		case "migration.lossy", "migration.legacy_evidence", "migration.orphan_start", "migration.duplicate_start", "migration.duplicate_terminal", "recovery.available":
+			continue
+		}
+		note := diagnostic.Code
+		if diagnostic.Message != "" {
+			note += ": " + diagnostic.Message
+		}
+		notes = append(notes, note)
+	}
+	for _, record := range inspection.Journal.Events {
+		if record.Legacy != nil {
+			var event domain.DurableEvent
+			if json.Unmarshal(record.Legacy.RawEnvelope, &event) == nil {
+				replay.Events = append(replay.Events, event)
+			}
+			continue
+		}
+		if record.Envelope.Kind == protocol.EventRecoveryDiagnostic {
+			var value protocol.DiagnosticV1
+			if json.Unmarshal(record.Envelope.Payload, &value) == nil {
+				note := value.Diagnostic.Code
+				if value.Diagnostic.Message != "" {
+					note += ": " + value.Diagnostic.Message
+				}
+				notes = append(notes, note)
+			}
+			continue
+		}
+		event, ok := legacyPresentationEvent(record)
+		if ok {
+			replay.Events = append(replay.Events, event)
+		}
+	}
+	replay.RecoveryNote = strings.Join(notes, "; ")
+	return replay
+}
+
+func legacyPresentationEvent(record protocol.EventRecord) (domain.DurableEvent, bool) {
+	envelope := record.Envelope
+	legacy := domain.DurableEvent{SchemaVersion: 1, EventID: string(envelope.EventID), SessionID: string(envelope.SessionID), Seq: envelope.Seq, Time: envelope.Time, Kind: domain.EventKind(envelope.Kind)}
+	var payload any
+	switch envelope.Kind {
+	case protocol.EventUserMessage:
+		var value protocol.UserMessageV1
+		if json.Unmarshal(envelope.Payload, &value) != nil {
+			return domain.DurableEvent{}, false
+		}
+		payload = domain.MessagePayload{Content: value.Content}
+	case protocol.EventAssistantMessage:
+		var value protocol.AssistantMessageV1
+		if json.Unmarshal(envelope.Payload, &value) != nil {
+			return domain.DurableEvent{}, false
+		}
+		message := domain.MessagePayload{}
+		for _, block := range value.Blocks {
+			if block.Kind == protocol.ContentText {
+				message.Content += block.Text
+			}
+			if block.ToolUse != nil {
+				message.ToolCalls = append(message.ToolCalls, domain.ToolCall{ID: block.ToolUse.CallID, Name: block.ToolUse.Alias, Arguments: protocol.CloneRawMessage(block.ToolUse.Arguments)})
+			}
+		}
+		payload = message
+	case protocol.EventTurnCompleted, protocol.EventTurnFailed, protocol.EventTurnInterrupted:
+		var value protocol.TurnTerminalV1
+		if json.Unmarshal(envelope.Payload, &value) != nil {
+			return domain.DurableEvent{}, false
+		}
+		payload = domain.TurnTerminalPayload{Reason: value.Reason}
+	case protocol.EventModeChanged:
+		var value protocol.ModeChangedV1
+		if json.Unmarshal(envelope.Payload, &value) != nil {
+			return domain.DurableEvent{}, false
+		}
+		payload = domain.ModeChangedPayload{Mode: domain.PermissionMode(value.Mode)}
+	case protocol.EventModelChanged:
+		var value protocol.ModelChangedV1
+		if json.Unmarshal(envelope.Payload, &value) != nil {
+			return domain.DurableEvent{}, false
+		}
+		payload = domain.ModelChangedPayload{Selection: domain.ModelSelection{Profile: string(value.ProviderID), Model: string(value.ModelID)}}
+	case protocol.EventTrustedExecutionAcknowledged:
+		var value protocol.TrustedExecutionAcknowledgedV1
+		if json.Unmarshal(envelope.Payload, &value) != nil {
+			return domain.DurableEvent{}, false
+		}
+		payload = domain.TrustedExecutionPayload{Enabled: value.Enabled}
+	default:
+		return domain.DurableEvent{}, false
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return domain.DurableEvent{}, false
+	}
+	legacy.Payload = raw
+	return legacy, true
 }
 
 func NewIncrementalSessionStateProjector(reader SessionStateJournal) *IncrementalSessionStateProjector {

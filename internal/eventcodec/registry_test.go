@@ -192,6 +192,38 @@ func TestFoundationRegistryDecodesStrictlyAndPreservesUnknownRaw(t *testing.T) {
 	}
 }
 
+func TestSessionCreatedAllowsExplicitlyUnconfiguredModelSelection(t *testing.T) {
+	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, selection := range map[string]struct {
+		provider protocol.ProviderID
+		model    protocol.ModelID
+		valid    bool
+	}{
+		"configured":   {provider: "p", model: "m", valid: true},
+		"unconfigured": {valid: true},
+		"partial":      {provider: "p", valid: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			record, decodeErr := registry.Decode(envelope(protocol.EventSessionCreated, protocol.SessionCreatedV1{
+				WorkspaceID: "w", CanonicalPath: "/w", Title: "x", Mode: "ask", ProviderID: selection.provider, ModelID: selection.model,
+			}))
+			if decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			validateErr := registry.Validate(record)
+			if selection.valid && validateErr != nil {
+				t.Fatal(validateErr)
+			}
+			if !selection.valid && validateErr == nil {
+				t.Fatal("partial selection was accepted")
+			}
+		})
+	}
+}
+
 func TestFoundationRegistryRejectsDuplicateDescriptorsAndInvalidSemantics(t *testing.T) {
 	t.Parallel()
 	descriptor := eventcodec.Descriptor{Kind: "x", Version: 1, New: func() any { return new(struct{}) }}

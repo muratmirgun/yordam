@@ -71,7 +71,7 @@ func TestLoadInspectsAndExplicitRecoveryPreservesIncompleteFinalLine(t *testing.
 	if err := os.WriteFile(target, []byte("before"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Append(context.Background(), session.ID, domain.EventToolStarted, map[string]string{
+	if _, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventToolStarted, map[string]string{
 		"call_id": "c1",
 		"path":    target,
 		"content": "after",
@@ -218,7 +218,7 @@ func TestLoadLeavesEarlierCorruptionReadOnlyAndUnchanged(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
 			store, workspace, session := createTestSession(t, root)
-			if _, err := store.Append(
+			if _, err := store.WriteLegacyFixture(
 				context.Background(),
 				session.ID,
 				domain.EventToolStarted,
@@ -323,7 +323,7 @@ func TestLoadTreatsNewlineTerminatedInvalidFinalLineAsCorruption(t *testing.T) {
 func TestLoadReportsLaggingMetadataWithoutRepair(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
-	if _, err := store.Append(
+	if _, err := store.WriteLegacyFixture(
 		context.Background(),
 		session.ID,
 		domain.EventUserMessage,
@@ -348,7 +348,7 @@ func TestLoadReportsLaggingMetadataWithoutRepair(t *testing.T) {
 	if err := os.WriteFile(metadataPath, rolledBack, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Append(
+	if _, err := store.WriteLegacyFixture(
 		context.Background(),
 		session.ID,
 		domain.EventUserMessage,
@@ -374,7 +374,7 @@ func TestLoadReportsLaggingMetadataWithoutRepair(t *testing.T) {
 	if metadata.LastSeq != 1 {
 		t.Fatalf("pure Load repaired metadata last_seq=%d want persisted 1", metadata.LastSeq)
 	}
-	_, err = store.Append(
+	_, err = store.WriteLegacyFixture(
 		context.Background(),
 		session.ID,
 		domain.EventUserMessage,
@@ -422,7 +422,7 @@ func TestLoadTreatsMetadataAheadOfCompleteLogAsReadOnlyCorruption(t *testing.T) 
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
 			store, workspace, session := createTestSession(t, root)
-			if _, err := store.Append(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "durable"}); err != nil {
+			if _, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "durable"}); err != nil {
 				t.Fatal(err)
 			}
 			sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
@@ -446,7 +446,7 @@ func TestLoadTreatsMetadataAheadOfCompleteLogAsReadOnlyCorruption(t *testing.T) 
 			}
 			assertSessionTreeUnchanged(t, sessionDir, before)
 
-			if _, err := store.Append(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"}); err == nil {
+			if _, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"}); err == nil {
 				t.Fatal("Append made a metadata-ahead session writable")
 			}
 			assertSessionTreeUnchanged(t, sessionDir, before)
@@ -496,7 +496,7 @@ func TestMissingEventLogFailsClosedWithoutMutation(t *testing.T) {
 				t.Fatalf("Load created missing event log: %v", err)
 			}
 
-			if _, err := store.Append(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"}); err == nil {
+			if _, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"}); err == nil {
 				t.Fatal("Append recreated a missing event log")
 			}
 			assertSessionTreeUnchanged(t, sessionDir, before)
@@ -538,7 +538,7 @@ func TestLoadReportsUnmatchedToolStartWithoutAppending(t *testing.T) {
 	if err := os.WriteFile(target, []byte("original"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Append(
+	if _, err := store.WriteLegacyFixture(
 		context.Background(),
 		session.ID,
 		domain.EventToolStarted,
@@ -571,7 +571,7 @@ func TestLoadReportsUnmatchedToolStartWithoutAppending(t *testing.T) {
 
 func TestLoadMarksOrphanToolStartAndTerminalUncertain(t *testing.T) {
 	store, _, session := createTestSession(t, t.TempDir())
-	if _, err := store.Append(
+	if _, err := store.WriteLegacyFixture(
 		context.Background(),
 		session.ID,
 		domain.EventToolStarted,
@@ -579,7 +579,7 @@ func TestLoadMarksOrphanToolStartAndTerminalUncertain(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Append(
+	if _, err := store.WriteLegacyFixture(
 		context.Background(),
 		session.ID,
 		domain.EventToolResult,

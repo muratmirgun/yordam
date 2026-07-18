@@ -271,7 +271,7 @@ func (b *Broker) readCatchUpLocked(ctx context.Context, ref protocol.JournalRef,
 
 func (b *Broker) PublishCommitted(_ context.Context, ref protocol.JournalRef, cursor protocol.CommittedCursor, events []protocol.EventEnvelope) error {
 	if err := validateCursorForJournal(cursor, ref); err != nil {
-		return err
+		return fmt.Errorf("publish cursor %+v for journal %+v: %w", cursor, ref, err)
 	}
 	for _, event := range events {
 		if event.JournalKind != ref.Kind || event.JournalID != ref.ID || event.TransactionID != cursor.TransactionID {

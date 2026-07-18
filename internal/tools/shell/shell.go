@@ -166,6 +166,14 @@ func (p *prepared) Preview() domain.PreparedToolRequest {
 	}
 }
 
+// PreparePreview proves that planning the process action is still valid
+// without launching it. The orchestrator records this observation before it
+// authorizes the separate mutation handle.
+func (p *prepared) PreparePreview(ctx context.Context) error {
+	_, err := p.Revalidate(ctx)
+	return err
+}
+
 func (p *prepared) Revalidate(ctx context.Context) (domain.PreparedToolRequest, error) {
 	if _, err := p.validateCurrentIdentities(ctx); err != nil {
 		return domain.PreparedToolRequest{}, err

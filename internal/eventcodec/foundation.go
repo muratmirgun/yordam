@@ -111,7 +111,8 @@ func validateFoundationStructural(payload any) error {
 func validateFoundationSemantic(kind string, payload any) error {
 	switch value := payload.(type) {
 	case *protocol.SessionCreatedV1:
-		if value.WorkspaceID == "" || value.CanonicalPath == "" || value.Title == "" || value.ProviderID == "" || value.ModelID == "" || !validMode(value.Mode) {
+		selectionIncomplete := (value.ProviderID == "") != (value.ModelID == "")
+		if value.WorkspaceID == "" || value.CanonicalPath == "" || value.Title == "" || selectionIncomplete || !validMode(value.Mode) {
 			return fmt.Errorf("session creation is incomplete")
 		}
 	case *protocol.SessionForkedV1:

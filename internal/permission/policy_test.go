@@ -113,6 +113,37 @@ func TestPermissionStructuredFactCrossProductDoesNotBroadenAuthority(t *testing.
 	}
 }
 
+func TestPermissionAllowsBoundTrustedMutationPreviewWithoutMutationGrant(t *testing.T) {
+	request := structuredRequest("shell.preview", builtinIdentity("shell"))
+	request.Effect = "mutation"
+	request.ExecutionLocus = "process"
+	request.Boundary = "process"
+	request.Resources = shellResources("/workspace")
+	input := structuredEvaluationInput(t, request, "process", "trusted_adapter", nil)
+	input.Permission.Mode = domain.ModeAuto
+	input.Request.Action = "shell.preview"
+	input.Request.Effect = "observation"
+	input.Request.Reversibility = "not_applicable"
+
+	decision, err := permission.NewSession(domain.ModeAuto).EvaluateAuthorization(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Action != "allow" {
+		t.Fatalf("trusted preview decision=%#v", decision)
+	}
+
+	spoofed := protocol.DeepCopy(input)
+	spoofed.Request.Action = "shell.inspect"
+	decision, err = permission.NewSession(domain.ModeAuto).EvaluateAuthorization(context.Background(), spoofed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Action != "ask" {
+		t.Fatalf("spoofed preview decision=%#v", decision)
+	}
+}
+
 func TestPermissionConfiguredProviderCompatibilityBindsExactModelDescriptor(t *testing.T) {
 	request := structuredRequest("model_egress", protocol.ToolIdentity{Source: "provider", Authority: "openai", Name: "model-a"})
 	request.Effect, request.Boundary, request.ExecutionLocus = "egress", "network", "remote"

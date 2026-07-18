@@ -134,7 +134,7 @@ func TestAppendRejectsSubstitutedEventsLeaf(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := store.Append(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"}); err == nil {
+	if _, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"}); err == nil {
 		t.Fatal("Append followed a substituted events.jsonl leaf")
 	}
 	after, err := os.ReadFile(target)
@@ -429,7 +429,7 @@ func TestContextCancellationWhileWaitingForSharedRootLock(t *testing.T) {
 	ctx := newObservedContext(parent)
 	waiterDone := make(chan error, 1)
 	go func() {
-		_, err := waiter.Append(ctx, session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"})
+		_, err := waiter.WriteLegacyFixture(ctx, session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"})
 		waiterDone <- err
 	}()
 
@@ -567,7 +567,7 @@ func TestLoadProjectsToolCallMultiplicityWithoutAppendingInterruption(t *testing
 		t.Run(test.name, func(t *testing.T) {
 			store, _, session := createTestSession(t, t.TempDir())
 			for _, spec := range test.events {
-				if _, err := store.Append(context.Background(), session.ID, spec.kind, spec.payload); err != nil {
+				if _, err := store.WriteLegacyFixture(context.Background(), session.ID, spec.kind, spec.payload); err != nil {
 					t.Fatal(err)
 				}
 			}

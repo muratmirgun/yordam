@@ -70,16 +70,33 @@ func TestRunTurnProviderLifecycleUsesDurableAuthorizationAndTerminalBarriers(t *
 	}
 }
 
+func TestCollectProviderStreamDoesNotDuplicateFinalizedDeltaBlock(t *testing.T) {
+	service := &Service{deps: Dependencies{Admission: passthroughAdmission{}}}
+	stream := make(chan protocol.ModelEvent, 3)
+	stream <- protocol.ModelEvent{Sequence: 1, Kind: protocol.ModelEventContentDelta, Delta: &protocol.ContentDelta{BlockID: "content-1", Kind: protocol.ContentText, Text: "durable transcript"}}
+	stream <- protocol.ModelEvent{Sequence: 2, Kind: protocol.ModelEventContentBlock, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: "durable transcript"}}
+	stream <- protocol.ModelEvent{Sequence: 3, Kind: protocol.ModelEventTerminal, Terminal: &protocol.ModelTerminal{Reason: "stop"}}
+	close(stream)
+	message, _, err := service.collectProviderStream(context.Background(), "generation-a", stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(message.Blocks) != 1 || message.Blocks[0].Text != "durable transcript" {
+		t.Fatalf("assistant message=%#v", message)
+	}
+}
+
 func TestDurableOrderingMutationPreviewCheckpointRevalidationExecutionAndContinuation(t *testing.T) {
 	log := &recordLog{}
 	request := validStartTurnRequest()
 	request.Runtime = validRuntimeManifest(t, "mutation")
 	repository := &recordingRepository{head: request.ExpectedHead, log: log}
+	providerService := &toolThenFinalProvider{log: log}
 	service, err := NewService(Dependencies{
 		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{},
 		Lane: &loggingLane{delegate: NewOperationLane(), log: log}, Repository: repository,
 		TurnLeases: &recordingTurnLeaseManager{log: log}, Context: fakeContextPlanner{log: log},
-		Providers: fakeProviderCatalog{log: log}, Provider: &toolThenFinalProvider{log: log},
+		Providers: fakeProviderCatalog{log: log}, Provider: providerService,
 		Tools: mutationToolService{log: log}, Authorization: &allowingAuthorization{log: log},
 		Evidence: recordingEvidence{log: log}, Recovery: recordingRecovery{log: log},
 		Verification: loggingVerification{log: log, delegate: verification.NewService(time.Now)},
@@ -90,6 +107,16 @@ func TestDurableOrderingMutationPreviewCheckpointRevalidationExecutionAndContinu
 
 	if _, err := service.RunTurn(context.Background(), request); err != nil {
 		t.Fatal(err)
+	}
+	providerService.mu.Lock()
+	requests := protocol.DeepCopy(providerService.requests)
+	providerService.mu.Unlock()
+	if len(requests) != 2 || len(requests[1].Messages) == 0 {
+		t.Fatalf("provider continuation requests=%#v", requests)
+	}
+	continuation := requests[1].Messages[len(requests[1].Messages)-1]
+	if continuation.Role != "tool" || len(continuation.Blocks) != 1 || continuation.Blocks[0].Kind != protocol.ContentToolResult {
+		t.Fatalf("provider continuation=%#v", continuation)
 	}
 	got := log.snapshot()
 	wantSequence := []string{
@@ -600,7 +627,9 @@ func validStartTurnRequest() StartTurnRequest {
 			CommitSeq:     1,
 			TransactionID: "transaction-head",
 		},
-		Prompt: "inspect",
+		Prompt:     "inspect",
+		ProviderID: "provider-a",
+		ModelID:    "model-a",
 		Runtime: protocol.RuntimeGenerationManifest{
 			ID:     "generation-a",
 			Digest: repeatedDigest("b"),
@@ -814,8 +843,10 @@ func (s fakeProviderService) Prepare(context.Context, protocol.ActivityID, strin
 }
 
 type toolThenFinalProvider struct {
-	log     *recordLog
-	streams atomic.Int64
+	log      *recordLog
+	streams  atomic.Int64
+	mu       sync.Mutex
+	requests []protocol.ModelRequest
 }
 
 type twoToolThenFinalProvider struct {
@@ -842,8 +873,11 @@ func (s *twoToolThenFinalProvider) Stream(context.Context, provider.ProviderHand
 	return stream, nil
 }
 
-func (s *toolThenFinalProvider) Prepare(context.Context, protocol.ActivityID, string, protocol.ModelRequest, protocol.Digest) (provider.ProviderHandle, error) {
+func (s *toolThenFinalProvider) Prepare(_ context.Context, _ protocol.ActivityID, _ string, request protocol.ModelRequest, _ protocol.Digest) (provider.ProviderHandle, error) {
 	s.log.add("provider.prepare")
+	s.mu.Lock()
+	s.requests = append(s.requests, protocol.DeepCopy(request))
+	s.mu.Unlock()
 	return provider.ProviderHandle{}, nil
 }
 func (s *toolThenFinalProvider) Stream(context.Context, provider.ProviderHandle, authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {

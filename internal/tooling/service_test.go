@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
@@ -50,6 +51,44 @@ func TestDispatchToolExecuteConsumesHandleAndTokenBeforeOneEffect(t *testing.T) 
 	}
 	if tool.effects.Load() != 1 {
 		t.Fatalf("repeat effects=%d", tool.effects.Load())
+	}
+}
+
+func TestDispatchToolCancellationJoinsEffectCleanupBeforeReturning(t *testing.T) {
+	tool := newDispatchTool("mutate", trustedRemoteClassification())
+	started := make(chan struct{})
+	cleanup := make(chan struct{})
+	tool.execute = func(ctx context.Context, request domain.ToolRequest) domain.ToolResult {
+		close(started)
+		<-ctx.Done()
+		<-cleanup
+		return domain.ToolResult{CallID: request.CallID, Status: domain.ToolCancelled}
+	}
+	catalog, err := NewCatalog("revision-1", tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(catalog, &countingDispatchGate{})
+	handle, _, err := service.Plan(context.Background(), planRequest("mutate", `{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, executeErr := service.Execute(ctx, handle, authorization.CommittedToken{})
+		done <- executeErr
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("execute returned before effect cleanup: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(cleanup)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("execute error=%v", err)
 	}
 }
 
@@ -280,6 +319,33 @@ func TestPreviewMutationRequiresExactHandleRequestPreparedStateAndEvidence(t *te
 	}
 }
 
+func TestPreviewMutationAllowsASeparateMutationActivity(t *testing.T) {
+	classification := domain.ToolClassification{Effect: "mutation", Mutation: "file", ExecutionLoci: []string{"builtin"}, Boundary: "workspace", Reversibility: "preimage", VerificationCoverage: "full", Idempotency: "conditional", Retry: "never_after_dispatch", RequestedProfile: "restricted", EffectiveProfile: "restricted"}
+	tool := newDispatchTool("edit_preview", classification)
+	catalog, err := NewCatalog("revision-1", tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(catalog, &countingDispatchGate{})
+	request := planRequest("edit_preview", `{}`)
+	handle, _, err := service.PlanPreviewInspection(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, _, _, err := service.PreparePreview(context.Background(), handle, authorization.CommittedToken{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.ActivityID = "mutation-activity"
+	_, plan, err := service.PlanMutation(context.Background(), preview, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Body.Effect != "mutation" || plan.Body.CallID != request.CallID {
+		t.Fatalf("mutation plan=%#v", plan)
+	}
+}
+
 type countingDispatchGate struct {
 	mu   sync.Mutex
 	used bool
@@ -303,6 +369,7 @@ type dispatchTool struct {
 	opens          atomic.Int64
 	revalidations  atomic.Int64
 	plans          atomic.Int64
+	execute        func(context.Context, domain.ToolRequest) domain.ToolResult
 }
 
 func newDispatchTool(alias string, classification domain.ToolClassification) *dispatchTool {
@@ -344,8 +411,11 @@ func (p *dispatchPrepared) Revalidate(context.Context) (domain.PreparedToolReque
 	return p.Preview(), nil
 }
 func (p *dispatchPrepared) PreparePreview(context.Context) error { p.tool.opens.Add(1); return nil }
-func (p *dispatchPrepared) Execute(context.Context) domain.ToolResult {
+func (p *dispatchPrepared) Execute(ctx context.Context) domain.ToolResult {
 	p.tool.effects.Add(1)
+	if p.tool.execute != nil {
+		return p.tool.execute(ctx, p.request)
+	}
 	return domain.ToolResult{CallID: p.request.CallID, Status: domain.ToolSucceeded, Content: "effect"}
 }
 

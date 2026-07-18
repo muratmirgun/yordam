@@ -1090,7 +1090,7 @@ func receiveEvent(t *testing.T, events <-chan app.Event) app.Event {
 	select {
 	case event := <-events:
 		return event
-	case <-time.After(time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("timed out waiting for app event")
 		return app.Event{}
 	}

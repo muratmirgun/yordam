@@ -269,7 +269,7 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 	if err := validateProposedEvents(events, request.Storage.Journal); err != nil {
 		return protocol.CommittedCursor{}, err
 	}
-	appendResult, err := s.repository.AppendBatch(ctx, journal.AppendRequest{Journal: request.Storage.Journal, ExpectedHead: expected, TransactionID: transactionID, Events: events})
+	appendResult, err := s.appendBatch(ctx, journal.AppendRequest{Journal: request.Storage.Journal, ExpectedHead: expected, TransactionID: transactionID, Events: events})
 	if err != nil {
 		return protocol.CommittedCursor{}, err
 	}

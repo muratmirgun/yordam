@@ -10,7 +10,6 @@ import (
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
 )
 
-var _ ports.SessionStore = (*jsonl.Store)(nil)
 var _ ports.ArtifactStore = (*jsonl.Store)(nil)
 var _ journal.Repository = (*jsonl.Store)(nil)
 

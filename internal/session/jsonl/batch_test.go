@@ -1140,7 +1140,7 @@ func TestLegacyAndV2MutatorsShareJournalLockBeforeTemporaryCleanup(t *testing.T)
 		},
 	})
 	go func() {
-		_, err := fixture.repo.Append(context.Background(), string(fixture.ref.ID), domain.EventUserMessage, map[string]any{"text": "legacy"})
+		_, err := fixture.repo.WriteLegacyFixture(context.Background(), string(fixture.ref.ID), domain.EventUserMessage, map[string]any{"text": "legacy"})
 		legacyDone <- err
 	}()
 	<-entered

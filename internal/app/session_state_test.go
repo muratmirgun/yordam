@@ -14,6 +14,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/journal"
+	"github.com/muratmirgun/yordam/internal/orchestrator"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
@@ -46,6 +47,18 @@ func TestSessionStateInitialInspectThenIncrementalReadRange(t *testing.T) {
 	}
 	if state.Selection != (domain.ModelSelection{Profile: "primary", Model: "model-b"}) || state.Head != secondHead || reader.inspectCalls != 1 || len(reader.ranges) != 1 || reader.ranges[0].After != firstHead {
 		t.Fatalf("incremental state=%+v inspect=%d ranges=%+v", state, reader.inspectCalls, reader.ranges)
+	}
+}
+
+func TestLegacyReplayCarriesRecoveryDiagnosticsFromPureInspection(t *testing.T) {
+	replay := app.LegacyReplayFromInspection(journal.SessionInspection{
+		Session: domain.Session{ID: "session"},
+		Journal: journal.Inspection{Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: "session"}, Writable: true, Diagnostics: []protocol.Diagnostic{{
+			Code: "recovery.completed", Message: "journal recovery preserved the observed tail", Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: "session"},
+		}}},
+	})
+	if replay.ReadOnly || !strings.Contains(replay.RecoveryNote, "recovery.completed") || !strings.Contains(replay.RecoveryNote, "preserved the observed tail") {
+		t.Fatalf("replay=%+v", replay)
 	}
 }
 
@@ -707,7 +720,7 @@ func TestAppRefreshesReplayAfterCompletedTurn(t *testing.T) {
 	current := testSession()
 	store := newStateStore(current)
 	runtime := &fakeRuntime{run: func(context.Context, agent.RunInput) error {
-		_, err := store.Append(context.Background(), current.Session.ID, domain.EventTurnCompleted, domain.TurnTerminalPayload{Reason: "complete"})
+		_, err := store.record(context.Background(), current.Session.ID, domain.EventTurnCompleted, domain.TurnTerminalPayload{Reason: "complete"})
 		return err
 	}}
 	application := app.New(app.Options{RuntimeSet: stateRuntimeSet(runtime, nil, current.Session.Selection), Sessions: store, Session: current.Session, Replay: current})
@@ -846,7 +859,7 @@ func (s *stateStore) Create(_ context.Context, workspace domain.Workspace, mode 
 	return session, nil
 }
 
-func (s *stateStore) Append(_ context.Context, sessionID string, kind domain.EventKind, payload any) (domain.DurableEvent, error) {
+func (s *stateStore) record(_ context.Context, sessionID string, kind domain.EventKind, payload any) (domain.DurableEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.appendErrs[kind]; err != nil {
@@ -883,6 +896,59 @@ func (s *stateStore) Load(_ context.Context, sessionID string) (domain.SessionRe
 		return domain.SessionReplay{}, errors.New("session not found")
 	}
 	return replay, nil
+}
+
+func (s *stateStore) Replay(ctx context.Context, sessionID string) (domain.SessionReplay, error) {
+	return s.Load(ctx, sessionID)
+}
+
+func (s *stateStore) Head(_ context.Context, ref protocol.JournalRef) (protocol.CommittedCursor, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	replay, ok := s.loads[string(ref.ID)]
+	if !ok {
+		return protocol.CommittedCursor{}, errors.New("session not found")
+	}
+	return protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: replay.Session.LastSeq, TransactionID: protocol.TransactionID("legacy:test-head")}, nil
+}
+
+func (s *stateStore) CommitSessionChange(_ context.Context, request orchestrator.SessionChangeRequest) (protocol.CommandResult, error) {
+	payload := any(request.Event.Payload)
+	switch request.Event.Kind {
+	case protocol.EventModeChanged:
+		var value protocol.ModeChangedV1
+		if err := json.Unmarshal(request.Event.Payload, &value); err != nil {
+			return protocol.CommandResult{}, err
+		}
+		payload = domain.ModeChangedPayload{Mode: domain.PermissionMode(value.Mode)}
+	case protocol.EventModelChanged:
+		var value protocol.ModelChangedV1
+		if err := json.Unmarshal(request.Event.Payload, &value); err != nil {
+			return protocol.CommandResult{}, err
+		}
+		payload = domain.ModelChangedPayload{Selection: domain.ModelSelection{Profile: string(value.ProviderID), Model: string(value.ModelID)}}
+	case protocol.EventTrustedExecutionAcknowledged:
+		var value protocol.TrustedExecutionAcknowledgedV1
+		if err := json.Unmarshal(request.Event.Payload, &value); err != nil {
+			return protocol.CommandResult{}, err
+		}
+		payload = domain.TrustedExecutionPayload{Enabled: value.Enabled}
+	}
+	event, err := s.record(context.Background(), string(request.SessionID), domain.EventKind(request.Event.Kind), payload)
+	if err != nil {
+		return protocol.CommandResult{}, err
+	}
+	cursor := protocol.CommittedCursor{JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, CommitSeq: event.Seq, TransactionID: request.TransactionID}
+	return protocol.CommandResult{ProtocolVersion: protocol.ApplicationProtocolVersion, CommandID: request.Command.CommandID, Status: "completed", RequestDigest: request.Command.RequestDigest, Cursor: protocol.ApplicationCursor{SelectedSession: &cursor}, PayloadVersion: 1, Payload: json.RawMessage(`{}`)}, nil
+}
+
+func (s *stateStore) RunControl(_ context.Context, request orchestrator.ControlRequest) (orchestrator.ControlResult, error) {
+	event, err := s.record(context.Background(), string(request.Journal.ID), domain.EventKind(request.Event.Kind), request.Event.Payload)
+	if err != nil {
+		return orchestrator.ControlResult{}, err
+	}
+	cursor := protocol.CommittedCursor{JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, CommitSeq: event.Seq, TransactionID: request.TransactionID}
+	return orchestrator.ControlResult{OperationID: request.OperationID, Cursor: cursor, Status: "completed"}, nil
 }
 
 func (s *stateStore) List(context.Context, domain.Workspace) ([]domain.SessionSummary, error) {

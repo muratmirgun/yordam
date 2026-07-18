@@ -36,6 +36,20 @@ func TestAdapterNormalizesSupportedBlocksAndTools(t *testing.T) {
 	}
 }
 
+func TestAdapterNormalizesSuccessfulToolResultWithoutOutput(t *testing.T) {
+	adapter := NewAdapter(nil)
+	got, err := adapter.normalize(context.Background(), protocol.ModelRequest{
+		RequestID: "request-1", ProviderID: "openai", ModelID: "model-a",
+		Messages: []protocol.ModelMessage{{Role: "tool", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolResult, ToolResult: &protocol.ToolResultBlock{CallID: "call-1", Status: "succeeded"}}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 1 || got.Messages[0].ToolCallID != "call-1" || got.Messages[0].Content != "succeeded" {
+		t.Fatalf("normalized=%#v", got)
+	}
+}
+
 func TestRouterNormalizationIsEffectFree(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Error("normalization opened a network connection")

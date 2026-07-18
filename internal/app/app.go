@@ -7,10 +7,15 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/agent"
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/journal"
+	"github.com/muratmirgun/yordam/internal/orchestrator"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 )
 
@@ -28,6 +33,15 @@ type MutablePolicy interface {
 
 type RestorePolicy func(domain.SessionReplay) MutablePolicy
 
+type sessionChangeService interface {
+	CommitSessionChange(context.Context, orchestrator.SessionChangeRequest) (protocol.CommandResult, error)
+}
+
+type sessionStore interface {
+	Create(context.Context, domain.Workspace, domain.PermissionMode, domain.ModelSelection) (domain.Session, error)
+	List(context.Context, domain.Workspace) ([]domain.SessionSummary, error)
+}
+
 type EventLogger interface {
 	Event(string, map[string]any) error
 }
@@ -39,7 +53,7 @@ type Options struct {
 	Input         TurnInput
 	Compact       func(context.Context) error
 	RuntimeEvents <-chan agent.RuntimeEvent
-	Sessions      ports.SessionStore
+	Sessions      sessionStore
 	Session       domain.Session
 	Replay        domain.SessionReplay
 	Workspace     domain.Workspace
@@ -54,27 +68,30 @@ type Options struct {
 	Logger                   EventLogger
 	Close                    func() error
 	SessionChanged           func(string)
+	WorkspaceControl         protocol.JournalRef
 }
 
 type App struct {
-	runtimeSet     RuntimeSet
-	reloadRuntime  ReloadRuntime
-	redactors      *secret.Binding
-	input          TurnInput
-	compact        func(context.Context) error
-	runtimeEvents  <-chan agent.RuntimeEvent
-	sessions       ports.SessionStore
-	session        domain.Session
-	replay         domain.SessionReplay
-	replayValid    bool
-	workspace      domain.Workspace
-	policy         MutablePolicy
-	restorePolicy  RestorePolicy
-	commands       chan Command
-	events         chan Event
-	logger         EventLogger
-	close          func() error
-	sessionChanged func(string)
+	runtimeSet       RuntimeSet
+	reloadRuntime    ReloadRuntime
+	redactors        *secret.Binding
+	input            TurnInput
+	compact          func(context.Context) error
+	runtimeEvents    <-chan agent.RuntimeEvent
+	sessions         sessionStore
+	session          domain.Session
+	replay           domain.SessionReplay
+	replayValid      bool
+	workspace        domain.Workspace
+	policy           MutablePolicy
+	restorePolicy    RestorePolicy
+	commands         chan Command
+	events           chan Event
+	logger           EventLogger
+	close            func() error
+	sessionChanged   func(string)
+	workspaceControl protocol.JournalRef
+	sessionChanges   sessionChangeService
 
 	pendingMu              sync.Mutex
 	pending                map[string]*pendingPermission
@@ -153,11 +170,16 @@ func New(options Options) *App {
 		logger:                 options.Logger,
 		close:                  options.Close,
 		sessionChanged:         options.SessionChanged,
+		workspaceControl:       options.WorkspaceControl,
+		sessionChanges:         runtimeSet.SessionChanges,
 		legacyQueueCapacity:    legacyQueueCapacity,
 		nonReconnectableCancel: options.NonReconnectableOverflow,
 		pending:                make(map[string]*pendingPermission),
 		pendingInternal:        make(map[string]*pendingPermission),
 		eventWake:              make(chan struct{}, 1),
+	}
+	if application.sessionChanges == nil {
+		application.sessionChanges, _ = options.Sessions.(sessionChangeService)
 	}
 	runtimeSet.BindApprover(application)
 	return application
@@ -252,6 +274,14 @@ func (a *App) Run(ctx context.Context) error {
 						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 						continue
 					}
+				}
+				if activeSet.Orchestrator != nil {
+					metadata, head, err := a.prepareTurnCommand(ctx, command.Prompt)
+					if err != nil {
+						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
+						continue
+					}
+					input.Command, input.ExpectedHead = metadata, head
 				}
 				if activeSet.Runtime == nil {
 					err := errors.New("runtime is not configured")
@@ -400,7 +430,7 @@ func (a *App) Run(ctx context.Context) error {
 				}
 			}
 			if a.sessions != nil && a.session.ID != "" && (result.kind == operationTurn || result.err == nil) {
-				refreshed, err := a.sessions.Load(ctx, a.session.ID)
+				refreshed, err := a.inspectSession(ctx, a.session.ID)
 				if err != nil {
 					a.replayValid = false
 					event = Event{Kind: EventError, Err: err, Message: err.Error()}
@@ -432,6 +462,61 @@ func (a *App) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+type sessionHeadReader interface {
+	Head(context.Context, protocol.JournalRef) (protocol.CommittedCursor, error)
+}
+
+type sessionInspector interface {
+	InspectSession(context.Context, protocol.SessionID) (journal.SessionInspection, error)
+}
+
+type legacyReplayReader interface {
+	Replay(context.Context, string) (domain.SessionReplay, error)
+}
+
+func (a *App) inspectSession(ctx context.Context, sessionID string) (domain.SessionReplay, error) {
+	inspector, ok := a.sessions.(sessionInspector)
+	if ok {
+		inspection, err := inspector.InspectSession(ctx, protocol.SessionID(sessionID))
+		if err != nil {
+			return domain.SessionReplay{}, err
+		}
+		return LegacyReplayFromInspection(inspection), nil
+	}
+	if reader, legacy := a.sessions.(legacyReplayReader); legacy && a.runtimeSet.Orchestrator == nil {
+		return reader.Replay(ctx, sessionID)
+	}
+	return domain.SessionReplay{}, fmt.Errorf("pure session inspector is not configured")
+}
+
+func (a *App) prepareTurnCommand(ctx context.Context, prompt string) (orchestrator.CommandMetadata, protocol.CommittedCursor, error) {
+	reader, ok := a.sessions.(sessionHeadReader)
+	if !ok {
+		return orchestrator.CommandMetadata{}, protocol.CommittedCursor{}, fmt.Errorf("session journal head reader is not configured")
+	}
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(a.session.ID)}
+	head, err := reader.Head(ctx, ref)
+	if err != nil {
+		return orchestrator.CommandMetadata{}, protocol.CommittedCursor{}, err
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return orchestrator.CommandMetadata{}, protocol.CommittedCursor{}, err
+	}
+	id := fmt.Sprintf("legacy-turn-%x", raw)
+	digest, err := canonicaljson.Digest(struct {
+		SessionID string `json:"session_id"`
+		Prompt    string `json:"prompt"`
+	}{a.session.ID, prompt})
+	if err != nil {
+		return orchestrator.CommandMetadata{}, protocol.CommittedCursor{}, err
+	}
+	return orchestrator.CommandMetadata{
+		CommandID: protocol.CommandID(id), IdempotencyKey: id, RequestDigest: digest,
+		Actor: protocol.ActorRef{ID: "legacy-user", Kind: protocol.ActorUser},
+	}, head, nil
 }
 
 func (a *App) drainRuntimeEvents(ctx context.Context, runtimeEvents <-chan agent.RuntimeEvent) {
@@ -466,22 +551,36 @@ func (a *App) completeReload(ctx context.Context, result operationResult) {
 			return
 		}
 		if a.sessions != nil && a.session.ID != "" {
-			event, err := a.sessions.Append(ctx, a.session.ID, domain.EventModelChanged, domain.ModelChangedPayload{Selection: selection})
-			if err != nil {
+			changeService := candidate.SessionChanges
+			generation := candidate.RuntimeGenerationID
+			if changeService == nil {
+				changeService = a.sessionChanges
+			}
+			if generation == "" {
+				generation = a.runtimeSet.RuntimeGenerationID
+			}
+			if err := a.commitSessionChangeUsing(ctx, changeService, generation, protocol.EventModelChanged, protocol.ModelChangedV1{ProviderID: protocol.ProviderID(selection.Profile), ModelID: protocol.ModelID(selection.Model)}); err != nil {
 				a.publish(ctx, Event{Kind: EventReloadCompleted, Err: err, Message: err.Error()})
 				candidate.retireSecrets()
 				return
 			}
-			a.replay.Events = append(a.replay.Events, event)
-			a.session.LastSeq = event.Seq
-			a.session.UpdatedAt = event.Time
 		}
 		a.session.Selection = selection
 		a.replay.Session = a.session
 	}
+	if candidate.Orchestrator != nil && a.workspaceControl != (protocol.JournalRef{}) {
+		if err := a.activateRuntimeGeneration(ctx, candidate); err != nil {
+			a.publish(ctx, Event{Kind: EventReloadCompleted, Err: err, Message: err.Error()})
+			candidate.retireSecrets()
+			return
+		}
+	}
 	candidate.BindApprover(a)
 	previous := a.runtimeSet
 	a.runtimeSet = candidate
+	if candidate.SessionChanges != nil {
+		a.sessionChanges = candidate.SessionChanges
+	}
 	if a.redactors != nil {
 		a.redactors.Replace(candidate.Redactor)
 	}
@@ -500,20 +599,75 @@ func (a *App) completeReload(ctx context.Context, result operationResult) {
 	a.publish(ctx, event)
 }
 
+func (a *App) activateRuntimeGeneration(ctx context.Context, candidate RuntimeSet) error {
+	reader, ok := a.sessions.(sessionHeadReader)
+	if !ok {
+		return fmt.Errorf("workspace-control head reader is not configured")
+	}
+	head, err := reader.Head(ctx, a.workspaceControl)
+	if err != nil {
+		return err
+	}
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return err
+	}
+	identity := fmt.Sprintf("reload-%x", random)
+	actor := protocol.ActorRef{ID: "legacy-user", Kind: protocol.ActorUser}
+	requestDigest, err := canonicaljson.Digest(struct {
+		Manifest protocol.RuntimeGenerationManifest `json:"manifest"`
+		Previous protocol.RuntimeGenerationID       `json:"previous"`
+	}{candidate.Manifest, a.runtimeSet.RuntimeGenerationID})
+	if err != nil {
+		return err
+	}
+	descriptorDigest, err := canonicaljson.Digest(struct {
+		Name string `json:"name"`
+	}{"runtime.reload"})
+	if err != nil {
+		return err
+	}
+	body := protocol.ActionPlanBody{
+		CallID: identity, Tool: protocol.ToolIdentity{Source: "runtime", Authority: "yordam", Name: "reload"}, SourceRevision: "runtime-v1",
+		DescriptorDigest: descriptorDigest, Action: "runtime.reload", Purpose: "activate runtime generation",
+		Resources:      []protocol.ResourceTarget{{Kind: "runtime_generation", CanonicalID: string(candidate.RuntimeGenerationID)}},
+		ExecutionLocus: "runtime", Effect: "mutation", Boundary: "process", Reversibility: "exact", VerificationCoverage: "exact",
+		RequestedProfile: "restricted", EffectiveProfile: "restricted", RuntimeGenerationID: candidate.RuntimeGenerationID,
+	}
+	planDigest, err := canonicaljson.Digest(body)
+	if err != nil {
+		return err
+	}
+	payload, err := canonicaljson.Marshal(protocol.RuntimeGenerationActivatedV1{Manifest: protocol.DeepCopy(candidate.Manifest), Previous: a.runtimeSet.RuntimeGenerationID})
+	if err != nil {
+		return err
+	}
+	eventActor := actor
+	result, err := candidate.Orchestrator.RunControl(ctx, orchestrator.ControlRequest{
+		Command:     orchestrator.CommandMetadata{CommandID: protocol.CommandID(identity), IdempotencyKey: identity, RequestDigest: requestDigest, Actor: actor},
+		OperationID: protocol.ControlOperationID(identity), Kind: orchestrator.OperationReloadActivation, Journal: a.workspaceControl, ExpectedHead: head,
+		TransactionID: protocol.TransactionID(identity), Runtime: protocol.DeepCopy(candidate.Manifest), Plan: protocol.ActionPlan{Body: body, Digest: planDigest},
+		Event: protocol.ProposedEvent{EventID: protocol.EventID(identity), Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventRuntimeGenerationActivated, Actor: &eventActor, RuntimeGenerationID: candidate.RuntimeGenerationID, Payload: payload},
+	})
+	if err != nil {
+		return err
+	}
+	if result.Status != "completed" {
+		return fmt.Errorf("runtime activation status %q", result.Status)
+	}
+	return nil
+}
+
 func (a *App) applyMode(ctx context.Context, mode domain.PermissionMode) bool {
 	if a.sessions == nil || a.session.ID == "" {
 		a.publish(ctx, Event{Kind: EventError, Message: "session store is not configured", NonTerminal: true})
 		return false
 	}
-	event, err := a.sessions.Append(ctx, a.session.ID, domain.EventModeChanged, domain.ModeChangedPayload{Mode: mode})
-	if err != nil {
+	if err := a.commitSessionChange(ctx, protocol.EventModeChanged, protocol.ModeChangedV1{Mode: string(mode)}); err != nil {
 		a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), NonTerminal: true})
 		return false
 	}
-	a.replay.Events = append(a.replay.Events, event)
 	a.session.Mode = mode
-	a.session.LastSeq = event.Seq
-	a.session.UpdatedAt = event.Time
 	if a.policy != nil {
 		a.policy.SetMode(mode)
 	}
@@ -525,15 +679,11 @@ func (a *App) applyModel(ctx context.Context, selection domain.ModelSelection) b
 		a.publish(ctx, Event{Kind: EventError, Message: "session store is not configured", NonTerminal: true})
 		return false
 	}
-	event, err := a.sessions.Append(ctx, a.session.ID, domain.EventModelChanged, domain.ModelChangedPayload{Selection: selection})
-	if err != nil {
+	if err := a.commitSessionChange(ctx, protocol.EventModelChanged, protocol.ModelChangedV1{ProviderID: protocol.ProviderID(selection.Profile), ModelID: protocol.ModelID(selection.Model)}); err != nil {
 		a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), NonTerminal: true})
 		return false
 	}
-	a.replay.Events = append(a.replay.Events, event)
 	a.session.Selection = selection
-	a.session.LastSeq = event.Seq
-	a.session.UpdatedAt = event.Time
 	return a.publish(ctx, a.settingEvent())
 }
 
@@ -552,13 +702,9 @@ func (a *App) acknowledgeAutoShell(ctx context.Context, callID string, decision 
 			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q response is invalid", callID)})
 		}
 	}
-	event, err := a.sessions.Append(ctx, a.session.ID, domain.EventTrustedExecutionAcknowledged, domain.TrustedExecutionPayload{Enabled: true})
-	if err != nil {
+	if err := a.commitSessionChange(ctx, protocol.EventTrustedExecutionAcknowledged, protocol.TrustedExecutionAcknowledgedV1{Enabled: true, Profile: "unsandboxed"}); err != nil {
 		return a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), NonTerminal: true})
 	}
-	a.replay.Events = append(a.replay.Events, event)
-	a.session.LastSeq = event.Seq
-	a.session.UpdatedAt = event.Time
 	if a.policy != nil {
 		a.policy.AcknowledgeAutoShell()
 	}
@@ -571,6 +717,58 @@ func (a *App) acknowledgeAutoShell(ctx context.Context, callID string, decision 
 		}
 	}
 	return a.publish(ctx, a.settingEvent())
+}
+
+func (a *App) commitSessionChange(ctx context.Context, kind string, payload any) error {
+	return a.commitSessionChangeUsing(ctx, a.sessionChanges, a.runtimeSet.RuntimeGenerationID, kind, payload)
+}
+
+func (a *App) commitSessionChangeUsing(ctx context.Context, service sessionChangeService, generation protocol.RuntimeGenerationID, kind string, payload any) error {
+	if service == nil {
+		return fmt.Errorf("session change orchestrator is not configured")
+	}
+	metadata, head, err := a.prepareTurnCommand(ctx, kind)
+	if err != nil {
+		return err
+	}
+	raw, err := canonicaljson.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return err
+	}
+	identity := fmt.Sprintf("session-change-%x", random)
+	actor := protocol.DeepCopy(metadata.Actor)
+	result, err := service.CommitSessionChange(ctx, orchestrator.SessionChangeRequest{
+		Command: metadata, OperationID: protocol.ControlOperationID(identity),
+		Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(a.session.ID)}, SessionID: protocol.SessionID(a.session.ID),
+		ExpectedHead: head, TransactionID: protocol.TransactionID(identity), RuntimeGenerationID: generation,
+		Consequential: true,
+		Event: protocol.ProposedEvent{
+			EventID: protocol.EventID(identity), Time: time.Now().UTC(), PayloadVersion: 1, Kind: kind, SessionID: protocol.SessionID(a.session.ID),
+			Actor: &actor, RuntimeGenerationID: generation, Payload: raw,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if result.Cursor.SelectedSession == nil {
+		return fmt.Errorf("session change returned no session cursor")
+	}
+	a.session.LastSeq = result.Cursor.SelectedSession.CommitSeq
+	a.session.UpdatedAt = time.Now().UTC()
+	updated, err := a.inspectSession(ctx, a.session.ID)
+	if err != nil {
+		return err
+	}
+	projected := ProjectSessionState(updated)
+	updated.Session.Mode = projected.Mode
+	updated.Session.Selection = projected.Selection
+	a.replay = updated
+	a.replayValid = true
+	return nil
 }
 
 func (a *App) newSession(ctx context.Context) bool {
@@ -595,7 +793,7 @@ func (a *App) openSession(ctx context.Context, sessionID string) bool {
 	if sessionID == "" {
 		return a.publish(ctx, Event{Kind: EventRejected, Message: "session ID is empty"})
 	}
-	replay, err := a.sessions.Load(ctx, sessionID)
+	replay, err := a.inspectSession(ctx, sessionID)
 	if err != nil {
 		return a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), NonTerminal: true})
 	}
@@ -607,14 +805,15 @@ func (a *App) openSession(ctx context.Context, sessionID string) bool {
 	replay.Session.Selection = state.Selection
 	if !a.selectionConfigured(replay.Session.Selection) && a.selectionConfigured(a.runtimeSet.DefaultSelection) {
 		selection := a.runtimeSet.DefaultSelection
-		event, err := a.sessions.Append(ctx, replay.Session.ID, domain.EventModelChanged, domain.ModelChangedPayload{Selection: selection})
-		if err != nil {
+		previousSession := a.session
+		a.session = replay.Session
+		if err := a.commitSessionChange(ctx, protocol.EventModelChanged, protocol.ModelChangedV1{ProviderID: protocol.ProviderID(selection.Profile), ModelID: protocol.ModelID(selection.Model)}); err != nil {
+			a.session = previousSession
 			return a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), NonTerminal: true})
 		}
-		replay.Events = append(replay.Events, event)
 		replay.Session.Selection = selection
-		replay.Session.LastSeq = event.Seq
-		replay.Session.UpdatedAt = event.Time
+		replay.Session.LastSeq = a.session.LastSeq
+		replay.Session.UpdatedAt = a.session.UpdatedAt
 	}
 	var policy MutablePolicy
 	if a.restorePolicy != nil {

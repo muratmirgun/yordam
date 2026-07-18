@@ -40,7 +40,7 @@ func TestLoadReportsPlannedFileStateWithoutReplayingMutation(t *testing.T) {
 				t.Fatal(err)
 			}
 			plannedHash := sha256.Sum256([]byte(test.plannedBody))
-			if _, err := store.Append(context.Background(), session.ID, domain.EventFileChangePlanned, domain.FileChangePlan{
+			if _, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventFileChangePlanned, domain.FileChangePlan{
 				CallID:         "call-1",
 				Path:           target,
 				ExpectedSHA256: "before",
@@ -49,7 +49,7 @@ func TestLoadReportsPlannedFileStateWithoutReplayingMutation(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := store.Append(context.Background(), session.ID, domain.EventToolStarted, map[string]string{"call_id": "call-1"}); err != nil {
+			if _, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventToolStarted, map[string]string{"call_id": "call-1"}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -118,7 +118,7 @@ func TestLoadRecoveryHashRejectsSymlinksAndNeverBlocksOnFIFO(t *testing.T) {
 			contents := []byte("planned\n")
 			test.setup(t, target, contents)
 			digest := sha256.Sum256(contents)
-			if _, err := store.Append(context.Background(), session.ID, domain.EventFileChangePlanned, domain.FileChangePlan{
+			if _, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventFileChangePlanned, domain.FileChangePlan{
 				CallID:        "call-1",
 				Path:          target,
 				PlannedSHA256: fmt.Sprintf("%x", digest),
@@ -157,10 +157,10 @@ func TestLoadDoesNotReportCompletedFilePlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := domain.FileChangePlan{CallID: "call-1", Path: target, PlannedSHA256: strings.Repeat("0", 64)}
-	if _, err := store.Append(context.Background(), session.ID, domain.EventFileChangePlanned, plan); err != nil {
+	if _, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventFileChangePlanned, plan); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Append(context.Background(), session.ID, domain.EventFileChanged, domain.FileChange{CallID: "call-1", Path: target}); err != nil {
+	if _, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventFileChanged, domain.FileChange{CallID: "call-1", Path: target}); err != nil {
 		t.Fatal(err)
 	}
 

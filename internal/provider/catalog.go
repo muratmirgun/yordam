@@ -141,7 +141,7 @@ func resolveCandidates(candidates []protocol.ModelDescriptor) (protocol.ModelDes
 	seed := candidates[0]
 	selected := protocol.ModelDescriptor{
 		ProviderID: seed.ProviderID, ModelID: seed.ModelID, AdapterKind: seed.AdapterKind,
-		DisplayName: seed.DisplayName, UsageCategories: protocol.DeepCopy(seed.UsageCategories),
+		DisplayName: seed.DisplayName, Capabilities: []protocol.CapabilityFact{}, UsageCategories: protocol.DeepCopy(seed.UsageCategories), Pricing: []protocol.PricingFact{},
 		CredentialBindingRef: seed.CredentialBindingRef, SourceRevision: seed.SourceRevision,
 		RuntimeGenerationID: seed.RuntimeGenerationID,
 	}
