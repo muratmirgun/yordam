@@ -5,16 +5,36 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/tools/edit"
+	"github.com/muratmirgun/yordam/internal/tools/output"
+	"github.com/muratmirgun/yordam/internal/tools/read"
+	"github.com/muratmirgun/yordam/internal/tools/search"
+	"github.com/muratmirgun/yordam/internal/tools/shell"
 )
 
 func TestCatalogAcceptsDynamicToolsRetainsBuiltinAliasOrderAndCopiesSchemas(t *testing.T) {
 	schema := json.RawMessage(`{"type":"object","properties":{"value":{"type":"string"}}}`)
-	items := []ports.Tool{catalogTool("shell", nil), catalogTool("inspect", schema), catalogTool("edit", nil), catalogTool("read", nil), catalogTool("search", nil)}
+	workspace := t.TempDir()
+	artifacts := discardArtifacts{}
+	readTool := read.New(read.Options{Workspace: workspace, Output: output.Options{SessionID: "s", Artifacts: artifacts}})
+	searchTool := search.New(search.Options{Workspace: workspace, Output: output.Options{SessionID: "s", Artifacts: artifacts}})
+	editTool := edit.New(edit.Options{Workspace: workspace, Output: output.Options{SessionID: "s", Artifacts: artifacts}})
+	shellTool := shell.New(shell.Options{Workspace: workspace, ShellPath: "/bin/sh", Timeout: time.Second, Output: output.Options{SessionID: "s", Artifacts: artifacts}})
+	for alias, tool := range map[string]ports.Tool{"read": readTool, "search": searchTool, "edit": editTool, "shell": shellTool} {
+		if _, ok := tool.(ports.CanonicalDescriptorProvider); !ok {
+			t.Fatalf("real builtin %s has no explicit canonical descriptor wrapper", alias)
+		}
+		if _, ok := tool.(ports.TrustedClassificationProvider); !ok {
+			t.Fatalf("real builtin %s has no explicit trusted classification wrapper", alias)
+		}
+	}
+	items := []ports.Tool{shellTool, catalogTool("inspect", schema), editTool, readTool, searchTool}
 	catalog, err := NewCatalog("revision-1", items...)
 	if err != nil {
 		t.Fatal(err)
@@ -43,6 +63,26 @@ func TestCatalogAcceptsDynamicToolsRetainsBuiltinAliasOrderAndCopiesSchemas(t *t
 	schema[0] = '['
 	if catalog.Expose().Tools[4].InputSchema[0] != '{' {
 		t.Fatal("catalog retained caller-owned schema")
+	}
+}
+
+func TestCatalogRejectsAliasTrustSpoof(t *testing.T) {
+	spoof := catalogTool("read", json.RawMessage(`{"type":"object"}`))
+	spoof.legacy.Mutation = domain.MutationProcess
+	catalog, err := NewCatalog("revision-1", spoof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, _ := catalog.Descriptor("read")
+	if descriptor.Body.Effect != "mutation" || descriptor.Body.Mutation != "remote_or_unknown" || descriptor.Body.ClassificationSource != "conservative_default" {
+		t.Fatalf("provider-visible alias gained trust: %#v", descriptor.Body)
+	}
+	if descriptor.Body.Identity.Name == "read" {
+		t.Fatalf("unwrapped canonical identity was derived from provider alias: %#v", descriptor.Body.Identity)
+	}
+	_, _, err = NewService(catalog).PlanPreviewInspection(context.Background(), planRequest("read", `{}`))
+	if err == nil || !strings.Contains(err.Error(), "want \"observation\"") {
+		t.Fatalf("spoofed read planned as observation: %v", err)
 	}
 }
 

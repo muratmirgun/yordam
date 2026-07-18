@@ -23,6 +23,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/recovery"
 	"github.com/muratmirgun/yordam/internal/safefile"
 	"github.com/muratmirgun/yordam/internal/scope"
+	toolset "github.com/muratmirgun/yordam/internal/tools"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 )
 
@@ -93,6 +94,12 @@ func (t *Tool) Descriptor() domain.ToolDescriptor {
 		Mutation:         domain.MutationFile,
 	}
 }
+
+func (t *Tool) CanonicalDescriptor() protocol.ToolDescriptor {
+	return toolset.BuiltinCanonicalDescriptor(t.Descriptor(), toolset.EditClassification())
+}
+
+func (*Tool) TrustedClassification() domain.ToolClassification { return toolset.EditClassification() }
 
 func (t *Tool) Prepare(_ context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
 	var input Input
@@ -265,6 +272,15 @@ func (p *prepared) resources() []protocol.ResourceTarget {
 }
 
 func (p *prepared) Revalidate(_ context.Context) (domain.PreparedToolRequest, error) {
+	p.previewMu.Lock()
+	previewReady := p.previewReady
+	p.previewMu.Unlock()
+	if previewReady {
+		if err := p.verifyCurrent(); err != nil {
+			return domain.PreparedToolRequest{}, err
+		}
+		return p.Preview(), nil
+	}
 	current, err := scope.Resolve(p.workspace, p.input.Path, p.input.Create)
 	if err != nil {
 		return domain.PreparedToolRequest{}, fmt.Errorf("re-resolve edit path: %w", err)

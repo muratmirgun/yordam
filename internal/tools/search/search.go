@@ -22,6 +22,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/safefile"
 	"github.com/muratmirgun/yordam/internal/scope"
+	toolset "github.com/muratmirgun/yordam/internal/tools"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 )
 
@@ -78,6 +79,12 @@ func (t *Tool) Descriptor() domain.ToolDescriptor {
 		Mutation:         domain.MutationReadOnly,
 	}
 }
+
+func (t *Tool) CanonicalDescriptor() protocol.ToolDescriptor {
+	return toolset.BuiltinCanonicalDescriptor(t.Descriptor(), toolset.SearchClassification())
+}
+
+func (*Tool) TrustedClassification() domain.ToolClassification { return toolset.SearchClassification() }
 
 func (t *Tool) Plan(_ context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
 	input := Input{Path: "."}

@@ -98,6 +98,66 @@ func TestDescriptorRevalidationRejectsReplacedExecutableIdentity(t *testing.T) {
 	}
 }
 
+func TestRevalidationRejectsCWDReplacementBeforeCommandStart(t *testing.T) {
+	root := t.TempDir()
+	cwd := filepath.Join(root, "cwd")
+	if err := os.Mkdir(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tool := newTool(t, shell.Options{Workspace: root, ShellPath: "/bin/sh", Timeout: time.Second})
+	planned, err := tool.Plan(context.Background(), request(`{"command":"touch launched","cwd":"cwd"}`, root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := planned.(ports.ResourceRevalidator).Revalidate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(cwd); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result := planned.Execute(context.Background())
+	if result.Status != domain.ToolFailed || !strings.Contains(result.Content, "identity changed") {
+		t.Fatalf("result=%#v", result)
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "launched")); !os.IsNotExist(err) {
+		t.Fatalf("child side effect occurred after cwd replacement: %v", err)
+	}
+}
+
+func TestRevalidationRejectsExecutableReplacementBeforeCommandStart(t *testing.T) {
+	root := t.TempDir()
+	executable := filepath.Join(root, "tool-shell")
+	marker := filepath.Join(root, "child-started")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexec /bin/sh \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tool := newTool(t, shell.Options{Workspace: root, ShellPath: executable, Timeout: time.Second})
+	planned, err := tool.Plan(context.Background(), request(`{"command":"true","cwd":"."}`, root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := planned.(ports.ResourceRevalidator).Revalidate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(executable); err != nil {
+		t.Fatal(err)
+	}
+	replacement := fmt.Sprintf("#!/bin/sh\ntouch %q\nexit 0\n", marker)
+	if err := os.WriteFile(executable, []byte(replacement), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result := planned.Execute(context.Background())
+	if result.Status != domain.ToolFailed || !strings.Contains(result.Content, "identity changed") {
+		t.Fatalf("result=%#v", result)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("replacement executable started: %v", err)
+	}
+}
+
 func TestShellRejectsInvalidInput(t *testing.T) {
 	root := t.TempDir()
 	tool := newTool(t, shell.Options{Workspace: root, ShellPath: "/bin/sh", Timeout: time.Second})

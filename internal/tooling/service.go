@@ -69,8 +69,16 @@ func (s *Service) PlanMutation(ctx context.Context, preview PreviewResult, reque
 	}
 	s.mu.Lock()
 	observed, ok := s.actions[preview.handleID]
+	var observedTurnID protocol.TurnID
+	var observedActivityID protocol.ActivityID
+	var observedDigest protocol.Digest
+	if ok {
+		observedTurnID = observed.turnID
+		observedActivityID = observed.activityID
+		observedDigest = observed.plan.Digest
+	}
 	s.mu.Unlock()
-	if !ok || observed.turnID != request.TurnID || observed.activityID != request.ActivityID || observed.plan.Digest != preview.observationDigest {
+	if !ok || observedTurnID != request.TurnID || observedActivityID != request.ActivityID || observedDigest != preview.observationDigest {
 		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("preview result does not match turn and activity")
 	}
 	for _, digest := range preview.evidenceDigests {
@@ -133,6 +141,7 @@ func (s *Service) Revalidate(ctx context.Context, handle ActionHandle) (protocol
 		return protocol.ActionPlan{}, false, fmt.Errorf("action handle was already revalidated")
 	}
 	action.revalidated = true
+	originalPlan := action.plan
 	s.mu.Unlock()
 
 	revalidator, ok := action.prepared.(ports.ResourceRevalidator)
@@ -147,7 +156,7 @@ func (s *Service) Revalidate(ctx context.Context, handle ActionHandle) (protocol
 	if err != nil {
 		return protocol.ActionPlan{}, false, err
 	}
-	changed := current.Digest != action.plan.Digest
+	changed := current.Digest != originalPlan.Digest
 	s.mu.Lock()
 	action.plan = current
 	s.mu.Unlock()

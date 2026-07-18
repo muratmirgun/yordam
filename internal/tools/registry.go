@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
 type Registry struct {
@@ -18,6 +20,40 @@ var builtInRank = map[string]int{
 	"search": 1,
 	"edit":   2,
 	"shell":  3,
+}
+
+const BuiltinSourceRevision = "builtin-v1"
+
+func BuiltinCanonicalDescriptor(legacy domain.ToolDescriptor, classification domain.ToolClassification) protocol.ToolDescriptor {
+	input, err := canonicaljson.Marshal(legacy.InputSchema)
+	if err != nil {
+		panic(fmt.Sprintf("canonicalize builtin %s schema: %v", legacy.Name, err))
+	}
+	body := protocol.ToolDescriptorBody{
+		Identity:       protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: legacy.Name},
+		SourceRevision: BuiltinSourceRevision, DisplayName: legacy.Name, Description: legacy.Description, InputSchema: input,
+		Effect: classification.Effect, Mutation: classification.Mutation, ExecutionLoci: append([]string(nil), classification.ExecutionLoci...),
+		ClassificationSource: "trusted_adapter", Idempotency: classification.Idempotency, Retry: classification.Retry,
+	}
+	digest, err := canonicaljson.Digest(body)
+	if err != nil {
+		panic(fmt.Sprintf("digest builtin %s descriptor: %v", legacy.Name, err))
+	}
+	return protocol.ToolDescriptor{Body: body, DescriptorDigest: digest}
+}
+
+func ReadClassification() domain.ToolClassification {
+	return domain.ToolClassification{Effect: "observation", Mutation: "read_only", ExecutionLoci: []string{"builtin"}, Boundary: "workspace", Reversibility: "not_applicable", VerificationCoverage: "full", Idempotency: "idempotent", Retry: "safe_before_dispatch", RequestedProfile: "restricted", EffectiveProfile: "restricted"}
+}
+
+func SearchClassification() domain.ToolClassification { return ReadClassification() }
+
+func EditClassification() domain.ToolClassification {
+	return domain.ToolClassification{Effect: "mutation", Mutation: "file", ExecutionLoci: []string{"builtin"}, Boundary: "workspace", Reversibility: "preimage", VerificationCoverage: "preimage_and_postimage", Idempotency: "conditional", Retry: "never_after_dispatch", RequestedProfile: "restricted", EffectiveProfile: "restricted"}
+}
+
+func ShellClassification() domain.ToolClassification {
+	return domain.ToolClassification{Effect: "mutation", Mutation: "process", ExecutionLoci: []string{"process"}, Boundary: "process", Reversibility: "unknown", VerificationCoverage: "partial", Idempotency: "unknown", Retry: "never_after_dispatch", RequestedProfile: "unsandboxed", EffectiveProfile: "unsandboxed"}
 }
 
 func NewRegistry(items ...ports.Tool) *Registry {

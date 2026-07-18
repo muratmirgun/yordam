@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
@@ -50,11 +51,11 @@ func NewCatalog(revision string, tools ...ports.Tool) (*Catalog, error) {
 		if err != nil {
 			return nil, fmt.Errorf("tool alias %q: %w", legacy.Name, err)
 		}
-		classification, trusted := classificationFor(tool, legacy.Name, supplied)
+		classification, trusted := classificationFor(tool)
 		if err := classification.Validate(); err != nil {
 			return nil, fmt.Errorf("tool alias %q: %w", legacy.Name, err)
 		}
-		body, err := canonicalDescriptorBody(revision, legacy, source, supplied, classification, trusted)
+		body, err := canonicalDescriptorBody(revision, legacy, source, supplied, unwrappedIdentity(tool), classification, trusted)
 		if err != nil {
 			return nil, fmt.Errorf("tool alias %q: %w", legacy.Name, err)
 		}
@@ -129,7 +130,7 @@ func normalizeSourceBody(body protocol.ToolDescriptorBody) (protocol.ToolDescrip
 	return body, nil
 }
 
-func canonicalDescriptorBody(revision string, legacy domain.ToolDescriptor, source protocol.ToolDescriptor, supplied bool, classification domain.ToolClassification, trusted bool) (protocol.ToolDescriptorBody, error) {
+func canonicalDescriptorBody(revision string, legacy domain.ToolDescriptor, source protocol.ToolDescriptor, supplied bool, fallbackIdentity protocol.ToolIdentity, classification domain.ToolClassification, trusted bool) (protocol.ToolDescriptorBody, error) {
 	var body protocol.ToolDescriptorBody
 	if supplied {
 		body = source.Body
@@ -139,7 +140,7 @@ func canonicalDescriptorBody(revision string, legacy domain.ToolDescriptor, sour
 			return body, fmt.Errorf("canonicalize input schema: %w", err)
 		}
 		body = protocol.ToolDescriptorBody{
-			Identity:       protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: legacy.Name},
+			Identity:       fallbackIdentity,
 			SourceRevision: revision, DisplayName: legacy.Name, Description: legacy.Description, InputSchema: input,
 		}
 	}
@@ -159,16 +160,27 @@ func canonicalDescriptorBody(revision string, legacy domain.ToolDescriptor, sour
 	return body, nil
 }
 
-func classificationFor(tool ports.Tool, alias string, supplied bool) (domain.ToolClassification, bool) {
+func unwrappedIdentity(tool ports.Tool) protocol.ToolIdentity {
+	typeOf := reflect.TypeOf(tool)
+	for typeOf.Kind() == reflect.Pointer {
+		typeOf = typeOf.Elem()
+	}
+	authority := typeOf.PkgPath()
+	if authority == "" {
+		authority = "unknown_go_package"
+	}
+	name := typeOf.Name()
+	if name == "" {
+		name = "unnamed_tool"
+	}
+	return protocol.ToolIdentity{Source: "untrusted", Authority: authority, Name: name}
+}
+
+func classificationFor(tool ports.Tool) (domain.ToolClassification, bool) {
 	if provider, ok := tool.(ports.TrustedClassificationProvider); ok {
 		classification := provider.TrustedClassification()
 		if classification.Effect != "" {
 			return cloneClassification(classification), true
-		}
-	}
-	if !supplied {
-		if classification, ok := builtinClassification(alias); ok {
-			return classification, true
 		}
 	}
 	return domain.ToolClassification{
@@ -176,19 +188,6 @@ func classificationFor(tool ports.Tool, alias string, supplied bool) (domain.Too
 		Boundary: "remote_or_unknown", Reversibility: "unknown", VerificationCoverage: "none",
 		Idempotency: "unknown", Retry: "never_after_dispatch", RequestedProfile: "ask_or_deny", EffectiveProfile: "ask_or_deny",
 	}, false
-}
-
-func builtinClassification(alias string) (domain.ToolClassification, bool) {
-	switch alias {
-	case "read", "search":
-		return domain.ToolClassification{Effect: "observation", Mutation: "read_only", ExecutionLoci: []string{"builtin"}, Boundary: "workspace", Reversibility: "not_applicable", VerificationCoverage: "full", Idempotency: "idempotent", Retry: "safe_before_dispatch", RequestedProfile: "restricted", EffectiveProfile: "restricted"}, true
-	case "edit":
-		return domain.ToolClassification{Effect: "mutation", Mutation: "file", ExecutionLoci: []string{"builtin"}, Boundary: "workspace", Reversibility: "preimage", VerificationCoverage: "preimage_and_postimage", Idempotency: "conditional", Retry: "never_after_dispatch", RequestedProfile: "restricted", EffectiveProfile: "restricted"}, true
-	case "shell":
-		return domain.ToolClassification{Effect: "mutation", Mutation: "process", ExecutionLoci: []string{"process"}, Boundary: "process", Reversibility: "unknown", VerificationCoverage: "partial", Idempotency: "unknown", Retry: "never_after_dispatch", RequestedProfile: "unsandboxed", EffectiveProfile: "unsandboxed"}, true
-	default:
-		return domain.ToolClassification{}, false
-	}
 }
 
 func (c *Catalog) Expose() protocol.ToolExposure {

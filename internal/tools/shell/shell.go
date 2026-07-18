@@ -16,7 +16,9 @@ import (
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/safefile"
 	"github.com/muratmirgun/yordam/internal/scope"
+	toolset "github.com/muratmirgun/yordam/internal/tools"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 	"github.com/muratmirgun/yordam/internal/workspace"
 )
@@ -73,7 +75,13 @@ func (t *Tool) Descriptor() domain.ToolDescriptor {
 	}
 }
 
-func (t *Tool) Plan(_ context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
+func (t *Tool) CanonicalDescriptor() protocol.ToolDescriptor {
+	return toolset.BuiltinCanonicalDescriptor(t.Descriptor(), toolset.ShellClassification())
+}
+
+func (*Tool) TrustedClassification() domain.ToolClassification { return toolset.ShellClassification() }
+
+func (t *Tool) Plan(ctx context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
 	var input Input
 	if err := decodeStrict(request.Input, &input); err != nil {
 		return nil, fmt.Errorf("shell input: %w", err)
@@ -89,6 +97,10 @@ func (t *Tool) Plan(_ context.Context, request domain.ToolRequest) (ports.Prepar
 	if err != nil {
 		return nil, fmt.Errorf("resolve shell cwd: %w", err)
 	}
+	cwdIdentity, err := anchoredDirectoryIdentity(ctx, cwd.Path)
+	if err != nil {
+		return nil, fmt.Errorf("stat shell cwd: %w", err)
+	}
 	shellPath, err := filepath.EvalSymlinks(t.shellPath)
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize shell executable: %w", err)
@@ -102,6 +114,7 @@ func (t *Tool) Plan(_ context.Context, request domain.ToolRequest) (ports.Prepar
 		input:              input,
 		normalizedCommand:  normalizedCommand,
 		cwd:                cwd,
+		cwdIdentity:        cwdIdentity,
 		workspace:          t.workspace,
 		shellPath:          shellPath,
 		executableIdentity: executableIdentity,
@@ -129,6 +142,7 @@ type prepared struct {
 	input              Input
 	normalizedCommand  string
 	cwd                scope.Resolved
+	cwdIdentity        os.FileInfo
 	workspace          string
 	shellPath          string
 	executableIdentity os.FileInfo
@@ -152,35 +166,44 @@ func (p *prepared) Preview() domain.PreparedToolRequest {
 	}
 }
 
-func (p *prepared) Revalidate(_ context.Context) (domain.PreparedToolRequest, error) {
+func (p *prepared) Revalidate(ctx context.Context) (domain.PreparedToolRequest, error) {
+	if _, err := p.validateCurrentIdentities(ctx); err != nil {
+		return domain.PreparedToolRequest{}, err
+	}
+	return p.Preview(), nil
+}
+
+func (p *prepared) validateCurrentIdentities(ctx context.Context) (scope.Resolved, error) {
 	current, err := scope.Resolve(p.workspace, p.input.CWD, false)
 	if err != nil {
-		return domain.PreparedToolRequest{}, fmt.Errorf("re-resolve shell cwd: %w", err)
+		return scope.Resolved{}, fmt.Errorf("re-resolve shell cwd: %w", err)
 	}
-	info, err := os.Stat(current.Path)
+	if current.Path != p.cwd.Path || current.Inside != p.cwd.Inside {
+		return scope.Resolved{}, fmt.Errorf("canonical scope changed from %q to %q", p.cwd.Path, current.Path)
+	}
+	info, err := anchoredDirectoryIdentity(ctx, current.Path)
 	if err != nil {
-		return domain.PreparedToolRequest{}, fmt.Errorf("stat shell cwd: %w", err)
+		return scope.Resolved{}, fmt.Errorf("stat shell cwd: %w", err)
 	}
-	if !info.IsDir() {
-		return domain.PreparedToolRequest{}, fmt.Errorf("shell cwd is not a directory: %s", current.Path)
+	if p.cwdIdentity != nil && !os.SameFile(p.cwdIdentity, info) {
+		return scope.Resolved{}, fmt.Errorf("shell cwd identity changed after planning: %s", current.Path)
 	}
 	executable, err := exec.LookPath(p.shellPath)
 	if err != nil {
-		return domain.PreparedToolRequest{}, fmt.Errorf("resolve shell executable: %w", err)
+		return scope.Resolved{}, fmt.Errorf("resolve shell executable: %w", err)
 	}
 	executable, err = filepath.EvalSymlinks(executable)
 	if err != nil {
-		return domain.PreparedToolRequest{}, fmt.Errorf("canonicalize shell executable: %w", err)
+		return scope.Resolved{}, fmt.Errorf("canonicalize shell executable: %w", err)
 	}
 	executableIdentity, err := os.Stat(executable)
 	if err != nil {
-		return domain.PreparedToolRequest{}, fmt.Errorf("stat shell executable: %w", err)
+		return scope.Resolved{}, fmt.Errorf("stat shell executable: %w", err)
 	}
-	if p.executableIdentity != nil && !os.SameFile(p.executableIdentity, executableIdentity) {
-		return domain.PreparedToolRequest{}, fmt.Errorf("shell executable identity changed after planning: %s", executable)
+	if executable != p.shellPath || p.executableIdentity != nil && !os.SameFile(p.executableIdentity, executableIdentity) {
+		return scope.Resolved{}, fmt.Errorf("shell executable identity changed after planning: %s", executable)
 	}
-	p.cwd, p.shellPath, p.executableIdentity = current, executable, executableIdentity
-	return p.Preview(), nil
+	return current, nil
 }
 
 func (p *prepared) Execute(ctx context.Context) domain.ToolResult {
@@ -204,12 +227,9 @@ func (p *prepared) Execute(ctx context.Context) domain.ToolResult {
 	command.Stderr = buffer
 	command.Env = strippedEnvironment(os.Environ(), p.providerKeyEnvs)
 
-	current, err := scope.Resolve(p.workspace, p.input.CWD, false)
+	current, err := p.validateCurrentIdentities(runContext)
 	if err != nil {
-		return p.failedBeforeStart(started, buffer, fmt.Errorf("re-resolve shell cwd: %w", err))
-	}
-	if current.Path != p.cwd.Path || current.Inside != p.cwd.Inside {
-		return p.failedBeforeStart(started, buffer, fmt.Errorf("canonical scope changed from %q to %q", p.cwd.Path, current.Path))
+		return p.failedBeforeStart(started, buffer, err)
 	}
 	command.Dir = current.Path
 	if err := command.Start(); err != nil {
@@ -252,6 +272,22 @@ func (p *prepared) Execute(ctx context.Context) domain.ToolResult {
 	}
 	result.Duration = time.Since(started)
 	return result
+}
+
+func anchoredDirectoryIdentity(ctx context.Context, path string) (os.FileInfo, error) {
+	directory, err := safefile.OpenDirectory(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	info, statErr := directory.Stat()
+	closeErr := directory.Close()
+	if err := errors.Join(statErr, closeErr); err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("not a directory: %s", path)
+	}
+	return info, nil
 }
 
 func (p *prepared) reportProgress(buffer *output.Buffer, done <-chan struct{}, finished chan<- struct{}) {

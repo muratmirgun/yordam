@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/muratmirgun/yordam/internal/domain"
@@ -158,6 +159,52 @@ func TestPlanDigestUsesCanonicalActionAndExternalBoundary(t *testing.T) {
 	}
 	if plan.Body.Boundary != "filesystem_external" {
 		t.Fatalf("outside resource retained workspace boundary: %#v", plan.Body)
+	}
+}
+
+func TestPlanMutationConcurrentRevalidateHasConsistentSnapshot(t *testing.T) {
+	observationClassification := domain.ToolClassification{
+		Effect: "observation", Mutation: "read_only", ExecutionLoci: []string{"remote"}, Boundary: "remote",
+		Reversibility: "not_applicable", VerificationCoverage: "provider_reported", Idempotency: "idempotent",
+		Retry: "safe_before_dispatch", RequestedProfile: "networked", EffectiveProfile: "networked",
+	}
+	observe := catalogExternalTool("observe", protocol.ToolIdentity{Source: "mcp", Authority: "server-a", Name: "observe"}, observationClassification)
+	mutate := catalogExternalTool("mutate", protocol.ToolIdentity{Source: "mcp", Authority: "server-a", Name: "mutate"}, trustedRemoteClassification())
+	catalog, err := NewCatalog("revision-1", observe, mutate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(catalog)
+	for index := 0; index < 128; index++ {
+		observationRequest := planRequest("observe", `{}`)
+		observationRequest.CallID = fmt.Sprintf("observe-%d", index)
+		handle, plan, err := service.PlanPreviewInspection(context.Background(), observationRequest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		preview := PreviewResult{handleID: handle.id, observationDigest: plan.Digest}
+		mutationRequest := planRequest("mutate", `{}`)
+		mutationRequest.CallID = fmt.Sprintf("mutate-%d", index)
+		start := make(chan struct{})
+		var wait sync.WaitGroup
+		var mutationPlan protocol.ActionPlan
+		var mutationErr error
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			<-start
+			_, _, _ = service.Revalidate(context.Background(), handle)
+		}()
+		go func() {
+			defer wait.Done()
+			<-start
+			_, mutationPlan, mutationErr = service.PlanMutation(context.Background(), preview, mutationRequest)
+		}()
+		close(start)
+		wait.Wait()
+		if mutationErr != nil || mutationPlan.Body.Tool != mutate.canonical.Body.Identity {
+			t.Fatalf("iteration %d observed inconsistent preview snapshot: plan=%#v err=%v", index, mutationPlan, mutationErr)
+		}
 	}
 }
 
