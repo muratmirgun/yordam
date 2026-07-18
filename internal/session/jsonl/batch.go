@@ -3,6 +3,7 @@ package jsonl
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -186,7 +187,8 @@ type appendGeneratedIdentity struct {
 	compatibilityTime    time.Time
 	markerEventID        protocol.EventID
 	markerTime           time.Time
-	canonicalPayloads    bool
+	admittedPayloads     map[protocol.EventID]json.RawMessage
+	expectedBytes        []byte
 }
 
 func (s *Store) appendBatchLockedWithIdentity(
@@ -285,8 +287,17 @@ func (s *Store) appendBatchLockedWithIdentity(
 			return base, fmt.Errorf("duplicate durable event ID %q", proposed.EventID)
 		}
 		seen[proposed.EventID] = struct{}{}
-		admitted := protocol.CloneRawMessage(proposed.Payload)
-		if s.encoder != nil && !identity.canonicalPayloads {
+		var admitted json.RawMessage
+		if identity.admittedPayloads != nil {
+			persisted, ok := identity.admittedPayloads[proposed.EventID]
+			if !ok {
+				return base, fmt.Errorf("event %q has no persisted admission payload", proposed.EventID)
+			}
+			admitted = protocol.CloneRawMessage(persisted)
+		} else {
+			if s.encoder == nil {
+				return base, fmt.Errorf("journal encoder is required")
+			}
 			admitted, err = s.encoder.EncodeProposed(protocol.CloneProposedEvent(proposed))
 			if err != nil {
 				return base, fmt.Errorf("encode proposed event %q: %w", proposed.EventID, err)
@@ -377,6 +388,14 @@ func (s *Store) appendBatchLockedWithIdentity(
 	}
 	if err := s.registry.Validate(markerRecord); err != nil {
 		return base, err
+	}
+	if identity.expectedBytes != nil {
+		actual := make([]byte, 0, eventLines.Len()+len(markerLine))
+		actual = append(actual, eventLines.Bytes()...)
+		actual = append(actual, markerLine...)
+		if !bytes.Equal(actual, identity.expectedBytes) {
+			return base, fmt.Errorf("prepared append differs from persisted admitted transaction bytes")
+		}
 	}
 	cursor := protocol.CommittedCursor{
 		JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,

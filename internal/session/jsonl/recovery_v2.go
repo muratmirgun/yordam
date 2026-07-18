@@ -12,6 +12,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
@@ -20,22 +21,30 @@ import (
 )
 
 const (
-	recoveryManifestVersion  = 1
+	recoveryManifestVersion  = 2
 	maxRecoveryJournalBytes  = 64 << 20
 	recoveryDiagnosticStatus = "recovery.completed"
 )
 
 type explicitRecoveryManifest struct {
-	Version          uint32                  `json:"version"`
-	Request          journal.RecoveryRequest `json:"request"`
-	Observation      recoveryObservation     `json:"observation"`
-	PrefixDigest     protocol.Digest         `json:"prefix_digest"`
-	SourceDigest     protocol.Digest         `json:"source_digest"`
-	QuarantineName   string                  `json:"quarantine_name"`
-	CandidateName    string                  `json:"candidate_name"`
-	MetadataName     string                  `json:"metadata_name"`
-	RequestFileName  string                  `json:"request_file_name"`
-	RequestTemporary string                  `json:"request_temporary"`
+	Version          uint32                           `json:"version"`
+	Request          journal.RecoveryRequest          `json:"request"`
+	Observation      recoveryObservation              `json:"observation"`
+	PrefixDigest     protocol.Digest                  `json:"prefix_digest"`
+	SourceDigest     protocol.Digest                  `json:"source_digest"`
+	QuarantineName   string                           `json:"quarantine_name"`
+	CandidateName    string                           `json:"candidate_name"`
+	MetadataName     string                           `json:"metadata_name"`
+	RequestFileName  string                           `json:"request_file_name"`
+	RequestTemporary string                           `json:"request_temporary"`
+	DiagnosticAppend recoveryDiagnosticAppendManifest `json:"diagnostic_append"`
+}
+
+type recoveryDiagnosticAppendManifest struct {
+	EventTime            time.Time `json:"event_time"`
+	CompatibilityPayload []byte    `json:"compatibility_payload,omitempty"`
+	DiagnosticPayload    []byte    `json:"diagnostic_payload"`
+	TransactionBytes     []byte    `json:"transaction_bytes"`
 }
 
 func (s *Store) RecoverSession(ctx context.Context, request journal.RecoveryRequest) (journal.RecoveryResult, error) {
@@ -130,8 +139,7 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 		}, nil
 	}
 	if exists {
-		diagnostic := recoveryCompletedDiagnostic(request, manifest)
-		deterministic, buildErr := buildDeterministicRecoveryDiagnosticAppend(session, request, diagnostic, scan)
+		deterministic, buildErr := s.buildPersistedRecoveryDiagnosticAppend(session, request, manifest, scan)
 		if buildErr != nil {
 			return journal.RecoveryResult{}, buildErr
 		}
@@ -139,6 +147,7 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 			if err := s.preserveAndResetPartialRecoveryDiagnostic(ctx, transaction, manifest, operationHash, activeRaw); err != nil {
 				return journal.RecoveryResult{}, err
 			}
+			s.clearMarkerUncertainty(request.Journal, request.TransactionID)
 			if err := transaction.close(); err != nil {
 				transactionOpen = false
 				return journal.RecoveryResult{}, err
@@ -159,6 +168,12 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 			return journal.RecoveryResult{Status: "conflict", Cursor: scan.head}, nil
 		}
 		manifest = newExplicitRecoveryManifest(request, manifestName, operationHash, activeRaw, scan.validPrefixSize)
+		diagnostic := recoveryCompletedDiagnostic(request, manifest)
+		admitted, admissionErr := s.admitRecoveryDiagnosticAppend(session, request, diagnostic, scan)
+		if admissionErr != nil {
+			return journal.RecoveryResult{}, admissionErr
+		}
+		manifest.DiagnosticAppend = admitted
 		if err := persistExplicitRecoveryManifest(ctx, transaction, manifest); err != nil {
 			return journal.RecoveryResult{}, err
 		}
@@ -236,8 +251,11 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 	}
 	transactionOpen = false
 
-	diagnostic := recoveryCompletedDiagnostic(request, manifest)
-	appendResult, appendErr := s.commitRecoveryDiagnostic(ctx, request, diagnostic)
+	diagnostic, diagnosticErr := recoveryDiagnosticFromManifest(manifest, request)
+	if diagnosticErr != nil {
+		return journal.RecoveryResult{}, diagnosticErr
+	}
+	appendResult, appendErr := s.commitRecoveryDiagnostic(ctx, request, manifest)
 	if appendErr != nil {
 		return journal.RecoveryResult{}, appendErr
 	}
@@ -247,7 +265,7 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 	}, nil
 }
 
-func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.RecoveryRequest, diagnostic protocol.Diagnostic) (journal.AppendResult, error) {
+func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.RecoveryRequest, manifest explicitRecoveryManifest) (journal.AppendResult, error) {
 	var result journal.AppendResult
 	err := s.runRecoveryAction(FaultRecoveryDiagnosticCommit, func() error {
 		transaction, session, err := s.openJournal(ctx, request.Journal, os.O_RDWR|os.O_APPEND)
@@ -262,7 +280,7 @@ func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.Re
 			result = journal.AppendResult{Status: journal.AppendCommitted, Cursor: committed.cursor, CurrentHead: committed.cursor}
 			return transaction.close()
 		}
-		deterministic, buildErr := buildDeterministicRecoveryDiagnosticAppend(session, request, diagnostic, scan)
+		deterministic, buildErr := s.buildPersistedRecoveryDiagnosticAppend(session, request, manifest, scan)
 		if buildErr != nil {
 			return errors.Join(buildErr, transaction.close())
 		}
@@ -275,6 +293,7 @@ func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.Re
 	if result.Status != journal.AppendCommitted {
 		return result, fmt.Errorf("recovery diagnostic append status %q", result.Status)
 	}
+	s.clearMarkerUncertainty(request.Journal, request.TransactionID)
 	return result, nil
 }
 
@@ -284,14 +303,103 @@ type deterministicRecoveryDiagnosticAppend struct {
 	raw      []byte
 }
 
-func buildDeterministicRecoveryDiagnosticAppend(
+func (s *Store) admitRecoveryDiagnosticAppend(
 	session domain.Session,
 	request journal.RecoveryRequest,
 	diagnostic protocol.Diagnostic,
 	scan journalScan,
-) (deterministicRecoveryDiagnosticAppend, error) {
+) (recoveryDiagnosticAppendManifest, error) {
+	if s.encoder == nil {
+		return recoveryDiagnosticAppendManifest{}, fmt.Errorf("journal encoder is required")
+	}
 	operationPrefix := "recovery:" + recoveryOperationHash(request.OperationID)
 	eventTime := session.UpdatedAt.UTC()
+	admitted := recoveryDiagnosticAppendManifest{EventTime: eventTime}
+	if scan.hasLegacy && !scanHasCommittedV2(scan) {
+		payload, err := canonicaljson.Marshal(protocol.MigrationCompatibilityDeclaredV1{
+			ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion,
+			LegacyHead: request.ExpectedHead, DowngradeStatus: "v0.1_read_only_after_v2",
+		})
+		if err != nil {
+			return recoveryDiagnosticAppendManifest{}, err
+		}
+		proposed := protocol.ProposedEvent{
+			EventID: protocol.EventID(operationPrefix + ":compatibility"), Time: eventTime, PayloadVersion: 1,
+			Kind: protocol.EventMigrationCompatibilityDeclared, SessionID: protocol.SessionID(request.Journal.ID), Payload: payload,
+		}
+		admitted.CompatibilityPayload, err = s.admitRecoveryPayload(proposed)
+		if err != nil {
+			return recoveryDiagnosticAppendManifest{}, err
+		}
+	}
+	diagnosticPayload, err := canonicaljson.Marshal(protocol.DiagnosticV1{Diagnostic: diagnostic})
+	if err != nil {
+		return recoveryDiagnosticAppendManifest{}, err
+	}
+	proposed := protocol.ProposedEvent{
+		EventID: protocol.EventID(operationPrefix + ":diagnostic"), Time: eventTime, PayloadVersion: 1,
+		Kind: protocol.EventRecoveryDiagnostic, SessionID: protocol.SessionID(request.Journal.ID), Payload: diagnosticPayload,
+	}
+	admitted.DiagnosticPayload, err = s.admitRecoveryPayload(proposed)
+	if err != nil {
+		return recoveryDiagnosticAppendManifest{}, err
+	}
+	deterministic, err := s.buildRecoveryDiagnosticAppend(session, request, admitted, scan)
+	if err != nil {
+		return recoveryDiagnosticAppendManifest{}, err
+	}
+	admitted.TransactionBytes = bytes.Clone(deterministic.raw)
+	return admitted, nil
+}
+
+func (s *Store) admitRecoveryPayload(proposed protocol.ProposedEvent) ([]byte, error) {
+	admitted, err := s.encoder.EncodeProposed(protocol.CloneProposedEvent(proposed))
+	if err != nil {
+		return nil, fmt.Errorf("encode proposed event %q: %w", proposed.EventID, err)
+	}
+	canonical, err := canonicaljson.Marshal(admitted)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize proposed event %q: %w", proposed.EventID, err)
+	}
+	return bytes.Clone(canonical), nil
+}
+
+func (s *Store) buildPersistedRecoveryDiagnosticAppend(
+	session domain.Session,
+	request journal.RecoveryRequest,
+	manifest explicitRecoveryManifest,
+	scan journalScan,
+) (deterministicRecoveryDiagnosticAppend, error) {
+	deterministic, err := s.buildRecoveryDiagnosticAppend(session, request, manifest.DiagnosticAppend, scan)
+	if err != nil {
+		return deterministicRecoveryDiagnosticAppend{}, err
+	}
+	if len(manifest.DiagnosticAppend.TransactionBytes) == 0 || !bytes.Equal(deterministic.raw, manifest.DiagnosticAppend.TransactionBytes) {
+		return deterministicRecoveryDiagnosticAppend{}, fmt.Errorf("persisted recovery diagnostic transaction bytes do not match admitted payloads")
+	}
+	deterministic.identity.expectedBytes = bytes.Clone(manifest.DiagnosticAppend.TransactionBytes)
+	return deterministic, nil
+}
+
+func (s *Store) buildRecoveryDiagnosticAppend(
+	session domain.Session,
+	request journal.RecoveryRequest,
+	admitted recoveryDiagnosticAppendManifest,
+	scan journalScan,
+) (deterministicRecoveryDiagnosticAppend, error) {
+	operationPrefix := "recovery:" + recoveryOperationHash(request.OperationID)
+	eventTime := admitted.EventTime.UTC()
+	if admitted.EventTime.IsZero() || !eventTime.Equal(session.UpdatedAt.UTC()) {
+		return deterministicRecoveryDiagnosticAppend{}, fmt.Errorf("persisted recovery diagnostic time does not match the validated session head")
+	}
+	diagnosticPayload, err := canonicalPersistedRecoveryPayload(admitted.DiagnosticPayload)
+	if err != nil {
+		return deterministicRecoveryDiagnosticAppend{}, fmt.Errorf("persisted recovery diagnostic payload: %w", err)
+	}
+	if _, err := recoveryDiagnosticFromPayload(diagnosticPayload, request); err != nil {
+		return deterministicRecoveryDiagnosticAppend{}, err
+	}
+
 	appendRequest := journal.AppendRequest{
 		Journal: request.Journal, ExpectedHead: request.ExpectedHead, TransactionID: request.TransactionID,
 	}
@@ -300,40 +408,44 @@ func buildDeterministicRecoveryDiagnosticAppend(
 		compatibilityTime:    eventTime,
 		markerEventID:        protocol.EventID(operationPrefix + ":marker"),
 		markerTime:           eventTime,
-		canonicalPayloads:    true,
+		admittedPayloads:     make(map[protocol.EventID]json.RawMessage, 2),
 	}
 
 	seq := request.ExpectedHead.CommitSeq + 1
 	envelopes := make([]protocol.EventEnvelope, 0, 2)
-	if scan.hasLegacy && !scanHasCommittedV2(scan) {
+	needsCompatibility := scan.hasLegacy && !scanHasCommittedV2(scan)
+	if needsCompatibility {
+		compatibilityPayload, payloadErr := canonicalPersistedRecoveryPayload(admitted.CompatibilityPayload)
+		if payloadErr != nil {
+			return deterministicRecoveryDiagnosticAppend{}, fmt.Errorf("persisted recovery compatibility payload: %w", payloadErr)
+		}
+		var declaration protocol.MigrationCompatibilityDeclaredV1
+		if err := json.Unmarshal(compatibilityPayload, &declaration); err != nil || declaration.ReaderVersion != protocol.EnvelopeVersion ||
+			declaration.WriterVersion != protocol.EnvelopeVersion || declaration.LegacyHead != request.ExpectedHead ||
+			declaration.DowngradeStatus != "v0.1_read_only_after_v2" {
+			return deterministicRecoveryDiagnosticAppend{}, fmt.Errorf("persisted recovery compatibility admission is invalid")
+		}
 		appendRequest.Compatibility = &journal.CompatibilityDeclaration{
 			ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: request.ExpectedHead,
 		}
-		payload, err := canonicaljson.Marshal(protocol.MigrationCompatibilityDeclaredV1{
-			ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion,
-			LegacyHead: request.ExpectedHead, DowngradeStatus: "v0.1_read_only_after_v2",
-		})
-		if err != nil {
-			return deterministicRecoveryDiagnosticAppend{}, err
-		}
+		identity.admittedPayloads[identity.compatibilityEventID] = protocol.CloneRawMessage(compatibilityPayload)
 		envelopes = append(envelopes, protocol.EventEnvelope{
 			SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1,
 			JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
 			EventID: identity.compatibilityEventID, SessionID: protocol.SessionID(request.Journal.ID),
 			Seq: seq, Time: eventTime, Kind: protocol.EventMigrationCompatibilityDeclared,
-			TransactionID: request.TransactionID, Payload: payload,
+			TransactionID: request.TransactionID, Payload: compatibilityPayload,
 		})
 		seq++
+	} else if len(admitted.CompatibilityPayload) != 0 {
+		return deterministicRecoveryDiagnosticAppend{}, fmt.Errorf("persisted recovery admission has an unexpected compatibility payload")
 	}
 
-	diagnosticPayload, err := canonicaljson.Marshal(protocol.DiagnosticV1{Diagnostic: diagnostic})
-	if err != nil {
-		return deterministicRecoveryDiagnosticAppend{}, err
-	}
 	diagnosticEvent := protocol.ProposedEvent{
 		EventID: protocol.EventID(operationPrefix + ":diagnostic"), Time: eventTime, PayloadVersion: 1,
 		Kind: protocol.EventRecoveryDiagnostic, SessionID: protocol.SessionID(request.Journal.ID), Payload: diagnosticPayload,
 	}
+	identity.admittedPayloads[diagnosticEvent.EventID] = protocol.CloneRawMessage(diagnosticPayload)
 	appendRequest.Events = []protocol.ProposedEvent{diagnosticEvent}
 	envelopes = append(envelopes, protocol.EventEnvelope{
 		SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: diagnosticEvent.PayloadVersion,
@@ -370,14 +482,68 @@ func buildDeterministicRecoveryDiagnosticAppend(
 		if lineErr != nil {
 			return deterministicRecoveryDiagnosticAppend{}, lineErr
 		}
+		record, decodeErr := s.registry.Decode(protocol.CloneRawMessage(line[:len(line)-1]))
+		if decodeErr != nil {
+			return deterministicRecoveryDiagnosticAppend{}, decodeErr
+		}
+		if validateErr := s.registry.Validate(record); validateErr != nil {
+			return deterministicRecoveryDiagnosticAppend{}, validateErr
+		}
 		raw = append(raw, line...)
 	}
 	markerLine, err := encodeLine(marker)
 	if err != nil {
 		return deterministicRecoveryDiagnosticAppend{}, err
 	}
+	markerRecord, err := s.registry.Decode(protocol.CloneRawMessage(markerLine[:len(markerLine)-1]))
+	if err != nil {
+		return deterministicRecoveryDiagnosticAppend{}, err
+	}
+	if err := s.registry.Validate(markerRecord); err != nil {
+		return deterministicRecoveryDiagnosticAppend{}, err
+	}
 	raw = append(raw, markerLine...)
 	return deterministicRecoveryDiagnosticAppend{request: appendRequest, identity: identity, raw: raw}, nil
+}
+
+func canonicalPersistedRecoveryPayload(raw []byte) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("payload is empty")
+	}
+	canonical, err := canonicaljson.Marshal(json.RawMessage(raw))
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(canonical, raw) {
+		return nil, fmt.Errorf("payload is not canonical")
+	}
+	return protocol.CloneRawMessage(canonical), nil
+}
+
+func recoveryDiagnosticFromPayload(raw json.RawMessage, request journal.RecoveryRequest) (protocol.Diagnostic, error) {
+	var payload protocol.DiagnosticV1
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return protocol.Diagnostic{}, fmt.Errorf("decode persisted recovery diagnostic admission: %w", err)
+	}
+	var details struct {
+		OperationID   protocol.ControlOperationID `json:"operation_id"`
+		TransactionID protocol.TransactionID      `json:"transaction_id"`
+	}
+	if payload.Diagnostic.Code != recoveryDiagnosticStatus || payload.Diagnostic.Journal != request.Journal ||
+		payload.Diagnostic.AtSeq != request.ExpectedHead.CommitSeq+1 ||
+		json.Unmarshal(payload.Diagnostic.Details, &details) != nil || details.OperationID != request.OperationID ||
+		details.TransactionID != request.TransactionID {
+		return protocol.Diagnostic{}, fmt.Errorf("persisted recovery diagnostic admission does not match the recovery request")
+	}
+	return protocol.DeepCopy(payload.Diagnostic), nil
+}
+
+func recoveryDiagnosticFromManifest(manifest explicitRecoveryManifest, request journal.RecoveryRequest) (protocol.Diagnostic, error) {
+	raw, err := canonicalPersistedRecoveryPayload(manifest.DiagnosticAppend.DiagnosticPayload)
+	if err != nil {
+		return protocol.Diagnostic{}, fmt.Errorf("persisted recovery diagnostic payload: %w", err)
+	}
+	return recoveryDiagnosticFromPayload(raw, request)
 }
 
 func scanHasCommittedV2(scan journalScan) bool {
@@ -434,7 +600,9 @@ func validatePersistedRecoveryManifest(
 		manifest.PrefixDigest.Validate() != nil || manifest.SourceDigest.Validate() != nil ||
 		manifest.QuarantineName != expectedQuarantine || manifest.CandidateName != expectedCandidate ||
 		manifest.MetadataName != expectedMetadata || manifest.RequestFileName != manifestName ||
-		manifest.RequestTemporary != expectedTemporary {
+		manifest.RequestTemporary != expectedTemporary || manifest.DiagnosticAppend.EventTime.IsZero() ||
+		len(manifest.DiagnosticAppend.DiagnosticPayload) == 0 || len(manifest.DiagnosticAppend.TransactionBytes) == 0 ||
+		len(manifest.DiagnosticAppend.TransactionBytes) > 3*(protocol.MaxEventBytes+1) {
 		return fmt.Errorf("persisted recovery manifest does not match the derived recovery operation")
 	}
 	for _, name := range []string{manifest.QuarantineName, manifest.CandidateName, manifest.MetadataName, manifest.RequestTemporary} {

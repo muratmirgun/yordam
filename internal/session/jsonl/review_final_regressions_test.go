@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -20,6 +21,204 @@ type deterministicDiagnosticMaterial struct {
 	raw         []byte
 	lineEnds    []int
 	markerStart int
+}
+
+type recoveryDiagnosticAppendTestView struct {
+	DiagnosticPayload []byte `json:"diagnostic_payload"`
+	TransactionBytes  []byte `json:"transaction_bytes"`
+}
+
+type recoveryAdmissionEncoder struct {
+	calls     []string
+	reject    error
+	transform bool
+}
+
+func (e *recoveryAdmissionEncoder) EncodeProposed(event protocol.ProposedEvent) (json.RawMessage, error) {
+	e.calls = append(e.calls, event.Kind)
+	if e.reject != nil {
+		return nil, e.reject
+	}
+	if !e.transform || event.Kind != protocol.EventRecoveryDiagnostic {
+		return protocol.CloneRawMessage(event.Payload), nil
+	}
+	var payload protocol.DiagnosticV1
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return nil, err
+	}
+	payload.Diagnostic.Message = "admitted redacted recovery diagnostic"
+	return canonicaljson.Marshal(payload)
+}
+
+func TestRecoveryAdmissionRejectsBeforeAnyPersistence(t *testing.T) {
+	fixture := copyFixture(t, "incomplete-batch")
+	setup := openFixtureStore(fixture)
+	_, request := recoveryRequestForFixture(t, setup, "operation-admission-reject", "txn-admission-reject")
+	before := snapshotTree(t, fixture.root)
+	rejected := errors.New("reject recovery diagnostic admission")
+	encoder := &recoveryAdmissionEncoder{reject: rejected}
+	store := New(fixture.root, Options{Encoder: encoder})
+	if _, err := store.RecoverSession(context.Background(), request); !errors.Is(err, rejected) {
+		t.Fatalf("recovery admission err=%v", err)
+	}
+	if len(encoder.calls) != 1 || encoder.calls[0] != protocol.EventMigrationCompatibilityDeclared {
+		t.Fatalf("encoder calls=%v, want one rejected compatibility admission", encoder.calls)
+	}
+	if after := snapshotTree(t, fixture.root); !reflect.DeepEqual(after, before) {
+		t.Fatal("rejected recovery admission wrote storage")
+	}
+}
+
+func TestRecoveryPersistsAdmittedPayloadAndReusesItsExactBytes(t *testing.T) {
+	fixture := copyFixture(t, "incomplete-batch")
+	setup := openFixtureStore(fixture)
+	_, request := recoveryRequestForFixture(t, setup, "operation-admission-transform", "txn-admission-transform")
+	pause := errors.New("pause after admitted recovery material is persisted")
+	paused := false
+	encoder := &recoveryAdmissionEncoder{transform: true}
+	store := New(fixture.root, Options{Encoder: encoder, Fault: func(point FaultPoint) error {
+		if point == FaultRecoveryDiagnosticCommit && !paused {
+			paused = true
+			return pause
+		}
+		return nil
+	}})
+	if _, err := store.RecoverSession(context.Background(), request); !errors.Is(err, pause) {
+		t.Fatalf("initial recovery err=%v", err)
+	}
+	if fmt.Sprint(encoder.calls) != fmt.Sprint([]string{
+		protocol.EventMigrationCompatibilityDeclared, protocol.EventRecoveryDiagnostic,
+	}) {
+		t.Fatalf("encoder calls=%v", encoder.calls)
+	}
+	manifest := readOnlyRecoveryManifest(t, fixture)
+	appendMaterial := recoveryDiagnosticAppendView(t, manifest)
+	admitted := []byte("admitted redacted recovery diagnostic")
+	original := []byte("journal recovery preserved the observed tail and activated the validated prefix")
+	if !bytes.Contains(appendMaterial.DiagnosticPayload, admitted) ||
+		bytes.Contains(appendMaterial.DiagnosticPayload, original) {
+		t.Fatalf("manifest diagnostic payload=%s", appendMaterial.DiagnosticPayload)
+	}
+	if !bytes.Contains(appendMaterial.TransactionBytes, admitted) ||
+		bytes.Contains(appendMaterial.TransactionBytes, original) {
+		t.Fatalf("manifest transaction bytes=%s", appendMaterial.TransactionBytes)
+	}
+	eventsPath := filepath.Join(fixture.sessionDir, "events.jsonl")
+	cut := len(appendMaterial.TransactionBytes) / 3
+	file, err := os.OpenFile(eventsPath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(appendMaterial.TransactionBytes[:cut]); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	retryEncoder := &recoveryAdmissionEncoder{reject: errors.New("re-admission is forbidden")}
+	retry := New(fixture.root, Options{Encoder: retryEncoder})
+	result, err := retry.RecoverSession(context.Background(), request)
+	if err != nil || result.Status != "recovered" {
+		t.Fatalf("retry result=%+v err=%v", result, err)
+	}
+	if len(retryEncoder.calls) != 0 {
+		t.Fatalf("retry re-admitted recovery events: %v", retryEncoder.calls)
+	}
+	active, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prefix := manifest.Observation.ValidPrefixBytes; !bytes.Equal(active[prefix:], appendMaterial.TransactionBytes) {
+		t.Fatalf("retried bytes differ from admitted manifest bytes\ngot:  %q\nwant: %q", active[prefix:], appendMaterial.TransactionBytes)
+	}
+}
+
+func TestRecoveryResetClearsOnlyExactMarkerUncertaintyForSameStoreRetry(t *testing.T) {
+	fixture := copyFixture(t, "incomplete-batch")
+	setup := openFixtureStore(fixture)
+	_, request := recoveryRequestForFixture(t, setup, "operation-exact-uncertainty", "txn-exact-uncertainty")
+	pause := errors.New("pause before diagnostic append")
+	paused := false
+	store := New(fixture.root, Options{Encoder: fixturePassthroughEncoder{}, Fault: func(point FaultPoint) error {
+		if point == FaultRecoveryDiagnosticCommit && !paused {
+			paused = true
+			return pause
+		}
+		return nil
+	}})
+	if _, err := store.RecoverSession(context.Background(), request); !errors.Is(err, pause) {
+		t.Fatalf("initial recovery err=%v", err)
+	}
+	manifest := readOnlyRecoveryManifest(t, fixture)
+	raw := recoveryDiagnosticAppendView(t, manifest).TransactionBytes
+	markerStart := bytes.LastIndex(raw[:len(raw)-1], []byte{'\n'}) + 1
+	cut := markerStart + (len(raw)-markerStart)/2
+	eventsPath := filepath.Join(fixture.sessionDir, "events.jsonl")
+	file, err := os.OpenFile(eventsPath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(raw[:cut]); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	eventsInfo, err := os.Stat(eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exactKey := markerUncertaintyKey(request.Journal, request.TransactionID)
+	otherRef := protocol.JournalRef{Kind: protocol.JournalSession, ID: "01ARZ3NDEKTSV4RRFFQ69G5FB0"}
+	otherKey := markerUncertaintyKey(otherRef, "txn-unrelated-uncertainty")
+	store.state.markerUncertainty.Store(exactKey, eventsInfo)
+	store.state.markerUncertainty.Store(otherKey, eventsInfo)
+
+	result, err := store.RecoverSession(context.Background(), request)
+	if err != nil || result.Status != "recovered" {
+		t.Fatalf("same-store retry result=%+v err=%v", result, err)
+	}
+	if _, exists := store.state.markerUncertainty.Load(exactKey); exists {
+		t.Fatal("successful retry retained exact marker uncertainty")
+	}
+	if _, exists := store.state.markerUncertainty.Load(otherKey); !exists {
+		t.Fatal("recovery broadly cleared unrelated marker uncertainty")
+	}
+}
+
+func readOnlyRecoveryManifest(t *testing.T, fixture fixtureMaterialization) explicitRecoveryManifest {
+	t.Helper()
+	manifestPath := onlyGlob(t, filepath.Join(fixture.sessionDir, ".recovery-request-*.json"))
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest explicitRecoveryManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	return manifest
+}
+
+func recoveryDiagnosticAppendView(t *testing.T, manifest explicitRecoveryManifest) recoveryDiagnosticAppendTestView {
+	t.Helper()
+	raw, err := canonicaljson.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted struct {
+		DiagnosticAppend recoveryDiagnosticAppendTestView `json:"diagnostic_append"`
+	}
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.DiagnosticAppend.DiagnosticPayload) == 0 || len(persisted.DiagnosticAppend.TransactionBytes) == 0 {
+		t.Fatal("recovery manifest has no admitted diagnostic append material")
+	}
+	return persisted.DiagnosticAppend
 }
 
 func TestRecoveryDiagnosticResumesEveryDeterministicBytePrefix(t *testing.T) {

@@ -13,6 +13,8 @@ Task 3 is implemented from signed base `45b656d2256c604cbacfce9feeb5704578c195e1
 - Recovery is advertised and accepted only for eligible incomplete final fragments or incomplete known transactions; unsupported, malformed, and invalid-transition data stays read-only and non-discardable.
 - Persisted recovery manifests, activation candidates, metadata, quarantine artifacts, and their rooted identities are revalidated immediately before mutation. Recovery-diagnostic append retries cover every Task 2 append crash window.
 - Recovery diagnostics use operation-derived compatibility, diagnostic, and marker identities plus the persisted session timestamp, so every operation-owned byte prefix is recognizable and retryable even when the first JSON line was only partly written.
+- Recovery compatibility/diagnostic payloads cross the configured encoder/admission boundary exactly once before manifest persistence; the manifest binds the canonical admitted payloads and exact transaction bytes reused by every retry.
+- A durable diagnostic reset clears only that request transaction's marker-uncertainty latch before reappend; the successfully synced retry clears the same exact latch without touching unrelated journal state.
 - Candidate and metadata identities are checked at the final rename boundaries after active handles close; diagnostic reset applies the same fail-closed boundary validation.
 - The exact 11-case fixture matrix contains 33 fixture files plus one sorted lowercase SHA-256 manifest.
 - No config, schema, reload, Task 4+, or progress-ledger semantics were changed.
@@ -60,6 +62,13 @@ The final re-review returned two Important findings. Both were reproduced in one
 1. A true short first diagnostic write, before a complete event or even before `transaction_id`, was not recognizable as operation-owned and conflicted forever. GREEN: recovery constructs the exact deterministic compatibility/diagnostic/marker transaction from the persisted request and session state, recognizes only strict byte prefixes of that transaction, preserves the observed prefix, resets to the validated journal prefix, and retries with the same identities and timestamp. Tests cut before `transaction_id`, midway through the first line, between event lines, and midway through the marker, then require byte-for-byte equality after retry.
 2. Candidate and metadata identities could change after validation/handle close but before final rename. GREEN: normal activation closes the active handle, executes a deterministic boundary probe, revalidates the retained rooted identity, and immediately renames with no intervening work at both metadata and journal-candidate boundaries. Diagnostic reset performs the equivalent metadata/candidate validation immediately before its candidate rename. Deterministic substitutions at every boundary fail without changing the active journal.
 
+### Narrow final re-review correction batch
+
+The narrow final re-review returned two Important findings. Both were reproduced before the correction:
+
+1. The deterministic recovery path's `canonicalPayloads` flag skipped the configured encoder. A rejecting encoder was never called and a transforming encoder recorded no admissions. GREEN: the compatibility and diagnostic proposals each cross the encoder exactly once before any recovery manifest or journal mutation. Their canonical admitted payloads, timestamp, and complete deterministic transaction bytes are persisted in manifest version 2. Retry reconstructs and validates the transaction from that admission record, requires byte equality with the persisted transaction, and never invokes the encoder again. Rejecting admission leaves the complete storage tree unchanged; transforming admission persists and commits only the transformed payload with stable bytes across a partial-prefix retry.
+2. A real short marker write set the exact transaction's in-memory uncertainty latch, but diagnostic reset left it in place and same-Store reappend returned `commit_unknown`. GREEN: only after the replacement prefix is identity-checked, renamed, and directory-synced does recovery clear `markerUncertaintyKey(request.Journal, request.TransactionID)`. The completed, synced retry clears that same exact key again after append resolution. A mid-marker regression explicitly installs the latch, retries on the same Store, and proves success while an unrelated journal latch remains present.
+
 ## Implementation and compatibility
 
 ### Inspection and upcasting
@@ -79,6 +88,7 @@ The final re-review returned two Important findings. Both were reproduced in one
 - Same-request restart returns `recovered` or `already_recovered`; changed request/head/tail returns `conflict` without mutation.
 - Partial operation-owned files and diagnostic append bytes resume safely. Candidate/session/artifacts/quarantine substitution tests fail closed without changing the active source.
 - Even a non-newline-terminated prefix of the first recovery-diagnostic event is preserved and resumed only when it exactly matches the persisted operation's deterministic transaction bytes.
+- Recovery admission rejection occurs before manifest/quarantine/candidate mutation. Admitted canonical payloads and exact transaction bytes are manifest-bound and reused without re-admission.
 - Recovery appends `recovery.diagnostic` in a new committed transaction and automatically includes the first-v2 compatibility declaration for a legacy-only prefix.
 
 ## Test migrations outside the nominal brief list
@@ -90,7 +100,7 @@ The following existing Task 2/v0.1 tests encoded the removed automatic-Load muta
 - `hardening_test.go`: restart recovery now uses the complete explicit request; unmatched tool calls are diagnostics without appended events.
 - `transaction_test.go`: pure Load does not scan or mutate unrelated legacy recovery artifacts.
 
-`recovery_test.go` and `recovery_generation_test.go` were migrated from automatic truncation/metadata repair/interruption expectations to unchanged-source inspection plus explicit recovery. Superseded mutation-only helper coverage was replaced by explicit fault, partial-write, candidate-substitution, and opened-root tests.
+`recovery_test.go` and `recovery_generation_test.go` were migrated from automatic truncation/metadata repair/interruption expectations to unchanged-source inspection plus explicit recovery. Their explicit-recovery paths now also provide the mandatory encoder boundary. Superseded mutation-only helper coverage was replaced by explicit fault, partial-write, candidate-substitution, and opened-root tests.
 
 ## Verification
 
@@ -111,9 +121,9 @@ gofmt -l internal/session/jsonl
 Latest package results:
 
 ```text
-final two-finding focused regression batch: PASS
-jsonl package: PASS (16.664s final package rerun)
-jsonl race package: PASS (35.582s final rerun)
+narrow final two-finding focused regression batch: PASS
+jsonl package: PASS (18.005s final package rerun)
+jsonl race package: PASS (36.477s final rerun)
 repository-wide go test ./...: PASS (including internal/ptytest)
 go vet ./...: PASS
 diff/gofmt checks: PASS

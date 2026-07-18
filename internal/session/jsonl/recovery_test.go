@@ -50,8 +50,9 @@ func recoveryRequestFromInspection(t *testing.T, store *jsonl.Store, sessionID s
 func TestLoadInspectsAndExplicitRecoveryPreservesIncompleteFinalLine(t *testing.T) {
 	root := t.TempDir()
 	store := jsonl.New(root, jsonl.Options{
-		Clock:   func() time.Time { return time.Unix(1, 0).UTC() },
-		Entropy: strings.NewReader(strings.Repeat("b", 2048)),
+		Clock:    func() time.Time { return time.Unix(1, 0).UTC() },
+		Entropy:  strings.NewReader(strings.Repeat("b", 2048)),
+		Sanitize: func(value any) (json.RawMessage, error) { return json.Marshal(value) },
 	})
 	workspace, err := jsonl.WorkspaceFromPath(t.TempDir())
 	if err != nil {

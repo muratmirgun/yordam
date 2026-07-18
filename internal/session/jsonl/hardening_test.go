@@ -20,6 +20,7 @@ import (
 func TestLoadInspectionAndExplicitRecoveryAreRestartIdempotent(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
+	store = jsonl.New(root, jsonl.Options{Sanitize: func(value any) (json.RawMessage, error) { return json.Marshal(value) }})
 	eventsPath := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID, "events.jsonl")
 	tail := []byte(`{"schema_version":1`)
 	appendFile(t, eventsPath, tail)

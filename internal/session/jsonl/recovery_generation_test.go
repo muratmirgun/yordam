@@ -23,6 +23,7 @@ import (
 func TestExplicitRecoveryPreservesDistinctTailGenerations(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
+	store = jsonl.New(root, jsonl.Options{Sanitize: func(value any) (json.RawMessage, error) { return json.Marshal(value) }})
 	sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
 	eventsPath := filepath.Join(sessionDir, "events.jsonl")
 	artifactsDir := filepath.Join(sessionDir, "artifacts")
@@ -73,6 +74,7 @@ func TestExplicitRecoveryPreservesDistinctTailGenerations(t *testing.T) {
 func TestExplicitRecoveryPreservesTailsThatDifferBeyondLegacyRetentionCap(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
+	store = jsonl.New(root, jsonl.Options{Sanitize: func(value any) (json.RawMessage, error) { return json.Marshal(value) }})
 	sessionDir := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID)
 	eventsPath := filepath.Join(sessionDir, "events.jsonl")
 	artifactsDir := filepath.Join(sessionDir, "artifacts")
