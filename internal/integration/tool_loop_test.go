@@ -53,6 +53,7 @@ func TestToolLoopProductionCompositionDelegatesTurnToOrchestrator(t *testing.T) 
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- application.Run(ctx) }()
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "reply once", DraftID: 1}

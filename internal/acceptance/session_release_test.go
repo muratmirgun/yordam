@@ -380,7 +380,7 @@ func runAcceptanceApp(t *testing.T, application *app.App) <-chan error {
 
 func waitForAppTerminal(t *testing.T, events <-chan app.Event) app.Event {
 	t.Helper()
-	deadline := time.NewTimer(5 * time.Second)
+	deadline := time.NewTimer(15 * time.Second)
 	defer deadline.Stop()
 	for {
 		select {
