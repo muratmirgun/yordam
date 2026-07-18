@@ -20,6 +20,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/eventcodec"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 type sanitizeEncoder struct {
@@ -43,9 +44,8 @@ func (s *Store) admitProposed(event protocol.ProposedEvent) (json.RawMessage, er
 	if s.encoder == nil {
 		return nil, fmt.Errorf("journal encoder is required")
 	}
-	admitted, err := s.encoder.EncodeProposed(protocol.CloneProposedEvent(event))
-	if err != nil || s.secrets == nil {
-		return admitted, err
+	if s.secrets == nil {
+		return s.encoder.EncodeProposed(protocol.CloneProposedEvent(event))
 	}
 	if event.RuntimeGenerationID == "" {
 		return nil, fmt.Errorf("runtime generation is required for secret admission")
@@ -55,6 +55,17 @@ func (s *Store) admitProposed(event protocol.ProposedEvent) (json.RawMessage, er
 		return nil, fmt.Errorf("acquire secret admission lease: %w", err)
 	}
 	defer lease.Close()
+	return s.admitProposedWithLease(event, lease)
+}
+
+func (s *Store) admitProposedWithLease(event protocol.ProposedEvent, lease *secret.Lease) (json.RawMessage, error) {
+	if s.encoder == nil {
+		return nil, fmt.Errorf("journal encoder is required")
+	}
+	admitted, err := s.encoder.EncodeProposed(protocol.CloneProposedEvent(event))
+	if err != nil || lease == nil {
+		return admitted, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(admitted))
 	decoder.UseNumber()
 	var value any

@@ -18,6 +18,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 const (
@@ -329,7 +330,12 @@ func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.Re
 		if buildErr != nil {
 			return errors.Join(buildErr, transaction.close())
 		}
-		result, err = s.appendBatchLockedWithIdentity(ctx, transaction, session, deterministic.request, deterministic.identity)
+		admission, admissionErr := s.acquireAppendAdmission(deterministic.request)
+		if admissionErr != nil {
+			return errors.Join(admissionErr, transaction.close())
+		}
+		result, err = s.appendBatchLockedWithIdentity(ctx, transaction, session, deterministic.request, deterministic.identity, admission)
+		err = errors.Join(err, admission.Close())
 		return errors.Join(err, transaction.close())
 	})
 	if err != nil {
@@ -360,6 +366,15 @@ func (s *Store) admitRecoveryDiagnosticAppend(
 	operationPrefix := "recovery:" + recoveryOperationHash(request.OperationID)
 	eventTime := session.UpdatedAt.UTC()
 	admitted := recoveryDiagnosticAppendManifest{EventTime: eventTime}
+	var admission *secret.Lease
+	var err error
+	if s.secrets != nil {
+		admission, err = s.secrets.AcquireExisting(request.RuntimeGenerationID)
+		if err != nil {
+			return recoveryDiagnosticAppendManifest{}, fmt.Errorf("acquire recovery transaction admission lease: %w", err)
+		}
+		defer admission.Close()
+	}
 	if scan.hasLegacy && !scanHasCommittedV2(scan) {
 		payload, err := canonicaljson.Marshal(protocol.MigrationCompatibilityDeclaredV1{
 			ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion,
@@ -373,7 +388,7 @@ func (s *Store) admitRecoveryDiagnosticAppend(
 			Kind: protocol.EventMigrationCompatibilityDeclared, SessionID: protocol.SessionID(request.Journal.ID), Payload: payload,
 			RuntimeGenerationID: request.RuntimeGenerationID,
 		}
-		admitted.CompatibilityPayload, err = s.admitRecoveryPayload(proposed)
+		admitted.CompatibilityPayload, err = s.admitRecoveryPayload(proposed, admission)
 		if err != nil {
 			return recoveryDiagnosticAppendManifest{}, err
 		}
@@ -387,7 +402,7 @@ func (s *Store) admitRecoveryDiagnosticAppend(
 		Kind: protocol.EventRecoveryDiagnostic, SessionID: protocol.SessionID(request.Journal.ID), Payload: diagnosticPayload,
 		RuntimeGenerationID: request.RuntimeGenerationID,
 	}
-	admitted.DiagnosticPayload, err = s.admitRecoveryPayload(proposed)
+	admitted.DiagnosticPayload, err = s.admitRecoveryPayload(proposed, admission)
 	if err != nil {
 		return recoveryDiagnosticAppendManifest{}, err
 	}
@@ -395,12 +410,17 @@ func (s *Store) admitRecoveryDiagnosticAppend(
 	if err != nil {
 		return recoveryDiagnosticAppendManifest{}, err
 	}
+	if admission != nil {
+		if err := admission.Admit(deterministic.raw); err != nil {
+			return recoveryDiagnosticAppendManifest{}, fmt.Errorf("admit complete recovery transaction: %w", err)
+		}
+	}
 	admitted.TransactionBytes = bytes.Clone(deterministic.raw)
 	return admitted, nil
 }
 
-func (s *Store) admitRecoveryPayload(proposed protocol.ProposedEvent) ([]byte, error) {
-	admitted, err := s.admitProposed(protocol.CloneProposedEvent(proposed))
+func (s *Store) admitRecoveryPayload(proposed protocol.ProposedEvent, admission *secret.Lease) ([]byte, error) {
+	admitted, err := s.admitProposedWithLease(protocol.CloneProposedEvent(proposed), admission)
 	if err != nil {
 		return nil, fmt.Errorf("encode proposed event %q: %w", proposed.EventID, err)
 	}

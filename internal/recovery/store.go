@@ -18,6 +18,7 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/rootanchor"
 	"github.com/muratmirgun/yordam/internal/secret"
 )
 
@@ -26,6 +27,7 @@ var (
 	ErrDigestMismatch       = errors.New("recovery preimage digest mismatch")
 	ErrConfidentialMaterial = errors.New("recovery candidate is confidential and cannot be serialized")
 	ErrUnsafePath           = errors.New("unsafe recovery path")
+	ErrRecoveryBusy         = errors.New("recovery store is busy")
 )
 
 const containerMagic = "YORDAM-RECOVERY-1\n"
@@ -99,21 +101,15 @@ func WithFault(fault FaultInjector) Option {
 }
 
 type fileStore struct {
-	root      string
-	admission *secret.Lease
-	sealer    Sealer
-	clock     func() time.Time
-	fault     FaultInjector
-	opMu      sync.Mutex
-	mu        sync.Mutex
-	rootFS    *os.Root
-	chain     []rootIdentity
-	closed    bool
-}
-
-type rootIdentity struct {
-	path string
-	info os.FileInfo
+	root       string
+	admission  *secret.Lease
+	sealer     Sealer
+	clock      func() time.Time
+	fault      FaultInjector
+	opMu       sync.Mutex
+	mu         sync.Mutex
+	rootAnchor *rootanchor.Anchor
+	closed     bool
 }
 
 func New(root string, admission *secret.Lease, configured ...Option) (RecoveryStore, error) {
@@ -135,12 +131,12 @@ func New(root string, admission *secret.Lease, configured ...Option) (RecoverySt
 			return nil, err
 		}
 	}
-	absolute, err := normalizeRoot(root)
+	anchor, err := rootanchor.New(root, ErrUnsafePath)
 	if err != nil {
 		_ = owned.Close()
 		return nil, err
 	}
-	return &fileStore{root: absolute, admission: owned, sealer: opts.sealer, clock: opts.clock, fault: opts.fault}, nil
+	return &fileStore{root: anchor.Target(), admission: owned, sealer: opts.sealer, clock: opts.clock, fault: opts.fault, rootAnchor: anchor}, nil
 }
 
 func (s *fileStore) Close() error {
@@ -153,13 +149,12 @@ func (s *fileStore) Close() error {
 		return nil
 	}
 	s.closed = true
-	root := s.rootFS
-	s.rootFS = nil
-	s.chain = nil
+	anchor := s.rootAnchor
+	s.rootAnchor = nil
 	s.mu.Unlock()
 	var rootErr error
-	if root != nil {
-		rootErr = root.Close()
+	if anchor != nil {
+		rootErr = anchor.Close()
 	}
 	return errors.Join(rootErr, s.admission.Close())
 }
@@ -175,6 +170,18 @@ func (s *fileStore) Put(ctx context.Context, candidate Candidate) (protocol.Reco
 	if existing, exists, err := s.readExisting(ctx, id, candidate); err != nil {
 		return protocol.RecoveryMaterialRecord{}, err
 	} else if exists {
+		root, rootErr := s.pinnedRoot(ctx, false)
+		if rootErr != nil {
+			return protocol.RecoveryMaterialRecord{}, rootErr
+		}
+		coordination, coordinationErr := acquireRecoveryCoordination(ctx, root)
+		if coordinationErr != nil {
+			return protocol.RecoveryMaterialRecord{}, coordinationErr
+		}
+		defer coordination.release()
+		if err := s.reconcileTemporaries(root); err != nil {
+			return protocol.RecoveryMaterialRecord{}, err
+		}
 		return existing, nil
 	}
 	material := bytes.Clone(candidate.Preimage)
@@ -206,6 +213,9 @@ func (s *fileStore) Put(ctx context.Context, candidate Candidate) (protocol.Reco
 	if err != nil {
 		return protocol.RecoveryMaterialRecord{}, err
 	}
+	if err := s.admission.Admit(container); err != nil {
+		return protocol.RecoveryMaterialRecord{}, fmt.Errorf("admit final recovery container: %w", err)
+	}
 	root, err := s.pinnedRoot(ctx, true)
 	if err != nil {
 		return protocol.RecoveryMaterialRecord{}, err
@@ -213,12 +223,22 @@ func (s *fileStore) Put(ctx context.Context, candidate Candidate) (protocol.Reco
 	if err := s.ensureMaterials(root); err != nil {
 		return protocol.RecoveryMaterialRecord{}, err
 	}
+	coordination, err := acquireRecoveryCoordination(ctx, root)
+	if err != nil {
+		return protocol.RecoveryMaterialRecord{}, err
+	}
+	defer coordination.release()
 	if err := s.reconcileTemporaries(root); err != nil {
 		return protocol.RecoveryMaterialRecord{}, err
 	}
+	if existing, exists, err := s.readExistingRoot(ctx, root, id, candidate); err != nil {
+		return protocol.RecoveryMaterialRecord{}, err
+	} else if exists {
+		return existing, nil
+	}
 	name := filepath.Join("materials", string(id)+".recovery")
 	if err := s.publishContainer(ctx, root, name, container); errors.Is(err, os.ErrExist) {
-		existing, exists, readErr := s.readExisting(ctx, id, candidate)
+		existing, exists, readErr := s.readExistingRoot(ctx, root, id, candidate)
 		if readErr != nil || !exists {
 			return protocol.RecoveryMaterialRecord{}, errors.Join(err, readErr)
 		}
@@ -341,19 +361,30 @@ func (s *fileStore) readExisting(ctx context.Context, id protocol.RecoveryMateri
 	if err != nil {
 		return protocol.RecoveryMaterialRecord{}, false, err
 	}
-	if err := s.ensureMaterials(root); err != nil {
+	info, err := root.Lstat("materials")
+	if os.IsNotExist(err) {
+		return protocol.RecoveryMaterialRecord{}, false, nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return protocol.RecoveryMaterialRecord{}, false, errors.Join(ErrUnsafePath, err)
+	}
+	if err := s.pinDirectory("materials"); err != nil {
 		return protocol.RecoveryMaterialRecord{}, false, err
 	}
-	if err := s.reconcileTemporaries(root); err != nil {
-		return protocol.RecoveryMaterialRecord{}, false, err
-	}
+	return s.readExistingRoot(ctx, root, id, candidate)
+}
+
+func (s *fileStore) readExistingRoot(ctx context.Context, root *os.Root, id protocol.RecoveryMaterialID, candidate Candidate) (protocol.RecoveryMaterialRecord, bool, error) {
 	name := filepath.Join("materials", string(id)+".recovery")
-	raw, err := readRegularRoot(ctx, root, name, 64<<20)
+	raw, err := s.readRegularRoot(ctx, root, name, 64<<20)
 	if os.IsNotExist(err) {
 		return protocol.RecoveryMaterialRecord{}, false, nil
 	}
 	if err != nil {
 		return protocol.RecoveryMaterialRecord{}, false, err
+	}
+	if err := s.admission.Admit(raw); err != nil {
+		return protocol.RecoveryMaterialRecord{}, false, fmt.Errorf("admit existing recovery container: %w", err)
 	}
 	record, _, err := decodeContainer(raw)
 	if err != nil {
@@ -381,10 +412,11 @@ func (s *fileStore) ensureMaterials(root *os.Root) error {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.Join(ErrUnsafePath, err)
 	}
-	return nil
+	return s.pinDirectory("materials")
 }
 
-func (s *fileStore) reconcileTemporaries(root *os.Root) error {
+func (s *fileStore) reconcileTemporaries(root *os.Root) (resultErr error) {
+	defer func() { resultErr = errors.Join(resultErr, s.verifyRootIdentity()) }()
 	directory, err := root.Open("materials")
 	if err != nil {
 		return err
@@ -414,7 +446,8 @@ func (s *fileStore) reconcileTemporaries(root *os.Root) error {
 	return nil
 }
 
-func (s *fileStore) publishContainer(ctx context.Context, root *os.Root, final string, content []byte) error {
+func (s *fileStore) publishContainer(ctx context.Context, root *os.Root, final string, content []byte) (resultErr error) {
+	defer func() { resultErr = errors.Join(resultErr, s.verifyRootIdentity()) }()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -493,71 +526,43 @@ func (s *fileStore) pinnedRoot(ctx context.Context, create bool) (*os.Root, erro
 	if s.closed {
 		return nil, secret.ErrLeaseClosed
 	}
-	if s.rootFS != nil {
-		if err := verifyChain(s.chain); err != nil {
-			return nil, err
-		}
-		return s.rootFS, nil
-	}
-	if create {
-		if err := os.MkdirAll(s.root, 0o700); err != nil {
-			return nil, err
-		}
-	}
-	info, err := os.Lstat(s.root)
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+	if s.rootAnchor == nil {
 		return nil, ErrUnsafePath
 	}
-	chain, err := captureChain(s.root)
+	return s.rootAnchor.Open(ctx, create)
+}
+
+func (s *fileStore) pinDirectory(relative string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.rootAnchor == nil {
+		return secret.ErrLeaseClosed
+	}
+	return s.rootAnchor.PinDirectory(relative)
+}
+
+func (s *fileStore) verifyRootIdentity() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.rootAnchor == nil {
+		return secret.ErrLeaseClosed
+	}
+	return s.rootAnchor.Verify()
+}
+
+func (s *fileStore) readRegularRoot(ctx context.Context, root *os.Root, name string, limit int64) ([]byte, error) {
+	s.mu.Lock()
+	if s.closed || s.rootAnchor == nil {
+		s.mu.Unlock()
+		return nil, secret.ErrLeaseClosed
+	}
+	err := s.rootAnchor.VerifyRelative(name)
+	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	root, err := os.OpenRoot(s.root)
-	if err != nil {
-		return nil, err
-	}
-	opened, err := root.Stat(".")
-	if err != nil || !os.SameFile(info, opened) {
-		_ = root.Close()
-		return nil, errors.Join(ErrUnsafePath, err)
-	}
-	s.rootFS, s.chain = root, chain
-	return root, nil
-}
-
-func captureChain(path string) ([]rootIdentity, error) {
-	var paths []string
-	for cursor := filepath.Clean(path); ; cursor = filepath.Dir(cursor) {
-		paths = append(paths, cursor)
-		if parent := filepath.Dir(cursor); parent == cursor {
-			break
-		}
-	}
-	chain := make([]rootIdentity, 0, len(paths))
-	for index := len(paths) - 1; index >= 0; index-- {
-		info, err := os.Lstat(paths[index])
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return nil, errors.Join(ErrUnsafePath, err)
-		}
-		chain = append(chain, rootIdentity{paths[index], info})
-	}
-	return chain, nil
-}
-
-func verifyChain(chain []rootIdentity) error {
-	if len(chain) == 0 {
-		return ErrUnsafePath
-	}
-	for _, identity := range chain {
-		info, err := os.Lstat(identity.path)
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !os.SameFile(identity.info, info) {
-			return errors.Join(ErrUnsafePath, err)
-		}
-	}
-	return nil
+	raw, readErr := readRegularRoot(ctx, root, name, limit)
+	return raw, errors.Join(readErr, s.verifyRootIdentity())
 }
 
 func readRegularRoot(ctx context.Context, root *os.Root, name string, limit int64) ([]byte, error) {
@@ -605,27 +610,4 @@ func digestBytes(value []byte) protocol.Digest {
 
 func safeName(value string) bool {
 	return value != "" && value != "." && value != ".." && filepath.Base(value) == value && !strings.ContainsAny(value, "/\\\x00")
-}
-
-func normalizeRoot(root string) (string, error) {
-	absolute, err := filepath.Abs(filepath.Clean(root))
-	if err != nil {
-		return "", err
-	}
-	cursor := absolute
-	var missing []string
-	for {
-		if canonical, resolveErr := filepath.EvalSymlinks(cursor); resolveErr == nil {
-			for index := len(missing) - 1; index >= 0; index-- {
-				canonical = filepath.Join(canonical, missing[index])
-			}
-			return canonical, nil
-		}
-		parent := filepath.Dir(cursor)
-		if parent == cursor {
-			return absolute, nil
-		}
-		missing = append(missing, filepath.Base(cursor))
-		cursor = parent
-	}
 }

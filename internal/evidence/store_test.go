@@ -3,6 +3,7 @@ package evidence_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -222,6 +223,37 @@ func TestEvidenceRejectsSecretMetadataAndInvalidBoundsBeforeCreatingRoot(t *test
 	}
 }
 
+func TestEvidenceAdmitsFinalCanonicalRecordBeforeAnyPublication(t *testing.T) {
+	content := []byte("final-record-content")
+	contentDigest := sha256.Sum256(content)
+	for name, generatedOnly := range map[string][]byte{
+		"created_at":   []byte(`"created_at"`),
+		"availability": []byte(`"availability"`),
+		"blob_digest":  []byte(hex.EncodeToString(contentDigest[:])),
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "not-created")
+			registry := secret.NewRegistry()
+			lease, err := registry.Acquire("evidence-final", [][]byte{generatedOnly})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lease.Close()
+			store, err := evidence.New(root, lease)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if _, err := store.Put(context.Background(), evidenceCandidate("ses-a", "final-a", content)); !errors.Is(err, secret.ErrSecretDetected) {
+				t.Fatalf("final record admission error=%v", err)
+			}
+			if _, err := os.Stat(root); !os.IsNotExist(err) {
+				t.Fatalf("rejected final record created storage: %v", err)
+			}
+		})
+	}
+}
+
 func TestEvidenceFailsAfterPinnedRootOrParentReplacement(t *testing.T) {
 	for _, target := range []string{"root", "parent"} {
 		t.Run(target, func(t *testing.T) {
@@ -260,6 +292,130 @@ func TestEvidenceFailsAfterPinnedRootOrParentReplacement(t *testing.T) {
 			}
 			if _, err := store.Put(context.Background(), evidenceCandidate("ses-a", "root-b", []byte("second"))); !errors.Is(err, evidence.ErrUnsafePath) {
 				t.Fatalf("replacement error=%v", err)
+			}
+		})
+	}
+}
+
+func TestEvidencePinsExistingRootOrDeepestAncestorAtConstruction(t *testing.T) {
+	for _, target := range []string{"existing_root", "deepest_existing_ancestor"} {
+		t.Run(target, func(t *testing.T) {
+			base := t.TempDir()
+			anchor := filepath.Join(base, "anchor")
+			if err := os.Mkdir(anchor, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			root := anchor
+			if target == "deepest_existing_ancestor" {
+				root = filepath.Join(anchor, "missing", "evidence")
+			}
+			registry := secret.NewRegistry()
+			lease, err := registry.Acquire("evidence-construction-anchor", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err := evidence.New(root, lease)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			if target == "deepest_existing_ancestor" {
+				if _, err := os.Stat(root); !os.IsNotExist(err) {
+					t.Fatalf("constructor created confidential root: %v", err)
+				}
+			}
+			moved := anchor + "-retained"
+			if err := os.Rename(anchor, moved); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(anchor, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Put(context.Background(), evidenceCandidate("ses-a", "construction-swap", []byte("confidential"))); !errors.Is(err, evidence.ErrUnsafePath) {
+				t.Fatalf("construction identity replacement error=%v", err)
+			}
+			for _, candidateRoot := range []string{root, filepath.Join(moved, "missing", "evidence")} {
+				if raw, err := os.ReadDir(candidateRoot); err == nil && len(raw) != 0 {
+					t.Fatalf("rejected put populated %q", candidateRoot)
+				} else if err != nil && !os.IsNotExist(err) {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestEvidenceRejectsInRootSymlinkSwapOfPinnedDescendant(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		relative func(protocol.EvidenceRecord) string
+		access   func(context.Context, evidence.Store, protocol.EvidenceRecord) error
+	}{
+		{
+			name: "records",
+			relative: func(protocol.EvidenceRecord) string {
+				return filepath.Join("evidence", "records")
+			},
+			access: func(ctx context.Context, store evidence.Store, record protocol.EvidenceRecord) error {
+				_, err := store.Get(ctx, record.Body.ID)
+				return err
+			},
+		},
+		{
+			name: "dynamic_workspace",
+			relative: func(record protocol.EvidenceRecord) string {
+				return filepath.Join("workspaces", string(record.Body.WorkspaceID))
+			},
+			access: func(ctx context.Context, store evidence.Store, record protocol.EvidenceRecord) error {
+				opened, err := store.Open(ctx, record.Body.ID)
+				if opened != nil {
+					_ = opened.Close()
+				}
+				return err
+			},
+		},
+		{
+			name: "blob_directory",
+			relative: func(record protocol.EvidenceRecord) string {
+				return filepath.Join("workspaces", string(record.Body.WorkspaceID), "evidence", "blobs", "sha256")
+			},
+			access: func(ctx context.Context, store evidence.Store, record protocol.EvidenceRecord) error {
+				opened, err := store.Open(ctx, record.Body.ID)
+				if opened != nil {
+					_ = opened.Close()
+				}
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, store := newEvidenceStore(t)
+			record := putEvidence(t, store, evidenceCandidate("ses-a", "descendant-"+test.name, []byte("content")))
+			relative := test.relative(record)
+			original := filepath.Join(root, relative)
+			retained := original + "-retained"
+			if err := os.Rename(original, retained); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Base(retained), original); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.access(context.Background(), store, record); !errors.Is(err, evidence.ErrUnsafePath) {
+				t.Fatalf("existing store descendant swap error=%v", err)
+			}
+
+			registry := secret.NewRegistry()
+			lease, err := registry.Acquire("evidence-fresh-descendant", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fresh, err := evidence.New(root, lease)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fresh.Close()
+			if err := test.access(context.Background(), fresh, record); !errors.Is(err, evidence.ErrUnsafePath) {
+				t.Fatalf("fresh store descendant swap error=%v", err)
 			}
 		})
 	}

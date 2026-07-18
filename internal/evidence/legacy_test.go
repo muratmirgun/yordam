@@ -2,12 +2,17 @@ package evidence_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/evidence"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
@@ -57,6 +62,75 @@ func TestLegacyArtifactMigrationRejectsTraversalAndSymlink(t *testing.T) {
 		if _, err := store.MigrateLegacyArtifact(context.Background(), protocol.SessionID("session-a"), id); !errors.Is(err, evidence.ErrUnsafePath) {
 			t.Fatalf("id=%q error=%v", id, err)
 		}
+	}
+}
+
+func TestLegacyAliasAdmitsFinalBodyAndDigestBeforeAnyPublication(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "not-created")
+	sessionID := protocol.SessionID("session-a")
+	artifactID := "legacy-a"
+	sum := sha256.Sum256([]byte("legacy-artifact\x00" + string(sessionID) + "\x00" + artifactID))
+	evidenceID := protocol.EvidenceID("legacy-" + hex.EncodeToString(sum[:]))
+	body := struct {
+		SessionID   protocol.SessionID   `json:"session_id"`
+		ArtifactID  string               `json:"artifact_id"`
+		WorkspaceID protocol.WorkspaceID `json:"workspace_id"`
+		EvidenceID  protocol.EvidenceID  `json:"evidence_id"`
+	}{sessionID, artifactID, "workspace-a", evidenceID}
+	digest, err := canonicaljson.Digest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("legacy-final-alias", [][]byte{[]byte(digest.Value)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	resolver := &legacyResolverFixture{artifacts: map[string][]byte{"session-a/legacy-a": []byte("legacy-content")}}
+	store, err := evidence.New(root, lease, evidence.WithLegacyResolver(resolver))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.MigrateLegacyArtifact(context.Background(), sessionID, artifactID); !errors.Is(err, secret.ErrSecretDetected) {
+		t.Fatalf("alias admission error=%v", err)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("rejected final alias created storage: %v", err)
+	}
+}
+
+func TestLegacyAliasRejectsInRootSymlinkSwapForExistingAndFreshStores(t *testing.T) {
+	resolver := &legacyResolverFixture{artifacts: map[string][]byte{"session-a/legacy-a": []byte("legacy-content")}}
+	root, store := newEvidenceStoreWithResolver(t, resolver)
+	if _, err := store.MigrateLegacyArtifact(context.Background(), "session-a", "legacy-a"); err != nil {
+		t.Fatal(err)
+	}
+	aliases := filepath.Join(root, "evidence", "aliases")
+	retained := aliases + "-retained"
+	if err := os.Rename(aliases, retained); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Base(retained), aliases); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MigrateLegacyArtifact(context.Background(), "session-a", "legacy-a"); !errors.Is(err, evidence.ErrUnsafePath) {
+		t.Fatalf("existing store alias swap error=%v", err)
+	}
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("legacy-fresh-swap", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	fresh, err := evidence.New(root, lease, evidence.WithLegacyResolver(resolver))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if _, err := fresh.MigrateLegacyArtifact(context.Background(), "session-a", "legacy-a"); !errors.Is(err, evidence.ErrUnsafePath) {
+		t.Fatalf("fresh store alias swap error=%v", err)
 	}
 }
 

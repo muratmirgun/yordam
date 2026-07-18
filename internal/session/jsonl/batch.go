@@ -15,6 +15,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 type keyedJournalLock struct {
@@ -132,7 +133,12 @@ func (s *Store) AppendBatch(ctx context.Context, request journal.AppendRequest) 
 	if err := validateAppendRequest(request); err != nil {
 		return journal.AppendResult{}, err
 	}
-	if err := s.admitAppendRequestMetadata(request); err != nil {
+	admission, err := s.acquireAppendAdmission(request)
+	if err != nil {
+		return journal.AppendResult{}, err
+	}
+	defer admission.Close()
+	if err := s.admitAppendRequestMetadata(request, admission); err != nil {
 		return journal.AppendResult{}, err
 	}
 	if s.encoder == nil {
@@ -155,7 +161,7 @@ func (s *Store) AppendBatch(ctx context.Context, request journal.AppendRequest) 
 	if err := guard.bind(ctx, transaction); err != nil {
 		return journal.AppendResult{}, errors.Join(err, transaction.close(), guard.release())
 	}
-	result, operationErr := s.appendBatchLocked(ctx, transaction, session, request)
+	result, operationErr := s.appendBatchLocked(ctx, transaction, session, request, admission)
 	closeErr := transaction.close()
 	resultErr := errors.Join(operationErr, closeErr, guard.release())
 	if resultErr == nil && result.Status == journal.AppendCommitted {
@@ -164,8 +170,28 @@ func (s *Store) AppendBatch(ctx context.Context, request journal.AppendRequest) 
 	return result, resultErr
 }
 
-func (s *Store) admitAppendRequestMetadata(request journal.AppendRequest) error {
+func (s *Store) acquireAppendAdmission(request journal.AppendRequest) (*secret.Lease, error) {
 	if s.secrets == nil {
+		return nil, nil
+	}
+	generationID := request.Events[0].RuntimeGenerationID
+	if generationID == "" {
+		return nil, fmt.Errorf("runtime generation is required for secret admission")
+	}
+	for _, event := range request.Events[1:] {
+		if event.RuntimeGenerationID != generationID {
+			return nil, fmt.Errorf("one pinned runtime generation is required for the entire transaction")
+		}
+	}
+	lease, err := s.secrets.AcquireExisting(generationID)
+	if err != nil {
+		return nil, fmt.Errorf("acquire secret admission lease: %w", err)
+	}
+	return lease, nil
+}
+
+func (s *Store) admitAppendRequestMetadata(request journal.AppendRequest, admission *secret.Lease) error {
+	if admission == nil {
 		return nil
 	}
 	type appendMetadata struct {
@@ -181,24 +207,13 @@ func (s *Store) admitAppendRequestMetadata(request journal.AppendRequest) error 
 	for index, event := range request.Events {
 		metadata.Events[index] = protocol.CloneProposedEvent(event)
 		metadata.Events[index].Payload = nil
-		if event.RuntimeGenerationID == "" {
-			return fmt.Errorf("runtime generation is required for secret admission")
-		}
-		lease, err := s.secrets.AcquireExisting(event.RuntimeGenerationID)
-		if err != nil {
-			return fmt.Errorf("acquire secret admission lease: %w", err)
-		}
-		raw, marshalErr := canonicaljson.Marshal(struct {
-			Journal       protocol.JournalRef
-			ExpectedHead  protocol.CommittedCursor
-			TransactionID protocol.TransactionID
-			Event         protocol.ProposedEvent
-		}{request.Journal, request.ExpectedHead, request.TransactionID, metadata.Events[index]})
-		admitErr := lease.Admit(raw)
-		closeErr := lease.Close()
-		if err := errors.Join(marshalErr, admitErr, closeErr); err != nil {
-			return fmt.Errorf("admit proposed envelope metadata: %w", err)
-		}
+	}
+	raw, err := canonicaljson.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("marshal proposed envelope metadata: %w", err)
+	}
+	if err := admission.Admit(raw); err != nil {
+		return fmt.Errorf("admit proposed envelope metadata: %w", err)
 	}
 	return nil
 }
@@ -233,8 +248,9 @@ func (s *Store) appendBatchLocked(
 	transaction *sessionTransaction,
 	session domain.Session,
 	request journal.AppendRequest,
+	admission *secret.Lease,
 ) (journal.AppendResult, error) {
-	return s.appendBatchLockedWithIdentity(ctx, transaction, session, request, appendGeneratedIdentity{})
+	return s.appendBatchLockedWithIdentity(ctx, transaction, session, request, appendGeneratedIdentity{}, admission)
 }
 
 type appendGeneratedIdentity struct {
@@ -252,6 +268,7 @@ func (s *Store) appendBatchLockedWithIdentity(
 	session domain.Session,
 	request journal.AppendRequest,
 	identity appendGeneratedIdentity,
+	admission *secret.Lease,
 ) (journal.AppendResult, error) {
 	if s.journalHasMarkerUncertainty(request.Journal) {
 		return journal.AppendResult{Status: journal.AppendCommitUnknown}, fmt.Errorf("journal has unresolved marker durability uncertainty")
@@ -354,7 +371,7 @@ func (s *Store) appendBatchLockedWithIdentity(
 			if s.encoder == nil {
 				return base, fmt.Errorf("journal encoder is required")
 			}
-			admitted, err = s.admitProposed(protocol.CloneProposedEvent(proposed))
+			admitted, err = s.admitProposedWithLease(protocol.CloneProposedEvent(proposed), admission)
 			if err != nil {
 				return base, fmt.Errorf("encode proposed event %q: %w", proposed.EventID, err)
 			}
@@ -446,12 +463,17 @@ func (s *Store) appendBatchLockedWithIdentity(
 	if err := s.registry.Validate(markerRecord); err != nil {
 		return base, err
 	}
+	actual := make([]byte, 0, eventLines.Len()+len(markerLine))
+	actual = append(actual, eventLines.Bytes()...)
+	actual = append(actual, markerLine...)
 	if identity.expectedBytes != nil {
-		actual := make([]byte, 0, eventLines.Len()+len(markerLine))
-		actual = append(actual, eventLines.Bytes()...)
-		actual = append(actual, markerLine...)
 		if !bytes.Equal(actual, identity.expectedBytes) {
 			return base, fmt.Errorf("prepared append differs from persisted admitted transaction bytes")
+		}
+	}
+	if admission != nil {
+		if err := admission.Admit(actual); err != nil {
+			return base, fmt.Errorf("admit complete generated transaction: %w", err)
 		}
 	}
 	cursor := protocol.CommittedCursor{

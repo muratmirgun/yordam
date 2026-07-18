@@ -53,6 +53,19 @@ func (s *fileStore) MigrateLegacyArtifact(ctx context.Context, sessionID protoco
 		return protocol.EvidenceRecord{}, ErrUnsafePath
 	}
 	evidenceID := legacyEvidenceID(sessionID, artifactID)
+	body := legacyAliasBody{SessionID: sessionID, ArtifactID: artifactID, WorkspaceID: workspaceID, EvidenceID: evidenceID}
+	digest, err := canonicaljson.Digest(body)
+	if err != nil {
+		return protocol.EvidenceRecord{}, err
+	}
+	alias := legacyAlias{Body: body, Digest: digest}
+	aliasRaw, err := canonicaljson.Marshal(alias)
+	if err != nil {
+		return protocol.EvidenceRecord{}, err
+	}
+	if err := s.admission.Admit(aliasRaw); err != nil {
+		return protocol.EvidenceRecord{}, fmt.Errorf("admit final legacy alias: %w", err)
+	}
 	candidate := protocol.EvidenceCandidate{
 		ID: evidenceID, Kind: "legacy_artifact", WorkspaceID: workspaceID, SessionID: sessionID,
 		MediaType: "application/octet-stream", ProducingActivityID: "legacy-artifact-migration",
@@ -66,15 +79,10 @@ func (s *fileStore) MigrateLegacyArtifact(ctx context.Context, sessionID protoco
 	if err != nil {
 		return protocol.EvidenceRecord{}, err
 	}
-	body := legacyAliasBody{SessionID: sessionID, ArtifactID: artifactID, WorkspaceID: workspaceID, EvidenceID: record.Body.ID}
+	body.EvidenceID = record.Body.ID
 	if err := validateLegacyTarget(record, body); err != nil {
 		return protocol.EvidenceRecord{}, err
 	}
-	digest, err := canonicaljson.Digest(body)
-	if err != nil {
-		return protocol.EvidenceRecord{}, err
-	}
-	alias := legacyAlias{Body: body, Digest: digest}
 	if err := s.publishLegacyAlias(ctx, alias); errors.Is(err, os.ErrExist) {
 		persisted, readErr := s.readLegacyAlias(ctx, sessionID, artifactID)
 		if readErr != nil {
@@ -117,7 +125,7 @@ func (s *fileStore) publishLegacyAlias(ctx context.Context, alias legacyAlias) e
 		return err
 	}
 	_, err = publishNoReplace(ctx, root, filepath.Join(directory, alias.Body.ArtifactID+".json"), raw, 0o600)
-	return err
+	return errors.Join(err, s.verifyRootIdentity())
 }
 
 func (s *fileStore) readLegacyAlias(ctx context.Context, sessionID protocol.SessionID, artifactID string) (legacyAlias, error) {
@@ -126,7 +134,7 @@ func (s *fileStore) readLegacyAlias(ctx context.Context, sessionID protocol.Sess
 		return legacyAlias{}, err
 	}
 	path := filepath.Join("evidence", "aliases", string(sessionID), artifactID+".json")
-	raw, err := readRegularRoot(ctx, root, path, protocol.MaxByteFieldBytes)
+	raw, err := s.readRegularRoot(ctx, root, path, protocol.MaxByteFieldBytes)
 	if err != nil {
 		return legacyAlias{}, err
 	}

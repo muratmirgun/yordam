@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/muratmirgun/yordam/internal/journal"
@@ -39,6 +41,119 @@ func TestAppendBatchUsesGenerationLeaseBeforeJournalWrite(t *testing.T) {
 	if bytes.Contains(raw, []byte("am91cm5hbC1zZWNyZXQ=")) {
 		t.Fatalf("encoded secret remained in journal: %s", raw)
 	}
+}
+
+func TestAppendBatchAdmitsCompleteGeneratedTransactionBeforeFirstWrite(t *testing.T) {
+	for name, generatedOnly := range map[string][]byte{
+		"marker_kind":    []byte(`"transaction.committed"`),
+		"marker_payload": []byte(`"event_count"`),
+		"envelope_seq":   []byte(`"seq"`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			registry := secret.NewRegistry()
+			lease, err := registry.Acquire("generation-final-transaction", [][]byte{generatedOnly})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lease.Close()
+			fixture := newV2JournalWithOptions(t, jsonl.Options{Encoder: passthroughEncoder{}, Secrets: registry})
+			before := task5TreeSnapshot(t, fixture.root)
+			event := proposed("event-final-transaction", protocol.EventTaskCreated)
+			event.SessionID = protocol.SessionID(fixture.ref.ID)
+			event.RuntimeGenerationID = "generation-final-transaction"
+			if _, err := fixture.repo.AppendBatch(context.Background(), journal.AppendRequest{
+				Journal: fixture.ref, ExpectedHead: fixture.head, TransactionID: "txn-final-transaction", Events: []protocol.ProposedEvent{event},
+			}); !errors.Is(err, secret.ErrSecretDetected) {
+				t.Fatalf("final transaction admission error=%v", err)
+			}
+			if after := task5TreeSnapshot(t, fixture.root); !reflect.DeepEqual(after, before) {
+				t.Fatal("rejected final transaction mutated journal storage")
+			}
+		})
+	}
+}
+
+func TestAppendBatchRequiresOnePinnedGenerationForEntireTransaction(t *testing.T) {
+	registry := secret.NewRegistry()
+	first, err := registry.Acquire("generation-first", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := registry.Acquire("generation-second", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	fixture := newV2JournalWithOptions(t, jsonl.Options{Encoder: passthroughEncoder{}, Secrets: registry})
+	before := task5TreeSnapshot(t, fixture.root)
+	events := []protocol.ProposedEvent{
+		proposed("event-first-generation", protocol.EventTaskCreated),
+		proposed("event-second-generation", protocol.EventTaskCreated),
+	}
+	for index := range events {
+		events[index].SessionID = protocol.SessionID(fixture.ref.ID)
+	}
+	events[0].RuntimeGenerationID = "generation-first"
+	events[1].RuntimeGenerationID = "generation-second"
+	if _, err := fixture.repo.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: fixture.ref, ExpectedHead: fixture.head, TransactionID: "txn-mixed-generation", Events: events,
+	}); err == nil {
+		t.Fatal("mixed-generation transaction was accepted")
+	}
+	if after := task5TreeSnapshot(t, fixture.root); !reflect.DeepEqual(after, before) {
+		t.Fatal("mixed-generation transaction mutated journal storage")
+	}
+}
+
+func TestRecoveryAdmitsCompleteGeneratedTransactionBeforeManifestWrite(t *testing.T) {
+	root := t.TempDir()
+	store, workspace, session := createTestSession(t, root)
+	eventsPath := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID, "events.jsonl")
+	appendFile(t, eventsPath, []byte(`{"incomplete":`))
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("generation-recovery-final", [][]byte{[]byte(`"transaction.committed"`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	admitted := jsonl.New(root, jsonl.Options{Encoder: passthroughEncoder{}, Secrets: registry})
+	request := recoveryRequestFromInspection(t, store, session.ID, "operation-final-admission", "txn-final-admission")
+	request.RuntimeGenerationID = "generation-recovery-final"
+	before := task5TreeSnapshot(t, root)
+	if _, err := admitted.RecoverSession(context.Background(), request); !errors.Is(err, secret.ErrSecretDetected) {
+		t.Fatalf("recovery final transaction admission error=%v", err)
+	}
+	if after := task5TreeSnapshot(t, root); !reflect.DeepEqual(after, before) {
+		t.Fatal("rejected recovery transaction wrote manifest/candidate/journal bytes")
+	}
+}
+
+func task5TreeSnapshot(t *testing.T, root string) map[string]string {
+	t.Helper()
+	snapshot := make(map[string]string)
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			snapshot[relative] = "directory"
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		snapshot[relative] = fmt.Sprintf("%v:%x", entry.Type(), raw)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
 }
 
 func TestAppendBatchRejectsSecretInFullEnvelopeMetadataBeforeWrite(t *testing.T) {
