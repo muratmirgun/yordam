@@ -13,6 +13,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/activity"
 	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
+	"github.com/muratmirgun/yordam/internal/compaction"
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/journal"
@@ -70,6 +71,27 @@ func runtimeModelDescriptors(cfg config.Config, generation protocol.RuntimeGener
 		})
 	}
 	return result
+}
+
+func runtimeCompactReserve(cfg config.Config) protocol.ValueInt64 {
+	if cfg.Context.CompactReserveTokens == nil {
+		return protocol.ValueInt64{State: protocol.ValueUnknown}
+	}
+	return protocol.ValueInt64{State: protocol.ValueKnown, Value: *cfg.Context.CompactReserveTokens, Provenance: "configured"}
+}
+
+func runtimeCompactionMetadata(sessionID protocol.SessionID, head protocol.CommittedCursor, generation protocol.RuntimeGenerationID) (orchestrator.CommandMetadata, error) {
+	identity, err := canonicaljson.Digest(struct {
+		SessionID  protocol.SessionID           `json:"session_id"`
+		Head       protocol.CommittedCursor     `json:"head"`
+		Trigger    compaction.Trigger           `json:"trigger"`
+		Generation protocol.RuntimeGenerationID `json:"generation"`
+	}{sessionID, head, compaction.TriggerManual, generation})
+	if err != nil {
+		return orchestrator.CommandMetadata{}, err
+	}
+	commandID := protocol.CommandID("compact-" + identity.Value)
+	return orchestrator.CommandMetadata{CommandID: commandID, IdempotencyKey: string(commandID), RequestDigest: identity, Actor: protocol.ActorRef{ID: "legacy-user", Kind: protocol.ActorUser}}, nil
 }
 
 type routedProviderRequest struct {
@@ -533,6 +555,46 @@ func (d runtimeCommandDispatcher) DispatchCommand(ctx context.Context, metadata 
 		return d.runSettingControl(ctx, metadata, command, protocol.EventModelChanged, protocol.ModelChangedV1{ProviderID: payload.ProviderID, ModelID: payload.ModelID}, "model", "change model selection")
 	case *protocol.TrustedShellCommandV1:
 		return d.runSettingControl(ctx, metadata, command, protocol.EventTrustedExecutionAcknowledged, protocol.TrustedExecutionAcknowledgedV1{Enabled: payload.Enabled, Profile: "unsandboxed"}, "trusted-shell", "acknowledge trusted shell execution")
+	case *protocol.EmptyCommandV1:
+		if command.Kind != string(CommandCompact) {
+			return failedCommand(command, codeUnsupportedCommand, "command is not available through this runtime generation", false), nil
+		}
+		if command.Expected == nil || command.Expected.SelectedSessionID == "" || command.Expected.Session == nil {
+			return failedCommand(command, codeInvalidCommand, "compact command requires a selected session cursor", false), nil
+		}
+		ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(command.Expected.SelectedSessionID)}
+		head, err := d.Store.Head(ctx, ref)
+		if err != nil {
+			return protocol.CommandResult{}, err
+		}
+		inspection, err := d.Store.InspectSession(ctx, command.Expected.SelectedSessionID)
+		if err != nil {
+			return protocol.CommandResult{}, err
+		}
+		state := ProjectSessionState(LegacyReplayFromInspection(inspection))
+		providerID, modelID := protocol.ProviderID(state.Selection.Profile), protocol.ModelID(state.Selection.Model)
+		if providerID == "" || modelID == "" {
+			if len(d.Manifest.Body.Models) == 0 {
+				return failedCommand(command, codeInvalidCommand, "compact command has no configured model", false), nil
+			}
+			providerID, modelID = d.Manifest.Body.Models[0].ProviderID, d.Manifest.Body.Models[0].ModelID
+		}
+		_, err = d.Orchestrator.RunCompaction(ctx, orchestrator.CompactRequest{
+			Command: metadata, SessionID: command.Expected.SelectedSessionID, ExpectedHead: head,
+			ProviderID: providerID, ModelID: modelID,
+			Runtime: protocol.DeepCopy(d.Manifest), Trigger: compaction.TriggerManual,
+		})
+		if err != nil {
+			return protocol.CommandResult{}, err
+		}
+		result, ok, err := d.Orchestrator.LookupCommand(ctx, ref, metadata.CommandID, metadata.RequestDigest)
+		if err != nil {
+			return protocol.CommandResult{}, err
+		}
+		if !ok {
+			return protocol.CommandResult{}, fmt.Errorf("compaction completed without a durable command result")
+		}
+		return result, nil
 	default:
 		return failedCommand(command, codeUnsupportedCommand, "command is not available through this runtime generation", false), nil
 	}

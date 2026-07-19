@@ -375,6 +375,33 @@ func (a *App) Run(ctx context.Context) error {
 				activeCancel = cancel
 				activeOperation = operationCompact
 				session, replay := a.session, a.replay
+				if activeSet.ApplicationService != nil && activeSet.LegacyAdapter != nil {
+					applicationCommand, err := activeSet.LegacyAdapter.Command(command)
+					if err != nil {
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error()})
+						continue
+					}
+					_, subscription, err := activeSet.ApplicationService.SnapshotAndSubscribe(ctx, protocol.SnapshotRequest{
+						ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(a.session.ID), Consumer: "legacy_tui", QueueCapacity: 256,
+					})
+					if err != nil {
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error()})
+						continue
+					}
+					go consumeLegacyProtocolEvents(ctx, subscription, activeSet.LegacyAdapter, protocolEvents)
+					go func() {
+						result, executeErr := activeSet.ApplicationService.Execute(compactCtx, applicationCommand)
+						if executeErr == nil && result.Error != nil {
+							executeErr = errors.New(result.Error.Message)
+						}
+						done <- operationResult{kind: operationCompact, err: executeErr}
+					}()
+					continue
+				}
 				go func() {
 					var err error
 					if activeSet.CompactSession != nil {

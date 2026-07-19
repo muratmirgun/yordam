@@ -184,8 +184,91 @@ func TestRuntimeCompositionUsesOnlyOrchestratedRunner(t *testing.T) {
 	if _, ok := set.Runtime.(*agent.OrchestratedRunner); !ok {
 		t.Fatalf("production runtime=%T, want *agent.OrchestratedRunner", set.Runtime)
 	}
-	if set.Orchestrator == nil || set.ProviderCatalog == nil || set.ProviderService == nil || set.ToolService == nil || set.AuthorizationService == nil || set.Broker == nil || set.ApplicationService == nil || set.LegacyAdapter == nil {
+	if set.Orchestrator == nil || set.ProviderCatalog == nil || set.ProviderService == nil || set.ToolService == nil || set.AuthorizationService == nil || set.Broker == nil || set.ApplicationService == nil || set.LegacyAdapter == nil || set.CompactSession == nil {
 		t.Fatalf("foundation composition is incomplete: %+v", set)
+	}
+}
+
+func TestRuntimeBuilderProjectsCompactionPolicyIntoImmutableManifest(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	reserve := int64(8_192)
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Context.AutoCompact = false
+	cfg.Context.CompactReserveTokens = &reserve
+
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := set.Manifest.Body.Limits
+	if limits.AutoCompact || limits.CompactReserveTokens.State != protocol.ValueKnown || limits.CompactReserveTokens.Value != reserve || limits.CompactReserveTokens.Provenance != "configured" {
+		t.Fatalf("compaction limits=%+v", limits)
+	}
+	if err := set.Validate(); err != nil {
+		t.Fatalf("valid runtime rejected: %v", err)
+	}
+
+	cfg.Context.CompactReserveTokens = nil
+	defaultBuilder := newRuntimeBuilderForTest(t, nil)
+	defaulted, err := defaultBuilder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := defaulted.Manifest.Body.Limits.CompactReserveTokens; got != (protocol.ValueInt64{State: protocol.ValueUnknown}) {
+		t.Fatalf("default reserve=%+v want unknown", got)
+	}
+}
+
+func TestProductionCompactProtocolCommandUsesRuntimeCompactionService(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := set.LegacyAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := set.ApplicationService.Execute(t.Context(), command)
+	if err == nil || (result.Error != nil && result.Error.Code == codeUnsupportedCommand) {
+		t.Fatalf("compact result=%+v err=%v, want compaction service result rather than dispatcher rejection", result, err)
+	}
+}
+
+func TestProductionLegacyCompactNeverReportsMissingConfiguration(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := builder.store.InspectSession(t.Context(), protocol.SessionID(builder.activeSession.get()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay := LegacyReplayFromInspection(inspection)
+	application := New(Options{RuntimeSet: set, Sessions: builder.store, Session: replay.Session, Replay: replay, Workspace: builder.workspace})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go application.Run(ctx)
+	application.Commands() <- Command{Kind: CommandCompact}
+	var event Event
+	for range 8 {
+		select {
+		case event = <-application.Events():
+			if event.Kind == EventError || event.Kind == EventTurnCompleted || event.Kind == EventTurnInterrupted {
+				goto terminal
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for compact result")
+		}
+	}
+	t.Fatal("compact did not produce a terminal event")
+terminal:
+	if strings.Contains(event.Message, "compaction is not configured") {
+		t.Fatalf("valid production runtime rejected compact as unconfigured: %+v", event)
 	}
 }
 

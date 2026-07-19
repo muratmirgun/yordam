@@ -15,6 +15,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/cli"
+	"github.com/muratmirgun/yordam/internal/compaction"
 	"github.com/muratmirgun/yordam/internal/config"
 	contextplanner "github.com/muratmirgun/yordam/internal/context"
 	"github.com/muratmirgun/yordam/internal/domain"
@@ -83,6 +84,13 @@ func (s RuntimeSet) Validate() error {
 	}
 	if len(s.Manifest.Body.Models) == 0 || s.Manifest.Body.Limits.MaxToolCalls < 1 || s.Manifest.Body.Limits.MaxToolCalls > 128 || s.Manifest.Body.Limits.ShellTimeoutNanos <= 0 || s.Manifest.Body.Limits.ApplicationQueueCapacity <= 0 {
 		return fmt.Errorf("runtime generation manifest limits or models are invalid")
+	}
+	reserve := s.Manifest.Body.Limits.CompactReserveTokens
+	if err := reserve.Validate(); err != nil || (reserve.State != protocol.ValueKnown && reserve.State != protocol.ValueUnknown) || (reserve.State == protocol.ValueKnown && reserve.Value <= 0) {
+		return fmt.Errorf("runtime generation compact reserve is invalid")
+	}
+	if s.CompactSession == nil {
+		return fmt.Errorf("runtime compaction is not configured")
 	}
 	for _, model := range s.Manifest.Body.Models {
 		if err := model.Validate(); err != nil || model.RuntimeGenerationID != s.Manifest.ID {
@@ -311,6 +319,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		ExecutionProfiles:       []string{"network", "restricted", "unsandboxed"},
 		Limits: protocol.RuntimeLimits{
 			MaxToolCalls: effectiveMaxToolCalls(cfg, b.cli), ShellTimeoutNanos: int64(effectiveShellTimeout(cfg, b.cli)), ApplicationQueueCapacity: 64,
+			AutoCompact: cfg.Context.AutoCompact, CompactReserveTokens: runtimeCompactReserve(cfg),
 		},
 	}
 	manifestDigest, err := canonicaljson.Digest(body)
@@ -366,6 +375,26 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		_ = recoveryStore.Close()
 		return RuntimeSet{}, configurationError(b.configPath, "build turn orchestrator", err)
 	}
+	compactSession := func(ctx context.Context, session domain.Session, _ domain.SessionReplay) error {
+		if session.ID == "" {
+			return fmt.Errorf("compaction requires a selected session")
+		}
+		ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(session.ID)}
+		head, err := b.store.Head(ctx, ref)
+		if err != nil {
+			return err
+		}
+		metadata, err := runtimeCompactionMetadata(protocol.SessionID(session.ID), head, manifest.ID)
+		if err != nil {
+			return err
+		}
+		_, err = service.RunCompaction(ctx, orchestrator.CompactRequest{
+			Command: metadata, SessionID: protocol.SessionID(session.ID), ExpectedHead: head,
+			ProviderID: protocol.ProviderID(session.Selection.Profile), ModelID: protocol.ModelID(session.Selection.Model),
+			Runtime: protocol.DeepCopy(manifest), Trigger: compaction.TriggerManual,
+		})
+		return err
+	}
 	lifecycle := newRuntimeLifecycle(func() {
 		_ = evidenceStore.Close()
 		_ = recoveryStore.Close()
@@ -414,6 +443,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 	succeeded = true
 	result := RuntimeSet{
 		Runtime:              runner,
+		CompactSession:       compactSession,
 		Models:               cfg.Models(),
 		DefaultSelection:     cfg.DefaultSelection(),
 		CredentialEnvs:       credentialEnvs,
