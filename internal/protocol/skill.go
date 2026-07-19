@@ -94,7 +94,7 @@ func (d SkillDescriptor) Validate() error {
 	if err := d.Shadows.Validate(); err != nil {
 		return fmt.Errorf("shadow identity: %w", err)
 	}
-	if d.Identity.Name != d.Shadows.Name || d.Identity.Source != SkillSourceProject || d.Shadows.Source != SkillSourceGlobal || d.Identity == *d.Shadows {
+	if d.Identity.Name != d.Shadows.Name || d.Identity.Source != SkillSourceProject || d.Shadows.Source != SkillSourceGlobal || d.Identity.RuntimeGenerationID != d.Shadows.RuntimeGenerationID || d.Identity == *d.Shadows {
 		return fmt.Errorf("invalid skill shadow relationship")
 	}
 	if d.State != SkillStateActive {

@@ -117,6 +117,32 @@ func TestFoundationRegistryRejectsDuplicateRuntimeSkillNamesAcrossSources(t *tes
 	}
 }
 
+func TestFoundationRegistryRejectsRuntimeSkillShadowFromOtherGeneration(t *testing.T) {
+	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadow := protocol.SkillIdentity{Name: "go-testing", Source: protocol.SkillSourceGlobal, CanonicalPath: "/global/go-testing/SKILL.md", ContentDigest: testDigest('a'), RuntimeGenerationID: "other-generation"}
+	project := protocol.SkillDescriptor{Identity: protocol.SkillIdentity{Name: "go-testing", Source: protocol.SkillSourceProject, CanonicalPath: "/project/go-testing/SKILL.md", WorkspaceID: "workspace", ContentDigest: testDigest('b'), RuntimeGenerationID: "generation"}, Description: "project", State: protocol.SkillStateActive, Shadows: &shadow}
+	body := protocol.RuntimeGenerationBody{
+		ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{},
+		SkillCatalogRevision: "skills", Skills: []protocol.SkillDescriptor{project}, InstructionRevision: "instructions", PolicyGeneration: "policy",
+		ExecutionProfiles: []string{"restricted"}, Limits: protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1},
+	}
+	digest, err := canonicaljson.Digest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := protocol.RuntimeGenerationManifest{ID: "generation", Body: body, Digest: digest}
+	record, err := registry.Decode(envelopeFor(t, protocol.EventEnvelope{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", RuntimeGenerationID: "generation", Kind: protocol.EventRuntimeGenerationActivated}, protocol.RuntimeGenerationActivatedV1{Manifest: manifest}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Validate(record); err == nil {
+		t.Fatal("runtime manifest accepted a shadow target from another generation")
+	}
+}
+
 func compactionPayload(session protocol.SessionID, from, through uint64) protocol.ContextCompactedV1 {
 	cursor := func(sequence uint64) protocol.CommittedCursor {
 		return protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(session), CommitSeq: sequence, TransactionID: "transaction"}

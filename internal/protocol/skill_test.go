@@ -98,6 +98,13 @@ func TestSkillDescriptorValidatesStatesAndShadowTarget(t *testing.T) {
 	if err := globalDescriptor.Validate(); err == nil {
 		t.Fatal("global skill shadowing a project skill accepted")
 	}
+	project = validSkillDescriptor(protocol.SkillSourceProject)
+	otherGenerationGlobal := validSkillIdentity(protocol.SkillSourceGlobal)
+	otherGenerationGlobal.RuntimeGenerationID = "other-generation"
+	project.Shadows = &otherGenerationGlobal
+	if err := project.Validate(); err == nil {
+		t.Fatal("shadow target from another runtime generation accepted")
+	}
 }
 
 func TestSkillCatalogSnapshotRequiresStableBoundedLists(t *testing.T) {
