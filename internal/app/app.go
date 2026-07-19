@@ -289,7 +289,7 @@ func (a *App) Run(ctx context.Context) error {
 						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 						continue
 					}
-					_, subscription, err := activeSet.ApplicationService.SnapshotAndSubscribe(ctx, protocol.SnapshotRequest{
+					snapshot, subscription, err := activeSet.ApplicationService.SnapshotAndSubscribe(ctx, protocol.SnapshotRequest{
 						ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(a.session.ID), Consumer: "legacy_tui", QueueCapacity: 256,
 					})
 					if err != nil {
@@ -297,6 +297,17 @@ func (a *App) Run(ctx context.Context) error {
 						activeCancel, activeOperation = nil, ""
 						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 						continue
+					}
+					contextState, contextErr := DurableContext(snapshot)
+					if contextErr != nil {
+						_ = subscription.Close()
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, Err: contextErr, Message: "invalid durable context", NonTerminal: true})
+						continue
+					}
+					if contextState != nil {
+						a.publish(ctx, Event{Kind: EventState, Context: contextState})
 					}
 					// The operation result owns successful turn completion so it can
 					// clear activeOperation before publishing the sole terminal event.
@@ -385,7 +396,7 @@ func (a *App) Run(ctx context.Context) error {
 						a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error()})
 						continue
 					}
-					_, subscription, err := activeSet.ApplicationService.SnapshotAndSubscribe(compactCtx, protocol.SnapshotRequest{
+					snapshot, subscription, err := activeSet.ApplicationService.SnapshotAndSubscribe(compactCtx, protocol.SnapshotRequest{
 						ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(a.session.ID), Consumer: "legacy_tui", QueueCapacity: 256,
 					})
 					if err != nil {
@@ -393,6 +404,17 @@ func (a *App) Run(ctx context.Context) error {
 						activeCancel, activeOperation = nil, ""
 						a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error()})
 						continue
+					}
+					contextState, contextErr := DurableContext(snapshot)
+					if contextErr != nil {
+						_ = subscription.Close()
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, Err: contextErr, Message: "invalid durable context", NonTerminal: true})
+						continue
+					}
+					if contextState != nil {
+						a.publish(ctx, Event{Kind: EventState, Context: contextState})
 					}
 					go consumeLegacyProtocolEvents(compactCtx, subscription, activeSet.LegacyAdapter, protocolEvents, true)
 					go func() {
