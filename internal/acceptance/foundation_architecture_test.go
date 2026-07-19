@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ const traceArchitecture = "PRD-FR-03; Capability 4.1-4.3; Foundation 12.1-12.3; 
 func acceptFoundationArchitecture(t *testing.T) {
 	t.Logf("trace=%s", traceArchitecture)
 	root := foundationRepositoryRoot(t)
+	assertProductionDependenciesExcludeTestSupport(t, root)
 	internalRoot := filepath.Join(root, "internal")
 	fset := token.NewFileSet()
 
@@ -121,6 +123,22 @@ func acceptFoundationArchitecture(t *testing.T) {
 	runFoundationGoTest(t, traceArchitecture, "./internal/app", `^TestRuntimeCompositionUsesOnlyOrchestratedRunner$`)
 	runFoundationGoTest(t, traceArchitecture, "./internal/orchestrator", `^Test(DurableOrderingMutationPreviewCheckpointRevalidationExecutionAndContinuation|RunControlConsequentialEventCommitsInsideDispatchCallback|OperationLaneSerializesTurnsAndControlsAcrossSessions)$`)
 	t.Logf("trace=%s parser_append_calls=%d parser_storage_calls=%d parser_dispatch_calls=%d status=pass", traceArchitecture, appendCalls, storageCalls, dispatchCalls)
+}
+
+func assertProductionDependenciesExcludeTestSupport(t *testing.T, root string) {
+	t.Helper()
+	command := exec.CommandContext(t.Context(), "go", "list", "-deps", "./cmd/yordam")
+	command.Dir = root
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("[%s] list production dependencies: %v\n%s", traceArchitecture, err, output)
+	}
+	for _, dependency := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if strings.Contains(dependency, "/internal/testsupport/") {
+			t.Fatalf("[%s] production dependency graph contains test support package: %s", traceArchitecture, dependency)
+		}
+	}
+	t.Logf("trace=%s production_testsupport_dependencies=0 status=pass", traceArchitecture)
 }
 
 func underAllowedDirectory(path string, allowlist map[string]bool) bool {
