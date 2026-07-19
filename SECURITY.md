@@ -35,5 +35,7 @@ Yordam runs with the permissions of the local user who starts it. Model output a
 - Shell commands do not inherit `YORDAM_API_KEY` or configured provider-key environment variables, but they do inherit other environment variables.
 - Configuration stores provider credential environment-variable names with `apiKeyEnv`, not credential values. Set those variables before starting Yordam. Protect `~/.config/yordam/config.jsonc`; Yordam creates its parent directory with mode `0700` and the file with mode `0600`.
 - Sessions are persisted locally and can contain prompts, responses, tool metadata, diffs, command summaries, and bounded output artifacts. Debug logs are opt-in and redacted, but users should still protect and review all persisted data.
+- Context compaction summaries are derived context aids, not original evidence. The source journal remains immutable and compaction stores a binding to the summarized range and its evidence. Treat both the journal and summary evidence as sensitive local session data.
+- Configured provider credentials and registered secret values are redacted before provider-visible summary requests, stored summary evidence, durable events, application events, TUI output, debug logs, and public errors. Redaction reduces accidental disclosure; it cannot make arbitrary prompt or provider content safe to share.
 
 Permission prompts reduce accidental execution; they are not a sandbox or a guarantee that a command is safe. Use a separate OS account, container, or virtual machine when stronger isolation is required.

@@ -134,6 +134,25 @@ Each run creates a session by default. Common startup options are:
 | `Ctrl+C` | Exit, confirming first if a turn is active. |
 | `y` / `s` / `n` | At a permission prompt, allow once, allow for the exact session scope, or deny. |
 
+## Context compaction
+
+`/compact` manually summarizes an older, stable portion of an idle session. The
+original journal is immutable: compaction writes a durable range event and
+separate summary evidence, while the recent uncompacted suffix remains in the
+next provider context. Repeating an accepted command replays its durable result
+instead of making another summary request.
+
+When enabled by the selected model's known context window, automatic compaction
+runs only after the configured reserve threshold is reached. It is unavailable
+when automatic compaction is disabled or the context window is unknown. A
+provider `context too large` response opens the `/compact` action; it is not
+silently retried as a normal turn.
+
+Summary evidence is a derived aid for rebuilding context, not a replacement for
+the original journal evidence. If compaction is cancelled, its final durable
+state reports cancellation. If the journal cannot prove whether a final commit
+was recorded, Yordam reports an uncertain outcome rather than guessing.
+
 ## Session locations
 
 Sessions are local JSONL data grouped by a canonical workspace identity:
