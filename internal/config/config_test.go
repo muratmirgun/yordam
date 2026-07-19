@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -121,6 +122,61 @@ func TestLoadAppliesDefaultsOnlyToOmittedLimits(t *testing.T) {
 	}
 	if cfg.MaxToolCalls != 32 || cfg.ShellTimeoutSeconds != 120 {
 		t.Fatalf("limits=%d/%d", cfg.MaxToolCalls, cfg.ShellTimeoutSeconds)
+	}
+}
+
+func TestLoadContextCompactionDefaults(t *testing.T) {
+	cfg, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, validConfig)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Context.AutoCompact || cfg.Context.CompactReserveTokens != nil {
+		t.Fatalf("context defaults=%+v", cfg.Context)
+	}
+}
+
+func TestLoadConfiguredContextWindow(t *testing.T) {
+	cfg, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, withModelContextWindow(validConfig, "model-a", 128000))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Profiles["primary"].ModelContextWindows["model-a"]; got != 128000 {
+		t.Fatalf("context window=%d", got)
+	}
+}
+
+func TestLoadConfiguredContextCompaction(t *testing.T) {
+	reserve := int64(8192)
+	cfg, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, withContext(validConfig, `{"autoCompact": false, "compactReserveTokens": 8192}`))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Context.AutoCompact || cfg.Context.CompactReserveTokens == nil || *cfg.Context.CompactReserveTokens != reserve {
+		t.Fatalf("context=%+v", cfg.Context)
+	}
+}
+
+func TestLoadRejectsInvalidContextConfiguration(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "context unknown field", body: withContext(validConfig, `{"extra": true}`), want: `unknown field "extra"`},
+		{name: "zero context window", body: withModelContextWindow(validConfig, "model-a", 0), want: "contextWindow must be positive"},
+		{name: "negative context window", body: withModelContextWindow(validConfig, "model-a", -1), want: "contextWindow must be positive"},
+		{name: "zero compact reserve", body: withContext(validConfig, `{"compactReserveTokens": 0}`), want: "compactReserveTokens must be positive"},
+		{name: "negative compact reserve", body: withContext(validConfig, `{"compactReserveTokens": -1}`), want: "compactReserveTokens must be positive"},
+		{name: "reserve equals context window", body: withContext(withModelContextWindow(validConfig, "model-a", 128000), `{"compactReserveTokens": 128000}`), want: "compactReserveTokens must be less than configured contextWindow"},
+		{name: "reserve exceeds context window", body: withContext(withModelContextWindow(validConfig, "model-a", 128000), `{"compactReserveTokens": 128001}`), want: "compactReserveTokens must be less than configured contextWindow"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, test.body)})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error=%v want containing %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -332,4 +388,12 @@ func writeConfig(t *testing.T, body string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func withContext(body, context string) string {
+	return strings.Replace(body, `"limits":`, `"context": `+context+`, "limits":`, 1)
+}
+
+func withModelContextWindow(body, model string, window int64) string {
+	return strings.Replace(body, `"`+model+`": {"name": "Model A"}`, `"`+model+`": {"name": "Model A", "contextWindow": `+fmt.Sprint(window)+`}`, 1)
 }

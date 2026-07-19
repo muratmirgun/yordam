@@ -56,6 +56,36 @@ func TestRuntimeSetReadinessClassifiesModelsAndCredentials(t *testing.T) {
 	}
 }
 
+func TestRuntimeModelDescriptorsContextWindowProvenance(t *testing.T) {
+	descriptors := runtimeModelDescriptors(config.Config{Profiles: map[string]config.Profile{
+		"primary": {
+			APIKeyEnv:           "PRIMARY_KEY",
+			Models:              []string{"configured", "unknown"},
+			ModelContextWindows: map[string]int64{"configured": 128000},
+		},
+	}}, "generation")
+	if len(descriptors) != 2 {
+		t.Fatalf("descriptors=%+v", descriptors)
+	}
+	for _, descriptor := range descriptors {
+		if descriptor.MaximumOutput.State != protocol.ValueUnknown {
+			t.Fatalf("maximum output=%+v", descriptor.MaximumOutput)
+		}
+		switch descriptor.ModelID {
+		case "configured":
+			if descriptor.ContextWindow != (protocol.ValueInt64{State: protocol.ValueKnown, Value: 128000, Provenance: "configured_claim"}) {
+				t.Fatalf("configured context window=%+v", descriptor.ContextWindow)
+			}
+		case "unknown":
+			if descriptor.ContextWindow != (protocol.ValueInt64{State: protocol.ValueUnknown}) {
+				t.Fatalf("unknown context window=%+v", descriptor.ContextWindow)
+			}
+		default:
+			t.Fatalf("unexpected model=%q", descriptor.ModelID)
+		}
+	}
+}
+
 func TestRuntimeSetReadyReturnsConfigurationErrorBeforeCompatibilityBypass(t *testing.T) {
 	configuration := configurationError("/home/user/.config/yordam/config.jsonc", "configuration is invalid; edit the file and run /reload", nil)
 	set := RuntimeSet{ConfigurationError: configuration, unchecked: true}

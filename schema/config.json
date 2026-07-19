@@ -19,7 +19,8 @@
       "propertyNames": {"minLength": 1},
       "additionalProperties": {"$ref": "#/$defs/provider"}
     },
-    "limits": {"$ref": "#/$defs/limits"}
+    "limits": {"$ref": "#/$defs/limits"},
+    "context": {"$ref": "#/$defs/context"}
   },
   "$defs": {
     "provider": {
@@ -54,7 +55,10 @@
     "model": {
       "type": "object",
       "additionalProperties": false,
-      "properties": {"name": {"type": "string"}}
+      "properties": {
+        "name": {"type": "string"},
+        "contextWindow": {"type": "integer", "minimum": 1}
+      }
     },
     "limits": {
       "type": "object",
@@ -62,6 +66,14 @@
       "properties": {
         "maxToolCalls": {"type": "integer", "minimum": 1, "maximum": 128, "default": 32},
         "shellTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 1800, "default": 120}
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "autoCompact": {"type": "boolean", "default": true},
+        "compactReserveTokens": {"type": "integer", "minimum": 1}
       }
     }
   }

@@ -80,7 +80,7 @@ func TestSaveGlobalWritesStrictJSONAndRoundTrips(t *testing.T) {
 	}
 	if loaded.DefaultSelection() != (domain.ModelSelection{Profile: "primary", Model: "model-a"}) ||
 		!slices.Equal(loaded.Models(), []domain.ModelSelection{{Profile: "primary", Model: "model-a"}, {Profile: "primary", Model: "model-b"}}) ||
-		loaded.MaxToolCalls != 64 || loaded.ShellTimeoutSeconds != 300 {
+		loaded.MaxToolCalls != 64 || loaded.ShellTimeoutSeconds != 300 || !loaded.Context.AutoCompact || loaded.Context.CompactReserveTokens == nil || *loaded.Context.CompactReserveTokens != 8192 || loaded.Profiles["primary"].ModelContextWindows["model-a"] != 128000 {
 		t.Fatalf("round-tripped config=%+v models=%v", loaded, loaded.Models())
 	}
 	resolved, err := loaded.Resolve(config.ResolveOptions{})
@@ -196,19 +196,22 @@ func TestEnsureGlobalNeverOverwritesExistingFile(t *testing.T) {
 }
 
 func savedConfig() config.Config {
+	reserve := int64(8192)
 	return config.Config{
 		ActiveProfile: "primary",
 		Profiles: map[string]config.Profile{
 			"primary": {
-				Name:         "Primary",
-				BaseURL:      "https://llm.example/v1",
-				APIKeyEnv:    "PRIMARY_KEY",
-				Models:       []string{"model-b", "model-a"},
-				DefaultModel: "model-a",
+				Name:                "Primary",
+				BaseURL:             "https://llm.example/v1",
+				APIKeyEnv:           "PRIMARY_KEY",
+				Models:              []string{"model-b", "model-a"},
+				DefaultModel:        "model-a",
+				ModelContextWindows: map[string]int64{"model-a": 128000},
 			},
 		},
 		MaxToolCalls:        64,
 		ShellTimeoutSeconds: 300,
+		Context:             config.ContextConfig{AutoCompact: true, CompactReserveTokens: &reserve},
 	}
 }
 

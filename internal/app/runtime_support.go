@@ -48,10 +48,15 @@ func runtimeModelDescriptors(cfg config.Config, generation protocol.RuntimeGener
 	})
 	result := make([]protocol.ModelDescriptor, 0, len(selections))
 	for _, selection := range selections {
+		profile := cfg.Profiles[selection.Profile]
+		window := protocol.ValueInt64{State: protocol.ValueUnknown}
+		if value := profile.ModelContextWindows[selection.Model]; value > 0 {
+			window = protocol.ValueInt64{State: protocol.ValueKnown, Value: value, Provenance: "configured_claim"}
+		}
 		result = append(result, protocol.ModelDescriptor{
 			ProviderID: protocol.ProviderID(selection.Profile), ModelID: protocol.ModelID(selection.Model),
 			AdapterKind: openaicompat.AdapterKind, DisplayName: selection.Model,
-			ContextWindow: protocol.ValueInt64{State: protocol.ValueUnknown}, MaximumOutput: protocol.ValueInt64{State: protocol.ValueUnknown},
+			ContextWindow: window, MaximumOutput: protocol.ValueInt64{State: protocol.ValueUnknown},
 			Capabilities: []protocol.CapabilityFact{
 				{Capability: protocol.CapabilityStreaming, State: protocol.CapabilitySupported, Provenance: "openai-compatible-adapter", RuntimeGenerationID: generation},
 				{Capability: protocol.CapabilityTextInput, State: protocol.CapabilitySupported, Provenance: "openai-compatible-adapter", RuntimeGenerationID: generation},
@@ -59,7 +64,7 @@ func runtimeModelDescriptors(cfg config.Config, generation protocol.RuntimeGener
 				{Capability: protocol.CapabilityToolUse, State: protocol.CapabilitySupported, Provenance: "openai-compatible-adapter", RuntimeGenerationID: generation},
 			},
 			UsageCategories: []string{}, Pricing: []protocol.PricingFact{},
-			CredentialBindingRef: cfg.Profiles[selection.Profile].APIKeyEnv,
+			CredentialBindingRef: profile.APIKeyEnv,
 			SourceRevision:       "configured-v1",
 			RuntimeGenerationID:  generation,
 		})

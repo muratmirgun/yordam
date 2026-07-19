@@ -96,3 +96,47 @@ func TestPublishedSchemaMatchesRuntimeValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestSchemaContextParity(t *testing.T) {
+	compiler := jsonschema.NewCompiler()
+	compiler.AssertFormat()
+	schema, err := compiler.Compile(filepath.Join("..", "..", "schema", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name         string
+		body         string
+		schemaValid  bool
+		runtimeValid bool
+	}{
+		{name: "context defaults", body: validConfig, schemaValid: true, runtimeValid: true},
+		{name: "configured context", body: withContext(withModelContextWindow(validConfig, "model-a", 128000), `{"autoCompact": false, "compactReserveTokens": 8192}`), schemaValid: true, runtimeValid: true},
+		{name: "unknown context field", body: withContext(validConfig, `{"extra": true}`)},
+		{name: "zero context window", body: withModelContextWindow(validConfig, "model-a", 0)},
+		{name: "negative context window", body: withModelContextWindow(validConfig, "model-a", -1)},
+		{name: "zero reserve", body: withContext(validConfig, `{"compactReserveTokens": 0}`)},
+		{name: "negative reserve", body: withContext(validConfig, `{"compactReserveTokens": -1}`)},
+		{name: "reserve equals context window", body: withContext(withModelContextWindow(validConfig, "model-a", 128000), `{"compactReserveTokens": 128000}`), schemaValid: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value, err := hujson.Parse([]byte(test.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			value.Standardize()
+			var instance any
+			if err := json.Unmarshal(value.Pack(), &instance); err != nil {
+				t.Fatal(err)
+			}
+			if err := schema.Validate(instance); (err == nil) != test.schemaValid {
+				t.Fatalf("schema error=%v want valid=%t", err, test.schemaValid)
+			}
+			_, runtimeErr := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, test.body)})
+			if (runtimeErr == nil) != test.runtimeValid {
+				t.Fatalf("runtime error=%v want valid=%t", runtimeErr, test.runtimeValid)
+			}
+		})
+	}
+}
