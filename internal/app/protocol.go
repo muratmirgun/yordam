@@ -36,6 +36,7 @@ const (
 // PublicError values in serializable results or subscription terminals.
 type Service interface {
 	Execute(context.Context, protocol.Command) (protocol.CommandResult, error)
+	Snapshot(context.Context, protocol.SnapshotRequest) (protocol.ApplicationSnapshot, error)
 	SnapshotAndSubscribe(context.Context, protocol.SnapshotRequest) (protocol.ApplicationSnapshot, Subscription, error)
 	Subscribe(context.Context, protocol.SubscriptionRequest) (Subscription, error)
 }
@@ -445,6 +446,10 @@ func (s *ProtocolService) SnapshotAndSubscribe(ctx context.Context, request prot
 		return protocol.ApplicationSnapshot{}, nil, fmt.Errorf("snapshot service is unavailable")
 	}
 	return s.broker.SnapshotAndSubscribe(ctx, request)
+}
+
+func (s *ProtocolService) Snapshot(ctx context.Context, request protocol.SnapshotRequest) (protocol.ApplicationSnapshot, error) {
+	return s.broker.Snapshot(ctx, request)
 }
 
 func (s *ProtocolService) Subscribe(ctx context.Context, request protocol.SubscriptionRequest) (Subscription, error) {
