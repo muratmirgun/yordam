@@ -151,6 +151,16 @@ func TestBufferSnapshotIsThreadSafeAndBounded(t *testing.T) {
 	wait.Wait()
 }
 
+func TestBufferUsesSafeDefaultWhenRedactorIsNil(t *testing.T) {
+	buffer := output.New(output.Options{Redact: nil})
+	if written, err := buffer.Write([]byte("unconfigured value")); err != nil || written != len("unconfigured value") {
+		t.Fatalf("write=(%d, %v)", written, err)
+	}
+	if got, truncated := buffer.Snapshot(); got != "unconfigured value" || truncated {
+		t.Fatalf("snapshot=(%q, %v)", got, truncated)
+	}
+}
+
 func TestBufferKeepsImmutableRedactorSnapshot(t *testing.T) {
 	binding := secret.NewBinding(secret.New("old-secret"))
 	oldBuffer := output.New(output.Options{Redact: binding.Snapshot()})
@@ -162,6 +172,39 @@ func TestBufferKeepsImmutableRedactorSnapshot(t *testing.T) {
 	newValue, _ := newBuffer.Snapshot()
 	if oldValue != "[REDACTED] new-secret" || newValue != "old-secret [REDACTED]" {
 		t.Fatalf("old=%q new=%q", oldValue, newValue)
+	}
+}
+
+func TestBufferLeaseRedactsEncodedSecretBeforeModelAndArtifactOutput(t *testing.T) {
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("generation-a", [][]byte{[]byte("buffer-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeArtifactStore{}
+	buffer := output.New(output.Options{SessionID: "s", Artifacts: store, Admission: lease})
+	encoded := "YnVmZmVyLXNlY3JldA=="
+	input := strings.Repeat("x", output.ModelExcerptBytes) + encoded
+	if _, err := buffer.Write([]byte(input)); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Retire("generation-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := buffer.Result(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Content, encoded) {
+		t.Fatalf("encoded secret remained model-visible: %q", result.Content)
+	}
+	for _, raw := range store.contents() {
+		if bytes.Contains(raw, []byte(encoded)) {
+			t.Fatalf("encoded secret remained in artifact: %q", raw)
+		}
 	}
 }
 

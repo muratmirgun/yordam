@@ -33,7 +33,7 @@ Yordam runs with the permissions of the local user who starts it. Model output a
 - `safe` mode denies edits and shell. `ask` mode prompts for edits, outside reads, and shell. `auto` mode permits inside-workspace file operations but still requires acknowledgement before trusted shell execution and prompts for outside file access.
 - Shell execution is not OS-sandboxed. Approved commands can access files outside the workspace, use the network, launch processes, and otherwise act with the user's privileges.
 - Shell commands do not inherit `YORDAM_API_KEY` or configured provider-key environment variables, but they do inherit other environment variables.
-- Configuration can store API key values directly with `apiKey`, or environment-variable names with `apiKeyEnv`. Protect `~/.config/yordam/config.jsonc`; Yordam creates it with user-only permissions.
+- Configuration stores provider credential environment-variable names with `apiKeyEnv`, not credential values. Set those variables before starting Yordam. Protect `~/.config/yordam/config.jsonc`; Yordam creates its parent directory with mode `0700` and the file with mode `0600`.
 - Sessions are persisted locally and can contain prompts, responses, tool metadata, diffs, command summaries, and bounded output artifacts. Debug logs are opt-in and redacted, but users should still protect and review all persisted data.
 
 Permission prompts reduce accidental execution; they are not a sandbox or a guarantee that a command is safe. Use a separate OS account, container, or virtual machine when stronger isolation is required.

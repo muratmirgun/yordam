@@ -32,7 +32,7 @@ func TestSanitizedStoreAndArtifactsContainNoConfiguredSecret(t *testing.T) {
 		"message": "failed with " + sentinel,
 		"nested":  []any{map[string]any{"detail": sentinel}},
 	}
-	event, err := store.Append(context.Background(), session.ID, domain.EventTurnFailed, payload)
+	event, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventTurnFailed, payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestSanitizedStoreAndArtifactsContainNoConfiguredSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Append(context.Background(), session.ID, domain.EventToolResult, domain.ToolResultPayload{Result: result}); err != nil {
+	if _, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventToolResult, domain.ToolResultPayload{Result: result}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -61,14 +61,14 @@ func (model Model) handleAppEvent(event app.Event) Model {
 			model = model.replaceModels(event.Models, event.Selection)
 		}
 	case app.EventTurnAccepted:
-		draft := event.Draft
-		if draft == "" {
-			draft = model.pendingDraft
-		}
-		if draft != "" {
+		if model.matchesPendingDraft(event) {
+			draft := event.Draft
+			if draft == "" {
+				draft = model.pendingDraft
+			}
 			model.conversation.Append(components.BlockUser, draft)
+			model = model.clearPendingDraft()
 		}
-		model.pendingDraft = ""
 	case app.EventReloadCompleted:
 		model = model.setTurnActive(false)
 		if event.Applied {
@@ -146,21 +146,30 @@ func (model Model) handleAppEvent(event app.Event) Model {
 		model = model.finishPendingExit()
 	case app.EventError:
 		model = model.applyTerminalReplay(event)
+		terminalTransition := false
 		if !event.NonTerminal {
-			model = model.setTurnActive(false)
-		}
-		if event.Draft != "" {
-			model.composer.SetValue(event.Draft)
-			model.pendingDraft = ""
+			switch {
+			case model.matchesPendingDraft(event):
+				model = model.restorePendingDraft(event)
+				terminalTransition = true
+			case model.pendingDraftID == 0:
+				model = model.setTurnActive(false)
+				if event.Draft != "" {
+					model.composer.SetValue(event.Draft)
+				}
+				terminalTransition = true
+			}
 		}
 		model = model.renderErrorEvent(event)
-		if !event.NonTerminal {
+		if terminalTransition {
 			model = model.finishPendingExit()
 		}
 	case app.EventRejected:
-		if event.Draft != "" {
+		switch {
+		case model.matchesPendingDraft(event):
+			model = model.restorePendingDraft(event)
+		case model.pendingDraftID == 0 && event.Draft != "":
 			model.composer.SetValue(event.Draft)
-			model.pendingDraft = ""
 			model = model.setTurnActive(false)
 		}
 		if message := eventMessage(event); message != "" {
@@ -214,10 +223,21 @@ func (model Model) updateComposer(message tea.Msg) Model {
 func (model Model) routeSubmission(submitted string) Model {
 	command := strings.TrimSpace(submitted)
 	if !strings.HasPrefix(command, "/") {
+		if model.nextDraftID == maxDraftID {
+			model.composer.SetValue(submitted)
+			model.conversation.Append(components.BlockNotice, "draft correlation exhausted; restart Yordam")
+			return model
+		}
+		draftID := model.nextDraftID
+		if draftID == 0 {
+			draftID = 1
+		}
+		model.nextDraftID = draftID + 1
 		model.pendingDraft = submitted
+		model.pendingDraftID = draftID
 		model = model.setTurnActive(true)
 		model = model.setTurnProgress(progressWaiting)
-		model.sendStartTurn(submitted)
+		model.sendStartTurn(submitted, draftID)
 		return model
 	}
 
@@ -261,6 +281,26 @@ func (model Model) routeSubmission(submitted string) Model {
 		model.conversation.Append(components.BlockNotice, "unknown command: "+command)
 	}
 	return model
+}
+
+func (model Model) matchesPendingDraft(event app.Event) bool {
+	return model.pendingDraftID != 0 && event.DraftID == model.pendingDraftID
+}
+
+func (model Model) clearPendingDraft() Model {
+	model.pendingDraft = ""
+	model.pendingDraftID = 0
+	return model
+}
+
+func (model Model) restorePendingDraft(event app.Event) Model {
+	draft := event.Draft
+	if draft == "" {
+		draft = model.pendingDraft
+	}
+	model.composer.SetValue(draft)
+	model = model.clearPendingDraft()
+	return model.setTurnActive(false)
 }
 
 func (model Model) renderErrorEvent(event app.Event) Model {

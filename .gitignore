@@ -1,5 +1,5 @@
 .superpowers/
+.worktrees/
 .DS_Store
 bin/
 dist/
-

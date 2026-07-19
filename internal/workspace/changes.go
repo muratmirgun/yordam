@@ -43,6 +43,7 @@ func Inspect(ctx context.Context, root string, options output.Options) (*domain.
 
 func inspectGitWorktree(ctx context.Context, root string, options output.Options) (bool, error) {
 	buffer := output.New(options)
+	defer buffer.Close()
 	command := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", "--is-inside-work-tree")
 	command.Stdout = buffer
 	command.Stderr = buffer
@@ -64,6 +65,7 @@ func inspectGitWorktree(ctx context.Context, root string, options output.Options
 
 func runGit(ctx context.Context, root string, options output.Options, arguments ...string) (domain.ToolResult, error) {
 	buffer := output.New(options)
+	defer buffer.Close()
 	commandArguments := append([]string{"-C", root}, arguments...)
 	command := exec.CommandContext(ctx, "git", commandArguments...)
 	command.Stdout = buffer

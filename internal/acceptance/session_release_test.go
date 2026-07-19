@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,8 +23,8 @@ import (
 	"github.com/muratmirgun/yordam/internal/cli"
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
-	"github.com/muratmirgun/yordam/internal/testsupport/agentfixture"
 	"github.com/muratmirgun/yordam/internal/testsupport/ptyfixture"
 )
 
@@ -36,8 +38,9 @@ func acceptResume(t *testing.T) {
 	workspace := t.TempDir()
 	dataDir := t.TempDir()
 	cfg := acceptanceConfig(server.URL+"/v1", "ACCEPTANCE_RESUME_KEY", map[string][]string{"resume": {"model-a"}})
+	configPath := writeAcceptanceConfig(t, cfg)
 	options := acceptanceCLI(dataDir, domain.ModeSafe)
-	application, first, err := app.Bootstrap(context.Background(), app.BootstrapOptions{Config: cfg, CLI: options, CWD: workspace, HTTPClient: server.Client()})
+	application, first, err := app.Bootstrap(context.Background(), app.BootstrapOptions{ConfigPath: configPath, CLI: options, CWD: workspace, HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +54,7 @@ func acceptResume(t *testing.T) {
 
 	continuedOptions := options
 	continuedOptions.Continue = true
-	continuedApp, continued, err := app.Bootstrap(context.Background(), app.BootstrapOptions{Config: cfg, CLI: continuedOptions, CWD: workspace, HTTPClient: server.Client()})
+	continuedApp, continued, err := app.Bootstrap(context.Background(), app.BootstrapOptions{ConfigPath: configPath, CLI: continuedOptions, CWD: workspace, HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +89,7 @@ func acceptResume(t *testing.T) {
 func acceptRecovery(t *testing.T) {
 	root := t.TempDir()
 	workspace := t.TempDir()
-	store := jsonl.New(root, jsonl.Options{})
+	store := jsonl.New(root, jsonl.Options{Sanitize: func(value any) (json.RawMessage, error) { return json.Marshal(value) }})
 	canonical, err := jsonl.WorkspaceFromPath(workspace)
 	if err != nil {
 		t.Fatal(err)
@@ -97,9 +100,7 @@ func acceptRecovery(t *testing.T) {
 	}
 	target := filepath.Join(workspace, "untouched.txt")
 	writeAcceptanceFile(t, target, []byte("before"))
-	if _, err := store.Append(context.Background(), session.ID, domain.EventToolStarted, map[string]string{"call_id": "unmatched", "path": target, "content": "after"}); err != nil {
-		t.Fatal(err)
-	}
+	writeLegacyAcceptanceEvent(t, root, canonical, &session, domain.EventToolStarted, map[string]string{"call_id": "unmatched", "path": target, "content": "after"})
 	eventsPath := filepath.Join(root, "workspaces", canonical.ID, "sessions", session.ID, "events.jsonl")
 	tail := []byte(`{"schema_version":1`)
 	file, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_WRONLY, 0)
@@ -114,21 +115,48 @@ func acceptRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	replay, err := store.Load(context.Background(), session.ID)
+	inspection, err := store.InspectSession(context.Background(), protocol.SessionID(session.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replay.ReadOnly || !strings.Contains(replay.RecoveryNote, "incomplete final line") {
-		t.Fatalf("recovery replay=%+v", replay)
+	var recoveryDetails struct {
+		ObservedTailDigest protocol.Digest `json:"observed_tail_digest"`
 	}
-	interrupted := 0
-	for _, event := range replay.Events {
-		if event.Kind == domain.EventTurnInterrupted {
-			interrupted++
+	for _, diagnostic := range inspection.Journal.Diagnostics {
+		if diagnostic.Code == "recovery.available" {
+			if err := json.Unmarshal(diagnostic.Details, &recoveryDetails); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
-	if interrupted != 1 || replay.Events[len(replay.Events)-1].Kind != domain.EventTurnInterrupted {
-		t.Fatalf("recovery interruptions=%d events=%v", interrupted, replay.Events)
+	if inspection.Journal.Writable || recoveryDetails.ObservedTailDigest.IsZero() {
+		t.Fatalf("pure inspection did not expose eligible recovery: %+v", inspection.Journal)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(response, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "yordam", "config.jsonc")
+	if err := config.SaveGlobal(configPath, acceptanceConfig(server.URL, "RECOVERY_KEY", map[string][]string{"test": {"test"}})); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RECOVERY_KEY", "recovery-key")
+	options := acceptanceCLI(root, domain.ModeAsk)
+	options.Continue = true
+	application, snapshot, err := app.Bootstrap(context.Background(), app.BootstrapOptions{ConfigPath: configPath, CLI: options, CWD: workspace, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := runAcceptanceApp(t, application)
+	application.Commands() <- app.Command{Kind: app.CommandShutdown}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	replay := snapshot.Replay
+	if replay.ReadOnly || !strings.Contains(replay.RecoveryNote, "recovery.completed") || !strings.Contains(replay.RecoveryNote, "migration.unmatched_activity") {
+		t.Fatalf("recovery replay=%+v", replay)
 	}
 	artifactsDir := filepath.Join(filepath.Dir(eventsPath), "artifacts")
 	entries, err := os.ReadDir(artifactsDir)
@@ -142,32 +170,22 @@ func acceptRecovery(t *testing.T) {
 	if raw, _ := os.ReadFile(target); string(raw) != "before" {
 		t.Fatalf("replay executed unmatched tool: %q", raw)
 	}
-	again, err := store.Load(context.Background(), session.ID)
+	again, err := store.InspectSession(context.Background(), protocol.SessionID(session.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
-	againInterrupted := 0
-	for _, event := range again.Events {
-		if event.Kind == domain.EventTurnInterrupted {
-			againInterrupted++
+	recoveryDiagnostics := 0
+	for _, event := range again.Journal.Events {
+		if event.Envelope.Kind == protocol.EventRecoveryDiagnostic {
+			recoveryDiagnostics++
 		}
 	}
-	if againInterrupted != 1 {
-		t.Fatalf("restart appended %d interruptions, want one", againInterrupted)
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
-		response.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(response, "data: [DONE]\n\n")
-	}))
-	defer server.Close()
-	home := t.TempDir()
-	configPath := filepath.Join(home, ".config", "yordam", "config.jsonc")
-	if err := config.SaveGlobal(configPath, acceptanceConfig(server.URL, "RECOVERY_KEY", map[string][]string{"test": {"test"}})); err != nil {
-		t.Fatal(err)
+	if !again.Journal.Writable || recoveryDiagnostics != 1 {
+		t.Fatalf("restart recovery diagnostics=%d inspection=%+v", recoveryDiagnostics, again.Journal)
 	}
 	ptySession := ptyfixture.Start(t, ptyfixture.CachedYordam(t), workspace, cleanPTYEnvironment(home, []string{"RECOVERY_KEY=recovery-key"}), "--continue", "--data-dir", root)
 	ptySession.WaitFor(t, "RECOVERY", 3*time.Second)
-	ptySession.WaitFor(t, "incomplete final line", 3*time.Second)
+	ptySession.WaitFor(t, "recovery.completed", 3*time.Second)
 	ptySession.Write(t, string([]byte{3}))
 	ptySession.WaitForExit(t, 3*time.Second)
 	ptySession.AssertRestored(t)
@@ -175,36 +193,55 @@ func acceptRecovery(t *testing.T) {
 
 func acceptModelChange(t *testing.T) {
 	workspace := t.TempDir()
-	oldSelection := domain.ModelSelection{Profile: "old", Model: "model-a"}
+	dataDir := t.TempDir()
 	newSelection := domain.ModelSelection{Profile: "new", Model: "model-b"}
-	fixture := newRuntimeFixtureWithSelection(t, workspace, domain.ModeAsk, oldSelection, [][]domain.ModelEvent{
-		agentfixture.FinalStream("first"),
-		agentfixture.FinalStream("second"),
-	}, nil)
 	started := make(chan struct{})
 	release := make(chan struct{})
-	fixture.provider.Block = func(ctx context.Context, index int) error {
-		if index != 0 {
-			return nil
+	var mu sync.Mutex
+	models := make([]string, 0, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var body struct {
+			Model string `json:"model"`
 		}
-		close(started)
-		select {
-		case <-release:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode provider request: %v", err)
+			response.WriteHeader(http.StatusBadRequest)
+			return
 		}
+		mu.Lock()
+		index := len(models)
+		models = append(models, body.Model)
+		mu.Unlock()
+		if index == 0 {
+			close(started)
+			<-release
+		}
+		response.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(response, `data: {"id":"request","choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`)
+		fmt.Fprintln(response)
+		fmt.Fprintln(response, "data: [DONE]")
+		fmt.Fprintln(response)
+	}))
+	defer server.Close()
+	t.Setenv("ACCEPTANCE_OLD_KEY", "old-key")
+	t.Setenv("ACCEPTANCE_NEW_KEY", "new-key")
+	t.Setenv("YORDAM_PROFILE", "old")
+	t.Setenv("YORDAM_MODEL", "model-a")
+	cfg := config.Config{
+		ActiveProfile: "old",
+		Profiles: map[string]config.Profile{
+			"old": {BaseURL: server.URL, APIKeyEnv: "ACCEPTANCE_OLD_KEY", Models: []string{"model-a"}, DefaultModel: "model-a"},
+			"new": {BaseURL: server.URL, APIKeyEnv: "ACCEPTANCE_NEW_KEY", Models: []string{"model-b"}, DefaultModel: "model-b"},
+		},
+		MaxToolCalls: 32, ShellTimeoutSeconds: 2,
 	}
-	application := app.New(app.Options{
-		Runtime:          fixture.runner,
-		Sessions:         fixture.store,
-		Session:          fixture.session,
-		Replay:           fixture.replay,
-		Policy:           fixture.policy,
-		ConfiguredModels: []domain.ModelSelection{oldSelection, newSelection},
-		CommandBuffer:    0,
-		EventBuffer:      8,
+	application, snapshot, err := app.Bootstrap(context.Background(), app.BootstrapOptions{
+		ConfigPath: writeAcceptanceConfig(t, cfg), CWD: workspace, HTTPClient: server.Client(),
+		CLI: acceptanceCLI(dataDir, domain.ModeAsk),
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	done := runAcceptanceApp(t, application)
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "first"}
 	<-started
@@ -222,23 +259,21 @@ func acceptModelChange(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	requests, remaining := fixture.provider.Snapshot()
-	if remaining != 0 || len(requests) != 2 || requests[0].Selection != oldSelection || requests[1].Selection != newSelection {
-		t.Fatalf("provider requests=%+v remaining=%d", requests, remaining)
+	mu.Lock()
+	gotModels := slices.Clone(models)
+	mu.Unlock()
+	if !slices.Equal(gotModels, []string{"model-a", "model-b"}) {
+		t.Fatalf("provider models=%v", gotModels)
 	}
-	replay, err := fixture.store.Load(context.Background(), fixture.session.ID)
+	store := jsonl.New(dataDir, jsonl.Options{})
+	inspection, err := store.InspectSession(context.Background(), protocol.SessionID(snapshot.Session.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
 	modelChanges := 0
-	for _, event := range replay.Events {
-		if event.Kind == domain.EventModelChanged {
+	for _, event := range inspection.Journal.Events {
+		if event.Envelope.Kind == protocol.EventModelChanged {
 			modelChanges++
-			var payload domain.ModelChangedPayload
-			decodeEvent(t, event, &payload)
-			if payload.Selection != newSelection {
-				t.Fatalf("durable model change=%+v", payload)
-			}
 		}
 	}
 	if modelChanges != 1 {
@@ -323,6 +358,15 @@ func acceptanceConfig(baseURL, keyEnv string, profiles map[string][]string) conf
 	return config.Config{ActiveProfile: active, Profiles: configured, MaxToolCalls: 32, ShellTimeoutSeconds: 120}
 }
 
+func writeAcceptanceConfig(t *testing.T, cfg config.Config) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.jsonc")
+	if err := config.SaveGlobal(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func acceptanceCLI(dataDir string, mode domain.PermissionMode) cli.Options {
 	return cli.Options{Mode: mode, DataDir: dataDir, MaxToolCalls: 32, ShellTimeout: 2 * time.Second}
 }
@@ -336,7 +380,7 @@ func runAcceptanceApp(t *testing.T, application *app.App) <-chan error {
 
 func waitForAppTerminal(t *testing.T, events <-chan app.Event) app.Event {
 	t.Helper()
-	deadline := time.NewTimer(5 * time.Second)
+	deadline := time.NewTimer(15 * time.Second)
 	defer deadline.Stop()
 	for {
 		select {

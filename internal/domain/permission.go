@@ -35,8 +35,9 @@ const (
 )
 
 type PermissionDecision struct {
-	Action   PermissionAction   `json:"action"`
-	Lifetime PermissionLifetime `json:"lifetime"`
-	Scope    string             `json:"scope"`
-	Reason   string             `json:"reason"`
+	Action       PermissionAction   `json:"action"`
+	Lifetime     PermissionLifetime `json:"lifetime"`
+	Scope        string             `json:"scope"`
+	Reason       string             `json:"reason"`
+	PolicySource string             `json:"policy_source,omitempty"`
 }

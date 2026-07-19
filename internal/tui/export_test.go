@@ -87,6 +87,11 @@ func SetTurnActiveForTest(model Model, active bool) Model {
 	return model
 }
 
+func SetNextDraftIDForTest(model Model, next uint64) Model {
+	model.nextDraftID = next
+	return model
+}
+
 func SetModalForTest(model Model, modal ModalKind) Model {
 	model.modal = modal
 	model.focusedComponent = focusModal

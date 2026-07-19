@@ -1,14 +1,18 @@
 package jsonl
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -17,11 +21,63 @@ const MaxArtifactBytes int64 = 10 << 20
 // Put checks ctx before and after each source read. It cannot interrupt an
 // arbitrary Reader whose Read method is itself blocked.
 func (s *Store) Put(ctx context.Context, sessionID, mediaType string, src io.Reader, limit int64) (domain.Artifact, error) {
-	if err := s.state.lockContext(ctx); err != nil {
+	if err := validateSessionID(sessionID); err != nil {
 		return domain.Artifact{}, err
 	}
-	defer s.state.unlock()
+	lock := s.journalLock(protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(sessionID)})
+	if err := lock.lock(ctx); err != nil {
+		return domain.Artifact{}, err
+	}
+	defer lock.unlock()
 	return s.putLocked(ctx, sessionID, mediaType, src, limit)
+}
+
+// ResolveLegacyArtifact resolves one already-identified session through the
+// store's rooted session transaction. It never enumerates workspace names.
+func (s *Store) ResolveLegacyArtifact(ctx context.Context, sessionID protocol.SessionID, artifactID string) (protocol.WorkspaceID, []byte, error) {
+	if err := validateSessionID(string(sessionID)); err != nil || !validLegacyArtifactID(artifactID) {
+		return "", nil, errors.Join(errors.New("unsafe legacy artifact identity"), err)
+	}
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(sessionID)}
+	lock := s.journalLock(ref)
+	if err := lock.lock(ctx); err != nil {
+		return "", nil, err
+	}
+	defer lock.unlock()
+	transaction, session, err := s.openSessionTransaction(ctx, string(sessionID), os.O_RDONLY, 0)
+	if err != nil {
+		return "", nil, err
+	}
+	defer transaction.close()
+	if err := transaction.openArtifacts(); err != nil {
+		return "", nil, err
+	}
+	name := artifactID + ".bin"
+	info, err := transaction.artifactsRoot.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return "", nil, errors.Join(errors.New("unsafe legacy artifact path"), err)
+	}
+	file, err := transaction.artifactsRoot.Open(name)
+	if err != nil {
+		return "", nil, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return "", nil, errors.Join(errors.New("unsafe legacy artifact substitution"), err)
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, MaxArtifactBytes+1))
+	if err != nil {
+		return "", nil, err
+	}
+	if int64(len(raw)) > MaxArtifactBytes {
+		return "", nil, fmt.Errorf("legacy artifact exceeds %d bytes", MaxArtifactBytes)
+	}
+	return protocol.WorkspaceID(session.Workspace.ID), raw, nil
+}
+
+func validLegacyArtifactID(value string) bool {
+	return value != "" && value != "." && value != ".." && filepath.Base(value) == value && !strings.ContainsAny(value, "/\\\x00")
 }
 
 func (s *Store) putLocked(ctx context.Context, sessionID, mediaType string, src io.Reader, limit int64) (domain.Artifact, error) {
@@ -33,6 +89,27 @@ func (s *Store) putLocked(ctx context.Context, sessionID, mediaType string, src 
 	}
 	if limit <= 0 || limit > MaxArtifactBytes {
 		limit = MaxArtifactBytes
+	}
+	var admission *secret.Lease
+	if s.requireAdmission {
+		var err error
+		admission, err = s.admission.AcquireLease()
+		if err != nil {
+			return domain.Artifact{}, fmt.Errorf("acquire artifact admission: %w", err)
+		}
+		defer admission.Close()
+	} else {
+		admission = s.artifactAdmission
+	}
+	if admission != nil {
+		candidate, err := readArtifactCandidate(ctx, src, limit)
+		if err != nil {
+			return domain.Artifact{}, err
+		}
+		if err := admission.Admit(candidate); err != nil {
+			return domain.Artifact{}, err
+		}
+		src = bytes.NewReader(candidate)
 	}
 	transaction, session, err := s.openSessionTransaction(ctx, sessionID, os.O_RDONLY, 0)
 	if err != nil {
@@ -61,6 +138,30 @@ func (s *Store) putLocked(ctx context.Context, sessionID, mediaType string, src 
 		Size:      written,
 		Truncated: truncated,
 	}, nil
+}
+
+func readArtifactCandidate(ctx context.Context, src io.Reader, limit int64) ([]byte, error) {
+	reader := io.LimitReader(src, limit+1)
+	var content bytes.Buffer
+	buffer := make([]byte, 32*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		count, err := reader.Read(buffer)
+		if count > 0 {
+			_, _ = content.Write(buffer[:count])
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return content.Bytes(), nil
+			}
+			return nil, err
+		}
+		if count == 0 {
+			return nil, io.ErrNoProgress
+		}
+	}
 }
 
 func writeArtifactTransactional(
@@ -164,10 +265,14 @@ func copyArtifact(ctx context.Context, dst io.Writer, src io.Reader, limit int64
 }
 
 func (s *Store) Open(ctx context.Context, artifact domain.Artifact) (io.ReadCloser, error) {
-	if err := s.state.lockContext(ctx); err != nil {
+	if err := validateSessionID(artifact.SessionID); err != nil {
 		return nil, err
 	}
-	defer s.state.unlock()
+	lock := s.journalLock(protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(artifact.SessionID)})
+	if err := lock.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer lock.unlock()
 	transaction, session, err := s.openSessionTransaction(ctx, artifact.SessionID, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err

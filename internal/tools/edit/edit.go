@@ -19,8 +19,11 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/recovery"
 	"github.com/muratmirgun/yordam/internal/safefile"
 	"github.com/muratmirgun/yordam/internal/scope"
+	toolset "github.com/muratmirgun/yordam/internal/tools"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 )
 
@@ -92,6 +95,12 @@ func (t *Tool) Descriptor() domain.ToolDescriptor {
 	}
 }
 
+func (t *Tool) CanonicalDescriptor() protocol.ToolDescriptor {
+	return toolset.BuiltinCanonicalDescriptor(t.Descriptor(), toolset.EditClassification())
+}
+
+func (*Tool) TrustedClassification() domain.ToolClassification { return toolset.EditClassification() }
+
 func (t *Tool) Prepare(_ context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
 	var input Input
 	if err := decodeStrict(request.Input, &input); err != nil {
@@ -104,6 +113,10 @@ func (t *Tool) Prepare(_ context.Context, request domain.ToolRequest) (ports.Pre
 		return t.prepareCreate(request, input)
 	}
 	return t.prepareExisting(request, input)
+}
+
+func (t *Tool) Plan(ctx context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
+	return t.Prepare(ctx, request)
 }
 
 func (t *Tool) prepareCreate(request domain.ToolRequest, input Input) (ports.PreparedTool, error) {
@@ -188,6 +201,7 @@ func (p *prepared) buildPreview(ctx context.Context, before, after []byte, mode 
 		return fmt.Errorf("label edit diff: %w", err)
 	}
 	buffer := output.New(p.output)
+	defer buffer.Close()
 	if err := writeUnifiedDiff(buffer, before, after, relative); err != nil {
 		return fmt.Errorf("generate edit diff: %w", err)
 	}
@@ -237,12 +251,55 @@ func (p *prepared) Preview() domain.PreparedToolRequest {
 		CanonicalScope:  p.target.Path,
 		InsideWorkspace: p.target.Inside,
 		Summary:         p.summary(),
+		Resources:       p.resources(),
 	}
 	if p.previewReady {
 		preview.ProposedDiff = p.plan.Diff
 		preview.FilePlan = &plan
 	}
 	return preview
+}
+
+func (p *prepared) resources() []protocol.ResourceTarget {
+	resource := protocol.ResourceTarget{Kind: "file", CanonicalID: p.target.Path}
+	if p.input.Create {
+		resource.ParentID = filepath.Dir(p.target.Path)
+		resource.Attributes = []protocol.ResourceAttribute{{Name: "create", Value: "true"}}
+	} else {
+		resource.Digest = p.input.ExpectedSHA256
+	}
+	return []protocol.ResourceTarget{resource}
+}
+
+func (p *prepared) Revalidate(_ context.Context) (domain.PreparedToolRequest, error) {
+	p.previewMu.Lock()
+	previewReady := p.previewReady
+	p.previewMu.Unlock()
+	if previewReady {
+		if err := p.verifyCurrent(); err != nil {
+			return domain.PreparedToolRequest{}, err
+		}
+		return p.Preview(), nil
+	}
+	current, err := scope.Resolve(p.workspace, p.input.Path, p.input.Create)
+	if err != nil {
+		return domain.PreparedToolRequest{}, fmt.Errorf("re-resolve edit path: %w", err)
+	}
+	p.previewMu.Lock()
+	p.target = current
+	p.previewMu.Unlock()
+	return p.Preview(), nil
+}
+
+func (p *prepared) RecoveryMaterial(_ context.Context) (recovery.Candidate, bool, error) {
+	p.previewMu.Lock()
+	defer p.previewMu.Unlock()
+	if !p.previewReady || p.input.Create {
+		return recovery.Candidate{}, false, nil
+	}
+	preimageDigest := protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hashBytes(p.before)}
+	postimageDigest := protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hashBytes(p.after)}
+	return recovery.Candidate{Preimage: bytes.Clone(p.before), PreimageDigest: preimageDigest, ExpectedPostimageDigest: postimageDigest, Mode: uint32(p.mode.Perm())}, true, nil
 }
 
 func (p *prepared) summary() string {

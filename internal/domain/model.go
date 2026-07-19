@@ -1,6 +1,10 @@
 package domain
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/muratmirgun/yordam/internal/protocol"
+)
 
 type Role string
 
@@ -38,15 +42,21 @@ type ModelRequest struct {
 type ModelEventKind string
 
 const (
-	ModelTextDelta   ModelEventKind = "text_delta"
-	ModelToolCall    ModelEventKind = "tool_call"
-	ModelDone        ModelEventKind = "done"
-	ModelStreamError ModelEventKind = "error"
+	ModelTextDelta    ModelEventKind = "text_delta"
+	ModelToolCall     ModelEventKind = "tool_call"
+	ModelUsageUpdate  ModelEventKind = "usage_update"
+	ModelRefusalDelta ModelEventKind = "refusal_delta"
+	ModelDone         ModelEventKind = "done"
+	ModelStreamError  ModelEventKind = "error"
 )
 
 type ModelEvent struct {
-	Kind     ModelEventKind `json:"kind"`
-	Text     string         `json:"text,omitempty"`
-	ToolCall *ToolCall      `json:"tool_call,omitempty"`
-	Err      error          `json:"-"`
+	Kind         ModelEventKind       `json:"kind"`
+	Text         string               `json:"text,omitempty"`
+	ToolCall     *ToolCall            `json:"tool_call,omitempty"`
+	Usage        *protocol.ModelUsage `json:"usage,omitempty"`
+	Refusal      string               `json:"refusal,omitempty"`
+	RequestID    string               `json:"request_id,omitempty"`
+	FinishReason string               `json:"finish_reason,omitempty"`
+	Err          error                `json:"-"`
 }

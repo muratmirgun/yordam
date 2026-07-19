@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 type ClientOptions struct {
@@ -21,6 +22,7 @@ type ClientOptions struct {
 	RetryDelays []time.Duration
 	Jitter      func(time.Duration) time.Duration
 	Redact      func(string) string
+	Admission   *secret.Lease
 }
 
 type Client struct {
@@ -31,11 +33,16 @@ type Client struct {
 	retryDelays []time.Duration
 	jitter      func(time.Duration) time.Duration
 	redact      func(string) string
+	admission   *secret.Lease
 }
 
 func New(opts ClientOptions) *Client {
 	if opts.HTTPClient == nil {
 		opts.HTTPClient = http.DefaultClient
+	}
+	httpClient := *opts.HTTPClient
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 	if opts.RetryDelays == nil {
 		opts.RetryDelays = []time.Duration{250 * time.Millisecond, time.Second, 2 * time.Second}
@@ -49,14 +56,18 @@ func New(opts ClientOptions) *Client {
 	if opts.Redact == nil {
 		opts.Redact = func(value string) string { return value }
 	}
+	if opts.Admission != nil {
+		opts.Redact = opts.Admission.String
+	}
 	return &Client{
-		http:        opts.HTTPClient,
+		http:        &httpClient,
 		endpoint:    strings.TrimRight(opts.BaseURL, "/") + "/chat/completions",
 		apiKey:      opts.APIKey,
 		model:       opts.Model,
 		retryDelays: append([]time.Duration(nil), opts.RetryDelays...),
 		jitter:      opts.Jitter,
 		redact:      opts.Redact,
+		admission:   opts.Admission,
 	}
 }
 

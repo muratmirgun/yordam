@@ -3,6 +3,8 @@ package logging_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -107,16 +109,92 @@ func TestLoggerUsesCurrentRedactorBinding(t *testing.T) {
 	var destination bytes.Buffer
 	binding := secret.NewBinding(secret.New("old-secret"))
 	logger := logging.New(&destination, binding)
-	if err := logger.Event("old", map[string]any{"message": "old-secret"}); err != nil {
+	if err := logger.Event("old-secret", map[string]any{"message": "old-secret new-secret"}); err != nil {
 		t.Fatal(err)
 	}
 	binding.Replace(secret.New("new-secret"))
-	if err := logger.Event("new", map[string]any{"message": "new-secret"}); err != nil {
+	if err := logger.Event("new-secret", map[string]any{"message": "old-secret new-secret"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := destination.String(); strings.Contains(got, "old-secret") || strings.Contains(got, "new-secret") || strings.Count(got, "[REDACTED]") != 2 {
-		t.Fatalf("unsafe dynamic log=%q", got)
+
+	lines := bytes.Split(bytes.TrimSpace(destination.Bytes()), []byte{'\n'})
+	if len(lines) != 2 {
+		t.Fatalf("lines=%d log=%q", len(lines), destination.String())
 	}
+	wantMessages := []string{"[REDACTED] new-secret", "old-secret [REDACTED]"}
+	for index, line := range lines {
+		var event struct {
+			Event   string `json:"event"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatalf("line %d: %v", index, err)
+		}
+		if event.Event != "[REDACTED]" || event.Message != wantMessages[index] {
+			t.Fatalf("line %d event=%+v want message=%q", index, event, wantMessages[index])
+		}
+	}
+}
+
+func TestLeasedLoggerRedactsEncodedSecretVariants(t *testing.T) {
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("generation-a", [][]byte{[]byte("logger-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lease.Close() }()
+	var destination bytes.Buffer
+	logger, err := logging.NewLeased(&destination, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logger.Event("provider", map[string]any{"message": "bG9nZ2VyLXNlY3JldA=="}); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(destination.Bytes(), []byte("bG9nZ2VyLXNlY3JldA==")) {
+		t.Fatalf("encoded secret remained in log: %s", destination.Bytes())
+	}
+}
+
+func TestLeasedLoggerRejectsMissingLease(t *testing.T) {
+	if _, err := logging.NewLeased(io.Discard, nil); err == nil {
+		t.Fatal("leased logger accepted a nil lease")
+	}
+}
+
+func TestGenerationBoundLoggerRequiresAndFollowsLeaseBinding(t *testing.T) {
+	registry := secret.NewRegistry()
+	oldLease, err := registry.Acquire("logger-old", [][]byte{[]byte("old-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := secret.NewBinding(oldLease)
+	var destination bytes.Buffer
+	logger, err := logging.NewGenerationBound(&destination, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logger.Event("old-secret", nil); err != nil {
+		t.Fatal(err)
+	}
+	newLease, err := registry.Acquire("logger-new", [][]byte{[]byte("new-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding.Replace(newLease)
+	_ = registry.Retire("logger-old")
+	_ = oldLease.Close()
+	if err := logger.Event("new-secret", nil); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(destination.Bytes(), []byte("old-secret")) || bytes.Contains(destination.Bytes(), []byte("new-secret")) {
+		t.Fatalf("generation-bound log leaked: %s", destination.Bytes())
+	}
+	binding.Replace(secret.New())
+	if err := logger.Event("public", nil); !errors.Is(err, secret.ErrLeaseClosed) {
+		t.Fatalf("missing generation event error=%v", err)
+	}
+	_ = newLease.Close()
 }
 
 func assertSafeLogTree(t *testing.T, value any) {

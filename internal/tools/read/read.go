@@ -15,8 +15,10 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/safefile"
 	"github.com/muratmirgun/yordam/internal/scope"
+	toolset "github.com/muratmirgun/yordam/internal/tools"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 )
 
@@ -62,7 +64,13 @@ func (t *Tool) Descriptor() domain.ToolDescriptor {
 	}
 }
 
-func (t *Tool) Prepare(_ context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
+func (t *Tool) CanonicalDescriptor() protocol.ToolDescriptor {
+	return toolset.BuiltinCanonicalDescriptor(t.Descriptor(), toolset.ReadClassification())
+}
+
+func (*Tool) TrustedClassification() domain.ToolClassification { return toolset.ReadClassification() }
+
+func (t *Tool) Plan(_ context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
 	input := Input{Offset: defaultOffset, Limit: defaultLimit}
 	if err := decodeStrict(request.Input, &input); err != nil {
 		return nil, fmt.Errorf("read input: %w", err)
@@ -81,34 +89,42 @@ func (t *Tool) Prepare(_ context.Context, request domain.ToolRequest) (ports.Pre
 	if err != nil {
 		return nil, fmt.Errorf("resolve read path: %w", err)
 	}
-	info, err := os.Stat(resolved.Path)
-	if err != nil {
-		return nil, fmt.Errorf("stat read path: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("read path is not a regular file: %s", resolved.Path)
-	}
-	if resolved.Inside {
-		file, err := safefile.OpenRegular(context.Background(), resolved.Path)
-		if err != nil {
-			return nil, fmt.Errorf("open read path: %w", err)
-		}
-		inspectErr := inspectTextFile(file, resolved.Path)
-		closeErr := file.Close()
-		if err := errors.Join(inspectErr, closeErr); err != nil {
-			return nil, err
-		}
-	}
-
 	return &prepared{
 		request:    request,
 		input:      input,
 		target:     resolved,
 		workspace:  t.workspace,
 		output:     t.output,
-		identity:   info,
 		beforeOpen: func() error { return nil },
 	}, nil
+}
+
+func (t *Tool) Prepare(ctx context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
+	planned, err := t.Plan(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	prepared := planned.(*prepared)
+	info, err := os.Stat(prepared.target.Path)
+	if err != nil {
+		return nil, fmt.Errorf("stat read path: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("read path is not a regular file: %s", prepared.target.Path)
+	}
+	if prepared.target.Inside {
+		file, err := safefile.OpenRegular(ctx, prepared.target.Path)
+		if err != nil {
+			return nil, fmt.Errorf("open read path: %w", err)
+		}
+		inspectErr := inspectTextFile(file, prepared.target.Path)
+		closeErr := file.Close()
+		if err := errors.Join(inspectErr, closeErr); err != nil {
+			return nil, err
+		}
+	}
+	prepared.identity = info
+	return prepared, nil
 }
 
 type prepared struct {
@@ -128,7 +144,26 @@ func (p *prepared) Preview() domain.PreparedToolRequest {
 		CanonicalScope:  p.target.Path,
 		InsideWorkspace: p.target.Inside,
 		Summary:         fmt.Sprintf("read %s from line %d (up to %d lines)", p.target.Path, p.input.Offset, p.input.Limit),
+		Resources: []protocol.ResourceTarget{{Kind: "file", CanonicalID: p.target.Path, Attributes: []protocol.ResourceAttribute{
+			{Name: "limit", Value: strconv.Itoa(p.input.Limit)}, {Name: "offset", Value: strconv.Itoa(p.input.Offset)},
+		}}},
 	}
+}
+
+func (p *prepared) Revalidate(_ context.Context) (domain.PreparedToolRequest, error) {
+	current, err := scope.Resolve(p.workspace, p.input.Path, false)
+	if err != nil {
+		return domain.PreparedToolRequest{}, fmt.Errorf("re-resolve read path: %w", err)
+	}
+	info, err := os.Stat(current.Path)
+	if err != nil {
+		return domain.PreparedToolRequest{}, fmt.Errorf("stat read path: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return domain.PreparedToolRequest{}, fmt.Errorf("read path is not a regular file: %s", current.Path)
+	}
+	p.target, p.identity = current, info
+	return p.Preview(), nil
 }
 
 func (p *prepared) Execute(ctx context.Context) domain.ToolResult {
@@ -164,6 +199,7 @@ func (p *prepared) Execute(ctx context.Context) domain.ToolResult {
 	}
 
 	buffer := output.New(p.output)
+	defer buffer.Close()
 	if err := streamLines(ctx, buffer, file, p.input.Offset, p.input.Limit); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return cancelled(p.request.CallID, started, err)

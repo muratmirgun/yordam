@@ -3,33 +3,63 @@ package tui
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/cli"
+	"github.com/muratmirgun/yordam/internal/domain"
 )
 
 func TestRunCreatesTemplateAndStartsNormalConversation(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	originalEnsureGlobal, originalBootstrap, originalNewProgram := ensureGlobal, bootstrap, newProgram
+	t.Cleanup(func() {
+		ensureGlobal, bootstrap, newProgram = originalEnsureGlobal, originalBootstrap, originalNewProgram
+	})
+
+	configPath := "/isolated/config.jsonc"
+	ensureGlobal = func() (string, bool, error) { return configPath, true, nil }
+	bootstrapCalled := false
+	bootstrap = func(_ context.Context, options app.BootstrapOptions) (*app.App, app.Snapshot, error) {
+		bootstrapCalled = true
+		if options.ConfigPath != configPath {
+			t.Fatalf("config path=%q want=%q", options.ConfigPath, configPath)
+		}
+		selection := domain.ModelSelection{Profile: "default", Model: "model"}
+		application := app.New(app.Options{})
+		return application, app.Snapshot{
+			Workspace:          domain.Workspace{CanonicalPath: "/workspace"},
+			Session:            domain.Session{ID: "session", Mode: domain.ModeAsk, Selection: selection},
+			Models:             []domain.ModelSelection{selection},
+			ConfigurationError: errors.New("missing TEST_KEY"),
+		}, nil
+	}
+	var startedModel Model
+	newProgram = func(model tea.Model) programRunner {
+		var ok bool
+		startedModel, ok = model.(Model)
+		if !ok {
+			t.Fatalf("program model type=%T", model)
+		}
+		program := newRunTestProgram()
+		program.run = func() (tea.Model, error) { return model, nil }
+		return program
+	}
 	options, err := cli.Parse(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	options.DataDir = t.TempDir()
-	application, model, err := prepareRun(t.Context(), options)
-	if err != nil {
+	if err := Run(t.Context(), options); err != nil {
 		t.Fatal(err)
 	}
-	if application == nil || model.screen != ScreenConversation {
-		t.Fatalf("application=%v screen=%q", application != nil, model.screen)
+	if !bootstrapCalled || startedModel.screen != ScreenConversation {
+		t.Fatalf("bootstrap=%t screen=%q", bootstrapCalled, startedModel.screen)
 	}
-	path := filepath.Join(home, ".config", "yordam", "config.jsonc")
-	if _, err := os.Stat(path); err != nil {
-		t.Fatal(err)
+	rendered := startedModel.conversation.View()
+	if !strings.Contains(rendered, configPath) || !strings.Contains(rendered, "missing TEST_KEY") {
+		t.Fatalf("first-launch notices=%q", rendered)
 	}
 }
 

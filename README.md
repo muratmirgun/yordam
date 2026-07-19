@@ -46,9 +46,9 @@ If no suitable release asset is published, build from source as described below.
 
 ## Configuration
 
-Yordam always opens its normal conversation TUI. On first run it creates `~/.config/yordam/config.jsonc` on both macOS and Linux. This is the only supported config location; old TOML files are not loaded or migrated.
+Yordam always opens its normal conversation TUI. On first run it creates `~/.config/yordam/config.jsonc` on both macOS and Linux. This is the only supported config location. Legacy TOML configuration files are ignored and are not migrated automatically.
 
-The generated JSONC template is intentionally incomplete. Replace both `your-model-id` occurrences and `your-provider-api-key`, then run `/reload` in Yordam:
+The generated JSONC template is intentionally incomplete. Replace both `your-model-id` occurrences with a real model ID, set the named environment variable before starting Yordam, then run `/reload` after editing the file:
 
 ```jsonc
 {
@@ -61,7 +61,7 @@ The generated JSONC template is intentionally incomplete. Replace both `your-mod
       "name": "OpenAI",
       "options": {
         "baseURL": "https://api.openai.com/v1",
-        "apiKey": "your-provider-api-key"
+        "apiKeyEnv": "OPENAI_API_KEY"
       },
       "models": {
         "your-model-id": {"name": "Your model"}
@@ -77,20 +77,14 @@ The generated JSONC template is intentionally incomplete. Replace both `your-mod
 
 JSONC comments and trailing commas are supported. The schema enables editor validation and autocomplete. Yordam validates locally and does not fetch the schema at runtime.
 
-You can alternatively keep the API key in an environment variable by replacing `apiKey` with:
-
-```jsonc
-"apiKeyEnv": "YORDAM_API_KEY"
-```
-
-Then start Yordam with the variable set:
+Configuration stores only the environment-variable name, never the credential value. Export the variable named by `apiKeyEnv` before starting Yordam:
 
 ```sh
-export YORDAM_API_KEY='your-provider-api-key'
+export OPENAI_API_KEY='your-provider-api-key'
 yordam
 ```
 
-`/reload` applies file changes without replacing the current session. Environment variables are inherited when Yordam starts, so setting a missing API key in another terminal requires restarting Yordam.
+`/reload` validates and applies file changes without replacing the current session or its data. If `apiKeyEnv` names a variable that was missing when Yordam started, the edited configuration is loaded but requests remain blocked with restart guidance. Export the variable and restart Yordam; a running process cannot inherit later changes from another shell.
 
 ## Usage
 

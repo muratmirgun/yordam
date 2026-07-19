@@ -5,17 +5,19 @@ import (
 	"sync"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
 type SessionPolicy struct {
-	mu        sync.RWMutex
-	mode      domain.PermissionMode
-	grants    map[string]struct{}
-	autoShell bool
+	mu                  sync.RWMutex
+	mode                domain.PermissionMode
+	grants              map[string]struct{}
+	authorizationGrants map[string]struct{}
+	autoShell           bool
 }
 
 func NewSession(mode domain.PermissionMode) *SessionPolicy {
-	return &SessionPolicy{mode: mode, grants: map[string]struct{}{}}
+	return &SessionPolicy{mode: mode, grants: map[string]struct{}{}, authorizationGrants: map[string]struct{}{}}
 }
 
 func (p *SessionPolicy) SetMode(mode domain.PermissionMode) {
@@ -39,6 +41,17 @@ func (p *SessionPolicy) GrantSession(tool, scope string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.grants[grantKey(tool, scope)] = struct{}{}
+}
+
+func (p *SessionPolicy) GrantAuthorizationSession(request protocol.AuthorizationRequest, constraints []protocol.AuthorizationConstraint) error {
+	key, err := authorizationGrantKey(request, constraints)
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.authorizationGrants[key] = struct{}{}
+	p.mu.Unlock()
+	return nil
 }
 
 func Restore(replay domain.SessionReplay) *SessionPolicy {

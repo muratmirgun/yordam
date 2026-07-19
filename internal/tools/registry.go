@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
 type Registry struct {
@@ -20,9 +22,38 @@ var builtInRank = map[string]int{
 	"shell":  3,
 }
 
-var builtInMutation = map[string]domain.MutationKind{
-	"read": domain.MutationReadOnly, "search": domain.MutationReadOnly,
-	"edit": domain.MutationFile, "shell": domain.MutationProcess,
+const BuiltinSourceRevision = "builtin-v1"
+
+func BuiltinCanonicalDescriptor(legacy domain.ToolDescriptor, classification domain.ToolClassification) protocol.ToolDescriptor {
+	input, err := canonicaljson.Marshal(legacy.InputSchema)
+	if err != nil {
+		panic(fmt.Sprintf("canonicalize builtin %s schema: %v", legacy.Name, err))
+	}
+	body := protocol.ToolDescriptorBody{
+		Identity:       protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: legacy.Name},
+		SourceRevision: BuiltinSourceRevision, DisplayName: legacy.Name, Description: legacy.Description, InputSchema: input,
+		Effect: classification.Effect, Mutation: classification.Mutation, ExecutionLoci: append([]string(nil), classification.ExecutionLoci...),
+		ClassificationSource: "trusted_adapter", Idempotency: classification.Idempotency, Retry: classification.Retry,
+	}
+	digest, err := canonicaljson.Digest(body)
+	if err != nil {
+		panic(fmt.Sprintf("digest builtin %s descriptor: %v", legacy.Name, err))
+	}
+	return protocol.ToolDescriptor{Body: body, DescriptorDigest: digest}
+}
+
+func ReadClassification() domain.ToolClassification {
+	return domain.ToolClassification{Effect: "observation", Mutation: "read_only", ExecutionLoci: []string{"builtin"}, Boundary: "workspace", Reversibility: "not_applicable", VerificationCoverage: "full", Idempotency: "idempotent", Retry: "safe_before_dispatch", RequestedProfile: "restricted", EffectiveProfile: "restricted"}
+}
+
+func SearchClassification() domain.ToolClassification { return ReadClassification() }
+
+func EditClassification() domain.ToolClassification {
+	return domain.ToolClassification{Effect: "mutation", Mutation: "file", ExecutionLoci: []string{"builtin"}, Boundary: "workspace", Reversibility: "preimage", VerificationCoverage: "preimage_and_postimage", Idempotency: "conditional", Retry: "never_after_dispatch", RequestedProfile: "restricted", EffectiveProfile: "restricted"}
+}
+
+func ShellClassification() domain.ToolClassification {
+	return domain.ToolClassification{Effect: "mutation", Mutation: "process", ExecutionLoci: []string{"process"}, Boundary: "process", Reversibility: "unknown", VerificationCoverage: "partial", Idempotency: "unknown", Retry: "never_after_dispatch", RequestedProfile: "unsandboxed", EffectiveProfile: "unsandboxed"}
 }
 
 func NewRegistry(items ...ports.Tool) *Registry {
@@ -35,12 +66,6 @@ func NewRegistry(items ...ports.Tool) *Registry {
 		if descriptor.ScopeDescription == "" {
 			panic(fmt.Sprintf("built-in tool %s has no scope description", descriptor.Name))
 		}
-		if _, known := builtInRank[descriptor.Name]; !known {
-			panic(fmt.Sprintf("unknown built-in tool %s", descriptor.Name))
-		}
-		if descriptor.Mutation != builtInMutation[descriptor.Name] {
-			panic(fmt.Sprintf("built-in tool %s has mutation %s, want %s", descriptor.Name, descriptor.Mutation, builtInMutation[descriptor.Name]))
-		}
 		descriptor.InputSchema = append([]byte(nil), descriptor.InputSchema...)
 		if _, exists := registry.byName[descriptor.Name]; exists {
 			panic(fmt.Sprintf("duplicate tool %s", descriptor.Name))
@@ -48,11 +73,16 @@ func NewRegistry(items ...ports.Tool) *Registry {
 		registry.byName[descriptor.Name] = item
 		registry.ordered = append(registry.ordered, descriptor)
 	}
-	if len(registry.byName) != len(builtInRank) {
-		panic("registry requires read, search, edit, and shell")
-	}
 	sort.Slice(registry.ordered, func(left, right int) bool {
-		return builtInRank[registry.ordered[left].Name] < builtInRank[registry.ordered[right].Name]
+		leftRank, leftBuiltin := builtInRank[registry.ordered[left].Name]
+		rightRank, rightBuiltin := builtInRank[registry.ordered[right].Name]
+		if leftBuiltin != rightBuiltin {
+			return leftBuiltin
+		}
+		if leftBuiltin {
+			return leftRank < rightRank
+		}
+		return registry.ordered[left].Name < registry.ordered[right].Name
 	})
 	return registry
 }
