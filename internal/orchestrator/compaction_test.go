@@ -124,7 +124,7 @@ func TestRunCompactionUsesRealProviderAndAuthorizationDispatchExactlyOnce(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := NewService(Dependencies{Admission: passthroughAdmission{}, Lane: NewOperationLane(), Repository: repository, Providers: catalog, Provider: providerService, Authorization: realCompactionAuthorization{gate: gate}, Evidence: &compactionEvidence{}})
+	service, err := NewService(Dependencies{Admission: passthroughAdmission{}, Lane: NewOperationLane(), Repository: repository, Providers: catalog, Provider: providerService, Authorization: &realCompactionAuthorization{gate: gate}, Evidence: &compactionEvidence{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -556,16 +556,16 @@ type realCompactionAuthorization struct {
 	nonce atomic.Int64
 }
 
-func (a realCompactionAuthorization) Decide(_ context.Context, request protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error) {
+func (a *realCompactionAuthorization) Decide(_ context.Context, request protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error) {
 	return protocol.AuthorizationDecision{Request: request, Action: "allow", Scope: protocol.CanonicalAuthorizationScope{Capability: request.Action, Source: request.Source, Resources: request.Resources, Constraints: []protocol.AuthorizationConstraint{}}, Constraints: []protocol.AuthorizationConstraint{}, Lifetime: protocol.AuthorizationLifetimeOnce, PolicySource: "test", PolicyGeneration: request.PolicyGeneration, Reason: "allowed", DecidedAt: time.Now().UTC(), PlanDigest: request.PlanDigest, DecisionNonce: protocol.DecisionNonce(fmt.Sprintf("real-nonce-%d", a.nonce.Add(1)))}, nil
 }
-func (a realCompactionAuthorization) ResolveInteractive(_ context.Context, request protocol.AuthorizationRequest, decision protocol.AuthorizationDecision, response protocol.ApprovalResponse) (protocol.AuthorizationDecision, error) {
+func (a *realCompactionAuthorization) ResolveInteractive(_ context.Context, request protocol.AuthorizationRequest, decision protocol.AuthorizationDecision, response protocol.ApprovalResponse) (protocol.AuthorizationDecision, error) {
 	return a.gate.ResolveInteractive(request, decision, response)
 }
-func (a realCompactionAuthorization) Issue(ctx context.Context, reference authorization.CommitReference) (authorization.CommittedToken, error) {
+func (a *realCompactionAuthorization) Issue(ctx context.Context, reference authorization.CommitReference) (authorization.CommittedToken, error) {
 	return a.gate.Issue(ctx, reference)
 }
-func (a realCompactionAuthorization) Dispatch(ctx context.Context, token authorization.CommittedToken, binding authorization.DispatchBinding, callback func(context.Context) error) error {
+func (a *realCompactionAuthorization) Dispatch(ctx context.Context, token authorization.CommittedToken, binding authorization.DispatchBinding, callback func(context.Context) error) error {
 	return a.gate.Dispatch(ctx, token, binding, callback)
 }
 
