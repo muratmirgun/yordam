@@ -435,9 +435,13 @@ func (a *App) Run(ctx context.Context) error {
 						}
 						if awaitTerminal {
 							select {
-							case event := <-compactTerminals:
-								println("compact terminal received", string(event.Kind))
-								terminal = &event
+							case event, ok := <-compactTerminals:
+								if ok {
+									terminal = &event
+								} else {
+									terminal = &Event{Kind: EventCompactionFailed, Message: "context compaction lifecycle ended unexpectedly", Compaction: &protocol.CompactionEventV1{Trigger: "manual", Stage: protocol.CompactionFailed, Usage: unknownCompactionUsage(), Error: &protocol.PublicError{Code: "compaction_failed", Message: "context compaction lifecycle ended unexpectedly"}}}
+									executeErr = errors.New(terminal.Message)
+								}
 							case <-compactCtx.Done():
 							}
 						}
@@ -1262,9 +1266,15 @@ func legacyTerminalEvent(kind EventKind) bool {
 
 func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription, adapter *LegacyAdapter, destination chan<- Event, suppressTerminal bool, compactTerminals chan<- Event) {
 	defer subscription.Close()
+	if compactTerminals != nil {
+		defer close(compactTerminals)
+	}
 	for {
 		item, err := subscription.Next(ctx)
 		if err != nil {
+			if compactTerminals != nil {
+				return
+			}
 			if ctx.Err() == nil {
 				select {
 				case destination <- Event{Kind: EventError, Err: err, Message: err.Error()}:
@@ -1274,6 +1284,9 @@ func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription,
 			return
 		}
 		if item.Terminal != nil {
+			if compactTerminals != nil {
+				return
+			}
 			err := errors.New(item.Terminal.Message)
 			select {
 			case destination <- Event{Kind: EventError, Code: item.Terminal.Code, Err: err, Message: err.Error()}:
@@ -1292,11 +1305,14 @@ func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription,
 		}
 		event, err := adapter.Event(*item.Event)
 		if err != nil {
+			if compactTerminals != nil {
+				return
+			}
 			select {
 			case destination <- Event{Kind: EventError, Err: err, Message: err.Error()}:
 			case <-ctx.Done():
 			}
-			return
+			continue
 		}
 		if event.Kind == "" {
 			continue
