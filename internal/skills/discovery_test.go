@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/protocol"
@@ -87,6 +88,19 @@ func TestDiscoverFindsGlobalAndProjectSkillsWithBoundIdentity(t *testing.T) {
 		if candidate.ContentDigest != digest(candidate.Content) {
 			t.Fatalf("content digest = %#v for %q", candidate.ContentDigest, candidate.Name)
 		}
+	}
+}
+
+func TestDiscoverRejectsExternalOrMissingProjectRoot(t *testing.T) {
+	global := canonicalTempDir(t)
+	options := skillOptions(t, global)
+	options.ProjectRoot = filepath.Join(canonicalTempDir(t), "external-skills")
+	if _, err := Discover(context.Background(), options); err == nil {
+		t.Fatal("Discover() error = nil for external project root")
+	}
+	options.ProjectRoot = ""
+	if _, err := Discover(context.Background(), options); err == nil {
+		t.Fatal("Discover() error = nil for missing project root")
 	}
 }
 
@@ -259,6 +273,103 @@ func TestDiscoverRejectsDuplicateIdentityAndReplacementRaces(t *testing.T) {
 	}
 	if len(result.Candidates) != 0 || len(result.Diagnostics) == 0 {
 		t.Fatalf("Discover() = %#v", result)
+	}
+}
+
+func TestDiscoverRejectsFileInspectOpenFIFOAndSymlinkReplacement(t *testing.T) {
+	for _, replacement := range []string{"fifo", "symlink"} {
+		t.Run(replacement, func(t *testing.T) {
+			discoveryHookMu.Lock()
+			defer discoveryHookMu.Unlock()
+			global := canonicalTempDir(t)
+			options := skillOptions(t, global)
+			path := writeSkill(t, global, "go-testing", "description", "first body\n")
+			secretTarget := filepath.Join(canonicalTempDir(t), "secret")
+			var replacementErr error
+			discoveryHook = func(stage, _ string) {
+				if stage != "after-file-inspect" {
+					return
+				}
+				if err := os.Remove(path); err != nil {
+					replacementErr = err
+					return
+				}
+				if replacement == "fifo" {
+					if err := unix.Mkfifo(path, 0o600); err != nil {
+						replacementErr = err
+					}
+					return
+				}
+				if err := os.Symlink(secretTarget, path); err != nil {
+					replacementErr = err
+				}
+			}
+			defer func() { discoveryHook = nil }()
+			type outcome struct {
+				result Discovery
+				err    error
+			}
+			done := make(chan outcome, 1)
+			go func() { result, err := Discover(context.Background(), options); done <- outcome{result, err} }()
+			var result Discovery
+			var err error
+			select {
+			case completed := <-done:
+				result, err = completed.result, completed.err
+			case <-time.After(time.Second):
+				t.Fatal("Discover() blocked on Lstat-to-open replacement")
+			}
+			if replacementErr != nil {
+				t.Fatalf("replacement setup: %v", replacementErr)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Candidates) != 0 || len(result.Diagnostics) == 0 {
+				t.Fatalf("Discover() = %#v", result)
+			}
+		})
+	}
+}
+
+func TestDiscoverReportsEveryHardlinkConflictDeterministically(t *testing.T) {
+	global := canonicalTempDir(t)
+	options := skillOptions(t, global)
+	first := writeSkill(t, global, "first", "description", "body\n")
+	for _, name := range []string{"second", "third"} {
+		if err := os.Mkdir(filepath.Join(global, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(first, filepath.Join(global, name, "SKILL.md")); err != nil {
+			t.Skipf("hard links unavailable: %v", err)
+		}
+	}
+	firstResult, err := Discover(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResult, err := Discover(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstResult.Candidates) != 0 || !reflect.DeepEqual(firstResult.Diagnostics, secondResult.Diagnostics) {
+		t.Fatalf("results = %#v / %#v", firstResult, secondResult)
+	}
+	conflicts := make([]string, 0, 3)
+	for _, diagnostic := range firstResult.Diagnostics {
+		if !strings.HasSuffix(diagnostic.Code, ".ambiguous_identity") {
+			continue
+		}
+		var details struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(diagnostic.Details, &details); err != nil {
+			t.Fatal(err)
+		}
+		conflicts = append(conflicts, details.Name)
+	}
+	if !reflect.DeepEqual(conflicts, []string{"first", "second", "third"}) {
+		t.Fatalf("conflicts = %#v", conflicts)
 	}
 }
 

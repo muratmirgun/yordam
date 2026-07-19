@@ -12,7 +12,7 @@ func Parse(name string, raw []byte) (Metadata, []byte, error) {
 	if len(raw) > MaxSkillBytes {
 		return Metadata{}, nil, errors.New("skill exceeds maximum size")
 	}
-	if !validName(name) || !utf8.Valid(raw) || hasDisallowedByte(raw) {
+	if !validName(name) || !utf8.Valid(raw) || hasDisallowedControl(raw) {
 		return Metadata{}, nil, errors.New("invalid skill input")
 	}
 	normalized := bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
@@ -80,6 +80,9 @@ func validScalar(value string) bool {
 		return false
 	}
 	plain := value[1:]
+	if strings.TrimSpace(plain) != plain {
+		return false
+	}
 	if strings.Contains(plain, "\\") || strings.Contains(plain, "#") || strings.Contains(plain, ": ") {
 		return false
 	}
@@ -91,12 +94,15 @@ func validScalar(value string) bool {
 			return false
 		}
 	}
+	if strings.HasPrefix(plain, "- ") || strings.HasPrefix(plain, "? ") || strings.HasPrefix(plain, ": ") {
+		return false
+	}
 	return true
 }
 
-func hasDisallowedByte(raw []byte) bool {
-	for _, value := range raw {
-		if value == 0 || (value < 0x20 && value != '\n' && value != '\r' && value != '\t') {
+func hasDisallowedControl(raw []byte) bool {
+	for _, value := range string(raw) {
+		if unicode.IsControl(value) && value != '\n' && value != '\r' && value != '\t' {
 			return true
 		}
 	}

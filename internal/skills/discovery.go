@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/safefile"
 )
 
 // discoveryHook exists solely to make identity substitution boundaries testable.
@@ -20,13 +21,15 @@ import (
 var discoveryHook func(stage, name string)
 
 type retainedRoot struct {
-	path string
-	root *os.Root
-	info os.FileInfo
+	path  string
+	guard *os.File
+	root  *os.Root
+	info  os.FileInfo
 }
 
 type scannedCandidate struct {
 	candidate Candidate
+	name      string
 	leaf      os.FileInfo
 	rejected  bool
 }
@@ -72,7 +75,7 @@ func validateOptions(options DiscoveryOptions) error {
 	if err != nil || canonicalWorkspace != options.Workspace.CanonicalPath {
 		return errors.New("invalid canonical workspace")
 	}
-	if options.GlobalRoot != "" && !absoluteClean(options.GlobalRoot) || options.ProjectRoot != "" && !absoluteClean(options.ProjectRoot) {
+	if options.GlobalRoot != "" && !absoluteClean(options.GlobalRoot) || !absoluteClean(options.ProjectRoot) || options.ProjectRoot != filepath.Join(options.Workspace.CanonicalPath, ".yordam", "skills") {
 		return errors.New("invalid skill discovery root")
 	}
 	return nil
@@ -94,6 +97,7 @@ func discoverRoot(ctx context.Context, source protocol.SkillSource, path string,
 		return nil, []protocol.Diagnostic{skillDiagnostic(source, "root_rejected", path, "")}, nil
 	}
 	defer root.root.Close()
+	defer root.guard.Close()
 	entries, err := rootedEntries(ctx, root.root)
 	if err != nil {
 		return nil, []protocol.Diagnostic{skillDiagnostic(source, "root_rejected", path, "")}, nil
@@ -118,29 +122,32 @@ func discoverRoot(ctx context.Context, source protocol.SkillSource, path string,
 			continue
 		}
 		record, diagnostic := scanEntry(ctx, root, source, name, options)
+		record.name = name
 		if diagnostic != nil {
 			diagnostics = append(diagnostics, *diagnostic)
 			if record.leaf != nil {
-				for index := range scanned {
-					if os.SameFile(scanned[index].leaf, record.leaf) {
-						scanned[index].rejected = true
-						diagnostics = append(diagnostics, skillDiagnostic(source, "ambiguous_identity", root.path, name))
-					}
-				}
 				scanned = append(scanned, record)
 			}
 			continue
 		}
-		for index := range scanned {
-			if os.SameFile(scanned[index].leaf, record.leaf) {
-				scanned[index].rejected = true
-				record.rejected = true
-				diagnostics = append(diagnostics, skillDiagnostic(source, "ambiguous_identity", root.path, name))
-			}
-		}
 		scanned = append(scanned, record)
 	}
-	if err := verifyRetainedRoot(root); err != nil {
+	for index := range scanned {
+		for other := range scanned {
+			if index != other && os.SameFile(scanned[index].leaf, scanned[other].leaf) {
+				scanned[index].rejected = true
+			}
+		}
+		if scanned[index].rejected && scanned[index].leaf != nil {
+			for other := range scanned {
+				if index != other && os.SameFile(scanned[index].leaf, scanned[other].leaf) {
+					diagnostics = append(diagnostics, skillDiagnostic(source, "ambiguous_identity", root.path, scanned[index].name))
+					break
+				}
+			}
+		}
+	}
+	if err := verifyRetainedRoot(ctx, root); err != nil {
 		return nil, []protocol.Diagnostic{skillDiagnostic(source, "root_rejected", path, "")}, nil
 	}
 	candidates := make([]Candidate, 0, len(scanned))
@@ -156,32 +163,48 @@ func openRetainedRoot(ctx context.Context, path string) (retainedRoot, bool, err
 	if err := ctx.Err(); err != nil {
 		return retainedRoot{}, false, err
 	}
-	if hasSymlinkComponent(path) {
-		return retainedRoot{}, false, errors.New("skill root contains symlink")
-	}
-	checked, err := os.Lstat(path)
-	if os.IsNotExist(err) {
+	state := rootPathState(path)
+	if state == rootPathMissing {
 		return retainedRoot{}, true, nil
 	}
-	if err != nil || !checked.IsDir() || checked.Mode()&os.ModeSymlink != 0 {
+	if state != rootPathSafe {
+		return retainedRoot{}, false, errors.New("unsafe skill root")
+	}
+	guard, err := safefile.OpenDirectory(ctx, path)
+	if err != nil {
+		return retainedRoot{}, false, err
+	}
+	guardInfo, err := guard.Stat()
+	if err != nil || !guardInfo.IsDir() {
+		_ = guard.Close()
 		return retainedRoot{}, false, errors.New("unsafe skill root")
 	}
 	root, err := os.OpenRoot(path)
 	if err != nil {
+		_ = guard.Close()
 		return retainedRoot{}, false, err
 	}
-	retained := retainedRoot{path: path, root: root, info: checked}
+	retained := retainedRoot{path: path, guard: guard, root: root, info: guardInfo}
 	if discoveryHook != nil {
 		discoveryHook("after-root-open", "")
 	}
-	if err := verifyRetainedRoot(retained); err != nil {
+	if err := verifyRetainedRoot(ctx, retained); err != nil {
 		_ = root.Close()
+		_ = guard.Close()
 		return retainedRoot{}, false, err
 	}
 	return retained, false, nil
 }
 
-func hasSymlinkComponent(path string) bool {
+type rootPathStatus uint8
+
+const (
+	rootPathUnsafe rootPathStatus = iota
+	rootPathMissing
+	rootPathSafe
+)
+
+func rootPathState(path string) rootPathStatus {
 	current := string(filepath.Separator)
 	for _, component := range strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator)) {
 		if component == "" {
@@ -190,26 +213,42 @@ func hasSymlinkComponent(path string) bool {
 		current = filepath.Join(current, component)
 		info, err := os.Lstat(current)
 		if os.IsNotExist(err) {
-			return false
+			return rootPathMissing
 		}
 		if err != nil || info.Mode()&os.ModeSymlink != 0 {
-			return true
+			return rootPathUnsafe
 		}
 	}
-	return false
+	return rootPathSafe
 }
 
-func verifyRetainedRoot(root retainedRoot) error {
+func verifyRetainedRoot(ctx context.Context, root retainedRoot) error {
+	if rootPathState(root.path) != rootPathSafe {
+		return errors.New("skill root path changed")
+	}
+	freshGuard, err := safefile.OpenDirectory(ctx, root.path)
+	if err != nil {
+		return err
+	}
+	freshInfo, statErr := freshGuard.Stat()
+	closeErr := freshGuard.Close()
+	if statErr != nil || closeErr != nil || !os.SameFile(root.info, freshInfo) {
+		return errors.New("skill root guard changed")
+	}
 	checked, err := os.Lstat(root.path)
 	if err != nil || !checked.IsDir() || checked.Mode()&os.ModeSymlink != 0 || !os.SameFile(root.info, checked) {
 		return errors.New("skill root changed")
+	}
+	guardInfo, err := root.guard.Stat()
+	if err != nil || !os.SameFile(root.info, guardInfo) {
+		return errors.New("retained root guard changed")
 	}
 	opened, err := root.root.Open(".")
 	if err != nil {
 		return err
 	}
 	openedInfo, statErr := opened.Stat()
-	closeErr := opened.Close()
+	closeErr = opened.Close()
 	if statErr != nil || closeErr != nil || !os.SameFile(root.info, openedInfo) {
 		return errors.New("retained root changed")
 	}
@@ -258,7 +297,7 @@ func scanEntry(ctx context.Context, root retainedRoot, source protocol.SkillSour
 		diagnostic := skillDiagnostic(source, "entry_rejected", root.path, name)
 		return scannedCandidate{}, &diagnostic
 	}
-	if err := verifyRetainedRoot(root); err != nil {
+	if err := verifyRetainedRoot(ctx, root); err != nil {
 		diagnostic := skillDiagnostic(source, "root_rejected", root.path, name)
 		return scannedCandidate{}, &diagnostic
 	}
@@ -267,7 +306,10 @@ func scanEntry(ctx context.Context, root retainedRoot, source protocol.SkillSour
 		diagnostic := skillDiagnostic(source, "file_rejected", root.path, name)
 		return scannedCandidate{}, &diagnostic
 	}
-	file, err := directory.Open("SKILL.md")
+	if discoveryHook != nil {
+		discoveryHook("after-file-inspect", name)
+	}
+	file, err := openRootedRegularNoFollow(directory, "SKILL.md", checkedFile)
 	if err != nil {
 		diagnostic := skillDiagnostic(source, "file_rejected", root.path, name)
 		return scannedCandidate{}, &diagnostic
@@ -282,7 +324,7 @@ func scanEntry(ctx context.Context, root retainedRoot, source protocol.SkillSour
 		discoveryHook("after-file-open", name)
 	}
 	raw, err := readBounded(ctx, file)
-	if err != nil || verifyFile(directory, "SKILL.md", checkedFile) != nil || verifyDirectory(root.root, name, checkedDirectory) != nil || verifyRetainedRoot(root) != nil {
+	if err != nil || verifyFile(directory, "SKILL.md", checkedFile) != nil || verifyDirectory(root.root, name, checkedDirectory) != nil || verifyRetainedRoot(ctx, root) != nil {
 		diagnostic := skillDiagnostic(source, "file_rejected", root.path, name)
 		return scannedCandidate{}, &diagnostic
 	}

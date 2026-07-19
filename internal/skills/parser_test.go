@@ -81,7 +81,13 @@ func TestParseRejectsInvalidInput(t *testing.T) {
 		{"invalid utf8", "go-testing", append(validSkill("go-testing", "description", "body"), 0xff)},
 		{"nul", "go-testing", validSkill("go-testing", "description", "body\x00\n")},
 		{"binary control", "go-testing", validSkill("go-testing", "description", "body\x01\n")},
+		{"delete control in body", "go-testing", validSkill("go-testing", "description", "body\x7f\n")},
+		{"c1 control in body", "go-testing", append(validSkill("go-testing", "description", "body "), []byte("\u0085\n")...)},
 		{"bare carriage return", "go-testing", []byte("---\rname: go-testing\ndescription: description\n---\nbody\n")},
+		{"list scalar", "go-testing", validSkill("go-testing", "- item", "body\n")},
+		{"mapping scalar", "go-testing", validSkill("go-testing", "? key", "body\n")},
+		{"unicode leading whitespace", "go-testing", validSkill("go-testing", "\u00a0description", "body\n")},
+		{"unicode trailing whitespace", "go-testing", validSkill("go-testing", "description\u00a0", "body\n")},
 		{"description too long", "go-testing", validSkill("go-testing", tooLongDescription, "body\n")},
 	}
 	for _, test := range cases {
