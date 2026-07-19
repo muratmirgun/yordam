@@ -46,6 +46,18 @@ func TestFoundationRegistryRejectsInvalidNativeCompactionPayloads(t *testing.T) 
 	}
 }
 
+func TestContextCompactionReferenceBindsSessionAndExactRange(t *testing.T) {
+	payload := compactionPayload("session", 1, 2)
+	reference := protocol.ContextCompactionReference{SessionID: "session", From: payload.From, Through: payload.Through, SummaryEvidenceID: "summary", Revision: "r1"}
+	if err := reference.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	reference.Through.JournalID = "other"
+	if err := reference.Validate(); err == nil {
+		t.Fatal("cross-session compaction range accepted")
+	}
+}
+
 func compactionPayload(session protocol.SessionID, from, through uint64) protocol.ContextCompactedV1 {
 	cursor := func(sequence uint64) protocol.CommittedCursor {
 		return protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(session), CommitSeq: sequence, TransactionID: "transaction"}

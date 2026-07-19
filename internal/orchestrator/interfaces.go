@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/muratmirgun/yordam/internal/authorization"
+	"github.com/muratmirgun/yordam/internal/compaction"
 	contextplanner "github.com/muratmirgun/yordam/internal/context"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
@@ -28,6 +29,25 @@ type StartTurnRequest struct {
 	ProviderID   protocol.ProviderID
 	ModelID      protocol.ModelID
 	Runtime      protocol.RuntimeGenerationManifest
+}
+
+type CompactRequest struct {
+	Command      CommandMetadata
+	SessionID    protocol.SessionID
+	ExpectedHead protocol.CommittedCursor
+	ProviderID   protocol.ProviderID
+	ModelID      protocol.ModelID
+	Runtime      protocol.RuntimeGenerationManifest
+	Trigger      compaction.Trigger
+}
+
+type CompactResult struct {
+	Cursor          protocol.CommittedCursor
+	SummaryEvidence protocol.EvidenceRecord
+	From            protocol.CommittedCursor
+	Through         protocol.CommittedCursor
+	Revision        string
+	Usage           protocol.ModelUsage
 }
 
 type RunResult struct {

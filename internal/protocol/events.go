@@ -82,6 +82,25 @@ type ProposedEvent struct {
 	Payload             json.RawMessage
 }
 
+// ContextCompactionReference is the durable identity that activates summary
+// evidence for a precise, already-committed session range. Keeping this small
+// value in the event package lets readers validate the range independently of
+// the payload codec or an evidence-store implementation.
+type ContextCompactionReference struct {
+	SessionID         SessionID
+	From              CommittedCursor
+	Through           CommittedCursor
+	SummaryEvidenceID EvidenceID
+	Revision          string
+}
+
+func (r ContextCompactionReference) Validate() error {
+	if r.SessionID == "" || r.SummaryEvidenceID == "" || r.Revision == "" || r.From.Validate() != nil || r.Through.Validate() != nil || r.From.JournalKind != JournalSession || r.Through.JournalKind != JournalSession || r.From.JournalID != JournalID(r.SessionID) || r.Through.JournalID != JournalID(r.SessionID) || r.From.CommitSeq > r.Through.CommitSeq {
+		return fmt.Errorf("invalid context compaction reference")
+	}
+	return nil
+}
+
 func CloneProposedEvent(event ProposedEvent) ProposedEvent {
 	return DeepCopy(event)
 }

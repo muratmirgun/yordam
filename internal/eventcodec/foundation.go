@@ -385,7 +385,8 @@ func validateContextCompactionEnvelope(envelope protocol.EventEnvelope, payload 
 	if err := value.Validate(); err != nil {
 		return err
 	}
-	if envelope.JournalKind != protocol.JournalSession || envelope.SessionID == "" || envelope.JournalID != protocol.JournalID(envelope.SessionID) || value.From.JournalID != envelope.JournalID || value.Through.JournalID != envelope.JournalID || value.Through.CommitSeq >= envelope.Seq {
+	reference := protocol.ContextCompactionReference{SessionID: envelope.SessionID, From: value.From, Through: value.Through, SummaryEvidenceID: value.SummaryEvidenceID, Revision: value.Revision}
+	if reference.Validate() != nil || envelope.JournalKind != protocol.JournalSession || envelope.JournalID != protocol.JournalID(envelope.SessionID) || value.Through.CommitSeq >= envelope.Seq {
 		return fmt.Errorf("context compaction is not anchored before its event")
 	}
 	return nil
