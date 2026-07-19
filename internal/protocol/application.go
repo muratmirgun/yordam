@@ -23,6 +23,15 @@ type CommandExpectation struct {
 	Session           *CommittedCursor `json:"session,omitempty"`
 }
 
+type ToolResultAvailableV1 struct {
+	ActivityID    ActivityID `json:"activity_id"`
+	CallID        string     `json:"call_id"`
+	Status        string     `json:"status"`
+	Content       string     `json:"content"`
+	DurationNanos int64      `json:"duration_nanos"`
+	Truncated     bool       `json:"truncated"`
+}
+
 type Command struct {
 	ProtocolVersion uint32              `json:"protocol_version"`
 	CommandID       CommandID           `json:"command_id"`

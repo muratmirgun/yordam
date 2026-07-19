@@ -654,6 +654,9 @@ func (s *Service) runObservationIntent(ctx context.Context, request StartTurnReq
 	if err := s.probe.After(ctx, BarrierEffectDispatch, barrierState); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
+	if err := s.publishToolPresentation(ctx, request, state, activityID, plan, execution); err != nil {
+		return protocol.ToolResultBlock{}, err
+	}
 	records, err := s.recordEvidence(ctx, request, activityID, plan, execution.Evidence)
 	if err != nil {
 		return protocol.ToolResultBlock{}, err
@@ -663,6 +666,21 @@ func (s *Service) runObservationIntent(ctx context.Context, request StartTurnReq
 	}
 	execution.ToolResult.EvidenceIDs = evidenceIDs(records)
 	return s.sanitizeToolResult(ctx, request.Runtime.ID, execution.ToolResult)
+}
+
+func (s *Service) publishToolPresentation(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, plan protocol.ActionPlan, execution protocol.ExecutionResult) error {
+	if plan.Body.Tool != (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "skill"}) {
+		return nil
+	}
+	publisher, ok := s.publisher.(TransientApplicationEventPublisher)
+	if !ok {
+		return nil
+	}
+	payload, err := canonicaljson.Marshal(protocol.ToolResultAvailableV1{ActivityID: activityID, CallID: execution.ToolResult.CallID, Status: execution.ToolResult.Status, Content: execution.Presentation.Content, DurationNanos: execution.Presentation.DurationNanos, Truncated: execution.Presentation.Truncated})
+	if err != nil {
+		return err
+	}
+	return publisher.PublishTransient(protocol.ApplicationEvent{Correlation: protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), SessionID: request.SessionID, TurnID: state.turnID, ActivityID: activityID}, Time: time.Now().UTC(), Kind: "runtime.tool_result_available", PayloadVersion: 1, Payload: payload})
 }
 
 func (s *Service) sanitizeToolResult(ctx context.Context, generation protocol.RuntimeGenerationID, result protocol.ToolResultBlock) (protocol.ToolResultBlock, error) {

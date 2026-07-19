@@ -12,6 +12,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	skilltool "github.com/muratmirgun/yordam/internal/tools/skill"
 )
 
 const (
@@ -54,6 +55,7 @@ type LegacyAdapter struct {
 	skillPlanCalls      map[protocol.ActivityID]string
 	skillPlanDigests    map[protocol.ActivityID]protocol.Digest
 	skillGenerations    map[protocol.ActivityID]protocol.RuntimeGenerationID
+	skillResults        map[protocol.ActivityID]bool
 }
 
 func NewLegacyAdapter(options LegacyAdapterOptions) *LegacyAdapter {
@@ -65,7 +67,7 @@ func NewLegacyAdapter(options LegacyAdapterOptions) *LegacyAdapter {
 	}
 	return &LegacyAdapter{
 		actor: options.Actor, selectedSessionID: options.SelectedSessionID, cursor: options.Cursor, runtimeGenerationID: options.RuntimeGenerationID, now: options.Now,
-		pending: make(map[protocol.CommandID]Command), turns: make(map[protocol.TurnID]Command), compactions: make(map[protocol.ActivityID]string), compactionFacts: make(map[protocol.ActivityID]compactionFacts), skillProvenance: make(map[protocol.ActivityID]domain.SkillProvenance), skillCalls: make(map[protocol.ActivityID]string), skillPlanCalls: make(map[protocol.ActivityID]string), skillPlanDigests: make(map[protocol.ActivityID]protocol.Digest), skillGenerations: make(map[protocol.ActivityID]protocol.RuntimeGenerationID),
+		pending: make(map[protocol.CommandID]Command), turns: make(map[protocol.TurnID]Command), compactions: make(map[protocol.ActivityID]string), compactionFacts: make(map[protocol.ActivityID]compactionFacts), skillProvenance: make(map[protocol.ActivityID]domain.SkillProvenance), skillCalls: make(map[protocol.ActivityID]string), skillPlanCalls: make(map[protocol.ActivityID]string), skillPlanDigests: make(map[protocol.ActivityID]protocol.Digest), skillGenerations: make(map[protocol.ActivityID]protocol.RuntimeGenerationID), skillResults: make(map[protocol.ActivityID]bool),
 	}
 }
 
@@ -219,6 +221,14 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 	}
 	legacy := Event{DraftID: payload.DraftID, Draft: payload.Draft, Message: payload.Message, Mode: payload.Mode, Selection: payload.Selection, Applied: payload.Applied}
 	switch event.Kind {
+	case "runtime.tool_result_available":
+		var available protocol.ToolResultAvailableV1
+		if err := strictUnmarshal(event.Payload, &available); err != nil {
+			return Event{}, err
+		}
+		if provenance, result, ok := a.skillResult(event.Correlation.ActivityID, available); ok {
+			legacy.Kind, legacy.Runtime.Skill, legacy.Runtime.Result = EventToolCompleted, &provenance, &result
+		}
 	case ApplicationEventState:
 		legacy.Kind = EventState
 		legacy.Runtime.State = payload.State
@@ -296,11 +306,12 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 		state := protocol.ContextProjectionV1{EstimatedInputTokens: recorded.Plan.Body.EstimatedInputTokens, ContextWindow: recorded.Plan.Body.ContextWindow, OutputReserve: recorded.Plan.Body.OutputReserve, Revision: recorded.Plan.Body.CompactionRevision}
 		legacy.Kind, legacy.Context = EventState, &state
 	case protocol.EventActivityPlanned:
+		a.clearSkillActivity(event.Correlation.ActivityID)
 		var planned protocol.ActivityPlannedV1
 		if err := json.Unmarshal(event.Payload, &planned); err != nil {
 			return Event{}, err
 		}
-		if provenance, ok := plannedSkillProvenance(planned.Plan); ok && event.Correlation.ActivityID != "" {
+		if provenance, ok := plannedSkillProvenance(planned); ok && event.Correlation.ActivityID != "" {
 			a.pendingMu.Lock()
 			a.skillProvenance[event.Correlation.ActivityID] = provenance
 			a.skillPlanCalls[event.Correlation.ActivityID] = planned.Plan.Body.CallID
@@ -329,7 +340,7 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 			legacy.Compaction = &protocol.CompactionEventV1{Trigger: trigger, Stage: protocol.CompactionSummarizing, Usage: unknownCompactionUsage()}
 		}
 	case protocol.EventActivitySucceeded:
-		if provenance, callID, ok := a.finishSkillActivity(event.Correlation.ActivityID); ok {
+		if provenance, callID, published, ok := a.finishSkillActivity(event.Correlation.ActivityID); ok && !published {
 			legacy.Kind = EventToolCompleted
 			legacy.Runtime.Skill = &provenance
 			legacy.Runtime.Result = &domain.ToolResult{CallID: callID, Status: domain.ToolSucceeded}
@@ -347,7 +358,7 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 			legacy.Compaction = &protocol.CompactionEventV1{Trigger: trigger, Stage: protocol.CompactionPersisting, Usage: unknownCompactionUsage()}
 		}
 	case protocol.EventActivityFailed, protocol.EventActivityDenied, protocol.EventActivityCancelled, protocol.EventActivityInterruptedNoEffect, protocol.EventActivityUncertain:
-		if provenance, callID, ok := a.finishSkillActivity(event.Correlation.ActivityID); ok {
+		if provenance, callID, published, ok := a.finishSkillActivity(event.Correlation.ActivityID); ok && !published {
 			legacy.Kind = EventToolCompleted
 			legacy.Runtime.Skill = &provenance
 			legacy.Runtime.Result = &domain.ToolResult{CallID: callID, Status: skillTerminalStatus(event.Kind)}
@@ -439,23 +450,57 @@ func (a *LegacyAdapter) startSkillActivity(activityID protocol.ActivityID, raw j
 	return protocol.DeepCopy(provenance), started.CallID, true
 }
 
-func (a *LegacyAdapter) finishSkillActivity(activityID protocol.ActivityID) (domain.SkillProvenance, string, bool) {
+func (a *LegacyAdapter) finishSkillActivity(activityID protocol.ActivityID) (domain.SkillProvenance, string, bool, bool) {
 	if activityID == "" {
-		return domain.SkillProvenance{}, "", false
+		return domain.SkillProvenance{}, "", false, false
 	}
 	a.pendingMu.Lock()
 	defer a.pendingMu.Unlock()
 	provenance, hasProvenance := a.skillProvenance[activityID]
 	callID, hasCall := a.skillCalls[activityID]
+	published := a.skillResults[activityID]
 	delete(a.skillProvenance, activityID)
 	delete(a.skillCalls, activityID)
 	delete(a.skillPlanCalls, activityID)
 	delete(a.skillPlanDigests, activityID)
 	delete(a.skillGenerations, activityID)
+	delete(a.skillResults, activityID)
 	if !hasProvenance || !hasCall || provenance.Validate() != nil || callID == "" {
-		return domain.SkillProvenance{}, "", false
+		return domain.SkillProvenance{}, "", false, false
 	}
-	return protocol.DeepCopy(provenance), callID, true
+	return protocol.DeepCopy(provenance), callID, published, true
+}
+
+func (a *LegacyAdapter) clearSkillActivity(activityID protocol.ActivityID) {
+	if a == nil || activityID == "" {
+		return
+	}
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	delete(a.skillProvenance, activityID)
+	delete(a.skillCalls, activityID)
+	delete(a.skillPlanCalls, activityID)
+	delete(a.skillPlanDigests, activityID)
+	delete(a.skillGenerations, activityID)
+	delete(a.skillResults, activityID)
+}
+
+func (a *LegacyAdapter) skillResult(activityID protocol.ActivityID, available protocol.ToolResultAvailableV1) (domain.SkillProvenance, domain.ToolResult, bool) {
+	if activityID == "" || available.ActivityID != activityID || available.CallID == "" || available.Status == "" || available.DurationNanos < 0 {
+		return domain.SkillProvenance{}, domain.ToolResult{}, false
+	}
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	provenance, ok := a.skillProvenance[activityID]
+	if !ok || provenance.Validate() != nil || a.skillCalls[activityID] != available.CallID || a.skillResults[activityID] {
+		return domain.SkillProvenance{}, domain.ToolResult{}, false
+	}
+	status := domain.ToolStatus(available.Status)
+	if status != domain.ToolSucceeded && status != domain.ToolFailed && status != domain.ToolDenied && status != domain.ToolCancelled {
+		return domain.SkillProvenance{}, domain.ToolResult{}, false
+	}
+	a.skillResults[activityID] = true
+	return protocol.DeepCopy(provenance), domain.ToolResult{CallID: available.CallID, Status: status, Content: available.Content, Duration: time.Duration(available.DurationNanos), Truncated: available.Truncated}, true
 }
 
 func skillTerminalStatus(kind string) domain.ToolStatus {
@@ -469,8 +514,15 @@ func skillTerminalStatus(kind string) domain.ToolStatus {
 	}
 }
 
-func plannedSkillProvenance(plan *protocol.ActionPlan) (domain.SkillProvenance, bool) {
-	if plan == nil || plan.Body.Validate() != nil || canonicaljson.ValidateDigest(plan.Body, plan.Digest) != nil || plan.Body.Action != "skill" || plan.Body.Tool != (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "skill"}) || len(plan.Body.Resources) != 1 {
+func plannedSkillProvenance(planned protocol.ActivityPlannedV1) (domain.SkillProvenance, bool) {
+	plan := planned.Plan
+	if planned.Kind != "tool" || planned.Purpose != "tool observation" || planned.PurposeActor != (protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorAgent}) || planned.Source != "builtin" || len(planned.InputEvidenceIDs) != 0 || planned.RequestedProfile != "restricted" || planned.EffectiveProfile != "restricted" {
+		return domain.SkillProvenance{}, false
+	}
+	canonical := skilltool.BuiltinDescriptor()
+	if plan == nil || plan.Body.Validate() != nil || canonicaljson.ValidateDigest(plan.Body, plan.Digest) != nil ||
+		plan.Body.Tool != canonical.Body.Identity || plan.Body.SourceRevision != canonical.Body.SourceRevision || plan.Body.DescriptorDigest != canonical.DescriptorDigest ||
+		plan.Body.Action != "skill" || plan.Body.Purpose != "inspect" || plan.Body.ExecutionLocus != "builtin" || plan.Body.Effect != "observation" || plan.Body.Boundary != "workspace" || plan.Body.Reversibility != "not_applicable" || plan.Body.VerificationCoverage != "full" || plan.Body.RequestedProfile != "restricted" || plan.Body.EffectiveProfile != "restricted" || len(plan.Body.Resources) != 1 {
 		return domain.SkillProvenance{}, false
 	}
 	resource := plan.Body.Resources[0]
@@ -488,13 +540,17 @@ func plannedSkillProvenance(plan *protocol.ActionPlan) (domain.SkillProvenance, 
 		}
 		attributes[attribute.Name] = attribute.Value
 	}
-	if len(attributes) != 3 || attributes["runtime_generation"] == "" || attributes["source"] == "" {
+	if len(attributes) != 3 || attributes["runtime_generation"] != string(plan.Body.RuntimeGenerationID) || attributes["source"] == "" {
 		return domain.SkillProvenance{}, false
 	}
 	if _, ok := attributes["workspace_id"]; !ok {
 		return domain.SkillProvenance{}, false
 	}
-	provenance := domain.SkillProvenance{Name: resource.CanonicalID, Source: protocol.SkillSource(attributes["source"]), Digest: protocol.Digest{Algorithm: algorithm, Value: value}}
+	source := protocol.SkillSource(attributes["source"])
+	if (source == protocol.SkillSourceGlobal && attributes["workspace_id"] != "") || (source == protocol.SkillSourceProject && attributes["workspace_id"] == "") {
+		return domain.SkillProvenance{}, false
+	}
+	provenance := domain.SkillProvenance{Name: resource.CanonicalID, Source: source, Digest: protocol.Digest{Algorithm: algorithm, Value: value}}
 	return provenance, provenance.Validate() == nil
 }
 

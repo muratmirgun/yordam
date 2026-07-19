@@ -547,7 +547,7 @@ func actionBinding(handleID string, action *plannedAction) authorization.Dispatc
 }
 
 func executionResult(result domain.ToolResult) protocol.ExecutionResult {
-	return protocol.ExecutionResult{Outcome: protocol.ActivityOutcomeV1{Status: string(result.Status), Reason: string(result.ErrorKind)}, ToolResult: protocol.ToolResultBlock{CallID: result.CallID, Status: string(result.Status), Text: result.Content}}
+	return protocol.ExecutionResult{Outcome: protocol.ActivityOutcomeV1{Status: string(result.Status), Reason: string(result.ErrorKind)}, ToolResult: protocol.ToolResultBlock{CallID: result.CallID, Status: string(result.Status), Text: result.Content}, Presentation: protocol.ToolResultPresentation{Content: result.Content, DurationNanos: int64(result.Duration), Truncated: result.Truncated}}
 }
 
 func previewEvidence(action *plannedAction, content string) (protocol.EvidenceCandidate, protocol.Digest, error) {

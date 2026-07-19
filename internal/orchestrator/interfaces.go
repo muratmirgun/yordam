@@ -115,6 +115,10 @@ type ApplicationEventPublisher interface {
 	PublishCommitted(context.Context, protocol.JournalRef, protocol.CommittedCursor, []protocol.EventEnvelope) error
 }
 
+type TransientApplicationEventPublisher interface {
+	PublishTransient(protocol.ApplicationEvent) error
+}
+
 type StreamingSanitizer interface {
 	Write(string) (string, error)
 	Close() (string, error)

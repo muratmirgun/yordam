@@ -11,6 +11,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	skilltool "github.com/muratmirgun/yordam/internal/tools/skill"
 )
 
 func TestApplicationLegacyAdapterPreservesCommandAndRedactedEventSemantics(t *testing.T) {
@@ -154,16 +155,17 @@ func TestApplicationLegacyAdapterContextPlanDoesNotGuessPolicy(t *testing.T) {
 func TestApplicationLegacyAdapterDerivesSkillProvenanceOnlyFromCanonicalPlan(t *testing.T) {
 	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{})
 	digest := protocol.Digest{Algorithm: "sha256", Value: strings.Repeat("a", 64)}
+	descriptor := skilltool.BuiltinDescriptor()
 	body := protocol.ActionPlanBody{
-		CallID: "skill-call", Tool: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "skill"}, SourceRevision: "builtin-v1", DescriptorDigest: digest,
-		Action: "skill", Purpose: "load frozen skill", ExecutionLocus: "local", Effect: "observation", Boundary: "workspace", Reversibility: "exact", VerificationCoverage: "exact", RequestedProfile: "restricted", EffectiveProfile: "restricted", RuntimeGenerationID: "runtime-1",
+		CallID: "skill-call", Tool: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest,
+		Action: "skill", Purpose: "inspect", ExecutionLocus: "builtin", Effect: "observation", Boundary: "workspace", Reversibility: "not_applicable", VerificationCoverage: "full", RequestedProfile: "restricted", EffectiveProfile: "restricted", RuntimeGenerationID: "runtime-1",
 		Resources: []protocol.ResourceTarget{{Kind: "skill", CanonicalID: "go-testing", Digest: "sha256:" + digest.Value, Attributes: []protocol.ResourceAttribute{{Name: "runtime_generation", Value: "runtime-1"}, {Name: "source", Value: "project"}, {Name: "workspace_id", Value: "workspace-1"}}}},
 	}
 	planDigest, err := canonicaljson.Digest(body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	planned := protocol.ActivityPlannedV1{Plan: &protocol.ActionPlan{Body: body, Digest: planDigest}}
+	planned := protocol.ActivityPlannedV1{Kind: "tool", Purpose: "tool observation", PurposeActor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorAgent}, Source: "builtin", RequestedProfile: "restricted", EffectiveProfile: "restricted", Plan: &protocol.ActionPlan{Body: body, Digest: planDigest}}
 	raw, err := json.Marshal(planned)
 	if err != nil {
 		t.Fatal(err)
@@ -179,8 +181,16 @@ func TestApplicationLegacyAdapterDerivesSkillProvenanceOnlyFromCanonicalPlan(t *
 	if err != nil || started.Kind != app.EventToolStarted || started.Runtime.Skill == nil || started.Runtime.Skill.Name != "go-testing" || started.Runtime.Progress == nil || started.Runtime.Progress.CallID != "skill-call" {
 		t.Fatalf("started=%+v err=%v", started, err)
 	}
+	available, err := json.Marshal(protocol.ToolResultAvailableV1{ActivityID: "skill-activity", CallID: "skill-call", Status: string(domain.ToolSucceeded), Content: "bounded skill body", DurationNanos: int64(time.Second), Truncated: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedWithBody, err := adapter.Event(compactionApplicationEvent("runtime.tool_result_available", "skill-activity", string(available)))
+	if err != nil || completedWithBody.Kind != app.EventToolCompleted || completedWithBody.Runtime.Result == nil || completedWithBody.Runtime.Result.Content != "bounded skill body" || !completedWithBody.Runtime.Result.Truncated || completedWithBody.Runtime.Result.Duration != time.Second {
+		t.Fatalf("completed body=%+v err=%v", completedWithBody, err)
+	}
 	completed, err := adapter.Event(compactionApplicationEvent(protocol.EventActivitySucceeded, "skill-activity", `{}`))
-	if err != nil || completed.Kind != app.EventToolCompleted || completed.Runtime.Skill == nil || completed.Runtime.Skill.Source != protocol.SkillSourceProject || completed.Runtime.Result == nil || completed.Runtime.Result.CallID != "skill-call" || completed.Runtime.Result.Status != domain.ToolSucceeded {
+	if err != nil || completed.Kind != "" {
 		t.Fatalf("completed=%+v err=%v", completed, err)
 	}
 	if _, ok := adapter.SkillProvenance("skill-activity"); ok {
