@@ -1331,7 +1331,7 @@ func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription,
 		// Automatic compaction is nested inside an active turn. Its lifecycle
 		// terminal updates durable context but must not make the TUI idle before
 		// the owning turn result arrives.
-		if compactTerminals == nil && suppressTerminal && (event.Kind == EventCompactionCompleted || event.Kind == EventCompactionFailed) {
+		if compactTerminals == nil && event.Compaction != nil && event.Compaction.Trigger == "automatic" && (event.Kind == EventCompactionCompleted || event.Kind == EventCompactionFailed) {
 			if event.Context != nil {
 				select {
 				case destination <- Event{Kind: EventState, Context: event.Context}:
