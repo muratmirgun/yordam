@@ -32,14 +32,47 @@ func DurableContext(snapshot protocol.ApplicationSnapshot) (*protocol.ContextPro
 	if err := expectEOF(decoder); err != nil {
 		return nil, err
 	}
-	if state.AutoReason == "" || !state.EstimatedInputTokens.State.Valid() || !state.ContextWindow.State.Valid() || !state.ReserveTokens.State.Valid() || state.OutputReserve < 0 {
-		return nil, fmt.Errorf("invalid durable context data")
-	}
-	if state.LatestRange != nil && (state.LatestRange.From.Validate() != nil || state.LatestRange.Through.Validate() != nil) {
-		return nil, fmt.Errorf("invalid durable context range")
+	if err := validateDurableContext(state); err != nil {
+		return nil, err
 	}
 	copy := protocol.DeepCopy(state)
 	return &copy, nil
+}
+
+func validateDurableContext(state protocol.ContextProjectionV1) error {
+	if state.AutoReason == "" || state.OutputReserve < 0 {
+		return fmt.Errorf("invalid durable context data")
+	}
+	for _, value := range []protocol.ValueInt64{state.EstimatedInputTokens, state.ContextWindow, state.ReserveTokens} {
+		if err := value.Validate(); err != nil {
+			return fmt.Errorf("invalid durable context value: %w", err)
+		}
+	}
+	available := state.AutoReason == "below_threshold" || state.AutoReason == "threshold_reached"
+	switch state.AutoReason {
+	case "disabled", "unknown_context_window", "unknown_generation", "invalid_budget", "below_threshold", "threshold_reached":
+	default:
+		return fmt.Errorf("invalid durable context reason %q", state.AutoReason)
+	}
+	if state.AutoAvailable != available {
+		return fmt.Errorf("durable context availability contradicts reason %q", state.AutoReason)
+	}
+	if available && state.ReserveTokens.State != protocol.ValueKnown {
+		return fmt.Errorf("available durable context requires known reserve")
+	}
+	if !available && state.ReserveTokens.State == protocol.ValueKnown {
+		return fmt.Errorf("unavailable durable context cannot have known reserve")
+	}
+	if state.AutoReason == "unknown_context_window" && state.ContextWindow.State == protocol.ValueKnown {
+		return fmt.Errorf("unknown context window reason has known window")
+	}
+	if state.LatestRange != nil {
+		from, through := state.LatestRange.From, state.LatestRange.Through
+		if from.Validate() != nil || through.Validate() != nil || from.JournalKind != protocol.JournalSession || through.JournalKind != protocol.JournalSession || from.JournalID != through.JournalID || from.CommitSeq > through.CommitSeq || state.SummaryEvidenceID == "" || state.Revision == "" {
+			return fmt.Errorf("invalid durable context range")
+		}
+	}
+	return nil
 }
 
 func expectEOF(decoder *json.Decoder) error {

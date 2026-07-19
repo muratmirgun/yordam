@@ -536,10 +536,10 @@ func TestAppOpenSessionRefreshesDurableContextFromNonSubscribingSnapshot(t *test
 	firstRange := protocol.CompactionRange{From: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: firstRef.ID, CommitSeq: 3, TransactionID: "first-a"}, Through: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: firstRef.ID, CommitSeq: 7, TransactionID: "first-b"}}
 	source.contexts[firstRef.ID] = protocol.ContextProjectionV1{
 		AutoAvailable: true, AutoReason: "below_threshold",
-		EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 70},
-		ContextWindow:        protocol.ValueInt64{State: protocol.ValueKnown, Value: 100},
+		EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 70, Provenance: "estimate"},
+		ContextWindow:        protocol.ValueInt64{State: protocol.ValueKnown, Value: 100, Provenance: "configured"},
 		OutputReserve:        20,
-		ReserveTokens:        protocol.ValueInt64{State: protocol.ValueKnown, Value: 10},
+		ReserveTokens:        protocol.ValueInt64{State: protocol.ValueKnown, Value: 10, Provenance: "policy"},
 		LatestRange:          &firstRange, Revision: "first-revision", SummaryEvidenceID: "first-evidence",
 	}
 	source.contexts[secondRef.ID] = protocol.ContextProjectionV1{

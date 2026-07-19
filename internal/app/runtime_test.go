@@ -817,9 +817,16 @@ func TestAppRunCompactProtocolSubscriptionDoesNotLeakTerminalEvents(t *testing.T
 				if event.Kind == EventTurnAccepted {
 					accepted = true
 				}
-				if event.Kind == EventTurnCompleted || event.Kind == EventTurnInterrupted || event.Kind == EventError {
+				terminal := event.Kind == EventTurnCompleted || event.Kind == EventTurnInterrupted || event.Kind == EventError
+				if command.Kind == CommandCompact {
+					terminal = terminal || event.Kind == EventCompactionCompleted || event.Kind == EventCompactionFailed
+				}
+				if terminal {
 					terminals++
-					if event.Kind != EventTurnCompleted {
+					if command.Kind == CommandCompact && event.Kind != EventCompactionCompleted {
+						t.Fatalf("command %s terminal=%+v", command.Kind, event)
+					}
+					if command.Kind != CommandCompact && event.Kind != EventTurnCompleted {
 						t.Fatalf("command %s terminal=%+v", command.Kind, event)
 					}
 				}

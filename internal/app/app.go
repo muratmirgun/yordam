@@ -128,6 +128,7 @@ type operationResult struct {
 	err             error
 	runtimeSet      RuntimeSet
 	throughProtocol bool
+	compactTerminal *Event
 }
 
 type operationKind string
@@ -311,7 +312,7 @@ func (a *App) Run(ctx context.Context) error {
 					}
 					// The operation result owns successful turn completion so it can
 					// clear activeOperation before publishing the sole terminal event.
-					go consumeLegacyProtocolEvents(ctx, subscription, activeSet.LegacyAdapter, protocolEvents, true)
+					go consumeLegacyProtocolEvents(ctx, subscription, activeSet.LegacyAdapter, protocolEvents, true, nil)
 					go func() {
 						result, executeErr := activeSet.ApplicationService.Execute(turnCtx, applicationCommand)
 						if executeErr == nil && result.Error != nil {
@@ -416,15 +417,26 @@ func (a *App) Run(ctx context.Context) error {
 					if contextState != nil {
 						a.publish(ctx, Event{Kind: EventState, Context: contextState})
 					}
-					go consumeLegacyProtocolEvents(compactCtx, subscription, activeSet.LegacyAdapter, protocolEvents, true)
+					compactTerminals := make(chan Event, 1)
+					go consumeLegacyProtocolEvents(compactCtx, subscription, activeSet.LegacyAdapter, protocolEvents, true, compactTerminals)
 					go func() {
 						result, executeErr := activeSet.ApplicationService.Execute(compactCtx, applicationCommand)
+						awaitTerminal := executeErr == nil || result.Error != nil
 						if executeErr == nil && result.Error != nil {
 							executeErr = errors.New(result.Error.Message)
 						}
+						var terminal *Event
+						if awaitTerminal {
+							select {
+							case event := <-compactTerminals:
+								println("compact terminal received", string(event.Kind))
+								terminal = &event
+							case <-compactCtx.Done():
+							}
+						}
 						cancel()
 						_ = subscription.Close()
-						done <- operationResult{kind: operationCompact, err: executeErr}
+						done <- operationResult{kind: operationCompact, err: executeErr, compactTerminal: terminal}
 					}()
 					continue
 				}
@@ -518,7 +530,10 @@ func (a *App) Run(ctx context.Context) error {
 			}
 			a.drainRuntimeEvents(ctx, runtimeEvents)
 			event := Event{Kind: EventTurnCompleted}
-			if result.err != nil {
+			if result.kind == operationCompact && result.compactTerminal != nil {
+				event = *result.compactTerminal
+			}
+			if result.err != nil && result.compactTerminal == nil {
 				event.Err = result.err
 				event.Message = result.err.Error()
 				if errors.Is(result.err, context.Canceled) || errors.Is(result.err, context.DeadlineExceeded) {
@@ -1238,7 +1253,7 @@ func legacyTerminalEvent(kind EventKind) bool {
 	}
 }
 
-func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription, adapter *LegacyAdapter, destination chan<- Event, suppressTerminal bool) {
+func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription, adapter *LegacyAdapter, destination chan<- Event, suppressTerminal bool, compactTerminals chan<- Event) {
 	defer subscription.Close()
 	for {
 		item, err := subscription.Next(ctx)
@@ -1278,6 +1293,13 @@ func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription,
 		}
 		if event.Kind == "" {
 			continue
+		}
+		if compactTerminals != nil && (event.Kind == EventCompactionCompleted || event.Kind == EventCompactionFailed) {
+			select {
+			case compactTerminals <- event:
+			case <-ctx.Done():
+			}
+			return
 		}
 		if suppressTerminal && legacyTerminalEvent(event.Kind) {
 			return
