@@ -3,6 +3,7 @@ package protocol
 import (
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 )
 
@@ -241,7 +242,7 @@ func hasActiveShadowTarget(discovered map[skillSourceName]SkillDescriptor, targe
 func validateSkillDiagnostics(values []Diagnostic) error {
 	previous := ""
 	for _, diagnostic := range values {
-		key := diagnostic.Code + "\x00" + diagnostic.Message + "\x00" + string(diagnostic.Journal.Kind) + "\x00" + string(diagnostic.Journal.ID) + "\x00" + string(diagnostic.EventID)
+		key := diagnostic.Code + "\x00" + diagnostic.Message + "\x00" + string(diagnostic.Journal.Kind) + "\x00" + string(diagnostic.Journal.ID) + "\x00" + strconv.FormatUint(diagnostic.AtSeq, 10) + "\x00" + string(diagnostic.EventID) + "\x00" + string(diagnostic.Details)
 		if key <= previous && previous != "" {
 			return fmt.Errorf("skill diagnostics must be sorted and unique")
 		}

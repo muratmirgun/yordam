@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
+	"github.com/muratmirgun/yordam/internal/skills"
 	"github.com/muratmirgun/yordam/internal/testsupport/agentfixture"
 )
 
@@ -148,6 +151,54 @@ func TestRuntimeBrokerSnapshotReconstructsDurableCompactionContext(t *testing.T)
 	}
 	if strings.Contains(string(durable.Context.Data), "provider-body-sentinel") || strings.Contains(string(durable.Context.Data), "summary-body-sentinel") {
 		t.Fatalf("context leaked content: %s", durable.Context.Data)
+	}
+}
+
+func TestRuntimeBrokerProjectsFrozenMetadataOnlySkillCatalog(t *testing.T) {
+	builder := newRuntimeBuilderForTest(t, nil)
+	workspaceRef, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := canonicaljson.Marshal(protocol.ControlOperationTerminalV1{ControlOperationID: "seed", Status: "interrupted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := builder.store.AppendBatch(t.Context(), journal.AppendRequest{Journal: workspaceRef, TransactionID: "seed", Events: []protocol.ProposedEvent{{EventID: "seed", Time: time.Unix(1, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventControlOperationInterrupted, Payload: payload}}}); err != nil {
+		t.Fatal(err)
+	}
+	head, err := builder.store.Head(t.Context(), workspaceRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("---\nname: go-testing\ndescription: Test Go.\n---\nmetadata-only-sentinel\n")
+	sum := sha256.Sum256(content)
+	catalog, err := skills.Build(skills.BuildOptions{Discovery: skills.Discovery{Candidates: []skills.Candidate{{Name: "go-testing", Description: "Test Go.", Content: content, Source: protocol.SkillSourceGlobal, CanonicalPath: "/skills/global/go-testing/SKILL.md", ContentDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hex.EncodeToString(sum[:])}}}}, Policy: config.ProjectSkillsAsk, Workspace: builder.workspace, Generation: "generation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable, _, err := (runtimeBrokerSource{Repository: builder.store, Workspace: workspaceRef, Skills: catalog}).Project(t.Context(), SnapshotVector{WorkspaceControl: head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(durable.Skills, catalog.Snapshot()) {
+		t.Fatalf("skills = %#v, want %#v", durable.Skills, catalog.Snapshot())
+	}
+	encoded, err := json.Marshal(durable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "metadata-only-sentinel") || strings.Contains(string(encoded), `"content"`) {
+		t.Fatalf("durable projection leaked skill content: %s", encoded)
+	}
+	copy := catalog.Snapshot()
+	copy.Active[0].Description = "changed"
+	if durable.Skills.Active[0].Description == "changed" {
+		t.Fatal("durable projection aliases catalog snapshot")
+	}
+	nilCatalog, _, err := (runtimeBrokerSource{Repository: builder.store, Workspace: workspaceRef}).Project(t.Context(), SnapshotVector{WorkspaceControl: head})
+	if err != nil || nilCatalog.Skills.Revision != "" {
+		t.Fatalf("nil catalog compatibility = %#v / %v", nilCatalog.Skills, err)
 	}
 }
 

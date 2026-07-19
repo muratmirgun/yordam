@@ -2,6 +2,7 @@ package protocol_test
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -225,5 +226,26 @@ func TestSkillRuntimeAndApplicationDTOsOnlyExposeMetadata(t *testing.T) {
 	}
 	if strings.Contains(string(raw), `"content":`) || strings.Contains(string(raw), "SKILL.md body") {
 		t.Fatalf("skill metadata DTO leaked content: %s", raw)
+	}
+}
+
+func TestSkillCatalogRetainsDistinctDiagnosticLocationsAndDetails(t *testing.T) {
+	descriptor := validSkillDescriptor(protocol.SkillSourceGlobal)
+	first := protocol.Diagnostic{Code: "skills.global.entry_rejected", Message: "rejected", AtSeq: 1, Details: json.RawMessage(`{"path":"/one"}`)}
+	second := protocol.Diagnostic{Code: "skills.global.entry_rejected", Message: "rejected", AtSeq: 2, Details: json.RawMessage(`{"path":"/two"}`)}
+	catalog := protocol.SkillCatalogSnapshot{Revision: "skills-v1", Digest: protocolDigest('a'), Active: []protocol.SkillDescriptor{descriptor}, Discovered: []protocol.SkillDescriptor{descriptor}, Diagnostics: []protocol.Diagnostic{first, second}}
+	if err := catalog.Validate(); err != nil {
+		t.Fatalf("distinct diagnostics rejected: %v", err)
+	}
+	encoded, err := json.Marshal(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTrip protocol.SkillCatalogSnapshot
+	if err := json.Unmarshal(encoded, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if err := roundTrip.Validate(); err != nil || !reflect.DeepEqual(roundTrip.Diagnostics, catalog.Diagnostics) {
+		t.Fatalf("round trip = %#v / %v", roundTrip.Diagnostics, err)
 	}
 }

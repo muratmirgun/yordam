@@ -28,6 +28,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/recovery"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
+	"github.com/muratmirgun/yordam/internal/skills"
 	taskprojection "github.com/muratmirgun/yordam/internal/task"
 	"github.com/muratmirgun/yordam/internal/tooling"
 )
@@ -398,6 +399,7 @@ type runtimeBrokerSource struct {
 	Workspace  protocol.JournalRef
 	Generation protocol.RuntimeGenerationID
 	Manifest   protocol.RuntimeGenerationManifest
+	Skills     skills.Catalog
 }
 
 func (s runtimeBrokerSource) WorkspaceControl() protocol.JournalRef { return s.Workspace }
@@ -443,6 +445,13 @@ func (s runtimeBrokerSource) Project(ctx context.Context, vector SnapshotVector)
 			Cached: protocol.UsageValue{State: protocol.UsageUnknown}, CacheWrite: protocol.UsageValue{State: protocol.UsageUnknown}, Reasoning: protocol.UsageValue{State: protocol.UsageUnknown},
 		},
 		Cost: protocol.CostValue{State: protocol.ValueUnknown}, Checkpoints: []protocol.ProjectionView{}, Evidence: []protocol.ProjectionView{}, Receipts: []protocol.ProjectionView{}, RecoveryDiagnostics: []protocol.Diagnostic{},
+	}
+	if s.Skills != nil {
+		snapshot := s.Skills.Snapshot()
+		if err := snapshot.Validate(); err != nil {
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("validate frozen skill catalog: %w", err)
+		}
+		durable.Skills = protocol.DeepCopy(snapshot)
 	}
 	if vector.SelectedSession != nil {
 		ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: vector.SelectedSession.JournalID}
