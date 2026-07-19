@@ -30,21 +30,23 @@ const (
 )
 
 type LegacyAdapterOptions struct {
-	Actor             protocol.ActorRef
-	SelectedSessionID protocol.SessionID
-	Cursor            func() *protocol.CommandExpectation
-	Now               func() time.Time
+	Actor               protocol.ActorRef
+	SelectedSessionID   protocol.SessionID
+	Cursor              func() *protocol.CommandExpectation
+	RuntimeGenerationID protocol.RuntimeGenerationID
+	Now                 func() time.Time
 }
 
 type LegacyAdapter struct {
-	actor             protocol.ActorRef
-	selectedSessionID protocol.SessionID
-	cursor            func() *protocol.CommandExpectation
-	now               func() time.Time
-	sequence          atomic.Uint64
-	pendingMu         sync.Mutex
-	pending           map[protocol.CommandID]Command
-	turns             map[protocol.TurnID]Command
+	actor               protocol.ActorRef
+	selectedSessionID   protocol.SessionID
+	cursor              func() *protocol.CommandExpectation
+	runtimeGenerationID protocol.RuntimeGenerationID
+	now                 func() time.Time
+	sequence            atomic.Uint64
+	pendingMu           sync.Mutex
+	pending             map[protocol.CommandID]Command
+	turns               map[protocol.TurnID]Command
 }
 
 func NewLegacyAdapter(options LegacyAdapterOptions) *LegacyAdapter {
@@ -55,7 +57,7 @@ func NewLegacyAdapter(options LegacyAdapterOptions) *LegacyAdapter {
 		options.Now = func() time.Time { return time.Now().UTC() }
 	}
 	return &LegacyAdapter{
-		actor: options.Actor, selectedSessionID: options.SelectedSessionID, cursor: options.Cursor, now: options.Now,
+		actor: options.Actor, selectedSessionID: options.SelectedSessionID, cursor: options.Cursor, runtimeGenerationID: options.RuntimeGenerationID, now: options.Now,
 		pending: make(map[protocol.CommandID]Command), turns: make(map[protocol.TurnID]Command),
 	}
 }
@@ -73,20 +75,40 @@ func (a *LegacyAdapter) Command(command Command) (protocol.Command, error) {
 		return protocol.Command{}, err
 	}
 	sequence := a.sequence.Add(1)
+	commandID := protocol.CommandID(fmt.Sprintf("legacy-command-%d", sequence))
+	idempotencyKey := fmt.Sprintf("legacy-%d", sequence)
+	var expectation *protocol.CommandExpectation
+	if a.cursor != nil {
+		expectation = protocol.DeepCopy(a.cursor())
+	} else if a.selectedSessionID != "" {
+		expectation = &protocol.CommandExpectation{SelectedSessionID: a.selectedSessionID}
+	}
+	if command.Kind == CommandCompact {
+		if expectation == nil || expectation.SelectedSessionID == "" || expectation.Session == nil {
+			return protocol.Command{}, fmt.Errorf("compact command requires a selected session cursor")
+		}
+		identity, digestErr := canonicaljson.Digest(struct {
+			SessionID  protocol.SessionID           `json:"session_id"`
+			Cursor     protocol.CommittedCursor     `json:"cursor"`
+			Trigger    string                       `json:"trigger"`
+			Generation protocol.RuntimeGenerationID `json:"generation"`
+		}{expectation.SelectedSessionID, *expectation.Session, "manual", a.runtimeGenerationID})
+		if digestErr != nil {
+			return protocol.Command{}, digestErr
+		}
+		commandID = protocol.CommandID("legacy-compact-" + identity.Value)
+		idempotencyKey = string(commandID)
+	}
 	applicationCommand := protocol.Command{
 		ProtocolVersion: protocol.ApplicationProtocolVersion,
-		CommandID:       protocol.CommandID(fmt.Sprintf("legacy-command-%d", sequence)),
+		CommandID:       commandID,
 		Actor:           a.actor,
-		IdempotencyKey:  fmt.Sprintf("legacy-%d", sequence),
+		IdempotencyKey:  idempotencyKey,
 		Kind:            kind,
 		PayloadVersion:  1,
 		Payload:         raw,
 	}
-	if a.cursor != nil {
-		applicationCommand.Expected = protocol.DeepCopy(a.cursor())
-	} else if a.selectedSessionID != "" {
-		applicationCommand.Expected = &protocol.CommandExpectation{SelectedSessionID: a.selectedSessionID}
-	}
+	applicationCommand.Expected = expectation
 	applicationCommand.RequestDigest, err = CanonicalRequestDigest(applicationCommand)
 	if err != nil {
 		return protocol.Command{}, err

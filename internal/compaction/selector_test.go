@@ -127,6 +127,25 @@ func TestSelectAcceptsMixedLegacyPrefixAndMarkerGapProjection(t *testing.T) {
 	}
 }
 
+func TestSelectAcceptsContiguousLegacyProjection(t *testing.T) {
+	t.Parallel()
+	events := make([]protocol.EventRecord, 0, 6)
+	for sequence := uint64(1); sequence <= 6; sequence++ {
+		events = append(events, protocol.EventRecord{Legacy: &protocol.LegacySource{
+			SchemaVersion: 1, EventID: protocol.EventID(fmt.Sprintf("legacy-%d", sequence)), SessionID: "session", Seq: sequence,
+			Time: time.Unix(int64(sequence), 0).UTC(), Kind: protocol.EventUserMessage,
+			Payload: json.RawMessage(fmt.Sprintf(`{"content":"legacy-%d"}`, sequence)),
+		}})
+	}
+	selection, err := compaction.Select(events, markerSelectionCursor(6, "legacy:legacy-6"), compaction.TriggerManual, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.From != markerSelectionCursor(1, "legacy:legacy-1") {
+		t.Fatalf("selection physical range=%+v", selection)
+	}
+}
+
 func TestSelectMapsPriorCompactionThroughCursorInsteadOfUsingPhysicalSequenceAsIndex(t *testing.T) {
 	t.Parallel()
 	events := []protocol.EventRecord{
@@ -175,6 +194,21 @@ func TestSelectRejectsInvalidMarkerGapProjection(t *testing.T) {
 			events[2].Envelope.SessionID = "other"
 		},
 		"head not final transaction": func(_ []protocol.EventRecord, head *protocol.CommittedCursor) { head.TransactionID = "tx-2" },
+		"marker record included": func(events []protocol.EventRecord, _ *protocol.CommittedCursor) {
+			events[3].Envelope.Kind = protocol.EventTransactionCommitted
+		},
+		"same transaction gap": func(events []protocol.EventRecord, _ *protocol.CommittedCursor) {
+			events[2].Envelope.Seq = 4
+		},
+		"v2 head is final event": func(_ []protocol.EventRecord, head *protocol.CommittedCursor) {
+			head.CommitSeq = 8
+		},
+		"legacy after v2": func(events []protocol.EventRecord, _ *protocol.CommittedCursor) {
+			events[3] = protocol.EventRecord{Legacy: &protocol.LegacySource{
+				SchemaVersion: 1, EventID: "legacy-after-v2", SessionID: "session", Seq: 5, Time: time.Unix(5, 0).UTC(),
+				Kind: protocol.EventUserMessage, Payload: json.RawMessage(`{"content":"late legacy"}`),
+			}}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			events := protocol.DeepCopy(valid)

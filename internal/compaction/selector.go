@@ -142,8 +142,9 @@ func committedEvents(events []protocol.EventRecord, head protocol.CommittedCurso
 		return nil, ErrNothingToCompact
 	}
 	committed := make([]protocol.EventRecord, 0, len(events))
-	var previous uint64
+	legacyPrefix := true
 	for index, record := range events {
+		legacy := record.Legacy != nil
 		if record.Legacy != nil && record.Envelope.Seq == 0 && record.Envelope.EventID == "" {
 			record.Envelope = protocol.EventEnvelope{
 				SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1, JournalKind: head.JournalKind, JournalID: head.JournalID,
@@ -152,21 +153,58 @@ func committedEvents(events []protocol.EventRecord, head protocol.CommittedCurso
 			}
 		}
 		envelope := record.Envelope
+		if envelope.Kind == protocol.EventTransactionCommitted {
+			return nil, fmt.Errorf("transaction marker must not appear in context projection")
+		}
 		if envelope.JournalKind != head.JournalKind || envelope.JournalID != head.JournalID || envelope.SessionID != protocol.SessionID(head.JournalID) || envelope.EventID == "" || envelope.TransactionID == "" {
-			return nil, fmt.Errorf("events are not a valid committed session journal projection: event identity at %d journal=%s/%s session=%s id=%s transaction=%s", index, envelope.JournalKind, envelope.JournalID, envelope.SessionID, envelope.EventID, envelope.TransactionID)
+			return nil, fmt.Errorf("events are not a valid committed session journal projection: event identity at %d", index)
 		}
 		if envelope.Seq > head.CommitSeq {
 			return nil, fmt.Errorf("events are not a valid committed session journal projection: event %d is beyond head %d", envelope.Seq, head.CommitSeq)
 		}
-		if (index == 0 && envelope.Seq != 1) || (index > 0 && (envelope.Seq <= previous || envelope.Seq-previous > 2)) {
+		if index == 0 && envelope.Seq != 1 {
 			return nil, fmt.Errorf("events are not a valid committed session journal projection")
 		}
+		if !legacy {
+			legacyPrefix = false
+		} else if !legacyPrefix {
+			return nil, fmt.Errorf("legacy records may only form a contiguous prefix")
+		}
 		committed = append(committed, protocol.CloneEventRecord(record))
-		previous = envelope.Seq
 	}
 	last := committed[len(committed)-1].Envelope
-	if last.TransactionID != head.TransactionID || (head.CommitSeq != last.Seq && head.CommitSeq != last.Seq+1) {
+	markerBacked := head.CommitSeq == last.Seq+1
+	if last.TransactionID != head.TransactionID || (!markerBacked && head.CommitSeq != last.Seq) {
 		return nil, fmt.Errorf("committed head is not present in event sequence")
+	}
+	for index := 1; index < len(committed); index++ {
+		previous, current := committed[index-1].Envelope, committed[index].Envelope
+		if current.Seq <= previous.Seq {
+			return nil, fmt.Errorf("events are not a valid committed session journal projection")
+		}
+		if !markerBacked {
+			if current.Seq != previous.Seq+1 {
+				return nil, fmt.Errorf("legacy projection is not contiguous")
+			}
+			continue
+		}
+		previousLegacy := committed[index-1].Legacy != nil && committed[index-1].Envelope.TransactionID == protocol.TransactionID("legacy:"+string(committed[index-1].Envelope.EventID))
+		currentLegacy := committed[index].Legacy != nil && committed[index].Envelope.TransactionID == protocol.TransactionID("legacy:"+string(committed[index].Envelope.EventID))
+		if currentLegacy {
+			return nil, fmt.Errorf("legacy records may only form a contiguous prefix")
+		}
+		if previousLegacy {
+			if current.Seq != previous.Seq+1 {
+				return nil, fmt.Errorf("legacy to v2 transition is not contiguous")
+			}
+			continue
+		}
+		if current.TransactionID == previous.TransactionID && current.Seq != previous.Seq+1 {
+			return nil, fmt.Errorf("v2 transaction has a sequence gap")
+		}
+		if current.TransactionID != previous.TransactionID && current.Seq != previous.Seq+2 {
+			return nil, fmt.Errorf("v2 transactions must be separated by one marker")
+		}
 	}
 	return committed, nil
 }

@@ -17,9 +17,11 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/agent"
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/cli"
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/permission"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
@@ -174,6 +176,61 @@ func TestRuntimeGenerationManifestIsImmutableAcrossCandidateBuilds(t *testing.T)
 	}
 }
 
+func TestRuntimeReloadKeepsCapturedGenerationDependenciesImmutable(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "generation-a")
+	builder := newRuntimeBuilderForTest(t, nil)
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	first, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAdapter := first.LegacyAdapter
+	oldCompact, err := oldAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A candidate receives fresh generation-scoped services while the captured
+	// generation-A adapter remains an immutable compatibility closure.
+	t.Setenv("PRIMARY_KEY", "generation-b")
+	cfg.Context.AutoCompact = false
+	second, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.retireSecrets()
+	if first.RuntimeGenerationID == second.RuntimeGenerationID || first.ProviderService == second.ProviderService || first.ToolService == second.ToolService || first.Orchestrator == second.Orchestrator || first.Broker == second.Broker || first.LegacyAdapter == second.LegacyAdapter || first.AuthorizationService == second.AuthorizationService {
+		t.Fatalf("candidate reused generation-bound dependencies: first=%+v second=%+v", first, second)
+	}
+
+	workspaceControl, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := cfg.DefaultSelection()
+	application := New(Options{
+		RuntimeSet: first, Sessions: builder.store, Workspace: builder.workspace, WorkspaceControl: workspaceControl,
+		Session: domain.Session{ID: builder.activeSession.get(), Workspace: builder.workspace, Selection: selection},
+		Replay:  domain.SessionReplay{Session: domain.Session{ID: builder.activeSession.get(), Workspace: builder.workspace, Selection: selection}},
+		EventBuffer: 1,
+	})
+	application.completeReload(t.Context(), operationResult{kind: operationReload, runtimeSet: second})
+	if application.runtimeSet.RuntimeGenerationID != second.RuntimeGenerationID || application.runtimeSet.ProviderService != second.ProviderService || application.runtimeSet.AuthorizationService != second.AuthorizationService {
+		t.Fatalf("reload did not activate candidate generation: active=%+v candidate=%+v", application.runtimeSet, second)
+	}
+	oldAfter, err := oldAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCompact, err := second.LegacyAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldAfter.CommandID != oldCompact.CommandID || newCompact.CommandID == oldCompact.CommandID {
+		t.Fatalf("compact identity was not generation-bound: old=%s old_after=%s new=%s", oldCompact.CommandID, oldAfter.CommandID, newCompact.CommandID)
+	}
+}
+
 func TestRuntimeCompositionUsesOnlyOrchestratedRunner(t *testing.T) {
 	t.Setenv("PRIMARY_KEY", "primary-secret")
 	builder := newRuntimeBuilderForTest(t, nil)
@@ -232,8 +289,93 @@ func TestProductionCompactProtocolCommandUsesRuntimeCompactionService(t *testing
 		t.Fatal(err)
 	}
 	result, err := set.ApplicationService.Execute(t.Context(), command)
-	if err == nil || (result.Error != nil && result.Error.Code == codeUnsupportedCommand) {
-		t.Fatalf("compact result=%+v err=%v, want compaction service result rather than dispatcher rejection", result, err)
+	if err != nil || result.Error == nil || result.Error.Code == codeUnsupportedCommand {
+		t.Fatalf("compact result=%+v err=%v, want a serializable compaction service failure rather than dispatcher rejection", result, err)
+	}
+}
+
+func TestProductionCompactProtocolRejectsStaleCursorBeforeProviderEgress(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+	defer server.Close()
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, server.Client())
+	set, err := builder.build(loadRuntimeConfig(t, server.URL+"/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := set.LegacyAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := *command.Expected.Session
+	stale.CommitSeq++
+	stale.TransactionID = "stale-cursor"
+	command.Expected.Session = &stale
+	command.RequestDigest, err = CanonicalRequestDigest(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := set.ApplicationService.Execute(t.Context(), command)
+	if err != nil || result.Error == nil || result.Error.Code != "stale_cursor" || requests.Load() != 0 {
+		t.Fatalf("result=%+v requests=%d err=%v", result, requests.Load(), err)
+	}
+}
+
+func TestProductionCompactProtocolRequiresIdleSessionWithoutProviderEgress(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+	defer server.Close()
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, server.Client())
+	set, err := builder.build(loadRuntimeConfig(t, server.URL+"/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(builder.activeSession.get())}
+	head, err := builder.store.Head(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := canonicaljson.Marshal(protocol.TurnAcceptedV1{CommandID: "active-command", Goal: "active", OutcomeContractID: "active-contract", ContractVersion: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appended, err := builder.store.AppendBatch(t.Context(), journal.AppendRequest{
+		Journal: ref, ExpectedHead: head, TransactionID: "active-turn",
+		Compatibility: &journal.CompatibilityDeclaration{ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: head},
+		Events: []protocol.ProposedEvent{{EventID: "active-turn-accepted", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventTurnAccepted, SessionID: protocol.SessionID(ref.ID), TurnID: "active-turn", Payload: payload}},
+	})
+	if err != nil || appended.Status != journal.AppendCommitted {
+		t.Fatalf("append=%+v err=%v", appended, err)
+	}
+	command, err := set.LegacyAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := set.ApplicationService.Execute(t.Context(), command)
+	if err != nil || result.Error == nil || result.Error.Code != "session_not_idle" || result.Error.Retryable || requests.Load() != 0 {
+		t.Fatalf("result=%+v requests=%d err=%v", result, requests.Load(), err)
+	}
+}
+
+func TestProductionCompactProtocolSerializesCancelledContext(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := set.LegacyAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	result, err := set.ApplicationService.Execute(ctx, command)
+	if err != nil || result.Error == nil || result.Error.Code != "cancelled" || result.Error.Retryable || strings.Contains(result.Error.Message, "context canceled") {
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }
 
@@ -404,6 +546,44 @@ completed:
 	if !strings.Contains(string(current.Durable.Workspace.Data), `"consumed":`) || strings.Contains(string(current.Durable.Workspace.Data), `"consumed":{}`) {
 		t.Fatalf("current durable projection has no committed control authorization state: %s", current.Durable.Workspace.Data)
 	}
+	_, compactionSubscription, err := application.runtimeSet.ApplicationService.SnapshotAndSubscribe(t.Context(), protocol.SnapshotRequest{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(bootstrapSnapshot.Session.ID), Consumer: "compaction-protocol", QueueCapacity: 128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer compactionSubscription.Close()
+	compactCommand, err := application.runtimeSet.LegacyAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerBeforeCompact := providerRequests.Load()
+	firstCompact, err := application.runtimeSet.ApplicationService.Execute(t.Context(), compactCommand)
+	if err != nil || firstCompact.Status != "completed" {
+		t.Fatalf("first compact=%+v err=%v", firstCompact, err)
+	}
+	secondCompact, err := application.runtimeSet.ApplicationService.Execute(t.Context(), compactCommand)
+	if err != nil || !reflect.DeepEqual(secondCompact, firstCompact) || providerRequests.Load() != providerBeforeCompact+1 {
+		t.Fatalf("replayed compact=%+v first=%+v calls=%d before=%d err=%v", secondCompact, firstCompact, providerRequests.Load(), providerBeforeCompact, err)
+	}
+	streamCtx, streamCancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer streamCancel()
+	sawProgress, sawCompletion := false, false
+	for !sawProgress || !sawCompletion {
+		item, nextErr := compactionSubscription.Next(streamCtx)
+		if nextErr != nil {
+			t.Fatalf("compaction subscription progress=%t completion=%t err=%v", sawProgress, sawCompletion, nextErr)
+		}
+		if item.Event == nil {
+			continue
+		}
+		switch item.Event.Kind {
+		case protocol.EventActivityStarted:
+			sawProgress = true
+		case protocol.EventCommandCompleted:
+			sawCompletion = true
+		}
+	}
 	oldDurable, _, err := (runtimeBrokerSource{Repository: store, Workspace: application.workspaceControl, Generation: application.runtimeSet.RuntimeGenerationID}).Project(t.Context(), SnapshotVector{
 		WorkspaceControl: initial.Cursor.WorkspaceControl, SelectedSession: initial.Cursor.SelectedSession,
 	})
@@ -442,23 +622,6 @@ completed:
 	if !reflect.DeepEqual(current.Durable, headless.Durable) || !reflect.DeepEqual(tuiSemantic, legacySemantic) {
 		t.Fatalf("consumer equivalence tui=%v legacy=%v headless=%+v current=%+v", tuiSemantic, legacySemantic, headless.Durable, current.Durable)
 	}
-	application.Commands() <- Command{Kind: CommandCompact}
-	for {
-		select {
-		case event := <-application.Events():
-			if event.Kind == EventError || event.Kind == EventTurnInterrupted {
-				inspection, _ := store.InspectSession(t.Context(), protocol.SessionID(bootstrapSnapshot.Session.ID))
-				t.Fatalf("production compact failed: %+v head=%+v events=%v", event, inspection.Journal.Head, inspectionSequenceRefs(inspection.Journal.Events))
-			}
-			if event.Kind == EventTurnCompleted {
-				goto compacted
-			}
-		case <-time.After(20 * time.Second):
-			t.Fatal("timed out waiting for production compact")
-		}
-	}
-
-compacted:
 	compactedInspection, err := store.InspectSession(t.Context(), protocol.SessionID(bootstrapSnapshot.Session.ID))
 	if err != nil {
 		t.Fatal(err)
@@ -735,7 +898,7 @@ func newRuntimeBuilderForTest(t *testing.T, client *http.Client) runtimeBuilder 
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := jsonl.New(t.TempDir(), jsonl.Options{})
+	store := jsonl.New(t.TempDir(), jsonl.Options{Sanitize: func(value any) (json.RawMessage, error) { return json.Marshal(value) }})
 	session, err := store.Create(t.Context(), workspace, domain.ModeAsk, domain.ModelSelection{})
 	if err != nil {
 		t.Fatal(err)

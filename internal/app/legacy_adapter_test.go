@@ -40,3 +40,47 @@ func TestApplicationLegacyAdapterPreservesCommandAndRedactedEventSemantics(t *te
 		t.Fatalf("legacy=%+v", legacy)
 	}
 }
+
+func TestApplicationLegacyAdapterCompactIdentityBindsCursorAndGeneration(t *testing.T) {
+	cursor := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "session-1", CommitSeq: 9, TransactionID: "tx-9"}
+	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{
+		Actor: protocol.ActorRef{ID: "user-1", Kind: protocol.ActorUser}, RuntimeGenerationID: "runtime-a",
+		Cursor: func() *protocol.CommandExpectation {
+			return &protocol.CommandExpectation{SelectedSessionID: "session-1", Session: &cursor}
+		},
+	})
+	first, err := adapter.Command(app.Command{Kind: app.CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := adapter.Command(app.Command{Kind: app.CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.CommandID != second.CommandID || first.IdempotencyKey != second.IdempotencyKey || first.RequestDigest != second.RequestDigest {
+		t.Fatalf("same compact cursor/generation identity changed: first=%+v second=%+v", first, second)
+	}
+	cursor.CommitSeq++
+	cursor.TransactionID = "tx-10"
+	changedHead, err := adapter.Command(app.Command{Kind: app.CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedHead.CommandID == first.CommandID {
+		t.Fatal("changed compact cursor reused command identity")
+	}
+	otherGeneration := app.NewLegacyAdapter(app.LegacyAdapterOptions{Actor: protocol.ActorRef{ID: "user-1", Kind: protocol.ActorUser}, RuntimeGenerationID: "runtime-b", Cursor: adapterCursor("session-1", cursor)})
+	changedGeneration, err := otherGeneration.Command(app.Command{Kind: app.CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedGeneration.CommandID == changedHead.CommandID {
+		t.Fatal("changed runtime generation reused command identity")
+	}
+}
+
+func adapterCursor(session protocol.SessionID, cursor protocol.CommittedCursor) func() *protocol.CommandExpectation {
+	return func() *protocol.CommandExpectation {
+		return &protocol.CommandExpectation{SelectedSessionID: session, Session: &cursor}
+	}
+}

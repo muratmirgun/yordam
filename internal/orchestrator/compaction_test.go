@@ -285,6 +285,34 @@ func TestRunCompactionCancellationBeforeAndDuringStream(t *testing.T) {
 	})
 }
 
+func TestCollectCompactionSummaryRejectsContentAfterImmutableBlock(t *testing.T) {
+	t.Parallel()
+	service := &Service{deps: Dependencies{Admission: passthroughAdmission{}}}
+	for name, events := range map[string][]protocol.ModelEvent{
+		"delta after block": {
+			{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: string(validCompactionSummary)}},
+			{Kind: protocol.ModelEventContentDelta, Sequence: 2, Delta: &protocol.ContentDelta{BlockID: "summary", Kind: protocol.ContentText, Text: "late"}},
+			{Kind: protocol.ModelEventTerminal, Sequence: 3, Terminal: &protocol.ModelTerminal{Reason: "stop"}},
+		},
+		"second block": {
+			{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: string(validCompactionSummary)}},
+			{Kind: protocol.ModelEventContentBlock, Sequence: 2, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: string(validCompactionSummary)}},
+			{Kind: protocol.ModelEventTerminal, Sequence: 3, Terminal: &protocol.ModelTerminal{Reason: "stop"}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			stream := make(chan protocol.ModelEvent, len(events))
+			for _, event := range events {
+				stream <- event
+			}
+			close(stream)
+			if _, _, err := service.collectCompactionSummary(t.Context(), "runtime-a", stream); err == nil {
+				t.Fatal("accepted content after immutable summary block")
+			}
+		})
+	}
+}
+
 func validCompactRequest(t *testing.T, head protocol.CommittedCursor) CompactRequest {
 	t.Helper()
 	return CompactRequest{Command: validStartTurnRequest().Command, SessionID: "session-a", ExpectedHead: head, ProviderID: "provider-a", ModelID: "model-a", Runtime: validRuntimeManifest(t, "observation"), Trigger: compaction.TriggerManual}
@@ -332,6 +360,10 @@ func newCompactionRepository(t *testing.T, log *recordLog) *compactionRepository
 func newAutomaticCompactionRepository(t *testing.T, log *recordLog) *compactionRepository {
 	repository := newCompactionRepository(t, log)
 	repository.appendMarkers = true
+	for index := range repository.events {
+		repository.events[index].Envelope.TransactionID = "tx-initial"
+	}
+	repository.head = protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "session-a", CommitSeq: 7, TransactionID: "tx-initial"}
 	return repository
 }
 
@@ -346,7 +378,13 @@ func (r *compactionRepository) Head(context.Context, protocol.JournalRef) (proto
 func (r *compactionRepository) ReadRange(_ context.Context, request journal.ReadRangeRequest) (journal.EventPage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return journal.EventPage{Events: protocol.DeepCopy(r.events), Head: r.head, Cursor: r.head}, nil
+	events := make([]protocol.EventRecord, 0, len(r.events))
+	for _, event := range r.events {
+		if event.Envelope.Kind != protocol.EventTransactionCommitted {
+			events = append(events, protocol.DeepCopy(event))
+		}
+	}
+	return journal.EventPage{Events: events, Head: r.head, Cursor: r.head}, nil
 }
 func (r *compactionRepository) ActiveTurn(context.Context, protocol.SessionID, protocol.CommittedCursor) (protocol.TurnID, bool, error) {
 	r.mu.Lock()

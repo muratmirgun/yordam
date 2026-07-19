@@ -125,12 +125,40 @@ func TestCommandIdempotencyReplaysDurableResultAndConflictsOnChangedPrincipal(t 
 	}
 }
 
+func TestProtocolExecuteSerializesDispatcherFailures(t *testing.T) {
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-1"}
+	head := committedCursor(ref, 1, "initial")
+	backend := &memoryCommandBackend{
+		head: head, results: make(map[protocol.CommandID]protocol.CommandResult), digests: make(map[protocol.CommandID]protocol.Digest),
+		dispatchErr: errors.New("provider credential should not cross the protocol boundary"),
+	}
+	service, err := app.NewProtocolService(app.ProtocolServiceOptions{
+		Orchestrator: backend, Dispatcher: backend,
+		WorkspaceControl: protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "workspace-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := applicationCommand(t, "command-failure", string(app.CommandStartTurn), protocol.StartTurnCommandV1{Prompt: "hello"})
+	command.Expected.Session = &head
+	command.RequestDigest, err = app.CanonicalRequestDigest(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.Execute(t.Context(), command)
+	if err != nil || result.Error == nil || result.Error.Code != "command_failed" || result.Error.Retryable || strings.Contains(result.Error.Message, "provider") {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
 type memoryCommandBackend struct {
 	mu           sync.Mutex
 	head         protocol.CommittedCursor
 	results      map[protocol.CommandID]protocol.CommandResult
 	digests      map[protocol.CommandID]protocol.Digest
 	dispatches   int
+	dispatchErr  error
 	lastMetadata orchestrator.CommandMetadata
 }
 
@@ -153,6 +181,9 @@ func (b *memoryCommandBackend) DispatchCommand(_ context.Context, metadata orche
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.dispatches++
+	if b.dispatchErr != nil {
+		return protocol.CommandResult{}, b.dispatchErr
+	}
 	b.lastMetadata = metadata
 	result := protocol.CommandResult{
 		ProtocolVersion: protocol.ApplicationProtocolVersion,

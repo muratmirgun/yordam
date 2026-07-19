@@ -92,7 +92,7 @@ func TestAutomaticCompactionPolicyThresholds(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			request := validStartTurnRequest()
-			request.ExpectedHead = protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), CommitSeq: 6, TransactionID: "tx-6"}
+			request.ExpectedHead = protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), CommitSeq: 7, TransactionID: "tx-initial"}
 			request.Runtime = validRuntimeManifest(t, "observation")
 			request.Runtime.Body.Models[0].ContextWindow = tc.window
 			request.Runtime.Body.Limits.AutoCompact = tc.auto
@@ -253,7 +253,7 @@ func TestAutomaticCompactionDeduplicatesAnUnchangedSourceDigest(t *testing.T) {
 func automaticCompactionRequest(t *testing.T) StartTurnRequest {
 	t.Helper()
 	request := validStartTurnRequest()
-	request.ExpectedHead = protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), CommitSeq: 6, TransactionID: "tx-6"}
+	request.ExpectedHead = protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), CommitSeq: 7, TransactionID: "tx-initial"}
 	request.Runtime = validRuntimeManifest(t, "observation")
 	request.Runtime.Body.Models[0].ContextWindow = protocol.ValueInt64{State: protocol.ValueKnown, Value: 10_000, Provenance: "test-window"}
 	// MaximumOutput is otherwise unused by this test; its value is reused as a

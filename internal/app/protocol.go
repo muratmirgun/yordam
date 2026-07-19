@@ -309,6 +309,9 @@ func (s *ProtocolService) Execute(ctx context.Context, command protocol.Command)
 		if errors.Is(lookupErr, orchestrator.ErrIdempotencyConflict) {
 			return failedCommand(command, codeIdempotencyConflict, "command ID was already used for a different request", false), nil
 		}
+		if errors.Is(lookupErr, context.Canceled) || errors.Is(lookupErr, context.DeadlineExceeded) {
+			return dispatchFailedCommand(command, lookupErr), nil
+		}
 		return protocol.CommandResult{}, lookupErr
 	} else if ok {
 		return durable, nil
@@ -320,7 +323,11 @@ func (s *ProtocolService) Execute(ctx context.Context, command protocol.Command)
 	if s.dispatcher == nil {
 		return failedCommand(command, "service_unavailable", "command dispatcher is unavailable", true), nil
 	}
-	return s.dispatcher.DispatchCommand(ctx, metadata, protocol.CloneCommand(command), protocol.DeepCopy(decoded))
+	result, dispatchErr := s.dispatcher.DispatchCommand(ctx, metadata, protocol.CloneCommand(command), protocol.DeepCopy(decoded))
+	if dispatchErr != nil {
+		return dispatchFailedCommand(command, dispatchErr), nil
+	}
+	return result, nil
 }
 
 func (s *ProtocolService) commandJournal(command protocol.Command, decoded any) (protocol.JournalRef, error) {
@@ -390,7 +397,10 @@ func (s *ProtocolService) executePure(ctx context.Context, command protocol.Comm
 	if errors.Is(err, orchestrator.ErrIdempotencyConflict) {
 		return failedCommand(command, codeIdempotencyConflict, "command ID was already used for a different request", false), nil
 	}
-	return result, err
+	if err != nil {
+		return dispatchFailedCommand(command, err), nil
+	}
+	return result, nil
 }
 
 func expectedHead(command protocol.Command, ref protocol.JournalRef) (protocol.CommittedCursor, error) {
@@ -414,6 +424,17 @@ func failedCommand(command protocol.Command, code, message string, retryable boo
 		ProtocolVersion: protocol.ApplicationProtocolVersion, CommandID: command.CommandID, Status: "failed",
 		RequestDigest: command.RequestDigest, PayloadVersion: 1, Payload: json.RawMessage(`{}`),
 		Error: &protocol.PublicError{Code: code, Message: message, Retryable: retryable},
+	}
+}
+
+func dispatchFailedCommand(command protocol.Command, err error) protocol.CommandResult {
+	switch {
+	case errors.Is(err, orchestrator.ErrCommitUncertain):
+		return failedCommand(command, "commit_uncertain", "command commit outcome is uncertain", false)
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return failedCommand(command, "cancelled", "command execution was cancelled", false)
+	default:
+		return failedCommand(command, "command_failed", "command execution failed", false)
 	}
 }
 

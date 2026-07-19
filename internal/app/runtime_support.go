@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -567,6 +569,9 @@ func (d runtimeCommandDispatcher) DispatchCommand(ctx context.Context, metadata 
 		if err != nil {
 			return protocol.CommandResult{}, err
 		}
+		if head != *command.Expected.Session {
+			return failedCommand(command, "stale_cursor", "selected session cursor is stale", false), nil
+		}
 		inspection, err := d.Store.InspectSession(ctx, command.Expected.SelectedSessionID)
 		if err != nil {
 			return protocol.CommandResult{}, err
@@ -579,25 +584,42 @@ func (d runtimeCommandDispatcher) DispatchCommand(ctx context.Context, metadata 
 			}
 			providerID, modelID = d.Manifest.Body.Models[0].ProviderID, d.Manifest.Body.Models[0].ModelID
 		}
-		_, err = d.Orchestrator.RunCompaction(ctx, orchestrator.CompactRequest{
-			Command: metadata, SessionID: command.Expected.SelectedSessionID, ExpectedHead: head,
+		_, runErr := d.Orchestrator.RunCompaction(ctx, orchestrator.CompactRequest{
+			Command: metadata, SessionID: command.Expected.SelectedSessionID, ExpectedHead: *command.Expected.Session,
 			ProviderID: providerID, ModelID: modelID,
 			Runtime: protocol.DeepCopy(d.Manifest), Trigger: compaction.TriggerManual,
 		})
-		if err != nil {
-			return protocol.CommandResult{}, err
-		}
 		result, ok, err := d.Orchestrator.LookupCommand(ctx, ref, metadata.CommandID, metadata.RequestDigest)
 		if err != nil {
 			return protocol.CommandResult{}, err
 		}
-		if !ok {
-			return protocol.CommandResult{}, fmt.Errorf("compaction completed without a durable command result")
+		if ok {
+			return result, nil
 		}
-		return result, nil
+		if runErr != nil {
+			return compactFailedCommand(command, runErr), nil
+		}
+		return protocol.CommandResult{}, fmt.Errorf("compaction completed without a durable command result")
 	default:
 		return failedCommand(command, codeUnsupportedCommand, "command is not available through this runtime generation", false), nil
 	}
+}
+
+func compactFailedCommand(command protocol.Command, err error) protocol.CommandResult {
+	code, message := "compaction_failed", "compaction failed"
+	switch {
+	case errors.Is(err, compaction.ErrNothingToCompact):
+		code, message = "nothing_to_compact", "no safe context range is available to compact"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		code, message = "cancelled", "compaction was cancelled"
+	case errors.Is(err, orchestrator.ErrCommitUncertain):
+		code, message = "commit_uncertain", "compaction commit outcome is uncertain"
+	case strings.Contains(err.Error(), "idle session"):
+		code, message = "session_not_idle", "compaction requires an idle session"
+	case strings.Contains(err.Error(), "selected model"):
+		code, message = "invalid_model", "selected model is unavailable for compaction"
+	}
+	return failedCommand(command, code, message, false)
 }
 
 func (d runtimeCommandDispatcher) runSettingControl(ctx context.Context, metadata orchestrator.CommandMetadata, command protocol.Command, eventKind string, eventPayload any, action, purpose string) (protocol.CommandResult, error) {

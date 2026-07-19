@@ -438,7 +438,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 	}
 	legacyAdapter := NewLegacyAdapter(LegacyAdapterOptions{
 		Actor: protocol.ActorRef{ID: "legacy-user", Kind: protocol.ActorUser}, SelectedSessionID: protocol.SessionID(b.activeSession.get()),
-		Cursor: runtimeCommandExpectation(b.store, workspaceControl, b.activeSession),
+		Cursor: runtimeCommandExpectation(b.store, workspaceControl, b.activeSession), RuntimeGenerationID: generationID,
 	})
 	succeeded = true
 	result := RuntimeSet{

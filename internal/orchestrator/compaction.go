@@ -499,7 +499,7 @@ func (s *Service) collectCompactionSummary(ctx context.Context, generation proto
 				// Streaming adapters may emit provisional deltas before their
 				// terminal immutable content block. The block below remains the
 				// sole accepted compaction summary.
-				if event.Delta.Kind != protocol.ContentText {
+				if summary != nil || event.Delta.Kind != protocol.ContentText {
 					return nil, protocol.ModelUsage{}, fmt.Errorf("compaction provider output is not text")
 				}
 			case protocol.ModelEventUsageUpdate:
