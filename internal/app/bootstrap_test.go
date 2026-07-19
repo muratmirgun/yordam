@@ -59,26 +59,27 @@ func TestBootstrapComposesCanonicalRedactedRuntime(t *testing.T) {
 	}
 	t.Setenv("SECONDARY_KEY", "secondary-secret")
 	t.Setenv("YORDAM_API_KEY", processKey)
-	application, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
-		Config: config.Config{
-			ActiveProfile: "primary",
-			Profiles: map[string]config.Profile{
-				"primary": {
-					BaseURL:      server.URL,
-					APIKeyEnv:    "PRIMARY_KEY",
-					Models:       []string{"model-a", "model-b"},
-					DefaultModel: "model-a",
-				},
-				"secondary": {
-					BaseURL:      server.URL,
-					APIKeyEnv:    "SECONDARY_KEY",
-					Models:       []string{"model-c"},
-					DefaultModel: "model-c",
-				},
+	cfg := config.Config{
+		ActiveProfile: "primary",
+		Profiles: map[string]config.Profile{
+			"primary": {
+				BaseURL:      server.URL,
+				APIKeyEnv:    "PRIMARY_KEY",
+				Models:       []string{"model-a", "model-b"},
+				DefaultModel: "model-a",
 			},
-			MaxToolCalls:        32,
-			ShellTimeoutSeconds: 120,
+			"secondary": {
+				BaseURL:      server.URL,
+				APIKeyEnv:    "SECONDARY_KEY",
+				Models:       []string{"model-c"},
+				DefaultModel: "model-c",
+			},
 		},
+		MaxToolCalls:        32,
+		ShellTimeoutSeconds: 120,
+	}
+	application, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
+		ConfigPath: writeBootstrapConfig(t, cfg),
 		CLI: cli.Options{
 			Mode:         domain.ModeAsk,
 			Profile:      "primary",
@@ -188,6 +189,39 @@ func TestBootstrapStartsWithoutValidConfiguration(t *testing.T) {
 	assertTreeOmits(t, filepath.Dir(debugLog), secret)
 }
 
+func TestBootstrapReloadFromInvalidConfigurationUsesCandidateSessionChangeService(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.jsonc")
+	if err := os.WriteFile(configPath, []byte(`{"model":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BOOTSTRAP_KEY", "reload-key")
+	application, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
+		ConfigPath: configPath,
+		CLI:        bootstrapCLI(t.TempDir()),
+		CWD:        t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.ConfigurationError == nil || snapshot.Session.Selection != (domain.ModelSelection{}) {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+	if err := config.SaveGlobal(configPath, bootstrapConfig("https://llm.example/v1")); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- application.Run(context.Background()) }()
+	application.Commands() <- app.Command{Kind: app.CommandReloadConfig}
+	event := receiveEvent(t, application.Events())
+	if event.Kind != app.EventReloadCompleted || !event.Applied || event.Err != nil || event.Selection != (domain.ModelSelection{Profile: "default", Model: "test-model"}) {
+		t.Fatalf("reload event=%+v", event)
+	}
+	application.Commands() <- app.Command{Kind: app.CommandShutdown}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBootstrapLoadsModelsWithoutCredential(t *testing.T) {
 	configPath := writeBootstrapConfig(t, bootstrapConfig("https://llm.example/v1"))
 	application, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
@@ -217,11 +251,12 @@ func TestBootstrapContinuesLatestAndRejectsSpecificSessionFromOtherWorkspace(t *
 	defer server.Close()
 	dataDir := t.TempDir()
 	cfg := bootstrapConfig(server.URL)
+	configPath := writeBootstrapConfig(t, cfg)
 	firstWorkspace := t.TempDir()
 	secondWorkspace := t.TempDir()
 
 	_, first, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
-		Config:     cfg,
+		ConfigPath: configPath,
 		CLI:        bootstrapCLI(dataDir),
 		CWD:        firstWorkspace,
 		HTTPClient: server.Client(),
@@ -232,7 +267,7 @@ func TestBootstrapContinuesLatestAndRejectsSpecificSessionFromOtherWorkspace(t *
 	continuedCLI := bootstrapCLI(dataDir)
 	continuedCLI.Continue = true
 	_, continued, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
-		Config:     cfg,
+		ConfigPath: configPath,
 		CLI:        continuedCLI,
 		CWD:        firstWorkspace,
 		HTTPClient: server.Client(),
@@ -245,7 +280,7 @@ func TestBootstrapContinuesLatestAndRejectsSpecificSessionFromOtherWorkspace(t *
 	}
 
 	_, other, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
-		Config:     cfg,
+		ConfigPath: configPath,
 		CLI:        bootstrapCLI(dataDir),
 		CWD:        secondWorkspace,
 		HTTPClient: server.Client(),
@@ -256,7 +291,7 @@ func TestBootstrapContinuesLatestAndRejectsSpecificSessionFromOtherWorkspace(t *
 	specificCLI := bootstrapCLI(dataDir)
 	specificCLI.Session = other.Session.ID
 	if _, _, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
-		Config:     cfg,
+		ConfigPath: configPath,
 		CLI:        specificCLI,
 		CWD:        firstWorkspace,
 		HTTPClient: server.Client(),
@@ -279,7 +314,8 @@ func TestBootstrapPersistsExplicitOverridesWhenContinuing(t *testing.T) {
 		"primary":   {BaseURL: server.URL, APIKeyEnv: "PRIMARY_KEY", Models: []string{"m1"}, DefaultModel: "m1"},
 		"secondary": {BaseURL: server.URL, APIKeyEnv: "SECONDARY_KEY", Models: []string{"m2"}, DefaultModel: "m2"},
 	}, MaxToolCalls: 32, ShellTimeoutSeconds: 120}
-	_, first, err := app.Bootstrap(t.Context(), app.BootstrapOptions{Config: cfg, CLI: bootstrapCLI(dataDir), CWD: workspace, HTTPClient: server.Client()})
+	configPath := writeBootstrapConfig(t, cfg)
+	_, first, err := app.Bootstrap(t.Context(), app.BootstrapOptions{ConfigPath: configPath, CLI: bootstrapCLI(dataDir), CWD: workspace, HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +327,7 @@ func TestBootstrapPersistsExplicitOverridesWhenContinuing(t *testing.T) {
 	continued.ProfileSet = true
 	continued.Model = "m2"
 	continued.ModelSet = true
-	_, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{Config: cfg, CLI: continued, CWD: workspace, HTTPClient: server.Client()})
+	_, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{ConfigPath: configPath, CLI: continued, CWD: workspace, HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,25 +344,26 @@ func TestBootstrapKeepsCredentialsBoundToNamedProfiles(t *testing.T) {
 	primary := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		primaryAuth = request.Header.Get("Authorization")
 		response.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(response, "data: [DONE]\n\n")
+		fmt.Fprint(response, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer primary.Close()
 	secondary := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		secondaryAuth = request.Header.Get("Authorization")
 		response.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(response, "data: [DONE]\n\n")
+		fmt.Fprint(response, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer secondary.Close()
 	t.Setenv("PRIMARY_KEY", "primary-key")
 	t.Setenv("SECONDARY_KEY", "secondary-key")
 	t.Setenv("YORDAM_API_KEY", "selected-env-key")
+	cfg := config.Config{ActiveProfile: "primary", Profiles: map[string]config.Profile{
+		"primary":   {BaseURL: primary.URL, APIKeyEnv: "PRIMARY_KEY", Models: []string{"m1"}, DefaultModel: "m1"},
+		"secondary": {BaseURL: secondary.URL, APIKeyEnv: "SECONDARY_KEY", Models: []string{"m2"}, DefaultModel: "m2"},
+	}, MaxToolCalls: 32, ShellTimeoutSeconds: 120}
 	application, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
-		Config: config.Config{ActiveProfile: "primary", Profiles: map[string]config.Profile{
-			"primary":   {BaseURL: primary.URL, APIKeyEnv: "PRIMARY_KEY", Models: []string{"m1"}, DefaultModel: "m1"},
-			"secondary": {BaseURL: secondary.URL, APIKeyEnv: "SECONDARY_KEY", Models: []string{"m2"}, DefaultModel: "m2"},
-		}, MaxToolCalls: 32, ShellTimeoutSeconds: 120},
-		CLI: cli.Options{Mode: domain.ModeAsk, Profile: "primary", Model: "m1", DataDir: t.TempDir(), MaxToolCalls: 32, ShellTimeout: time.Second},
-		CWD: t.TempDir(),
+		ConfigPath: writeBootstrapConfig(t, cfg),
+		CLI:        cli.Options{Mode: domain.ModeAsk, Profile: "primary", Model: "m1", DataDir: t.TempDir(), MaxToolCalls: 32, ShellTimeout: time.Second},
+		CWD:        t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -361,19 +398,19 @@ func TestBootstrapAppliesEnvironmentAndBaseURLOverridesToResumedSelection(t *tes
 	primary := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		primaryRequests <- request.Header.Get("Authorization")
 		response.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(response, "data: [DONE]\n\n")
+		fmt.Fprint(response, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer primary.Close()
 	secondary := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		response.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(response, "data: [DONE]\n\n")
+		fmt.Fprint(response, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer secondary.Close()
 	overrideRequests := make(chan string, 1)
 	override := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		overrideRequests <- request.Header.Get("Authorization")
 		response.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(response, "data: [DONE]\n\n")
+		fmt.Fprint(response, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer override.Close()
 	t.Setenv("PRIMARY_KEY", "primary-key")
@@ -384,10 +421,11 @@ func TestBootstrapAppliesEnvironmentAndBaseURLOverridesToResumedSelection(t *tes
 		"primary":   {BaseURL: primary.URL, APIKeyEnv: "PRIMARY_KEY", Models: []string{"m1"}, DefaultModel: "m1"},
 		"secondary": {BaseURL: secondary.URL, APIKeyEnv: "SECONDARY_KEY", Models: []string{"m2"}, DefaultModel: "m2"},
 	}, MaxToolCalls: 32, ShellTimeoutSeconds: 120}
+	configPath := writeBootstrapConfig(t, cfg)
 	create := bootstrapCLI(dataDir)
 	create.Profile, create.Model = "secondary", "m2"
 	create.ProfileSet, create.ModelSet = true, true
-	_, first, err := app.Bootstrap(t.Context(), app.BootstrapOptions{Config: cfg, CLI: create, CWD: workspace})
+	_, first, err := app.Bootstrap(t.Context(), app.BootstrapOptions{ConfigPath: configPath, CLI: create, CWD: workspace})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +433,7 @@ func TestBootstrapAppliesEnvironmentAndBaseURLOverridesToResumedSelection(t *tes
 	resume.Continue = true
 	resume.BaseURL, resume.BaseURLSet = override.URL, true
 	t.Setenv("YORDAM_API_KEY", "resumed-env-key")
-	application, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{Config: cfg, CLI: resume, CWD: workspace})
+	application, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{ConfigPath: configPath, CLI: resume, CWD: workspace})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +496,8 @@ func TestBootstrapRestoresDurableAutoShellAcknowledgement(t *testing.T) {
 	cliOptions := bootstrapCLI(dataDir)
 	cliOptions.Mode = domain.ModeAuto
 	cliOptions.ModeSet = true
-	firstApp, first, err := app.Bootstrap(t.Context(), app.BootstrapOptions{Config: bootstrapConfig(server.URL), CLI: cliOptions, CWD: workspace, HTTPClient: server.Client()})
+	configPath := writeBootstrapConfig(t, bootstrapConfig(server.URL))
+	firstApp, first, err := app.Bootstrap(t.Context(), app.BootstrapOptions{ConfigPath: configPath, CLI: cliOptions, CWD: workspace, HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +514,7 @@ func TestBootstrapRestoresDurableAutoShellAcknowledgement(t *testing.T) {
 
 	resume := bootstrapCLI(dataDir)
 	resume.Continue = true
-	resumedApp, resumed, err := app.Bootstrap(t.Context(), app.BootstrapOptions{Config: bootstrapConfig(server.URL), CLI: resume, CWD: workspace, HTTPClient: server.Client()})
+	resumedApp, resumed, err := app.Bootstrap(t.Context(), app.BootstrapOptions{ConfigPath: configPath, CLI: resume, CWD: workspace, HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}

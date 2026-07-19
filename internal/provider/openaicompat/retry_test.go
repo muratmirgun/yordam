@@ -16,16 +16,12 @@ import (
 	"github.com/muratmirgun/yordam/internal/provider/openaicompat"
 )
 
-func TestRetryStopsAfterFirstDelta(t *testing.T) {
+func TestRetryableHTTPStatusDoesNotRedispatch(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		n := requests.Add(1)
-		w.Header().Set("Content-Type", "text/event-stream")
-		if n == 1 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"partial"}}]}`)
+		requests.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprintln(w, "rate limited")
 	}))
 	defer server.Close()
 
@@ -37,22 +33,13 @@ func TestRetryStopsAfterFirstDelta(t *testing.T) {
 		RetryDelays: []time.Duration{0, 0},
 		Jitter:      func(delay time.Duration) time.Duration { return delay },
 	})
-	events, err := client.Stream(context.Background(), domain.ModelRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var streamErr error
-	for event := range events {
-		if event.Kind == domain.ModelStreamError {
-			streamErr = event.Err
-		}
-	}
-	if requests.Load() != 2 {
-		t.Fatalf("requests=%d want 2", requests.Load())
+	_, err := client.Stream(context.Background(), domain.ModelRequest{})
+	if requests.Load() != 1 {
+		t.Fatalf("requests=%d want 1", requests.Load())
 	}
 	var typed *domain.TypedError
-	if !errors.As(streamErr, &typed) || typed.Kind != domain.ErrorProviderInterrupted {
-		t.Fatalf("error=%v", streamErr)
+	if !errors.As(err, &typed) || typed.Kind != domain.ErrorProviderRetryable {
+		t.Fatalf("error=%v", err)
 	}
 }
 
@@ -189,14 +176,11 @@ func TestContextTooLargeClassification(t *testing.T) {
 	}
 }
 
-func TestRetryJitterIsInjected(t *testing.T) {
+func TestRetryConfigurationDoesNotRedispatch(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if requests.Add(1) == 1 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		fmt.Fprintln(w, "data: [DONE]")
+		requests.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
 
@@ -211,13 +195,9 @@ func TestRetryJitterIsInjected(t *testing.T) {
 			return 0
 		},
 	})
-	events, err := client.Stream(context.Background(), domain.ModelRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for range events {
-	}
-	if jitterInput != retryDelay || requests.Load() != 2 {
+	_, err := client.Stream(context.Background(), domain.ModelRequest{})
+	var typed *domain.TypedError
+	if !errors.As(err, &typed) || typed.Kind != domain.ErrorProviderRetryable || jitterInput != 0 || requests.Load() != 1 {
 		t.Fatalf("jitter input=%s requests=%d", jitterInput, requests.Load())
 	}
 }
@@ -335,7 +315,7 @@ func TestRetryStopsAfterMetadataDelta(t *testing.T) {
 	}
 }
 
-func TestPreDeltaScannerFailureIsRetried(t *testing.T) {
+func TestPreDeltaScannerFailureDoesNotRedispatch(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
@@ -348,10 +328,8 @@ func TestPreDeltaScannerFailureIsRetried(t *testing.T) {
 			var requests atomic.Int32
 			client := openaicompat.New(openaicompat.ClientOptions{
 				HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-					if requests.Add(1) == 1 {
-						return streamResponse(readError{err: test.err}), nil
-					}
-					return streamResponse(strings.NewReader("data: [DONE]\n")), nil
+					requests.Add(1)
+					return streamResponse(readError{err: test.err}), nil
 				})},
 				BaseURL:     "http://provider.invalid",
 				RetryDelays: []time.Duration{0},
@@ -361,21 +339,21 @@ func TestPreDeltaScannerFailureIsRetried(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var done bool
+			var streamErr error
 			for event := range events {
-				if event.Err != nil {
-					t.Fatalf("requests=%d error=%v", requests.Load(), event.Err)
+				if event.Kind == domain.ModelStreamError {
+					streamErr = event.Err
 				}
-				done = done || event.Kind == domain.ModelDone
 			}
-			if requests.Load() != 2 || !done {
-				t.Fatalf("requests=%d done=%v", requests.Load(), done)
+			var typed *domain.TypedError
+			if requests.Load() != 1 || !errors.As(streamErr, &typed) || typed.Kind != domain.ErrorProviderInterrupted {
+				t.Fatalf("requests=%d error=%v", requests.Load(), streamErr)
 			}
 		})
 	}
 }
 
-func TestCleanEOFBeforeDeltaUsesRetryBudget(t *testing.T) {
+func TestCleanEOFBeforeDeltaDoesNotRedispatch(t *testing.T) {
 	var requests atomic.Int32
 	client := openaicompat.New(openaicompat.ClientOptions{
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
@@ -397,25 +375,28 @@ func TestCleanEOFBeforeDeltaUsesRetryBudget(t *testing.T) {
 		}
 	}
 	var typed *domain.TypedError
-	if requests.Load() != 4 || len(streamErrors) != 1 || !errors.As(streamErrors[0], &typed) || typed.Kind != domain.ErrorProviderInterrupted {
+	if requests.Load() != 1 || len(streamErrors) != 1 || !errors.As(streamErrors[0], &typed) || typed.Kind != domain.ErrorProviderInterrupted {
 		t.Fatalf("requests=%d errors=%v", requests.Load(), streamErrors)
 	}
 }
 
-func TestRetriesAtMostThreeTimes(t *testing.T) {
-	var requests atomic.Int32
-	client := openaicompat.New(openaicompat.ClientOptions{
-		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			requests.Add(1)
-			return nil, errorReader{}
-		})},
-		BaseURL:     "http://provider.invalid",
-		RetryDelays: []time.Duration{0, 0, 0, 0, 0},
-		Jitter:      func(delay time.Duration) time.Duration { return delay },
-	})
-	_, err := client.Stream(context.Background(), domain.ModelRequest{})
-	if err == nil || requests.Load() != 4 {
-		t.Fatalf("requests=%d error=%v", requests.Load(), err)
+func TestTransportFailureDoesNotRedispatch(t *testing.T) {
+	for _, transportErr := range []error{errorReader{}, timeoutReader{}} {
+		var requests atomic.Int32
+		client := openaicompat.New(openaicompat.ClientOptions{
+			HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				requests.Add(1)
+				return nil, transportErr
+			})},
+			BaseURL:     "http://provider.invalid",
+			RetryDelays: []time.Duration{0, 0, 0, 0, 0},
+			Jitter:      func(delay time.Duration) time.Duration { return delay },
+		})
+		_, err := client.Stream(context.Background(), domain.ModelRequest{})
+		var typed *domain.TypedError
+		if requests.Load() != 1 || !errors.As(err, &typed) || typed.Kind != domain.ErrorProviderRetryable {
+			t.Fatalf("transport=%T requests=%d error=%v", transportErr, requests.Load(), err)
+		}
 	}
 }
 
@@ -455,6 +436,12 @@ func (errorReader) Read([]byte) (int, error) { return 0, errorReader{} }
 func (errorReader) Error() string            { return "stream transport failed" }
 func (errorReader) Timeout() bool            { return false }
 func (errorReader) Temporary() bool          { return true }
+
+type timeoutReader struct{}
+
+func (timeoutReader) Error() string   { return "provider request timed out" }
+func (timeoutReader) Timeout() bool   { return true }
+func (timeoutReader) Temporary() bool { return true }
 
 type readError struct{ err error }
 

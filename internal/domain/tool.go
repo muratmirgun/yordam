@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"regexp"
 	"time"
+
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
 type MutationKind string
@@ -23,6 +25,33 @@ type ToolDescriptor struct {
 	ScopeDescription string          `json:"scope_description"`
 	InputSchema      json.RawMessage `json:"input_schema"`
 	Mutation         MutationKind    `json:"mutation"`
+}
+
+// ToolClassification is supplied by a trusted adapter. Provider-authored
+// descriptor annotations are deliberately not used for authorization.
+type ToolClassification struct {
+	Effect               string
+	Mutation             string
+	ExecutionLoci        []string
+	Boundary             string
+	Reversibility        string
+	VerificationCoverage string
+	Idempotency          string
+	Retry                string
+	RequestedProfile     string
+	EffectiveProfile     string
+}
+
+func (c ToolClassification) Validate() error {
+	if c.Effect == "" || c.Mutation == "" || len(c.ExecutionLoci) == 0 || c.Boundary == "" || c.Reversibility == "" || c.VerificationCoverage == "" || c.Idempotency == "" || c.Retry == "" || c.RequestedProfile == "" || c.EffectiveProfile == "" {
+		return fmt.Errorf("tool classification is incomplete")
+	}
+	for _, locus := range c.ExecutionLoci {
+		if locus == "" {
+			return fmt.Errorf("tool execution locus is empty")
+		}
+	}
+	return nil
 }
 
 func (d ToolDescriptor) Validate() error {
@@ -66,14 +95,15 @@ type FileChange struct {
 }
 
 type PreparedToolRequest struct {
-	Request         ToolRequest     `json:"request"`
-	Mutation        MutationKind    `json:"mutation"`
-	CanonicalScope  string          `json:"canonical_scope"`
-	InsideWorkspace bool            `json:"inside_workspace"`
-	ProposedDiff    string          `json:"proposed_diff,omitempty"`
-	Summary         string          `json:"summary"`
-	FilePlan        *FileChangePlan `json:"file_plan,omitempty"`
-	ApprovalScope   string          `json:"-"`
+	Request         ToolRequest               `json:"request"`
+	Mutation        MutationKind              `json:"mutation"`
+	CanonicalScope  string                    `json:"canonical_scope"`
+	InsideWorkspace bool                      `json:"inside_workspace"`
+	ProposedDiff    string                    `json:"proposed_diff,omitempty"`
+	Summary         string                    `json:"summary"`
+	FilePlan        *FileChangePlan           `json:"file_plan,omitempty"`
+	ApprovalScope   string                    `json:"-"`
+	Resources       []protocol.ResourceTarget `json:"resources,omitempty"`
 }
 
 type ToolStatus string

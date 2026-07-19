@@ -3,8 +3,6 @@ package tui_test
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -14,6 +12,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/tui"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 	"github.com/muratmirgun/yordam/internal/workspace"
@@ -214,7 +213,7 @@ func TestComposerSubmitStartsTurnAndAppendsUserBlock(t *testing.T) {
 	if blocks := model.ConversationBlocksForTest(); len(blocks) != 0 {
 		t.Fatalf("unaccepted blocks=%+v", blocks)
 	}
-	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnAccepted, Draft: command.Prompt})
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnAccepted, DraftID: command.DraftID, Draft: command.Prompt})
 	blocks := model.ConversationBlocksForTest()
 	if len(blocks) != 1 || blocks[0].Kind != components.BlockUser || blocks[0].Content != "  inspect this  " {
 		t.Fatalf("blocks=%+v", blocks)
@@ -228,6 +227,81 @@ func TestComposerSubmitStartsTurnAndAppendsUserBlock(t *testing.T) {
 	if got := model.ComposerValueForTest(); got != "blocked" {
 		t.Fatalf("active composer value=%q", got)
 	}
+}
+
+func TestConfiguredSecretPromptIsRedactedBeforeConversationRendering(t *testing.T) {
+	const configuredSecret = "configured-tui-secret-sentinel"
+	runtime := tuiRuntimeFunc(func(context.Context, agent.RunInput) error { return nil })
+	selection := domain.ModelSelection{Profile: "profile", Model: "model"}
+	application := app.New(app.Options{
+		RuntimeSet: app.RuntimeSet{
+			Runtime:          runtime,
+			Models:           []domain.ModelSelection{selection},
+			DefaultSelection: selection,
+			Credentials:      map[string]string{selection.Profile: configuredSecret},
+			CredentialEnvs:   map[string]string{selection.Profile: "TEST_KEY"},
+		},
+		Redactors: secret.NewBinding(secret.New(configuredSecret)),
+		Session:   domain.Session{Selection: selection},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go application.Run(ctx)
+
+	events := application.Events()
+	model := tui.NewModel(tui.Options{Commands: application.Commands(), Events: events})
+	model = tui.SubmitForTest(model, configuredSecret)
+	for {
+		event := <-events
+		model = tui.ApplyAppEventForTest(model, event)
+		if event.Kind == app.EventTurnCompleted {
+			break
+		}
+	}
+	if strings.Contains(model.View().Content, configuredSecret) {
+		t.Fatal("rendered TUI contains configured secret")
+	}
+	blocks := model.ConversationBlocksForTest()
+	if len(blocks) != 1 || blocks[0].Content != "[REDACTED]" {
+		t.Fatal("conversation did not contain the redacted prompt")
+	}
+}
+
+func TestInputPreparationFailureRestoresCorrelatedSanitizedDraft(t *testing.T) {
+	const configuredSecret = "input-failure-tui-secret"
+	application := app.New(app.Options{
+		RuntimeSet: app.RuntimeSet{
+			Runtime:        tuiRuntimeFunc(func(context.Context, agent.RunInput) error { return nil }),
+			Models:         []domain.ModelSelection{{}},
+			Credentials:    map[string]string{"": "configured"},
+			CredentialEnvs: map[string]string{"": "TEST_KEY"},
+		},
+		Redactors: secret.NewBinding(secret.New(configuredSecret)),
+		Input: func(string) (agent.RunInput, error) {
+			return agent.RunInput{}, fmt.Errorf("prepare input")
+		},
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go application.Run(ctx)
+
+	events := application.Events()
+	model := tui.NewModel(tui.Options{Commands: application.Commands(), Events: events})
+	model = tui.SubmitForTest(model, configuredSecret)
+	event := <-events
+	if event.Kind != app.EventError || event.DraftID == 0 || event.Draft != "[REDACTED]" {
+		t.Fatalf("event=%+v", event)
+	}
+	model = tui.ApplyAppEventForTest(model, event)
+	if model.TurnActiveForTest() || model.ComposerValueForTest() != "[REDACTED]" || strings.Contains(model.View().Content, configuredSecret) {
+		t.Fatalf("active=%t composer=%q view=%q", model.TurnActiveForTest(), model.ComposerValueForTest(), model.View().Content)
+	}
+}
+
+type tuiRuntimeFunc func(context.Context, agent.RunInput) error
+
+func (run tuiRuntimeFunc) RunTurn(ctx context.Context, input agent.RunInput) error {
+	return run(ctx, input)
 }
 
 func TestRootDelegatesPasteToComposer(t *testing.T) {
@@ -510,12 +584,16 @@ func TestPermissionEscapeSendsExactDenyWithoutCancellingTurn(t *testing.T) {
 }
 
 func TestPermissionEscapeResolvesAppBroker(t *testing.T) {
-	application := app.New(app.Options{})
+	const configuredSecret = "tui-permission-internal-scope-secret"
+	rawScope := "/workspace/" + configuredSecret + "/file.go"
+	displayedScope := "/workspace/[REDACTED]/file.go"
+	application := app.New(app.Options{Redactors: secret.NewBinding(secret.New(configuredSecret))})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = application.Run(ctx) }()
 
-	prompt := tui.PermissionPromptForTest("edit", "/workspace/file.go", true)
+	prompt := tui.PermissionPromptForTest("edit", displayedScope, true)
+	prompt.Call.ApprovalScope = rawScope
 	resolved := make(chan domain.PermissionDecision, 1)
 	errors := make(chan error, 1)
 	go func() {
@@ -533,6 +611,9 @@ func TestPermissionEscapeResolvesAppBroker(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for permission event")
 	}
+	if event.Permission == nil || event.Permission.Call.ApprovalScope != displayedScope || strings.Contains(event.Permission.Call.ApprovalScope, configuredSecret) {
+		t.Fatal("app did not publish only the displayed approval scope")
+	}
 	model := tui.NewModel(tui.Options{Commands: application.Commands(), Events: application.Events()})
 	model = tui.SetTurnActiveForTest(model, true)
 	model = tui.ApplyAppEventForTest(model, event)
@@ -540,7 +621,7 @@ func TestPermissionEscapeResolvesAppBroker(t *testing.T) {
 
 	select {
 	case decision := <-resolved:
-		if decision.Action != domain.PermissionDeny || decision.Scope != prompt.Call.CanonicalScope {
+		if decision.Action != domain.PermissionDeny || decision.Scope != rawScope {
 			t.Fatalf("decision=%+v", decision)
 		}
 	case err := <-errors:
@@ -550,6 +631,57 @@ func TestPermissionEscapeResolvesAppBroker(t *testing.T) {
 	}
 	if !model.TurnActiveForTest() || model.CancelSentForTest() {
 		t.Fatal("permission escape cancelled the turn")
+	}
+}
+
+func TestPermissionEscapeRoundTripsOpaqueCallIDThroughAppBroker(t *testing.T) {
+	const configuredSecret = "tui-permission-call-id-secret"
+	rawCallID := "provider-" + configuredSecret
+	application := app.New(app.Options{Redactors: secret.NewBinding(secret.New(configuredSecret))})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = application.Run(ctx) }()
+
+	prompt := tui.PermissionPromptForTest("edit", "/workspace/file.go", true)
+	prompt.Call.Request.CallID = rawCallID
+	resolved := make(chan domain.PermissionDecision, 1)
+	errors := make(chan error, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, prompt)
+		if err != nil {
+			errors <- err
+			return
+		}
+		resolved <- decision
+	}()
+
+	var event app.Event
+	select {
+	case event = <-application.Events():
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for permission event")
+	}
+	if event.Permission == nil {
+		t.Fatal("permission request was not published")
+	}
+	displayedCallID := event.Permission.Call.Request.CallID
+	if displayedCallID == rawCallID || displayedCallID == "provider-[REDACTED]" || strings.Contains(displayedCallID, configuredSecret) {
+		t.Fatal("TUI received a raw or derived permission call ID")
+	}
+	model := tui.NewModel(tui.Options{Commands: application.Commands(), Events: application.Events()})
+	model = tui.SetTurnActiveForTest(model, true)
+	model = tui.ApplyAppEventForTest(model, event)
+	model = tui.PressForTest(model, "esc")
+
+	select {
+	case decision := <-resolved:
+		if decision.Action != domain.PermissionDeny || prompt.Call.Request.CallID != rawCallID {
+			t.Fatal("TUI response did not preserve the runner-owned internal call ID")
+		}
+	case err := <-errors:
+		t.Fatalf("resolve error=%v", err)
+	case <-time.After(time.Second):
+		t.Fatal("opaque TUI call ID left app permission request unresolved")
 	}
 }
 
@@ -659,7 +791,7 @@ func TestGoldenViews(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		t.Run(test.wantLayout+"-"+filepath.Base(goldenPath(test.width)), func(t *testing.T) {
+		t.Run(test.wantLayout+"-"+tui.WidthStringForTest(test.width), func(t *testing.T) {
 			model := tui.GoldenModelForTest(test.width, test.height)
 			if got := model.LayoutForTest(); got != test.wantLayout {
 				t.Fatalf("layout=%q want=%q", got, test.wantLayout)
@@ -690,19 +822,15 @@ func TestGoldenViews(t *testing.T) {
 				}
 			}
 
-			want, err := os.ReadFile(goldenPath(test.width))
-			if err != nil {
-				t.Fatal(err)
+			want, ok := goldenView(test.width)
+			if !ok {
+				t.Fatalf("golden view missing for width %d", test.width)
 			}
-			if view.Content != string(want) {
-				t.Fatalf("view does not match golden %s\n--- want ---\n%s\n--- got ---\n%s", goldenPath(test.width), want, view.Content)
+			if view.Content != want {
+				t.Fatalf("view does not match golden for width %d\n--- want ---\n%s\n--- got ---\n%s", test.width, want, view.Content)
 			}
 		})
 	}
-}
-
-func goldenPath(width int) string {
-	return filepath.Join("testdata", "view-"+tui.WidthStringForTest(width)+".golden")
 }
 
 func keyMessage(value string) tea.KeyPressMsg {

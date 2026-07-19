@@ -10,7 +10,7 @@ func TestV010Acceptance(t *testing.T) {
 		run  func(*testing.T)
 	}{
 		{"single_binary_startup", acceptSingleBinaryStartup},
-		{"secret_free_config_reload", acceptSecretFreeSetup},
+		{"secret_free_config_reload", acceptSecretFreeConfigReload},
 		{"scripted_four_tool_turn", acceptFourToolTurn},
 		{"ask_allow_and_deny", acceptAskPaths},
 		{"safe_blocks_mutations", acceptSafeMode},

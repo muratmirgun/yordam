@@ -20,20 +20,26 @@ type programRunner interface {
 	Quit()
 }
 
+var (
+	ensureGlobal = config.EnsureGlobal
+	bootstrap    = app.Bootstrap
+	newProgram   = func(model tea.Model) programRunner { return tea.NewProgram(model) }
+)
+
 func Run(ctx context.Context, options cli.Options) error {
 	application, model, err := prepareRun(ctx, options)
 	if err != nil {
 		return err
 	}
-	return runApplication(ctx, application, tea.NewProgram(model, tea.WithContext(ctx)))
+	return runApplication(ctx, application, newProgram(model))
 }
 
 func prepareRun(ctx context.Context, options cli.Options) (*app.App, Model, error) {
-	configPath, created, err := config.EnsureGlobal()
+	configPath, created, err := ensureGlobal()
 	if err != nil {
 		return nil, Model{}, fmt.Errorf("ensure config: %w", err)
 	}
-	application, snapshot, err := app.Bootstrap(ctx, app.BootstrapOptions{ConfigPath: configPath, CLI: options})
+	application, snapshot, err := bootstrap(ctx, app.BootstrapOptions{ConfigPath: configPath, CLI: options})
 	if err != nil {
 		return nil, Model{}, err
 	}

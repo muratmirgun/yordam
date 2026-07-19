@@ -2,48 +2,129 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/agent"
+	"github.com/muratmirgun/yordam/internal/authorization"
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/cli"
 	"github.com/muratmirgun/yordam/internal/config"
+	contextplanner "github.com/muratmirgun/yordam/internal/context"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/evidence"
+	"github.com/muratmirgun/yordam/internal/orchestrator"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/provider"
 	"github.com/muratmirgun/yordam/internal/provider/openaicompat"
+	"github.com/muratmirgun/yordam/internal/recovery"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
-	"github.com/muratmirgun/yordam/internal/tools"
+	"github.com/muratmirgun/yordam/internal/tooling"
 	edittool "github.com/muratmirgun/yordam/internal/tools/edit"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 	readtool "github.com/muratmirgun/yordam/internal/tools/read"
 	searchtool "github.com/muratmirgun/yordam/internal/tools/search"
 	shelltool "github.com/muratmirgun/yordam/internal/tools/shell"
+	"github.com/muratmirgun/yordam/internal/verification"
 )
 
 type RuntimeSet struct {
-	Runtime            Runtime
-	CompactSession     CompactSession
-	Models             []domain.ModelSelection
-	DefaultSelection   domain.ModelSelection
-	CredentialEnvs     map[string]string
-	Credentials        map[string]string
-	Redactor           secret.Redactor
-	ConfigurationError error
-	configPath         string
-	bindApprover       func(ports.PermissionApprover)
-	unchecked          bool
+	Runtime              Runtime
+	CompactSession       CompactSession
+	Models               []domain.ModelSelection
+	DefaultSelection     domain.ModelSelection
+	CredentialEnvs       map[string]string
+	Credentials          map[string]string
+	Redactor             secret.Redacting
+	Admission            *secret.Lease
+	RuntimeGenerationID  protocol.RuntimeGenerationID
+	Manifest             protocol.RuntimeGenerationManifest
+	Orchestrator         *orchestrator.Service
+	SessionChanges       sessionChangeService
+	ProviderCatalog      provider.Catalog
+	ProviderService      *provider.Service
+	ToolService          *tooling.Service
+	AuthorizationService orchestrator.AuthorizationService
+	Broker               *Broker
+	ApplicationService   *ProtocolService
+	LegacyAdapter        *LegacyAdapter
+	ConfigurationError   error
+	configPath           string
+	bindApprover         func(ports.PermissionApprover)
+	unchecked            bool
+	retire               func()
+}
+
+var runtimeSecretGeneration atomic.Uint64
+
+func (s RuntimeSet) retireSecrets() {
+	if s.retire != nil {
+		s.retire()
+	}
+}
+
+func (s RuntimeSet) Validate() error {
+	if s.ConfigurationError != nil {
+		return s.ConfigurationError
+	}
+	if s.Manifest.ID == "" || s.Manifest.ID != s.RuntimeGenerationID {
+		return fmt.Errorf("runtime generation manifest identity mismatch")
+	}
+	if err := canonicaljson.ValidateDigest(s.Manifest.Body, s.Manifest.Digest); err != nil {
+		return fmt.Errorf("runtime generation manifest: %w", err)
+	}
+	if len(s.Manifest.Body.Models) == 0 || s.Manifest.Body.Limits.MaxToolCalls < 1 || s.Manifest.Body.Limits.MaxToolCalls > 128 || s.Manifest.Body.Limits.ShellTimeoutNanos <= 0 || s.Manifest.Body.Limits.ApplicationQueueCapacity <= 0 {
+		return fmt.Errorf("runtime generation manifest limits or models are invalid")
+	}
+	for _, model := range s.Manifest.Body.Models {
+		if err := model.Validate(); err != nil || model.RuntimeGenerationID != s.Manifest.ID {
+			return fmt.Errorf("runtime generation model is invalid")
+		}
+	}
+	for _, descriptor := range s.Manifest.Body.Tools {
+		if err := descriptor.Body.Validate(); err != nil || canonicaljson.ValidateDigest(descriptor.Body, descriptor.DescriptorDigest) != nil {
+			return fmt.Errorf("runtime generation tool is invalid")
+		}
+	}
+	return nil
 }
 
 type ReloadRuntime func(context.Context, domain.ModelSelection) (RuntimeSet, error)
 
+// String returns a diagnostic summary without exposing credential values.
+func (s RuntimeSet) String() string {
+	return fmt.Sprintf("RuntimeSet{Models:%v DefaultSelection:%+v CredentialEnvs:%v ConfigurationError:%t}", s.Models, s.DefaultSelection, s.CredentialEnvs, s.ConfigurationError != nil)
+}
+
+// MarshalJSON serializes only the non-sensitive runtime metadata.
+func (s RuntimeSet) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Models             []domain.ModelSelection `json:"models"`
+		DefaultSelection   domain.ModelSelection   `json:"defaultSelection"`
+		CredentialEnvs     map[string]string       `json:"credentialEnvs"`
+		ConfigurationError bool                    `json:"configurationError"`
+	}{
+		Models:             s.Models,
+		DefaultSelection:   s.DefaultSelection,
+		CredentialEnvs:     s.CredentialEnvs,
+		ConfigurationError: s.ConfigurationError != nil,
+	})
+}
+
 func (s RuntimeSet) Ready(selection domain.ModelSelection) error {
-	if s.unchecked {
-		return nil
-	}
 	if s.ConfigurationError != nil {
 		return s.ConfigurationError
+	}
+	if s.unchecked {
+		return nil
 	}
 	if !slices.Contains(s.Models, selection) {
 		return configurationError(s.configPath, fmt.Sprintf("model %q is not configured for provider %q; edit the file and run /reload", selection.Model, selection.Profile), nil)
@@ -62,17 +143,22 @@ func (s RuntimeSet) BindApprover(approver ports.PermissionApprover) {
 }
 
 type runtimeBuilder struct {
-	configPath    string
-	cli           cli.Options
-	workspace     domain.Workspace
-	store         *jsonl.Store
-	policy        *policyBinding
-	activeSession *sessionBinding
-	runtimeEvents chan<- agent.RuntimeEvent
-	httpClient    *http.Client
+	configPath       string
+	cli              cli.Options
+	workspace        domain.Workspace
+	store            *jsonl.Store
+	policy           *policyBinding
+	activeSession    *sessionBinding
+	runtimeEvents    chan<- agent.RuntimeEvent
+	httpClient       *http.Client
+	secrets          *secret.Registry
+	lane             orchestrator.OperationLane
+	publisher        orchestrator.ApplicationEventPublisher
+	dataDir          string
+	workspaceControl protocol.JournalRef
 }
 
-func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) (RuntimeSet, error) {
+func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) (RuntimeSet, error) {
 	defaultProfile, defaultModel := "", ""
 	if slices.Contains(cfg.Models(), current) {
 		defaultProfile, defaultModel = current.Profile, current.Model
@@ -90,10 +176,54 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 	credentials := cfg.APIKeys()
 	redactionValues := profileKeyValues(credentials)
 	credentials[selected.Name] = selected.APIKey
-	redactor := secret.New(append(redactionValues, selected.APIKey)...)
+	redactionValues = append(redactionValues, selected.APIKey)
+	values := make([][]byte, 0, len(redactionValues))
+	for _, value := range redactionValues {
+		if value != "" {
+			values = append(values, []byte(value))
+		}
+	}
+	secretRegistry := b.secrets
+	if secretRegistry == nil {
+		secretRegistry = secret.NewRegistry()
+	}
+	generationID := protocol.RuntimeGenerationID(fmt.Sprintf("runtime-%d", runtimeSecretGeneration.Add(1)))
+	admission, err := secretRegistry.Acquire(generationID, values)
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "bind runtime secret admission", err)
+	}
+	retireOnce := &sync.Once{}
+	producerLeases := make([]*secret.Lease, 0, len(cfg.Profiles)+2)
+	retire := func() {
+		retireOnce.Do(func() {
+			_ = secretRegistry.Retire(generationID)
+			_ = admission.Close()
+			for _, producer := range producerLeases {
+				_ = producer.Close()
+			}
+		})
+	}
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			retire()
+		}
+	}()
 	clients := make(map[string]*openaicompat.Client, len(cfg.Profiles))
+	routedAdapters := make(map[protocol.ProviderID]*openaicompat.Adapter, len(cfg.Profiles))
 	credentialEnvs := make(map[string]string, len(cfg.Profiles))
-	for name, profile := range cfg.Profiles {
+	profileNames := make([]string, 0, len(cfg.Profiles))
+	for name := range cfg.Profiles {
+		profileNames = append(profileNames, name)
+	}
+	slices.Sort(profileNames)
+	for _, name := range profileNames {
+		profile := cfg.Profiles[name]
+		clientAdmission, leaseErr := admission.Derive()
+		if leaseErr != nil {
+			return RuntimeSet{}, configurationError(b.configPath, "bind provider secret admission", leaseErr)
+		}
+		producerLeases = append(producerLeases, clientAdmission)
 		baseURL := profile.BaseURL
 		model := profile.DefaultModel
 		if name == selected.Name {
@@ -106,19 +236,23 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 			BaseURL:    baseURL,
 			APIKey:     credentials[name],
 			Model:      model,
-			Redact:     redactor.String,
+			Redact:     clientAdmission.String,
+			Admission:  clientAdmission,
 		})
-	}
-	provider, err := openaicompat.NewRouter(clients)
-	if err != nil {
-		return RuntimeSet{}, configurationError(b.configPath, "build provider runtime", err)
+		routedAdapters[protocol.ProviderID(name)] = openaicompat.NewAdapter(clients[name])
 	}
 	outputOptions := output.Options{
 		SessionID:        b.activeSession.get(),
 		CurrentSessionID: b.activeSession.get,
 		Artifacts:        b.store,
-		Redact:           redactor,
+		Redact:           admission,
+		Admission:        admission,
 	}
+	runnerAdmission, err := admission.Derive()
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "bind runner secret admission", err)
+	}
+	producerLeases = append(producerLeases, runnerAdmission)
 	progress := func(progress domain.ToolProgress) {
 		if b.runtimeEvents == nil {
 			return
@@ -129,7 +263,7 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 		default:
 		}
 	}
-	registry := tools.NewRegistry(
+	toolItems := []ports.Tool{
 		readtool.New(readtool.Options{Workspace: b.workspace.CanonicalPath, Output: outputOptions}),
 		searchtool.New(searchtool.Options{Workspace: b.workspace.CanonicalPath, Output: outputOptions}),
 		edittool.New(edittool.Options{Workspace: b.workspace.CanonicalPath, Output: outputOptions}),
@@ -140,33 +274,203 @@ func (b runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) 
 			Output:          outputOptions,
 			Progress:        progress,
 		}),
-	)
-	runner := &agent.Runner{
-		Provider:         provider,
-		Tools:            registry,
-		Policy:           b.policy,
-		Sessions:         b.store,
-		MaxToolCalls:     effectiveMaxToolCalls(cfg, b.cli),
-		SystemPrompt:     systemPrompt,
-		Redact:           redactor.String,
-		NewDeltaRedactor: func() agent.DeltaRedactor { return redactor.Stream() },
 	}
-	if b.runtimeEvents != nil {
-		runner.Sink = func(event agent.RuntimeEvent) { b.runtimeEvents <- event }
+	toolCatalogRevision := "builtin-v1"
+	toolCatalog, err := tooling.NewCatalog(toolCatalogRevision, toolItems...)
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "build tool catalog", err)
 	}
-	return RuntimeSet{
-		Runtime:          runner,
-		CompactSession:   compactSession(provider, b.store),
-		Models:           cfg.Models(),
-		DefaultSelection: cfg.DefaultSelection(),
-		CredentialEnvs:   credentialEnvs,
-		Credentials:      credentials,
-		Redactor:         redactor,
-		configPath:       b.configPath,
-		bindApprover: func(approver ports.PermissionApprover) {
-			runner.Approver = approver
+	models := runtimeModelDescriptors(cfg, generationID)
+	providerCatalogRevision := "configured-v1"
+	providerCatalog := provider.NewCatalog(providerCatalogRevision, models)
+	durableAuthorization := authorization.NewService(b.store)
+	authorizer := &runtimeAuthorization{
+		Service: durableAuthorization, Policy: b.policy, Tools: toolCatalog,
+		Workspace: b.workspace, ActiveSession: b.activeSession,
+	}
+	providerService, err := provider.NewService(providerCatalog, []provider.Adapter{&openAIAdapterRouter{byProvider: routedAdapters}}, authorizer)
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "build provider service", err)
+	}
+	toolService := tooling.NewService(toolCatalog, authorizer)
+	toolDescriptors := make([]protocol.ToolDescriptor, 0, len(toolItems))
+	for _, exposed := range toolCatalog.Expose().Aliases {
+		descriptor, ok := toolCatalog.Descriptor(exposed.Alias)
+		if !ok {
+			return RuntimeSet{}, configurationError(b.configPath, "build tool manifest", fmt.Errorf("tool alias %q disappeared", exposed.Alias))
+		}
+		toolDescriptors = append(toolDescriptors, descriptor)
+	}
+	body := protocol.RuntimeGenerationBody{
+		ProviderCatalogRevision: providerCatalogRevision,
+		Models:                  protocol.DeepCopy(models),
+		ToolCatalogRevision:     toolCatalogRevision,
+		Tools:                   protocol.DeepCopy(toolDescriptors),
+		InstructionRevision:     "system-v1",
+		PolicyGeneration:        "compatibility-v1",
+		ExecutionProfiles:       []string{"network", "restricted", "unsandboxed"},
+		Limits: protocol.RuntimeLimits{
+			MaxToolCalls: effectiveMaxToolCalls(cfg, b.cli), ShellTimeoutNanos: int64(effectiveShellTimeout(cfg, b.cli)), ApplicationQueueCapacity: 64,
 		},
-	}, nil
+	}
+	manifestDigest, err := canonicaljson.Digest(body)
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "digest runtime manifest", err)
+	}
+	manifest := protocol.RuntimeGenerationManifest{ID: generationID, Body: protocol.DeepCopy(body), Digest: manifestDigest}
+	if b.lane == nil {
+		b.lane = orchestrator.NewOperationLane()
+	}
+	workspaceControl := b.workspaceControl
+	if workspaceControl == (protocol.JournalRef{}) {
+		workspaceControl, err = b.store.EnsureWorkspaceControl(context.Background(), b.workspace)
+		if err != nil {
+			return RuntimeSet{}, configurationError(b.configPath, "initialize application broker", err)
+		}
+	}
+	broker, err := NewBroker(BrokerOptions{
+		Source: runtimeBrokerSource{Repository: b.store, Workspace: workspaceControl, Generation: generationID},
+		Epoch:  string(generationID), DefaultQueueCapacity: 64, MaxQueueCapacity: 1024,
+	})
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "build application broker", err)
+	}
+	dataDir := b.dataDir
+	if dataDir == "" {
+		dataDir = filepath.Join(b.workspace.CanonicalPath, ".yordam-runtime")
+	}
+	evidenceStore, err := evidence.New(filepath.Join(dataDir, "evidence"), runnerAdmission, evidence.WithLegacyResolver(b.store))
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "build evidence store", err)
+	}
+	recoveryStore, err := recovery.New(filepath.Join(dataDir, "recovery"), runnerAdmission)
+	if err != nil {
+		_ = evidenceStore.Close()
+		return RuntimeSet{}, configurationError(b.configPath, "build recovery store", err)
+	}
+	approverBridge := &interactiveApproverBinding{}
+	publisher := b.publisher
+	if publisher == nil {
+		publisher = broker
+	}
+	service, err := orchestrator.NewService(orchestrator.Dependencies{
+		Lane: b.lane, Repository: b.store, TurnLeases: b.store,
+		Context: contextplanner.NewPlanner(toolCatalogRevision), Providers: providerCatalog, Provider: providerService,
+		Tools: toolService, Authorization: authorizer, Approver: approverBridge,
+		Evidence: evidenceStore, Recovery: recoveryRecorder{Tools: toolService, Store: recoveryStore},
+		Verification: verification.NewService(time.Now), Projection: recoveryProjection{Repository: b.store},
+		Publisher: publisher, Admission: generationAdmission{Registry: secretRegistry}, Instructions: staticInstructions{},
+	})
+	if err != nil {
+		_ = evidenceStore.Close()
+		_ = recoveryStore.Close()
+		return RuntimeSet{}, configurationError(b.configPath, "build turn orchestrator", err)
+	}
+	lifecycle := newRuntimeLifecycle(func() {
+		_ = evidenceStore.Close()
+		_ = recoveryStore.Close()
+		_ = secretRegistry.Retire(generationID)
+		_ = admission.Close()
+		for _, producer := range producerLeases {
+			_ = producer.Close()
+		}
+	})
+	retire = lifecycle.retire
+	runner := &agent.OrchestratedRunner{
+		Orchestrator: service,
+		Prepare: func(_ context.Context, input agent.RunInput) (orchestrator.StartTurnRequest, error) {
+			if input.ExpectedHead.Validate() != nil || input.Command.CommandID == "" {
+				return orchestrator.StartTurnRequest{}, fmt.Errorf("turn input has no committed command or session head")
+			}
+			return orchestrator.StartTurnRequest{
+				Command: input.Command, ExpectedHead: input.ExpectedHead,
+				ProviderID: protocol.ProviderID(input.Session.Selection.Profile), ModelID: protocol.ModelID(input.Session.Selection.Model),
+				Runtime: protocol.DeepCopy(manifest),
+			}, nil
+		},
+		Acquire: lifecycle.acquire,
+		Sink: func(event agent.RuntimeEvent) {
+			if b.runtimeEvents == nil {
+				return
+			}
+			select {
+			case b.runtimeEvents <- event:
+			default:
+			}
+		},
+	}
+	dispatcher := runtimeCommandDispatcher{Orchestrator: service, Store: b.store, Manifest: protocol.DeepCopy(manifest), Workspace: workspaceControl}
+	applicationService, err := NewProtocolService(ProtocolServiceOptions{
+		Orchestrator: service, Dispatcher: dispatcher, Broker: broker, WorkspaceControl: workspaceControl,
+	})
+	if err != nil {
+		lifecycle.retire()
+		return RuntimeSet{}, configurationError(b.configPath, "build application service", err)
+	}
+	legacyAdapter := NewLegacyAdapter(LegacyAdapterOptions{
+		Actor: protocol.ActorRef{ID: "legacy-user", Kind: protocol.ActorUser}, SelectedSessionID: protocol.SessionID(b.activeSession.get()),
+		Cursor: runtimeCommandExpectation(b.store, workspaceControl, b.activeSession),
+	})
+	succeeded = true
+	result := RuntimeSet{
+		Runtime:              runner,
+		Models:               cfg.Models(),
+		DefaultSelection:     cfg.DefaultSelection(),
+		CredentialEnvs:       credentialEnvs,
+		Credentials:          credentials,
+		Redactor:             admission,
+		Admission:            admission,
+		RuntimeGenerationID:  generationID,
+		Manifest:             protocol.DeepCopy(manifest),
+		Orchestrator:         service,
+		SessionChanges:       service,
+		ProviderCatalog:      providerCatalog,
+		ProviderService:      providerService,
+		ToolService:          toolService,
+		AuthorizationService: authorizer,
+		Broker:               broker,
+		ApplicationService:   applicationService,
+		LegacyAdapter:        legacyAdapter,
+		configPath:           b.configPath,
+		bindApprover: func(approver ports.PermissionApprover) {
+			approverBridge.set(approver)
+		},
+		retire: retire,
+	}
+	if err := result.Validate(); err != nil {
+		result.retireSecrets()
+		return RuntimeSet{}, configurationError(b.configPath, "validate runtime generation", err)
+	}
+	return result, nil
+}
+
+type failClosedDeltaRedactor struct{}
+
+func (failClosedDeltaRedactor) Write(string) string { return "[REDACTED]" }
+func (failClosedDeltaRedactor) Close() string       { return "" }
+
+func profileKeyValues(keys map[string]string) []string {
+	values := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if key != "" {
+			values = append(values, key)
+		}
+	}
+	return values
+}
+
+func effectiveMaxToolCalls(cfg config.Config, options cli.Options) int {
+	if options.MaxToolsSet || (options.MaxToolCalls != 0 && options.MaxToolCalls != 32) {
+		return options.MaxToolCalls
+	}
+	return cfg.MaxToolCalls
+}
+
+func effectiveShellTimeout(cfg config.Config, options cli.Options) time.Duration {
+	if options.TimeoutSet || (options.ShellTimeout != 0 && options.ShellTimeout != 120*time.Second) {
+		return options.ShellTimeout
+	}
+	return time.Duration(cfg.ShellTimeoutSeconds) * time.Second
 }
 
 func configurationError(path, message string, cause error) error {

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,8 +9,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,8 +21,18 @@ import (
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/permission"
+	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
+	"github.com/muratmirgun/yordam/internal/testsupport/agentfixture"
 )
+
+func TestNewUsesEmptyRedactorBindingWhenNoneIsSupplied(t *testing.T) {
+	application := New(Options{RuntimeSet: RuntimeSet{Redactor: secret.New("candidate-secret")}})
+	if got := application.redactors.String("candidate-secret"); got != "candidate-secret" {
+		t.Fatalf("implicit binding inherited candidate secrets: %q", got)
+	}
+}
 
 func TestRuntimeSetReadinessClassifiesModelsAndCredentials(t *testing.T) {
 	set := RuntimeSet{
@@ -43,10 +56,17 @@ func TestRuntimeSetReadinessClassifiesModelsAndCredentials(t *testing.T) {
 	}
 }
 
+func TestRuntimeSetReadyReturnsConfigurationErrorBeforeCompatibilityBypass(t *testing.T) {
+	configuration := configurationError("/home/user/.config/yordam/config.jsonc", "configuration is invalid; edit the file and run /reload", nil)
+	set := RuntimeSet{ConfigurationError: configuration, unchecked: true}
+
+	if got := set.Ready(domain.ModelSelection{}); !errors.Is(got, configuration) {
+		t.Fatalf("Ready() error = %v, want configuration error %v", got, configuration)
+	}
+}
+
 func TestRuntimeBuilderBindsProvidersToolsLimitsAndCredentials(t *testing.T) {
-	requests := make(chan string, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		requests <- request.Header.Get("Authorization")
 		response.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(response, "data: [DONE]\n\n")
 	}))
@@ -68,54 +88,286 @@ func TestRuntimeBuilderBindsProvidersToolsLimitsAndCredentials(t *testing.T) {
 	if set.Credentials["primary"] != "primary-secret" || set.Credentials["secondary"] != "secondary-secret" {
 		t.Fatalf("credentials not bound by provider")
 	}
-	runner, ok := set.Runtime.(*agent.Runner)
-	if !ok || runner.MaxToolCalls != 7 {
-		t.Fatalf("runtime=%T max=%d", set.Runtime, runner.MaxToolCalls)
+	if summary := fmt.Sprintf("%+v", set); strings.Contains(summary, "primary-secret") || strings.Contains(summary, "secondary-secret") {
+		t.Fatalf("runtime set summary exposes credentials: %s", summary)
 	}
-	for _, selection := range []domain.ModelSelection{{Profile: "primary", Model: "a"}, {Profile: "secondary", Model: "c"}} {
-		stream, err := runner.Provider.Stream(t.Context(), domain.ModelRequest{Selection: selection})
+	serialized, err := json.Marshal(set)
+	if err != nil {
+		t.Fatalf("serialize runtime set summary: %v", err)
+	}
+	if strings.Contains(string(serialized), "primary-secret") || strings.Contains(string(serialized), "secondary-secret") {
+		t.Fatalf("serialized runtime set summary exposes credentials: %s", serialized)
+	}
+	if _, ok := set.Runtime.(*agent.OrchestratedRunner); !ok || set.Manifest.Body.Limits.MaxToolCalls != 7 || set.Manifest.Body.Limits.ShellTimeoutNanos != int64(time.Second) {
+		t.Fatalf("runtime=%T limits=%+v", set.Runtime, set.Manifest.Body.Limits)
+	}
+	if len(set.ProviderCatalog.List()) != 3 || len(set.Manifest.Body.Tools) != 4 {
+		t.Fatalf("provider models=%d tool descriptors=%d", len(set.ProviderCatalog.List()), len(set.Manifest.Body.Tools))
+	}
+}
+
+func TestRuntimeGenerationManifestIsImmutableAcrossCandidateBuilds(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "generation-a")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	builder := newRuntimeBuilderForTest(t, nil)
+	first, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Validate(); err != nil {
+		t.Fatalf("first runtime set: %v", err)
+	}
+	want := protocol.DeepCopy(first.Manifest)
+
+	t.Setenv("PRIMARY_KEY", "generation-b")
+	second, err := builder.build(cfg, domain.ModelSelection{Profile: "secondary", Model: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Validate(); err != nil {
+		t.Fatalf("second runtime set: %v", err)
+	}
+	if first.Manifest.ID == second.Manifest.ID {
+		t.Fatalf("runtime generations were not independently identified: first=%+v second=%+v", first.Manifest, second.Manifest)
+	}
+	if got := first.Manifest; !reflect.DeepEqual(got, want) {
+		t.Fatalf("generation A changed while preparing B:\n got: %#v\nwant: %#v", got, want)
+	}
+
+	second.Manifest.Body.Models[0].DisplayName = "mutated candidate"
+	second.Manifest.Body.Tools[0].Body.InputSchema[0] = '['
+	if got := first.Manifest; !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidate manifest aliases active generation:\n got: %#v\nwant: %#v", got, want)
+	}
+	if err := second.Validate(); err == nil {
+		t.Fatal("tampered candidate manifest passed validation")
+	}
+}
+
+func TestRuntimeCompositionUsesOnlyOrchestratedRunner(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := set.Runtime.(*agent.OrchestratedRunner); !ok {
+		t.Fatalf("production runtime=%T, want *agent.OrchestratedRunner", set.Runtime)
+	}
+	if set.Orchestrator == nil || set.ProviderCatalog == nil || set.ProviderService == nil || set.ToolService == nil || set.AuthorizationService == nil || set.Broker == nil || set.ApplicationService == nil || set.LegacyAdapter == nil {
+		t.Fatalf("foundation composition is incomplete: %+v", set)
+	}
+}
+
+func TestProductionLegacyCommandUsesApplicationProtocolAndRealCursorProjection(t *testing.T) {
+	var providerRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		if providerRequests.Add(1) == 1 {
+			arguments := `{"path":"protocol-evidence.txt","create":true,"new_content":"committed evidence\n"}`
+			fmt.Fprintf(response, "data: {\"id\":\"request-production-tool\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"edit-production\",\"function\":{\"name\":\"edit\",\"arguments\":%q}}]}}]}\n\n", arguments)
+			fmt.Fprintln(response, `data: {"id":"request-production-tool","choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
+			fmt.Fprintln(response)
+			fmt.Fprintln(response, "data: [DONE]")
+			fmt.Fprintln(response)
+			return
+		}
+		fmt.Fprintln(response, `data: {"id":"request-production","choices":[{"delta":{"content":"protocol reply"},"finish_reason":"stop"}]}`)
+		fmt.Fprintln(response)
+		fmt.Fprintln(response, "data: [DONE]")
+		fmt.Fprintln(response)
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.jsonc")
+	configBody := fmt.Sprintf(`{
+  "model": "primary/model-a",
+  "provider": {
+    "primary": {
+      "options": {"baseURL": %q, "apiKeyEnv": "PRIMARY_KEY"},
+      "models": {"model-a": {}}
+    }
+  }
+}`, server.URL)
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PRIMARY_KEY", "production-key")
+	application, bootstrapSnapshot, err := Bootstrap(t.Context(), BootstrapOptions{
+		ConfigPath: configPath, CWD: root, HTTPClient: server.Client(),
+		CLI: cli.Options{Mode: domain.ModeAsk, DataDir: filepath.Join(root, "data"), MaxToolCalls: 32, ShellTimeout: 2 * time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, subscription, err := application.runtimeSet.ApplicationService.SnapshotAndSubscribe(t.Context(), protocol.SnapshotRequest{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(bootstrapSnapshot.Session.ID), Consumer: "production-equivalence", QueueCapacity: 128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Close()
+	if initial.Durable.Task != nil || len(initial.Durable.Activities) != 0 {
+		t.Fatalf("initial projection unexpectedly contains turn state: %+v", initial.Durable)
+	}
+
+	application.runtimeSet.Runtime = forbiddenLegacyRuntime{}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- application.Run(ctx) }()
+	tuiSemantic := []string{}
+	application.Commands() <- Command{Kind: CommandChangeMode, Mode: domain.ModeAuto}
+	for {
+		select {
+		case event := <-application.Events():
+			if event.Kind == EventError || event.Kind == EventRejected {
+				t.Fatalf("production setting command failed: %+v", event)
+			}
+			if event.Kind == EventState && event.Mode == domain.ModeAuto {
+				tuiSemantic = append(tuiSemantic, legacyConsumerSemantic(event)...)
+				goto modeChanged
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatal("timed out waiting for application-protocol setting")
+		}
+	}
+
+modeChanged:
+	store := application.sessions.(*jsonl.Store)
+	workspaceInspection, err := store.Inspect(t.Context(), application.workspaceControl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionInspection, err := store.Inspect(t.Context(), protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(bootstrapSnapshot.Session.ID)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceKinds := inspectionKinds(workspaceInspection.Events)
+	sessionKinds := inspectionKinds(sessionInspection.Events)
+	if !slices.Contains(workspaceKinds, protocol.EventControlOperationAuthorized) || !slices.Contains(workspaceKinds, protocol.EventAuthorizationDecisionConsumed) || !slices.Contains(workspaceKinds, protocol.EventControlOperationStarted) || !slices.Contains(workspaceKinds, protocol.EventCommandCompleted) {
+		t.Fatalf("setting command missed canonical workspace control lifecycle: %v", workspaceKinds)
+	}
+	if countString(sessionKinds, protocol.EventModeChanged) != 1 || slices.Contains(sessionKinds, protocol.EventControlOperationStarted) {
+		t.Fatalf("setting consequence was not isolated to the session journal: %v", sessionKinds)
+	}
+
+	application.Commands() <- Command{Kind: CommandStartTurn, DraftID: 41, Prompt: "through application protocol"}
+	for {
+		select {
+		case event := <-application.Events():
+			if event.Kind == EventError {
+				t.Fatalf("production command failed: %+v", event)
+			}
+			if event.Kind == EventTurnCompleted {
+				tuiSemantic = append(tuiSemantic, legacyConsumerSemantic(event)...)
+				goto completed
+			}
+			tuiSemantic = append(tuiSemantic, legacyConsumerSemantic(event)...)
+		case <-time.After(20 * time.Second):
+			t.Fatal("timed out waiting for application-protocol turn")
+		}
+	}
+
+completed:
+	current, currentSubscription, err := application.runtimeSet.ApplicationService.SnapshotAndSubscribe(t.Context(), protocol.SnapshotRequest{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(bootstrapSnapshot.Session.ID), Consumer: "production-equivalence", QueueCapacity: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = currentSubscription.Close()
+	if current.Durable.Task == nil || len(current.Durable.Activities) < 2 || len(current.Durable.Evidence) == 0 || !strings.Contains(string(current.Durable.Task.Data), "through application protocol") {
+		t.Fatalf("current durable projection is not journal-derived: %+v", current.Durable)
+	}
+	if !strings.Contains(string(current.Durable.Permissions.Data), `"decisions":`) || strings.Contains(string(current.Durable.Permissions.Data), `"decisions":{}`) {
+		t.Fatalf("current durable projection has no committed authorization state: %s", current.Durable.Permissions.Data)
+	}
+	if !strings.Contains(string(current.Durable.Workspace.Data), `"consumed":`) || strings.Contains(string(current.Durable.Workspace.Data), `"consumed":{}`) {
+		t.Fatalf("current durable projection has no committed control authorization state: %s", current.Durable.Workspace.Data)
+	}
+	oldDurable, _, err := (runtimeBrokerSource{Repository: store, Workspace: application.workspaceControl, Generation: application.runtimeSet.RuntimeGenerationID}).Project(t.Context(), SnapshotVector{
+		WorkspaceControl: initial.Cursor.WorkspaceControl, SelectedSession: initial.Cursor.SelectedSession,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldDurable.Task != nil || len(oldDurable.Activities) != 0 {
+		t.Fatalf("projection at old cursor observed later turn: %+v", oldDurable)
+	}
+
+	legacyCompleted := false
+	legacySemantic := []string{}
+	for !legacyCompleted {
+		item, err := subscription.Next(t.Context())
 		if err != nil {
 			t.Fatal(err)
 		}
-		for range stream {
+		if item.Event == nil {
+			continue
+		}
+		legacy, err := application.runtimeSet.LegacyAdapter.Event(*item.Event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		legacySemantic = append(legacySemantic, legacyConsumerSemantic(legacy)...)
+		legacyCompleted = legacy.Kind == EventTurnCompleted
+	}
+	raw, err := json.Marshal(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var headless protocol.ApplicationSnapshot
+	if err := json.Unmarshal(raw, &headless); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(current.Durable, headless.Durable) || !reflect.DeepEqual(tuiSemantic, legacySemantic) {
+		t.Fatalf("consumer equivalence tui=%v legacy=%v headless=%+v current=%+v", tuiSemantic, legacySemantic, headless.Durable, current.Durable)
+	}
+	application.Commands() <- Command{Kind: CommandShutdown}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func legacyConsumerSemantic(event Event) []string {
+	switch event.Kind {
+	case EventState:
+		return []string{"state"}
+	case EventTurnAccepted:
+		return []string{"turn.accepted"}
+	case EventTextDelta:
+		return []string{"text:" + event.Runtime.Text}
+	case EventTurnCompleted:
+		return []string{"turn.completed"}
+	default:
+		return nil
+	}
+}
+
+func inspectionKinds(events []protocol.EventRecord) []string {
+	kinds := make([]string, 0, len(events))
+	for _, event := range events {
+		kinds = append(kinds, event.Envelope.Kind)
+	}
+	return kinds
+}
+
+func countString(values []string, target string) int {
+	count := 0
+	for _, value := range values {
+		if value == target {
+			count++
 		}
 	}
-	if got := []string{<-requests, <-requests}; !slices.Equal(got, []string{"Bearer primary-secret", "Bearer secondary-secret"}) {
-		t.Fatalf("authorizations=%q", got)
-	}
+	return count
+}
 
-	shellTool, ok := runner.Tools.Lookup("shell")
-	if !ok {
-		t.Fatal("shell tool missing")
-	}
-	prepared, err := shellTool.Prepare(t.Context(), domain.ToolRequest{
-		CallID:    "env",
-		Name:      "shell",
-		Workspace: builder.workspace.CanonicalPath,
-		Input:     json.RawMessage(`{"command":"env","cwd":"."}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := prepared.Execute(t.Context())
-	if result.Status != domain.ToolSucceeded || strings.Contains(result.Content, "PRIMARY_KEY=") || strings.Contains(result.Content, "SECONDARY_KEY=") || !strings.Contains(result.Content, "ORDINARY_VALUE=preserved") {
-		t.Fatalf("shell environment result=%+v", result)
-	}
+type forbiddenLegacyRuntime struct{}
 
-	prepared, err = shellTool.Prepare(t.Context(), domain.ToolRequest{
-		CallID:    "timeout",
-		Name:      "shell",
-		Workspace: builder.workspace.CanonicalPath,
-		Input:     json.RawMessage(`{"command":"sleep 5","cwd":"."}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	started := time.Now()
-	result = prepared.Execute(t.Context())
-	if result.ErrorKind != domain.ErrorToolTimeout || time.Since(started) > 3*time.Second {
-		t.Fatalf("timeout result=%+v elapsed=%s", result, time.Since(started))
-	}
+func (forbiddenLegacyRuntime) RunTurn(context.Context, agent.RunInput) error {
+	return errors.New("legacy Runtime.RunTurn bypass was invoked")
 }
 
 func TestRuntimeGenerationsKeepImmutableRedactors(t *testing.T) {
@@ -137,6 +389,94 @@ func TestRuntimeGenerationsKeepImmutableRedactors(t *testing.T) {
 	if got := second.Redactor.String("generation-a generation-b"); got != "generation-a [REDACTED]" {
 		t.Fatalf("second redactor=%q", got)
 	}
+	firstRunner, ok := first.Runtime.(*agent.OrchestratedRunner)
+	if !ok {
+		t.Fatalf("first runtime=%T", first.Runtime)
+	}
+	release, err := firstRunner.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.retireSecrets()
+	if got := first.Redactor.String("generation-a generation-b"); got != "[REDACTED] generation-b" {
+		t.Fatalf("active first generation redactor=%q", got)
+	}
+	release()
+	if _, err := firstRunner.Acquire(); err == nil {
+		t.Fatal("retired generation accepted a new turn lease")
+	}
+}
+
+func TestRuntimeGenerationBootstrapBindingAdvancesStoreWhileOldOutputIsImmutable(t *testing.T) {
+	const generationA = "generation-a"
+	const generationB = "generation-b"
+	t.Setenv("PRIMARY_KEY", generationA)
+
+	configPath := filepath.Join(t.TempDir(), "config.jsonc")
+	if err := os.WriteFile(configPath, []byte(`{
+  "model": "primary/a",
+  "provider": {
+    "primary": {
+      "options": {"baseURL": "https://example.invalid/v1", "apiKeyEnv": "PRIMARY_KEY"},
+      "models": {"a": {}}
+    }
+  }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	application, _, err := Bootstrap(t.Context(), BootstrapOptions{
+		ConfigPath: configPath,
+		CLI: cli.Options{
+			Mode:         domain.ModeAsk,
+			DataDir:      t.TempDir(),
+			MaxToolCalls: 32,
+			ShellTimeout: 120 * time.Second,
+		},
+		CWD: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSet := application.runtimeSet
+	firstRunner, ok := firstSet.Runtime.(*agent.OrchestratedRunner)
+	if !ok {
+		t.Fatalf("first runtime=%T", application.runtimeSet.Runtime)
+	}
+	release, err := firstRunner.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- application.Run(ctx) }()
+	t.Setenv("PRIMARY_KEY", generationB)
+	application.Commands() <- Command{Kind: CommandReloadConfig}
+	select {
+	case event := <-application.Events():
+		if event.Kind != EventReloadCompleted || !event.Applied || event.Err != nil {
+			t.Fatalf("reload event=%+v", event)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for reload")
+	}
+
+	if got := firstSet.Redactor.String(generationA + " " + generationB); got != "[REDACTED] "+generationB {
+		t.Fatalf("active old-generation redactor=%q", got)
+	}
+	if got := application.redactors.String(generationA + " " + generationB); got != generationA+" [REDACTED]" {
+		t.Fatalf("new production binding=%q", got)
+	}
+	release()
+	if _, err := firstRunner.Acquire(); err == nil {
+		t.Fatal("retired runtime started a new producer")
+	}
+
+	application.Commands() <- Command{Kind: CommandShutdown}
+	if err := <-done; err != nil {
+		t.Fatalf("app shutdown: %v", err)
+	}
 }
 
 func TestRuntimeBuilderRedactsConfiguredAndOverrideCredentials(t *testing.T) {
@@ -154,6 +494,46 @@ func TestRuntimeBuilderRedactsConfiguredAndOverrideCredentials(t *testing.T) {
 	if got := set.Redactor.String("configured-secret override-secret"); got != "[REDACTED] [REDACTED]" {
 		t.Fatalf("redacted=%q", got)
 	}
+	if set.Admission == nil || set.RuntimeGenerationID == "" {
+		t.Fatalf("runtime has no generation lease: %+v", set)
+	}
+	if got := set.Redactor.String("Y29uZmlndXJlZC1zZWNyZXQ="); got != "[REDACTED]" {
+		t.Fatalf("encoded redacted=%q", got)
+	}
+}
+
+func TestRuntimeBuilderRegistersGenerationInSharedProductionRegistry(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "shared-production-secret")
+	shared := secret.NewRegistry()
+	builder := newRuntimeBuilderForTest(t, nil)
+	builder.secrets = shared
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, err := shared.AcquireExisting(set.RuntimeGenerationID)
+	if err != nil {
+		t.Fatalf("runtime generation not registered in shared registry: %v", err)
+	}
+	defer func() { _ = producer.Close() }()
+	if got := producer.String("c2hhcmVkLXByb2R1Y3Rpb24tc2VjcmV0"); got != "[REDACTED]" {
+		t.Fatalf("shared generation redaction=%q", got)
+	}
+}
+
+func TestRuntimeSetBindsApproverToItsRunner(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ok := set.Runtime.(*agent.OrchestratedRunner)
+	if !ok {
+		t.Fatalf("runtime=%T", set.Runtime)
+	}
+	approver := &agentfixture.Approver{}
+	set.BindApprover(approver)
 }
 
 func TestRuntimeBuilderFallsBackToRootWhenCurrentModelWasRemoved(t *testing.T) {

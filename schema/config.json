@@ -44,20 +44,10 @@
     },
     "providerOptions": {
       "type": "object",
-      "required": ["baseURL"],
-      "oneOf": [
-        {"required": ["apiKey"]},
-        {"required": ["apiKeyEnv"]}
-      ],
+      "required": ["baseURL", "apiKeyEnv"],
       "additionalProperties": false,
       "properties": {
-        "baseURL": {
-          "type": "string",
-          "format": "uri",
-          "pattern": "^https?://",
-          "not": {"pattern": "^https?://[^/]*@"}
-        },
-        "apiKey": {"type": "string", "minLength": 1},
+        "baseURL": {"type": "string", "format": "uri", "pattern": "^https?://"},
         "apiKeyEnv": {"type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$"}
       }
     },

@@ -17,74 +17,34 @@ import (
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
 )
 
-func TestLoadRecoveryIsRestartIdempotentAcrossCrashWindows(t *testing.T) {
-	tests := []struct {
-		name        string
-		restoreTail bool
-	}{
-		{name: "artifact persisted before log truncation", restoreTail: true},
-		{name: "log truncated before restart", restoreTail: false},
+func TestLoadInspectionAndExplicitRecoveryAreRestartIdempotent(t *testing.T) {
+	root := t.TempDir()
+	store, workspace, session := createTestSession(t, root)
+	store = jsonl.New(root, jsonl.Options{Sanitize: func(value any) (json.RawMessage, error) { return json.Marshal(value) }})
+	eventsPath := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID, "events.jsonl")
+	tail := []byte(`{"schema_version":1`)
+	appendFile(t, eventsPath, tail)
+	before, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			root := t.TempDir()
-			store, workspace, session := createTestSession(t, root)
-			eventsPath := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID, "events.jsonl")
-			artifactsDir := filepath.Join(filepath.Dir(eventsPath), "artifacts")
-			tail := []byte(`{"schema_version":1`)
-			appendFile(t, eventsPath, tail)
-
-			first, err := store.Load(context.Background(), session.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(first.RecoveryNote, "incomplete final line") {
-				t.Fatalf("first recovery note=%q", first.RecoveryNote)
-			}
-			beforeArtifacts := directoryNames(t, artifactsDir)
-			if len(beforeArtifacts) != 1 {
-				t.Fatalf("initial recovery artifacts=%v want one", beforeArtifacts)
-			}
-			beforeInfo, err := os.Stat(filepath.Join(artifactsDir, beforeArtifacts[0]))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if test.restoreTail {
-				appendFile(t, eventsPath, tail)
-			}
-
-			restarted := jsonl.New(root, jsonl.Options{
-				Clock:   func() time.Time { return time.Date(2026, 7, 13, 12, 0, 1, 0, time.UTC) },
-				Entropy: strings.NewReader(strings.Repeat("r", 1024)),
-			})
-			replay, err := restarted.Load(context.Background(), session.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(replay.RecoveryNote, "incomplete final line") {
-				t.Fatalf("restart recovery note=%q", replay.RecoveryNote)
-			}
-			afterArtifacts := directoryNames(t, artifactsDir)
-			if strings.Join(afterArtifacts, "\x00") != strings.Join(beforeArtifacts, "\x00") {
-				t.Fatalf("restart artifacts=%v want reused %v", afterArtifacts, beforeArtifacts)
-			}
-			afterPath := filepath.Join(artifactsDir, afterArtifacts[0])
-			afterInfo, err := os.Stat(afterPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !os.SameFile(beforeInfo, afterInfo) {
-				t.Fatal("restart replaced rather than reused the recovery artifact")
-			}
-			artifactBytes, err := os.ReadFile(afterPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(artifactBytes, tail) {
-				t.Fatalf("recovery artifact=%q want %q", artifactBytes, tail)
-			}
-		})
+	replay, err := store.Load(context.Background(), session.ID)
+	if err != nil || !replay.ReadOnly || !strings.Contains(replay.RecoveryNote, "incomplete_final_fragment") {
+		t.Fatalf("pure load replay=%+v err=%v", replay, err)
+	}
+	after, err := os.ReadFile(eventsPath)
+	if err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("pure Load changed journal: err=%v", err)
+	}
+	request := recoveryRequestFromInspection(t, store, session.ID, "operation-hardening-restart", "txn-hardening-restart")
+	result, err := store.RecoverSession(context.Background(), request)
+	if err != nil || result.Status != "recovered" {
+		t.Fatalf("recovery result=%+v err=%v", result, err)
+	}
+	restarted := jsonl.New(root, jsonl.Options{Entropy: strings.NewReader(strings.Repeat("r", 1024))})
+	again, err := restarted.RecoverSession(context.Background(), request)
+	if err != nil || again.Status != "already_recovered" || again.Cursor != result.Cursor {
+		t.Fatalf("restart result=%+v err=%v", again, err)
 	}
 }
 
@@ -174,7 +134,7 @@ func TestAppendRejectsSubstitutedEventsLeaf(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := store.Append(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"}); err == nil {
+	if _, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"}); err == nil {
 		t.Fatal("Append followed a substituted events.jsonl leaf")
 	}
 	after, err := os.ReadFile(target)
@@ -469,7 +429,7 @@ func TestContextCancellationWhileWaitingForSharedRootLock(t *testing.T) {
 	ctx := newObservedContext(parent)
 	waiterDone := make(chan error, 1)
 	go func() {
-		_, err := waiter.Append(ctx, session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"})
+		_, err := waiter.WriteLegacyFixture(ctx, session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"})
 		waiterDone <- err
 	}()
 
@@ -542,16 +502,16 @@ func TestPutCleansTemporaryStateWhenCanceledDuringTempOpen(t *testing.T) {
 	}
 }
 
-func TestLoadPairsToolCallsByMultiplicityAndPayloadShape(t *testing.T) {
+func TestLoadProjectsToolCallMultiplicityWithoutAppendingInterruption(t *testing.T) {
 	type eventSpec struct {
 		kind    domain.EventKind
 		payload any
 	}
 	tests := []struct {
-		name            string
-		events          []eventSpec
-		wantInterrupted bool
-		wantCallCount   int
+		name           string
+		events         []eventSpec
+		wantReadOnly   bool
+		wantDiagnostic string
 	}{
 		{
 			name: "one result closes only one duplicate start",
@@ -560,8 +520,7 @@ func TestLoadPairsToolCallsByMultiplicityAndPayloadShape(t *testing.T) {
 				{kind: domain.EventToolStarted, payload: map[string]any{"call_id": "same"}},
 				{kind: domain.EventToolResult, payload: map[string]any{"call_id": "same"}},
 			},
-			wantInterrupted: true,
-			wantCallCount:   1,
+			wantDiagnostic: "migration.unmatched_activity",
 		},
 		{
 			name: "two results close two duplicate starts",
@@ -571,6 +530,7 @@ func TestLoadPairsToolCallsByMultiplicityAndPayloadShape(t *testing.T) {
 				{kind: domain.EventToolResult, payload: map[string]any{"call_id": "same"}},
 				{kind: domain.EventToolResult, payload: map[string]any{"call_id": "same"}},
 			},
+			wantDiagnostic: "migration.out_of_order",
 		},
 		{
 			name: "nested runner result closes flat start",
@@ -578,6 +538,7 @@ func TestLoadPairsToolCallsByMultiplicityAndPayloadShape(t *testing.T) {
 				{kind: domain.EventToolStarted, payload: map[string]any{"call_id": "nested"}},
 				{kind: domain.EventToolResult, payload: map[string]any{"result": map[string]any{"call_id": "nested"}}},
 			},
+			wantDiagnostic: "migration.out_of_order",
 		},
 		{
 			name: "malformed starts remain independently unmatched",
@@ -588,8 +549,8 @@ func TestLoadPairsToolCallsByMultiplicityAndPayloadShape(t *testing.T) {
 				{kind: domain.EventToolResult, payload: map[string]any{"call_id": ""}},
 				{kind: domain.EventToolResult, payload: map[string]any{"result": map[string]any{"call_id": 42}}},
 			},
-			wantInterrupted: true,
-			wantCallCount:   3,
+			wantReadOnly:   true,
+			wantDiagnostic: "corruption at sequence 2",
 		},
 		{
 			name: "prior interruption does not close future start",
@@ -598,8 +559,7 @@ func TestLoadPairsToolCallsByMultiplicityAndPayloadShape(t *testing.T) {
 				{kind: domain.EventTurnInterrupted, payload: map[string]any{"reason": "prior restart"}},
 				{kind: domain.EventToolStarted, payload: map[string]any{"call_id": "future"}},
 			},
-			wantInterrupted: true,
-			wantCallCount:   1,
+			wantDiagnostic: "migration.unmatched_activity",
 		},
 	}
 
@@ -607,7 +567,7 @@ func TestLoadPairsToolCallsByMultiplicityAndPayloadShape(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			store, _, session := createTestSession(t, t.TempDir())
 			for _, spec := range test.events {
-				if _, err := store.Append(context.Background(), session.ID, spec.kind, spec.payload); err != nil {
+				if _, err := store.WriteLegacyFixture(context.Background(), session.ID, spec.kind, spec.payload); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -616,30 +576,17 @@ func TestLoadPairsToolCallsByMultiplicityAndPayloadShape(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if replay.ReadOnly {
-				t.Fatal("valid tool events replayed read-only")
+			if replay.ReadOnly != test.wantReadOnly {
+				t.Fatalf("read-only=%v want %v note=%q", replay.ReadOnly, test.wantReadOnly, replay.RecoveryNote)
 			}
-			if !test.wantInterrupted {
-				if len(replay.Events) != before || replay.RecoveryNote != "" {
-					t.Fatalf("events=%d note=%q want fully matched", len(replay.Events), replay.RecoveryNote)
+			if test.wantReadOnly {
+				if !strings.Contains(replay.RecoveryNote, test.wantDiagnostic) {
+					t.Fatalf("events=%d note=%q want %q", len(replay.Events), replay.RecoveryNote, test.wantDiagnostic)
 				}
 				return
 			}
-			if len(replay.Events) != before+1 {
-				t.Fatalf("events=%d want interruption after %d durable events", len(replay.Events), before)
-			}
-			last := replay.Events[len(replay.Events)-1]
-			if last.Kind != domain.EventTurnInterrupted {
-				t.Fatalf("last kind=%q want turn.interrupted", last.Kind)
-			}
-			var payload struct {
-				CallCount int `json:"call_count"`
-			}
-			if err := json.Unmarshal(last.Payload, &payload); err != nil {
-				t.Fatal(err)
-			}
-			if payload.CallCount != test.wantCallCount {
-				t.Fatalf("interrupted call_count=%d want %d", payload.CallCount, test.wantCallCount)
+			if len(replay.Events) != before || !strings.Contains(replay.RecoveryNote, test.wantDiagnostic) {
+				t.Fatalf("events=%d note=%q want unchanged source plus %q", len(replay.Events), replay.RecoveryNote, test.wantDiagnostic)
 			}
 		})
 	}

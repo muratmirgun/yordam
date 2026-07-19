@@ -15,6 +15,7 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/provider/openaicompat"
+	"github.com/muratmirgun/yordam/internal/secret"
 )
 
 func TestStreamTextAndDone(t *testing.T) {
@@ -320,6 +321,37 @@ func TestCancellationUnblocksUnconsumedStream(t *testing.T) {
 	}
 	if _, ok := <-events; ok {
 		t.Fatal("stream emitted after cancellation while consumer was backpressured")
+	}
+}
+
+func TestProviderNormalizationUsesLeaseAcrossSSEBoundaries(t *testing.T) {
+	registry := secret.NewRegistry()
+	lease, err := registry.Acquire("generation-provider", [][]byte{[]byte("provider-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lease.Close() }()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(response, "data: {\"choices\":[{\"delta\":{\"content\":\"cHJvdmlkZXItc2\"}}]}\n\n")
+		fmt.Fprint(response, "data: {\"choices\":[{\"delta\":{\"content\":\"VjcmV0\"}}]}\n\n")
+		fmt.Fprint(response, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+	client := openaicompat.New(openaicompat.ClientOptions{HTTPClient: server.Client(), BaseURL: server.URL, Admission: lease})
+	events, err := client.Stream(context.Background(), domain.ModelRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var visible strings.Builder
+	for event := range events {
+		if event.Err != nil {
+			t.Fatal(event.Err)
+		}
+		visible.WriteString(event.Text)
+	}
+	if strings.Contains(visible.String(), "cHJvdmlkZXItc2VjcmV0") || visible.String() != "[REDACTED]" {
+		t.Fatalf("normalized provider output=%q", visible.String())
 	}
 }
 

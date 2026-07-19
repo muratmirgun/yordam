@@ -27,7 +27,6 @@ const (
 type Profile struct {
 	Name         string
 	BaseURL      string
-	APIKey       string
 	APIKeyEnv    string
 	Models       []string
 	DefaultModel string
@@ -79,8 +78,7 @@ type documentProvider struct {
 
 type documentProviderOptions struct {
 	BaseURL   string `json:"baseURL"`
-	APIKey    string `json:"apiKey,omitempty"`
-	APIKeyEnv string `json:"apiKeyEnv,omitempty"`
+	APIKeyEnv string `json:"apiKeyEnv"`
 }
 
 type documentModel struct {
@@ -90,6 +88,110 @@ type documentModel struct {
 type documentLimits struct {
 	MaxToolCalls        *int `json:"maxToolCalls,omitempty"`
 	ShellTimeoutSeconds *int `json:"shellTimeoutSeconds,omitempty"`
+}
+
+func (d *document) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "$schema", "model", "provider", "limits")
+	if err != nil {
+		return err
+	}
+	*d = document{}
+	if err := decodeField(fields, "$schema", &d.Schema); err != nil {
+		return err
+	}
+	if err := decodeField(fields, "model", &d.Model); err != nil {
+		return err
+	}
+	if err := decodeField(fields, "provider", &d.Provider); err != nil {
+		return err
+	}
+	return decodeField(fields, "limits", &d.Limits)
+}
+
+func (d *documentProvider) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "name", "options", "models")
+	if err != nil {
+		return err
+	}
+	*d = documentProvider{}
+	if err := decodeField(fields, "name", &d.Name); err != nil {
+		return err
+	}
+	if err := decodeField(fields, "options", &d.Options); err != nil {
+		return err
+	}
+	return decodeField(fields, "models", &d.Models)
+}
+
+func (d *documentProviderOptions) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "baseURL", "apiKeyEnv")
+	if err != nil {
+		return err
+	}
+	*d = documentProviderOptions{}
+	if err := decodeField(fields, "baseURL", &d.BaseURL); err != nil {
+		return err
+	}
+	return decodeField(fields, "apiKeyEnv", &d.APIKeyEnv)
+}
+
+func (d *documentModel) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "name")
+	if err != nil {
+		return err
+	}
+	*d = documentModel{}
+	return decodeField(fields, "name", &d.Name)
+}
+
+func (d *documentLimits) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "maxToolCalls", "shellTimeoutSeconds")
+	if err != nil {
+		return err
+	}
+	*d = documentLimits{}
+	if _, ok := fields["maxToolCalls"]; ok {
+		var value int
+		if err := decodeField(fields, "maxToolCalls", &value); err != nil {
+			return err
+		}
+		d.MaxToolCalls = &value
+	}
+	if _, ok := fields["shellTimeoutSeconds"]; ok {
+		var value int
+		if err := decodeField(fields, "shellTimeoutSeconds", &value); err != nil {
+			return err
+		}
+		d.ShellTimeoutSeconds = &value
+	}
+	return nil
+}
+
+func decodeExactObject(data []byte, allowed ...string) (map[string]json.RawMessage, error) {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil, fmt.Errorf("object must not be null")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	for key := range fields {
+		if !slices.Contains(allowed, key) {
+			return nil, fmt.Errorf("json: unknown field %q", key)
+		}
+	}
+	return fields, nil
+}
+
+func decodeField(fields map[string]json.RawMessage, name string, destination any) error {
+	raw, ok := fields[name]
+	if !ok {
+		return nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return fmt.Errorf("%s must not be null", name)
+	}
+	return json.Unmarshal(raw, destination)
 }
 
 var envName = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
@@ -112,13 +214,6 @@ func Load(opts LoadOptions) (Config, error) {
 	}
 	value.Standardize()
 	standardized := value.Pack()
-	var shape any
-	if err := json.Unmarshal(standardized, &shape); err != nil {
-		return Config{}, fmt.Errorf("decode standardized JSONC: %w", err)
-	}
-	if containsJSONNull(shape) {
-		return Config{}, fmt.Errorf("null values are not allowed")
-	}
 	var decoded document
 	decoder := json.NewDecoder(bytes.NewReader(standardized))
 	decoder.DisallowUnknownFields()
@@ -135,26 +230,6 @@ func Load(opts LoadOptions) (Config, error) {
 	cfg.raw = append([]byte(nil), raw...)
 	cfg.lookupEnv = opts.LookupEnv
 	return cfg, nil
-}
-
-func containsJSONNull(value any) bool {
-	switch value := value.(type) {
-	case nil:
-		return true
-	case []any:
-		for _, item := range value {
-			if containsJSONNull(item) {
-				return true
-			}
-		}
-	case map[string]any:
-		for _, item := range value {
-			if containsJSONNull(item) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func requireJSONEOF(decoder *json.Decoder) error {
@@ -213,7 +288,6 @@ func normalizeDocument(decoded document) (Config, error) {
 		cfg.Profiles[id] = Profile{
 			Name:         provider.Name,
 			BaseURL:      provider.Options.BaseURL,
-			APIKey:       provider.Options.APIKey,
 			APIKeyEnv:    provider.Options.APIKeyEnv,
 			Models:       models,
 			DefaultModel: defaultModel,
@@ -246,10 +320,7 @@ func (c Config) Validate() error {
 		if !validBaseURL(configured.BaseURL) {
 			return fmt.Errorf("provider %q has invalid baseURL", name)
 		}
-		if configured.APIKey != "" && configured.APIKeyEnv != "" {
-			return fmt.Errorf("provider %q must configure only one of apiKey or apiKeyEnv", name)
-		}
-		if configured.APIKey == "" && !envName.MatchString(configured.APIKeyEnv) {
+		if !envName.MatchString(configured.APIKeyEnv) {
 			return fmt.Errorf("provider %q has invalid apiKeyEnv", name)
 		}
 		if len(configured.Models) == 0 {
@@ -301,9 +372,6 @@ func (c Config) Resolve(opts ResolveOptions) (ResolvedProfile, error) {
 	}
 	key, _ := lookup("YORDAM_API_KEY")
 	if key == "" {
-		key = profile.APIKey
-	}
-	if key == "" && profile.APIKeyEnv != "" {
 		key, _ = lookup(profile.APIKeyEnv)
 	}
 	baseURL := opts.BaseURL
@@ -350,13 +418,15 @@ func (c Config) Models() []domain.ModelSelection {
 }
 
 func (c Config) ProviderKeyEnvironmentNames() []string {
-	names := make([]string, 0, len(c.Profiles))
-	for _, profile := range c.Profiles {
-		if profile.APIKeyEnv != "" {
-			names = append(names, profile.APIKeyEnv)
-		}
+	providers := make([]string, 0, len(c.Profiles))
+	for provider := range c.Profiles {
+		providers = append(providers, provider)
 	}
-	sort.Strings(names)
+	sort.Strings(providers)
+	names := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		names = append(names, c.Profiles[provider].APIKeyEnv)
+	}
 	return names
 }
 
@@ -367,10 +437,7 @@ func (c Config) APIKeys() map[string]string {
 	}
 	keys := make(map[string]string, len(c.Profiles))
 	for name, profile := range c.Profiles {
-		keys[name] = profile.APIKey
-		if keys[name] == "" && profile.APIKeyEnv != "" {
-			keys[name], _ = lookup(profile.APIKeyEnv)
-		}
+		keys[name], _ = lookup(profile.APIKeyEnv)
 	}
 	return keys
 }

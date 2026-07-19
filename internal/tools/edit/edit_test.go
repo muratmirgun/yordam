@@ -91,6 +91,78 @@ func TestEditPrepareDefersFileInspectionUntilAuthorizedPreview(t *testing.T) {
 	}
 }
 
+func TestPlanDigestResourceCarriesExpectedPreimage(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "target.txt")
+	writeFile(t, path, "before\n", 0o600)
+	tool := newTool(t, root, output.Options{})
+	expected := hashString([]byte("before\n"))
+	prepared, err := tool.Plan(context.Background(), request(fmt.Sprintf(`{"path":"target.txt","expected_sha256":"%s","replacements":[{"old":"before","new":"after"}]}`, expected), root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview := prepared.Preview()
+	if len(preview.Resources) != 1 || preview.Resources[0].Digest != expected || preview.FilePlan != nil {
+		t.Fatalf("planning read content or omitted preimage identity: %#v", preview)
+	}
+}
+
+func TestRevalidateRejectsPreviewedExistingFilePreimageDrift(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(string) error
+		want   string
+	}{
+		{name: "content changed at same path", change: func(path string) error { return os.WriteFile(path, []byte("changed\n"), 0o600) }, want: "stale preimage"},
+		{name: "target deleted", change: os.Remove, want: "re-resolve edit path"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "target.txt")
+			writeFile(t, path, "before\n", 0o600)
+			tool := newTool(t, root, output.Options{})
+			expected := hashString([]byte("before\n"))
+			preparedTool, err := tool.Prepare(context.Background(), request(fmt.Sprintf(`{"path":"target.txt","expected_sha256":"%s","replacements":[{"old":"before","new":"after"}]}`, expected), root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := preparedTool.(ports.PreviewPreparer).PreparePreview(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.change(path); err != nil {
+				t.Fatal(err)
+			}
+			_, err = preparedTool.(ports.ResourceRevalidator).Revalidate(context.Background())
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Revalidate error=%v want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestRevalidateRejectsPreviewedCreateTargetAppearance(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "target.txt")
+	tool := newTool(t, root, output.Options{})
+	preparedTool, err := tool.Prepare(context.Background(), request(`{"path":"target.txt","create":true,"new_content":"created\n"}`, root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preparedTool.(ports.PreviewPreparer).PreparePreview(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("appeared\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = preparedTool.(ports.ResourceRevalidator).Revalidate(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "appeared") {
+		t.Fatalf("Revalidate error=%v", err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "appeared\n" {
+		t.Fatalf("revalidation mutated appeared target: %q %v", got, err)
+	}
+}
+
 func TestEditPreviewsAndRejectsStalePreimage(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "a.txt")

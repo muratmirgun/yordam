@@ -2,14 +2,20 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/agent"
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/journal"
+	"github.com/muratmirgun/yordam/internal/orchestrator"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 )
 
@@ -27,68 +33,101 @@ type MutablePolicy interface {
 
 type RestorePolicy func(domain.SessionReplay) MutablePolicy
 
+type sessionChangeService interface {
+	CommitSessionChange(context.Context, orchestrator.SessionChangeRequest) (protocol.CommandResult, error)
+}
+
+type sessionStore interface {
+	Create(context.Context, domain.Workspace, domain.PermissionMode, domain.ModelSelection) (domain.Session, error)
+	List(context.Context, domain.Workspace) ([]domain.SessionSummary, error)
+}
+
 type EventLogger interface {
 	Event(string, map[string]any) error
 }
 
 type Options struct {
-	RuntimeSet       RuntimeSet
-	ReloadRuntime    ReloadRuntime
-	Redactors        *secret.Binding
-	Runtime          Runtime
-	Input            TurnInput
-	Compact          func(context.Context) error
-	CompactSession   CompactSession
-	RuntimeEvents    <-chan agent.RuntimeEvent
-	Sessions         ports.SessionStore
-	Session          domain.Session
-	Replay           domain.SessionReplay
-	Workspace        domain.Workspace
-	Policy           MutablePolicy
-	RestorePolicy    RestorePolicy
-	ConfiguredModels []domain.ModelSelection
-	CommandBuffer    int
-	EventBuffer      int
-	Logger           EventLogger
-	Close            func() error
-	SessionChanged   func(string)
+	RuntimeSet    RuntimeSet
+	ReloadRuntime ReloadRuntime
+	Redactors     *secret.Binding
+	Input         TurnInput
+	Compact       func(context.Context) error
+	RuntimeEvents <-chan agent.RuntimeEvent
+	Sessions      sessionStore
+	Session       domain.Session
+	Replay        domain.SessionReplay
+	Workspace     domain.Workspace
+	Policy        MutablePolicy
+	RestorePolicy RestorePolicy
+	CommandBuffer int
+	EventBuffer   int
+	// LegacyQueueCapacity bounds the compatibility TUI consumer. The versioned
+	// broker owns all reconnectable production subscriptions.
+	LegacyQueueCapacity      int
+	NonReconnectableOverflow func()
+	Logger                   EventLogger
+	Close                    func() error
+	SessionChanged           func(string)
+	WorkspaceControl         protocol.JournalRef
 }
 
 type App struct {
 	runtimeSet       RuntimeSet
 	reloadRuntime    ReloadRuntime
 	redactors        *secret.Binding
-	runtime          Runtime
 	input            TurnInput
 	compact          func(context.Context) error
-	compactSession   CompactSession
 	runtimeEvents    <-chan agent.RuntimeEvent
-	sessions         ports.SessionStore
+	sessions         sessionStore
 	session          domain.Session
 	replay           domain.SessionReplay
 	replayValid      bool
 	workspace        domain.Workspace
 	policy           MutablePolicy
 	restorePolicy    RestorePolicy
-	configuredModels []domain.ModelSelection
 	commands         chan Command
 	events           chan Event
 	logger           EventLogger
 	close            func() error
 	sessionChanged   func(string)
-	emitTurnAccepted bool
+	workspaceControl protocol.JournalRef
+	sessionChanges   sessionChangeService
 
-	pendingMu  sync.Mutex
-	pending    map[string]chan domain.PermissionDecision
-	eventMu    sync.Mutex
-	eventQueue []Event
-	eventWake  chan struct{}
+	pendingMu              sync.Mutex
+	pending                map[string]*pendingPermission
+	pendingInternal        map[string]*pendingPermission
+	permissionCallSequence uint64
+	eventMu                sync.Mutex
+	legacyQueue            []Event
+	legacyQueueCapacity    int
+	overflowOnce           sync.Once
+	nonReconnectableCancel func()
+	eventWake              chan struct{}
 }
 
+type pendingPermission struct {
+	internalCallID  string
+	displayedCallID string
+	decision        chan domain.PermissionDecision
+	internalScope   string
+	displayedScope  string
+}
+
+type permissionResolution uint8
+
+const (
+	permissionResolved permissionResolution = iota
+	permissionStale
+	permissionInvalidScope
+)
+
+var errPermissionCorrelationUnavailable = errors.New("permission correlation unavailable")
+
 type operationResult struct {
-	kind       operationKind
-	err        error
-	runtimeSet RuntimeSet
+	kind            operationKind
+	err             error
+	runtimeSet      RuntimeSet
+	throughProtocol bool
 }
 
 type operationKind string
@@ -105,48 +144,43 @@ func New(options Options) *App {
 		workspace = options.Session.Workspace
 	}
 	runtimeSet := options.RuntimeSet
-	emitTurnAccepted := runtimeSet.Runtime != nil || runtimeSet.ConfigurationError != nil
-	if runtimeSet.Runtime == nil && (options.Runtime != nil || options.Compact != nil || options.CompactSession != nil || len(options.ConfiguredModels) > 0) {
-		runtimeSet = RuntimeSet{
-			Runtime:          options.Runtime,
-			CompactSession:   options.CompactSession,
-			Models:           append([]domain.ModelSelection(nil), options.ConfiguredModels...),
-			DefaultSelection: options.Session.Selection,
-			unchecked:        true,
-		}
-	}
-	if runtimeSet.CompactSession == nil && options.CompactSession != nil {
-		runtimeSet.CompactSession = options.CompactSession
-	}
 	redactors := options.Redactors
 	if redactors == nil {
-		redactors = secret.NewBinding(runtimeSet.Redactor)
+		redactors = secret.NewBinding(secret.New())
+	}
+	legacyQueueCapacity := options.LegacyQueueCapacity
+	if legacyQueueCapacity <= 0 {
+		legacyQueueCapacity = 256
 	}
 	application := &App{
-		runtimeSet:       runtimeSet,
-		reloadRuntime:    options.ReloadRuntime,
-		redactors:        redactors,
-		runtime:          options.Runtime,
-		input:            options.Input,
-		compact:          options.Compact,
-		compactSession:   options.CompactSession,
-		runtimeEvents:    options.RuntimeEvents,
-		sessions:         options.Sessions,
-		session:          options.Session,
-		replay:           options.Replay,
-		replayValid:      true,
-		workspace:        workspace,
-		policy:           options.Policy,
-		restorePolicy:    options.RestorePolicy,
-		configuredModels: append([]domain.ModelSelection(nil), options.ConfiguredModels...),
-		commands:         make(chan Command, options.CommandBuffer),
-		events:           make(chan Event, options.EventBuffer),
-		logger:           options.Logger,
-		close:            options.Close,
-		sessionChanged:   options.SessionChanged,
-		emitTurnAccepted: emitTurnAccepted,
-		pending:          make(map[string]chan domain.PermissionDecision),
-		eventWake:        make(chan struct{}, 1),
+		runtimeSet:             runtimeSet,
+		reloadRuntime:          options.ReloadRuntime,
+		redactors:              redactors,
+		input:                  options.Input,
+		compact:                options.Compact,
+		runtimeEvents:          options.RuntimeEvents,
+		sessions:               options.Sessions,
+		session:                options.Session,
+		replay:                 options.Replay,
+		replayValid:            true,
+		workspace:              workspace,
+		policy:                 options.Policy,
+		restorePolicy:          options.RestorePolicy,
+		commands:               make(chan Command, options.CommandBuffer),
+		events:                 make(chan Event, options.EventBuffer),
+		logger:                 options.Logger,
+		close:                  options.Close,
+		sessionChanged:         options.SessionChanged,
+		workspaceControl:       options.WorkspaceControl,
+		sessionChanges:         runtimeSet.SessionChanges,
+		legacyQueueCapacity:    legacyQueueCapacity,
+		nonReconnectableCancel: options.NonReconnectableOverflow,
+		pending:                make(map[string]*pendingPermission),
+		pendingInternal:        make(map[string]*pendingPermission),
+		eventWake:              make(chan struct{}, 1),
+	}
+	if application.sessionChanges == nil {
+		application.sessionChanges, _ = options.Sessions.(sessionChangeService)
 	}
 	runtimeSet.BindApprover(application)
 	return application
@@ -161,6 +195,7 @@ func (a *App) Events() <-chan Event {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	defer func() { a.runtimeSet.retireSecrets() }()
 	publisherCtx, stopPublisher := context.WithCancel(context.Background())
 	publisherDone := make(chan struct{})
 	go func() {
@@ -175,6 +210,7 @@ func (a *App) Run(ctx context.Context) error {
 		defer func() { _ = a.close() }()
 	}
 	done := make(chan operationResult, 1)
+	protocolEvents := make(chan Event, 64)
 	runtimeEvents := a.runtimeEvents
 	var activeCancel context.CancelFunc
 	var activeOperation operationKind
@@ -216,20 +252,60 @@ func (a *App) Run(ctx context.Context) error {
 					ctxDone = nil
 				}
 			}
+		case event := <-protocolEvents:
+			if event.Kind != "" && !a.publish(ctx, event) {
+				if activeCancel != nil {
+					activeCancel()
+				}
+				a.clearPending()
+				shutdownRequested = true
+				shutdownErr = ctx.Err()
+				ctxDone = nil
+			}
 		case command := <-a.commands:
 			switch command.Kind {
 			case CommandStartTurn:
 				if !a.replayValid {
-					a.publish(ctx, Event{Kind: EventRejected, Message: "session context is unavailable until replay reload succeeds", Draft: command.Prompt})
+					a.publish(ctx, Event{Kind: EventRejected, DraftID: command.DraftID, Message: "session context is unavailable until replay reload succeeds", Draft: command.Prompt})
 					continue
 				}
 				if activeOperation != "" {
-					a.publish(ctx, Event{Kind: EventRejected, Message: "a turn is already active", Draft: command.Prompt})
+					a.publish(ctx, Event{Kind: EventRejected, DraftID: command.DraftID, Message: "a turn is already active", Draft: command.Prompt})
 					continue
 				}
 				activeSet := a.runtimeSet
 				if err := activeSet.Ready(a.session.Selection); err != nil {
-					a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), Draft: command.Prompt})
+					a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
+					continue
+				}
+				turnCtx, cancel := context.WithCancel(ctx)
+				activeCancel = cancel
+				activeOperation = operationTurn
+				if activeSet.ApplicationService != nil && activeSet.LegacyAdapter != nil {
+					applicationCommand, err := activeSet.LegacyAdapter.Command(command)
+					if err != nil {
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
+						continue
+					}
+					_, subscription, err := activeSet.ApplicationService.SnapshotAndSubscribe(ctx, protocol.SnapshotRequest{
+						ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(a.session.ID), Consumer: "legacy_tui", QueueCapacity: 256,
+					})
+					if err != nil {
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
+						continue
+					}
+					go consumeLegacyProtocolEvents(ctx, subscription, activeSet.LegacyAdapter, protocolEvents)
+					go func() {
+						result, executeErr := activeSet.ApplicationService.Execute(turnCtx, applicationCommand)
+						if executeErr == nil && result.Error != nil {
+							executeErr = errors.New(result.Error.Message)
+						}
+						done <- operationResult{kind: operationTurn, err: executeErr, throughProtocol: true}
+					}()
 					continue
 				}
 				input := agent.RunInput{Session: a.session, Replay: a.replay, Prompt: command.Prompt}
@@ -237,21 +313,30 @@ func (a *App) Run(ctx context.Context) error {
 					var err error
 					input, err = a.input(command.Prompt)
 					if err != nil {
-						a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error()})
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 						continue
 					}
 				}
+				if activeSet.Orchestrator != nil {
+					metadata, head, err := a.prepareTurnCommand(ctx, command.Prompt)
+					if err != nil {
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
+						continue
+					}
+					input.Command, input.ExpectedHead = metadata, head
+				}
 				if activeSet.Runtime == nil {
+					cancel()
+					activeCancel, activeOperation = nil, ""
 					err := errors.New("runtime is not configured")
-					a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), Draft: command.Prompt})
+					a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 					continue
 				}
-				if a.emitTurnAccepted {
-					a.publish(ctx, Event{Kind: EventTurnAccepted, Draft: command.Prompt})
-				}
-				turnCtx, cancel := context.WithCancel(ctx)
-				activeCancel = cancel
-				activeOperation = operationTurn
+				a.publish(ctx, Event{Kind: EventTurnAccepted, DraftID: command.DraftID, Draft: command.Prompt})
 				go func() {
 					done <- operationResult{kind: operationTurn, err: activeSet.Runtime.RunTurn(turnCtx, input)}
 				}()
@@ -261,8 +346,11 @@ func (a *App) Run(ctx context.Context) error {
 					a.clearPending()
 				}
 			case CommandResolvePermission:
-				if !a.resolvePermission(command.CallID, command.Decision) {
+				switch a.resolvePermission(command.CallID, command.Decision) {
+				case permissionStale:
 					a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q is stale", command.CallID)})
+				case permissionInvalidScope:
+					a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q response is invalid", command.CallID)})
 				}
 			case CommandCompact:
 				if !a.replayValid {
@@ -387,7 +475,7 @@ func (a *App) Run(ctx context.Context) error {
 				}
 			}
 			if a.sessions != nil && a.session.ID != "" && (result.kind == operationTurn || result.err == nil) {
-				refreshed, err := a.sessions.Load(ctx, a.session.ID)
+				refreshed, err := a.inspectSession(ctx, a.session.ID)
 				if err != nil {
 					a.replayValid = false
 					event = Event{Kind: EventError, Err: err, Message: err.Error()}
@@ -402,7 +490,10 @@ func (a *App) Run(ctx context.Context) error {
 					event.Session = a.session
 				}
 			}
-			if !a.publish(ctx, event) {
+			if result.throughProtocol && result.err == nil {
+				event.Kind = ""
+			}
+			if event.Kind != "" && !a.publish(ctx, event) {
 				if !shutdownRequested {
 					return ctx.Err()
 				}
@@ -419,6 +510,61 @@ func (a *App) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+type sessionHeadReader interface {
+	Head(context.Context, protocol.JournalRef) (protocol.CommittedCursor, error)
+}
+
+type sessionInspector interface {
+	InspectSession(context.Context, protocol.SessionID) (journal.SessionInspection, error)
+}
+
+type legacyReplayReader interface {
+	Replay(context.Context, string) (domain.SessionReplay, error)
+}
+
+func (a *App) inspectSession(ctx context.Context, sessionID string) (domain.SessionReplay, error) {
+	inspector, ok := a.sessions.(sessionInspector)
+	if ok {
+		inspection, err := inspector.InspectSession(ctx, protocol.SessionID(sessionID))
+		if err != nil {
+			return domain.SessionReplay{}, err
+		}
+		return LegacyReplayFromInspection(inspection), nil
+	}
+	if reader, legacy := a.sessions.(legacyReplayReader); legacy && a.runtimeSet.Orchestrator == nil {
+		return reader.Replay(ctx, sessionID)
+	}
+	return domain.SessionReplay{}, fmt.Errorf("pure session inspector is not configured")
+}
+
+func (a *App) prepareTurnCommand(ctx context.Context, prompt string) (orchestrator.CommandMetadata, protocol.CommittedCursor, error) {
+	reader, ok := a.sessions.(sessionHeadReader)
+	if !ok {
+		return orchestrator.CommandMetadata{}, protocol.CommittedCursor{}, fmt.Errorf("session journal head reader is not configured")
+	}
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(a.session.ID)}
+	head, err := reader.Head(ctx, ref)
+	if err != nil {
+		return orchestrator.CommandMetadata{}, protocol.CommittedCursor{}, err
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return orchestrator.CommandMetadata{}, protocol.CommittedCursor{}, err
+	}
+	id := fmt.Sprintf("legacy-turn-%x", raw)
+	digest, err := canonicaljson.Digest(struct {
+		SessionID string `json:"session_id"`
+		Prompt    string `json:"prompt"`
+	}{a.session.ID, prompt})
+	if err != nil {
+		return orchestrator.CommandMetadata{}, protocol.CommittedCursor{}, err
+	}
+	return orchestrator.CommandMetadata{
+		CommandID: protocol.CommandID(id), IdempotencyKey: id, RequestDigest: digest,
+		Actor: protocol.ActorRef{ID: "legacy-user", Kind: protocol.ActorUser},
+	}, head, nil
 }
 
 func (a *App) drainRuntimeEvents(ctx context.Context, runtimeEvents <-chan agent.RuntimeEvent) {
@@ -449,26 +595,40 @@ func (a *App) completeReload(ctx context.Context, result operationResult) {
 		if selection == (domain.ModelSelection{}) {
 			err := configurationError(candidate.configPath, "configuration has no default model", nil)
 			a.publish(ctx, Event{Kind: EventReloadCompleted, Err: err, Message: err.Error()})
+			candidate.retireSecrets()
 			return
 		}
 		if a.sessions != nil && a.session.ID != "" {
-			event, err := a.sessions.Append(ctx, a.session.ID, domain.EventModelChanged, domain.ModelChangedPayload{Selection: selection})
-			if err != nil {
+			changeService := candidate.SessionChanges
+			if changeService == nil {
+				changeService = a.sessionChanges
+			}
+			if err := a.commitSettingUsing(ctx, candidate, changeService, protocol.EventModelChanged, protocol.ModelChangedV1{ProviderID: protocol.ProviderID(selection.Profile), ModelID: protocol.ModelID(selection.Model)}); err != nil {
 				a.publish(ctx, Event{Kind: EventReloadCompleted, Err: err, Message: err.Error()})
+				candidate.retireSecrets()
 				return
 			}
-			a.replay.Events = append(a.replay.Events, event)
-			a.session.LastSeq = event.Seq
-			a.session.UpdatedAt = event.Time
 		}
 		a.session.Selection = selection
 		a.replay.Session = a.session
 	}
+	if candidate.Orchestrator != nil && a.workspaceControl != (protocol.JournalRef{}) {
+		if err := a.activateRuntimeGeneration(ctx, candidate); err != nil {
+			a.publish(ctx, Event{Kind: EventReloadCompleted, Err: err, Message: err.Error()})
+			candidate.retireSecrets()
+			return
+		}
+	}
 	candidate.BindApprover(a)
+	previous := a.runtimeSet
 	a.runtimeSet = candidate
+	if candidate.SessionChanges != nil {
+		a.sessionChanges = candidate.SessionChanges
+	}
 	if a.redactors != nil {
 		a.redactors.Replace(candidate.Redactor)
 	}
+	previous.retireSecrets()
 	event := Event{
 		Kind:      EventReloadCompleted,
 		Applied:   true,
@@ -478,8 +638,68 @@ func (a *App) completeReload(ctx context.Context, result operationResult) {
 	}
 	if readyErr := candidate.Ready(selection); readyErr != nil {
 		event.Err = readyErr
+		event.NonTerminal = true
 	}
 	a.publish(ctx, event)
+}
+
+func (a *App) activateRuntimeGeneration(ctx context.Context, candidate RuntimeSet) error {
+	reader, ok := a.sessions.(sessionHeadReader)
+	if !ok {
+		return fmt.Errorf("workspace-control head reader is not configured")
+	}
+	head, err := reader.Head(ctx, a.workspaceControl)
+	if err != nil {
+		return err
+	}
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return err
+	}
+	identity := fmt.Sprintf("reload-%x", random)
+	actor := protocol.ActorRef{ID: "legacy-user", Kind: protocol.ActorUser}
+	requestDigest, err := canonicaljson.Digest(struct {
+		Manifest protocol.RuntimeGenerationManifest `json:"manifest"`
+		Previous protocol.RuntimeGenerationID       `json:"previous"`
+	}{candidate.Manifest, a.runtimeSet.RuntimeGenerationID})
+	if err != nil {
+		return err
+	}
+	descriptorDigest, err := canonicaljson.Digest(struct {
+		Name string `json:"name"`
+	}{"runtime.reload"})
+	if err != nil {
+		return err
+	}
+	body := protocol.ActionPlanBody{
+		CallID: identity, Tool: protocol.ToolIdentity{Source: "runtime", Authority: "yordam", Name: "reload"}, SourceRevision: "runtime-v1",
+		DescriptorDigest: descriptorDigest, Action: "runtime.reload", Purpose: "activate runtime generation",
+		Resources:      []protocol.ResourceTarget{{Kind: "runtime_generation", CanonicalID: string(candidate.RuntimeGenerationID)}},
+		ExecutionLocus: "runtime", Effect: "mutation", Boundary: "process", Reversibility: "exact", VerificationCoverage: "exact",
+		RequestedProfile: "restricted", EffectiveProfile: "restricted", RuntimeGenerationID: candidate.RuntimeGenerationID,
+	}
+	planDigest, err := canonicaljson.Digest(body)
+	if err != nil {
+		return err
+	}
+	payload, err := canonicaljson.Marshal(protocol.RuntimeGenerationActivatedV1{Manifest: protocol.DeepCopy(candidate.Manifest), Previous: a.runtimeSet.RuntimeGenerationID})
+	if err != nil {
+		return err
+	}
+	eventActor := actor
+	result, err := candidate.Orchestrator.RunControl(ctx, orchestrator.ControlRequest{
+		Command:     orchestrator.CommandMetadata{CommandID: protocol.CommandID(identity), IdempotencyKey: identity, RequestDigest: requestDigest, Actor: actor},
+		OperationID: protocol.ControlOperationID(identity), Kind: orchestrator.OperationReloadActivation, Journal: a.workspaceControl, ExpectedHead: head,
+		TransactionID: protocol.TransactionID(identity), Runtime: protocol.DeepCopy(candidate.Manifest), Plan: protocol.ActionPlan{Body: body, Digest: planDigest},
+		Event: protocol.ProposedEvent{EventID: protocol.EventID(identity), Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventRuntimeGenerationActivated, Actor: &eventActor, RuntimeGenerationID: candidate.RuntimeGenerationID, Payload: payload},
+	})
+	if err != nil {
+		return err
+	}
+	if result.Status != "completed" {
+		return fmt.Errorf("runtime activation status %q", result.Status)
+	}
+	return nil
 }
 
 func (a *App) applyMode(ctx context.Context, mode domain.PermissionMode) bool {
@@ -487,15 +707,11 @@ func (a *App) applyMode(ctx context.Context, mode domain.PermissionMode) bool {
 		a.publish(ctx, Event{Kind: EventError, Message: "session store is not configured", NonTerminal: true})
 		return false
 	}
-	event, err := a.sessions.Append(ctx, a.session.ID, domain.EventModeChanged, domain.ModeChangedPayload{Mode: mode})
-	if err != nil {
+	if err := a.commitSessionChange(ctx, protocol.EventModeChanged, protocol.ModeChangedV1{Mode: string(mode)}); err != nil {
 		a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), NonTerminal: true})
 		return false
 	}
-	a.replay.Events = append(a.replay.Events, event)
 	a.session.Mode = mode
-	a.session.LastSeq = event.Seq
-	a.session.UpdatedAt = event.Time
 	if a.policy != nil {
 		a.policy.SetMode(mode)
 	}
@@ -507,15 +723,11 @@ func (a *App) applyModel(ctx context.Context, selection domain.ModelSelection) b
 		a.publish(ctx, Event{Kind: EventError, Message: "session store is not configured", NonTerminal: true})
 		return false
 	}
-	event, err := a.sessions.Append(ctx, a.session.ID, domain.EventModelChanged, domain.ModelChangedPayload{Selection: selection})
-	if err != nil {
+	if err := a.commitSessionChange(ctx, protocol.EventModelChanged, protocol.ModelChangedV1{ProviderID: protocol.ProviderID(selection.Profile), ModelID: protocol.ModelID(selection.Model)}); err != nil {
 		a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), NonTerminal: true})
 		return false
 	}
-	a.replay.Events = append(a.replay.Events, event)
 	a.session.Selection = selection
-	a.session.LastSeq = event.Seq
-	a.session.UpdatedAt = event.Time
 	return a.publish(ctx, a.settingEvent())
 }
 
@@ -526,20 +738,124 @@ func (a *App) acknowledgeAutoShell(ctx context.Context, callID string, decision 
 	if a.sessions == nil || a.session.ID == "" {
 		return a.publish(ctx, Event{Kind: EventError, Message: "session store is not configured", NonTerminal: true})
 	}
-	event, err := a.sessions.Append(ctx, a.session.ID, domain.EventTrustedExecutionAcknowledged, domain.TrustedExecutionPayload{Enabled: true})
-	if err != nil {
+	if callID != "" {
+		switch a.validatePermissionResponse(callID, decision) {
+		case permissionStale:
+			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q is stale", callID)})
+		case permissionInvalidScope:
+			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q response is invalid", callID)})
+		}
+	}
+	if err := a.commitSessionChange(ctx, protocol.EventTrustedExecutionAcknowledged, protocol.TrustedExecutionAcknowledgedV1{Enabled: true, Profile: "unsandboxed"}); err != nil {
 		return a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), NonTerminal: true})
 	}
-	a.replay.Events = append(a.replay.Events, event)
-	a.session.LastSeq = event.Seq
-	a.session.UpdatedAt = event.Time
 	if a.policy != nil {
 		a.policy.AcknowledgeAutoShell()
 	}
-	if callID != "" && !a.resolvePermission(callID, decision) {
-		return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q is stale", callID)})
+	if callID != "" {
+		switch a.resolvePermission(callID, decision) {
+		case permissionStale:
+			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q is stale", callID)})
+		case permissionInvalidScope:
+			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q response is invalid", callID)})
+		}
 	}
 	return a.publish(ctx, a.settingEvent())
+}
+
+func (a *App) commitSessionChange(ctx context.Context, kind string, payload any) error {
+	return a.commitSettingUsing(ctx, a.runtimeSet, a.sessionChanges, kind, payload)
+}
+
+func (a *App) commitSettingUsing(ctx context.Context, runtime RuntimeSet, fallback sessionChangeService, kind string, payload any) error {
+	if runtime.ApplicationService != nil && runtime.LegacyAdapter != nil {
+		var command Command
+		switch value := payload.(type) {
+		case protocol.ModeChangedV1:
+			command = Command{Kind: CommandChangeMode, Mode: domain.PermissionMode(value.Mode)}
+		case protocol.ModelChangedV1:
+			command = Command{Kind: CommandChangeModel, Selection: domain.ModelSelection{Profile: string(value.ProviderID), Model: string(value.ModelID)}}
+		case protocol.TrustedExecutionAcknowledgedV1:
+			command = Command{Kind: CommandAcknowledgeAutoShell}
+		default:
+			return fmt.Errorf("unsupported application setting payload %T", payload)
+		}
+		applicationCommand, err := runtime.LegacyAdapter.Command(command)
+		if err != nil {
+			return err
+		}
+		result, err := runtime.ApplicationService.Execute(ctx, applicationCommand)
+		if err != nil {
+			return err
+		}
+		if result.Error != nil {
+			return fmt.Errorf("%s: %s", result.Error.Code, result.Error.Message)
+		}
+		if result.Status != "completed" || result.Cursor.SelectedSession == nil {
+			return fmt.Errorf("setting command returned status %q without a selected-session cursor", result.Status)
+		}
+		a.session.LastSeq = result.Cursor.SelectedSession.CommitSeq
+		a.session.UpdatedAt = time.Now().UTC()
+		updated, err := a.inspectSession(ctx, a.session.ID)
+		if err != nil {
+			return err
+		}
+		projected := ProjectSessionState(updated)
+		updated.Session.Mode = projected.Mode
+		updated.Session.Selection = projected.Selection
+		a.replay = updated
+		a.replayValid = true
+		return nil
+	}
+	return a.commitSessionChangeCompatibility(ctx, fallback, runtime.RuntimeGenerationID, kind, payload)
+}
+
+func (a *App) commitSessionChangeCompatibility(ctx context.Context, service sessionChangeService, generation protocol.RuntimeGenerationID, kind string, payload any) error {
+	if service == nil {
+		return fmt.Errorf("session change orchestrator is not configured")
+	}
+	metadata, head, err := a.prepareTurnCommand(ctx, kind)
+	if err != nil {
+		return err
+	}
+	raw, err := canonicaljson.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return err
+	}
+	identity := fmt.Sprintf("session-change-%x", random)
+	actor := protocol.DeepCopy(metadata.Actor)
+	result, err := service.CommitSessionChange(ctx, orchestrator.SessionChangeRequest{
+		Command: metadata, OperationID: protocol.ControlOperationID(identity),
+		Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(a.session.ID)}, SessionID: protocol.SessionID(a.session.ID),
+		ExpectedHead: head, TransactionID: protocol.TransactionID(identity), RuntimeGenerationID: generation,
+		Consequential: true,
+		Event: protocol.ProposedEvent{
+			EventID: protocol.EventID(identity), Time: time.Now().UTC(), PayloadVersion: 1, Kind: kind, SessionID: protocol.SessionID(a.session.ID),
+			Actor: &actor, RuntimeGenerationID: generation, Payload: raw,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if result.Cursor.SelectedSession == nil {
+		return fmt.Errorf("session change returned no session cursor")
+	}
+	a.session.LastSeq = result.Cursor.SelectedSession.CommitSeq
+	a.session.UpdatedAt = time.Now().UTC()
+	updated, err := a.inspectSession(ctx, a.session.ID)
+	if err != nil {
+		return err
+	}
+	projected := ProjectSessionState(updated)
+	updated.Session.Mode = projected.Mode
+	updated.Session.Selection = projected.Selection
+	a.replay = updated
+	a.replayValid = true
+	return nil
 }
 
 func (a *App) newSession(ctx context.Context) bool {
@@ -564,7 +880,7 @@ func (a *App) openSession(ctx context.Context, sessionID string) bool {
 	if sessionID == "" {
 		return a.publish(ctx, Event{Kind: EventRejected, Message: "session ID is empty"})
 	}
-	replay, err := a.sessions.Load(ctx, sessionID)
+	replay, err := a.inspectSession(ctx, sessionID)
 	if err != nil {
 		return a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), NonTerminal: true})
 	}
@@ -576,14 +892,15 @@ func (a *App) openSession(ctx context.Context, sessionID string) bool {
 	replay.Session.Selection = state.Selection
 	if !a.selectionConfigured(replay.Session.Selection) && a.selectionConfigured(a.runtimeSet.DefaultSelection) {
 		selection := a.runtimeSet.DefaultSelection
-		event, err := a.sessions.Append(ctx, replay.Session.ID, domain.EventModelChanged, domain.ModelChangedPayload{Selection: selection})
-		if err != nil {
+		previousSession := a.session
+		a.session = replay.Session
+		if err := a.commitSessionChange(ctx, protocol.EventModelChanged, protocol.ModelChangedV1{ProviderID: protocol.ProviderID(selection.Profile), ModelID: protocol.ModelID(selection.Model)}); err != nil {
+			a.session = previousSession
 			return a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error(), NonTerminal: true})
 		}
-		replay.Events = append(replay.Events, event)
 		replay.Session.Selection = selection
-		replay.Session.LastSeq = event.Seq
-		replay.Session.UpdatedAt = event.Time
+		replay.Session.LastSeq = a.session.LastSeq
+		replay.Session.UpdatedAt = a.session.UpdatedAt
 	}
 	var policy MutablePolicy
 	if a.restorePolicy != nil {
@@ -604,11 +921,11 @@ func (a *App) openSession(ctx context.Context, sessionID string) bool {
 }
 
 func (a *App) modelConfigured(selection domain.ModelSelection) bool {
-	return slices.Contains(a.runtimeSet.Models, selection) || slices.Contains(a.configuredModels, selection)
+	return slices.Contains(a.runtimeSet.Models, selection)
 }
 
 func (a *App) selectionConfigured(selection domain.ModelSelection) bool {
-	if a.runtimeSet.unchecked && len(a.runtimeSet.Models) == 0 && len(a.configuredModels) == 0 {
+	if a.runtimeSet.unchecked && len(a.runtimeSet.Models) == 0 {
 		return true
 	}
 	return a.modelConfigured(selection)
@@ -633,51 +950,141 @@ func (a *App) settingEvent() Event {
 }
 
 func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domain.PermissionDecision, error) {
-	callID := prompt.Call.Request.CallID
-	decision := make(chan domain.PermissionDecision, 1)
-
-	a.pendingMu.Lock()
-	if _, exists := a.pending[callID]; exists {
-		a.pendingMu.Unlock()
-		return domain.PermissionDecision{}, fmt.Errorf("permission call %q is already pending", callID)
+	internalCallID := prompt.Call.Request.CallID
+	var redactor secret.Redacting = secret.New()
+	if a.redactors != nil {
+		redactor = a.redactors.Snapshot()
 	}
-	a.pending[callID] = decision
+	published, sanitizeErr := sanitizePublishedEvent(redactor, Event{Kind: EventPermissionRequested, Permission: &prompt})
+	if sanitizeErr != nil {
+		a.enqueuePublishedEvent(ctx, published)
+		if err := ctx.Err(); err != nil {
+			return domain.PermissionDecision{}, err
+		}
+		return domain.PermissionDecision{}, sanitizeErr
+	}
+	a.pendingMu.Lock()
+	if _, exists := a.pendingInternal[internalCallID]; exists {
+		a.pendingMu.Unlock()
+		return domain.PermissionDecision{}, errors.New("duplicate permission call is already pending")
+	}
+	displayedCallID, err := a.newDisplayedPermissionCallID(redactor)
+	if err != nil {
+		a.pendingMu.Unlock()
+		failure := Event{Kind: EventError, Message: err.Error(), Err: err}
+		a.enqueuePublishedEvent(ctx, failure)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return domain.PermissionDecision{}, ctxErr
+		}
+		return domain.PermissionDecision{}, err
+	}
+	published = permissionEventWithCallID(published, displayedCallID)
+	pending := &pendingPermission{
+		internalCallID:  internalCallID,
+		displayedCallID: displayedCallID,
+		decision:        make(chan domain.PermissionDecision, 1),
+		internalScope:   permissionApprovalScope(prompt.Call),
+		displayedScope:  permissionApprovalScope(published.Permission.Call),
+	}
+	a.pending[displayedCallID] = pending
+	a.pendingInternal[internalCallID] = pending
 	a.pendingMu.Unlock()
-	defer a.removePending(callID, decision)
+	defer a.removePending(pending)
 
-	if !a.publish(ctx, Event{Kind: EventPermissionRequested, Permission: &prompt}) {
+	if !a.enqueuePublishedEvent(ctx, published) {
 		return domain.PermissionDecision{}, ctx.Err()
 	}
 	select {
-	case resolved := <-decision:
+	case resolved := <-pending.decision:
 		return resolved, nil
 	case <-ctx.Done():
 		return domain.PermissionDecision{}, ctx.Err()
 	}
 }
 
-func (a *App) resolvePermission(callID string, decision domain.PermissionDecision) bool {
+func (a *App) newDisplayedPermissionCallID(redactor secret.Redacting) (string, error) {
+	for range 32 {
+		if a.permissionCallSequence == ^uint64(0) {
+			return "", errPermissionCorrelationUnavailable
+		}
+		a.permissionCallSequence++
+		callID := fmt.Sprintf("permission-%d-%s", a.permissionCallSequence, rand.Text())
+		if redactor.String(callID) != callID {
+			continue
+		}
+		return callID, nil
+	}
+	return "", errPermissionCorrelationUnavailable
+}
+
+func permissionEventWithCallID(event Event, callID string) Event {
+	prompt := *event.Permission
+	call := prompt.Call
+	request := call.Request
+	request.CallID = callID
+	call.Request = request
+	if call.FilePlan != nil {
+		plan := *call.FilePlan
+		plan.CallID = callID
+		plan.ArtifactIDs = append([]string(nil), plan.ArtifactIDs...)
+		call.FilePlan = &plan
+	}
+	prompt.Call = call
+	event.Permission = &prompt
+	return event
+}
+
+func permissionApprovalScope(request domain.PreparedToolRequest) string {
+	if request.ApprovalScope != "" {
+		return request.ApprovalScope
+	}
+	return request.CanonicalScope
+}
+
+func (a *App) validatePermissionResponse(callID string, decision domain.PermissionDecision) permissionResolution {
 	a.pendingMu.Lock()
 	defer a.pendingMu.Unlock()
 
 	pending, exists := a.pending[callID]
 	if !exists {
-		return false
+		return permissionStale
 	}
+	if decision.Scope != pending.displayedScope {
+		return permissionInvalidScope
+	}
+	return permissionResolved
+}
+
+func (a *App) resolvePermission(callID string, decision domain.PermissionDecision) permissionResolution {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+
+	pending, exists := a.pending[callID]
+	if !exists {
+		return permissionStale
+	}
+	if decision.Scope != pending.displayedScope {
+		return permissionInvalidScope
+	}
+	decision.Scope = pending.internalScope
 	select {
-	case pending <- decision:
+	case pending.decision <- decision:
 		delete(a.pending, callID)
-		return true
+		delete(a.pendingInternal, pending.internalCallID)
+		return permissionResolved
 	default:
-		return false
+		return permissionStale
 	}
 }
 
-func (a *App) removePending(callID string, decision chan domain.PermissionDecision) {
+func (a *App) removePending(pending *pendingPermission) {
 	a.pendingMu.Lock()
 	defer a.pendingMu.Unlock()
-	if a.pending[callID] == decision {
-		delete(a.pending, callID)
+	if a.pending[pending.displayedCallID] == pending {
+		delete(a.pending, pending.displayedCallID)
+	}
+	if a.pendingInternal[pending.internalCallID] == pending {
+		delete(a.pendingInternal, pending.internalCallID)
 	}
 }
 
@@ -685,9 +1092,22 @@ func (a *App) clearPending() {
 	a.pendingMu.Lock()
 	defer a.pendingMu.Unlock()
 	clear(a.pending)
+	clear(a.pendingInternal)
 }
 
 func (a *App) publish(ctx context.Context, event Event) bool {
+	event, _ = a.preparePublishedEvent(event)
+	return a.enqueuePublishedEvent(ctx, event)
+}
+
+func (a *App) preparePublishedEvent(event Event) (Event, error) {
+	if a.redactors != nil {
+		return sanitizePublishedEvent(a.redactors.Snapshot(), event)
+	}
+	return event, nil
+}
+
+func (a *App) enqueuePublishedEvent(ctx context.Context, event Event) bool {
 	if a.logger != nil {
 		_ = a.logger.Event("app_event", map[string]any{
 			"kind":    event.Kind,
@@ -698,7 +1118,20 @@ func (a *App) publish(ctx context.Context, event Event) bool {
 		return false
 	}
 	a.eventMu.Lock()
-	a.eventQueue = append(a.eventQueue, event)
+	limit := a.legacyQueueCapacity
+	if legacyTerminalEvent(event.Kind) {
+		limit++ // one reserved terminal item
+	}
+	if len(a.legacyQueue) >= limit {
+		a.eventMu.Unlock()
+		a.overflowOnce.Do(func() {
+			if a.nonReconnectableCancel != nil {
+				a.nonReconnectableCancel()
+			}
+		})
+		return false
+	}
+	a.legacyQueue = append(a.legacyQueue, event)
 	a.eventMu.Unlock()
 	select {
 	case a.eventWake <- struct{}{}:
@@ -710,7 +1143,7 @@ func (a *App) publish(ctx context.Context, event Event) bool {
 func (a *App) publishEvents(ctx context.Context) {
 	for {
 		a.eventMu.Lock()
-		if len(a.eventQueue) == 0 {
+		if len(a.legacyQueue) == 0 {
 			a.eventMu.Unlock()
 			select {
 			case <-ctx.Done():
@@ -719,7 +1152,7 @@ func (a *App) publishEvents(ctx context.Context) {
 			}
 			continue
 		}
-		event := a.eventQueue[0]
+		event := a.legacyQueue[0]
 		a.eventMu.Unlock()
 
 		select {
@@ -727,9 +1160,70 @@ func (a *App) publishEvents(ctx context.Context) {
 			return
 		case a.events <- event:
 			a.eventMu.Lock()
-			a.eventQueue[0] = Event{}
-			a.eventQueue = a.eventQueue[1:]
+			a.legacyQueue[0] = Event{}
+			a.legacyQueue = a.legacyQueue[1:]
 			a.eventMu.Unlock()
+		}
+	}
+}
+
+func legacyTerminalEvent(kind EventKind) bool {
+	switch kind {
+	case EventTurnCompleted, EventTurnInterrupted, EventReloadCompleted, EventError, EventRejected:
+		return true
+	default:
+		return false
+	}
+}
+
+func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription, adapter *LegacyAdapter, destination chan<- Event) {
+	defer subscription.Close()
+	for {
+		item, err := subscription.Next(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				select {
+				case destination <- Event{Kind: EventError, Err: err, Message: err.Error()}:
+				case <-ctx.Done():
+				}
+			}
+			return
+		}
+		if item.Terminal != nil {
+			err := errors.New(item.Terminal.Message)
+			select {
+			case destination <- Event{Kind: EventError, Code: item.Terminal.Code, Err: err, Message: err.Error()}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		if item.Event == nil {
+			continue
+		}
+		// The compatibility TUI receives the admitted execution error from the
+		// command result path. Publishing the durable generic turn failure first
+		// would make legacy consumers stop before that redacted diagnostic arrives.
+		if item.Event.Kind == protocol.EventTurnFailed {
+			return
+		}
+		event, err := adapter.Event(*item.Event)
+		if err != nil {
+			select {
+			case destination <- Event{Kind: EventError, Err: err, Message: err.Error()}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		if event.Kind == "" {
+			continue
+		}
+		select {
+		case destination <- event:
+		case <-ctx.Done():
+			return
+		}
+		if legacyTerminalEvent(event.Kind) {
+			return
 		}
 	}
 }

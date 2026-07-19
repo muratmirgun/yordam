@@ -216,9 +216,9 @@ func (model Model) sendAppCommand(command app.Command) {
 	}
 }
 
-func (model Model) sendStartTurn(prompt string) {
+func (model Model) sendStartTurn(prompt string, draftID uint64) {
 	if model.commands != nil {
-		model.commands <- app.Command{Kind: app.CommandStartTurn, Prompt: prompt}
+		model.commands <- app.Command{Kind: app.CommandStartTurn, DraftID: draftID, Prompt: prompt}
 	}
 }
 

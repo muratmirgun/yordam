@@ -77,7 +77,7 @@ func TestCreateAppendAndList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	event, err := store.Append(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "hello"})
+	event, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestAppendRejectsHostileSessionIDs(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store, _, session := createTestSession(t, t.TempDir())
-			_, err := store.Append(
+			_, err := store.WriteLegacyFixture(
 				context.Background(),
 				test.id(session.ID),
 				domain.EventUserMessage,
@@ -288,7 +288,7 @@ func TestAppendIgnoresSessionMetadataUnderInvalidWorkspaceDirectory(t *testing.T
 		t.Fatal(err)
 	}
 
-	event, err := store.Append(
+	event, err := store.WriteLegacyFixture(
 		context.Background(),
 		session.ID,
 		domain.EventUserMessage,
@@ -331,7 +331,7 @@ func TestAppendRejectsIncompleteTail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = store.Append(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "hello"})
+	_, err = store.WriteLegacyFixture(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "hello"})
 	if err == nil || !strings.Contains(err.Error(), "incomplete tail") {
 		t.Fatalf("error=%v want incomplete tail", err)
 	}
@@ -359,7 +359,7 @@ func TestAppendRejectsOversizedEncodedEventWithoutChangingSession(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	_, err = store.Append(
+	_, err = store.WriteLegacyFixture(
 		context.Background(),
 		session.ID,
 		domain.EventUserMessage,
@@ -384,7 +384,7 @@ func TestAppendRejectsOversizedEncodedEventWithoutChangingSession(t *testing.T) 
 func TestAppendRejectsDurableLogAheadOfMetadata(t *testing.T) {
 	root := t.TempDir()
 	store, workspace, session := createTestSession(t, root)
-	if _, err := store.Append(
+	if _, err := store.WriteLegacyFixture(
 		context.Background(),
 		session.ID,
 		domain.EventUserMessage,
@@ -416,7 +416,7 @@ func TestAppendRejectsDurableLogAheadOfMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = store.Append(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"})
+	_, err = store.WriteLegacyFixture(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"})
 	if err == nil || !strings.Contains(err.Error(), "session sequence mismatch") {
 		t.Fatalf("error=%v want session sequence mismatch", err)
 	}
@@ -466,7 +466,7 @@ func TestConcurrentAppendsUseStrictSequence(t *testing.T) {
 		go func() {
 			defer group.Done()
 			<-start
-			event, err := store.Append(context.Background(), session.ID, domain.EventUserMessage, map[string]int{"index": index})
+			event, err := store.WriteLegacyFixture(context.Background(), session.ID, domain.EventUserMessage, map[string]int{"index": index})
 			results <- result{seq: event.Seq, err: err}
 		}()
 	}
@@ -527,7 +527,7 @@ func TestStoresSharingRootSerializeConcurrentAppends(t *testing.T) {
 		go func() {
 			defer group.Done()
 			<-start
-			event, err := stores[index%len(stores)].Append(
+			event, err := stores[index%len(stores)].WriteLegacyFixture(
 				context.Background(),
 				session.ID,
 				domain.EventUserMessage,
@@ -616,7 +616,7 @@ func TestStoresShareStateWhenMissingRootIsBelowSymlink(t *testing.T) {
 		go func() {
 			defer group.Done()
 			<-start
-			event, err := stores[index%len(stores)].Append(
+			event, err := stores[index%len(stores)].WriteLegacyFixture(
 				context.Background(),
 				first.ID,
 				domain.EventUserMessage,
@@ -849,7 +849,7 @@ func TestAppendRejectsCorruptEarlierEvents(t *testing.T) {
 			root := t.TempDir()
 			store, workspace, session := createTestSession(t, root)
 			for index := range 3 {
-				if _, err := store.Append(
+				if _, err := store.WriteLegacyFixture(
 					context.Background(),
 					session.ID,
 					domain.EventUserMessage,
@@ -872,7 +872,7 @@ func TestAppendRejectsCorruptEarlierEvents(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			_, err = store.Append(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"})
+			_, err = store.WriteLegacyFixture(context.Background(), session.ID, domain.EventUserMessage, map[string]string{"content": "blocked"})
 			if err == nil {
 				t.Fatal("append accepted a corrupt earlier event")
 			}

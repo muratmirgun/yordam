@@ -19,8 +19,10 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/safefile"
 	"github.com/muratmirgun/yordam/internal/scope"
+	toolset "github.com/muratmirgun/yordam/internal/tools"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 )
 
@@ -78,7 +80,13 @@ func (t *Tool) Descriptor() domain.ToolDescriptor {
 	}
 }
 
-func (t *Tool) Prepare(_ context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
+func (t *Tool) CanonicalDescriptor() protocol.ToolDescriptor {
+	return toolset.BuiltinCanonicalDescriptor(t.Descriptor(), toolset.SearchClassification())
+}
+
+func (*Tool) TrustedClassification() domain.ToolClassification { return toolset.SearchClassification() }
+
+func (t *Tool) Plan(_ context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
 	input := Input{Path: "."}
 	if err := decodeStrict(request.Input, &input); err != nil {
 		return nil, fmt.Errorf("search input: %w", err)
@@ -100,14 +108,6 @@ func (t *Tool) Prepare(_ context.Context, request domain.ToolRequest) (ports.Pre
 	if err != nil {
 		return nil, fmt.Errorf("resolve search path: %w", err)
 	}
-	info, err := os.Stat(resolved.Path)
-	if err != nil {
-		return nil, fmt.Errorf("stat search path: %w", err)
-	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("search path is not a directory: %s", resolved.Path)
-	}
-
 	return &prepared{
 		request:    request,
 		input:      input,
@@ -116,9 +116,25 @@ func (t *Tool) Prepare(_ context.Context, request domain.ToolRequest) (ports.Pre
 		rgPath:     t.rgPath,
 		maxMatches: t.maxMatches,
 		output:     t.output,
-		identity:   info,
 		beforeOpen: func() error { return nil },
 	}, nil
+}
+
+func (t *Tool) Prepare(ctx context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
+	planned, err := t.Plan(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	prepared := planned.(*prepared)
+	info, err := os.Stat(prepared.target.Path)
+	if err != nil {
+		return nil, fmt.Errorf("stat search path: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("search path is not a directory: %s", prepared.target.Path)
+	}
+	prepared.identity = info
+	return prepared, nil
 }
 
 type prepared struct {
@@ -140,7 +156,29 @@ func (p *prepared) Preview() domain.PreparedToolRequest {
 		CanonicalScope:  p.target.Path,
 		InsideWorkspace: p.target.Inside,
 		Summary:         fmt.Sprintf("search %s for fixed string %q (up to %d matches)", p.target.Path, p.input.Query, p.maxMatches),
+		Resources: []protocol.ResourceTarget{{Kind: "directory", CanonicalID: p.target.Path, Attributes: []protocol.ResourceAttribute{
+			{Name: "exclude", Value: strings.Join(p.input.Exclude, "\x00")},
+			{Name: "include", Value: strings.Join(p.input.Include, "\x00")},
+			{Name: "max_matches", Value: strconv.Itoa(p.maxMatches)},
+			{Name: "query", Value: p.input.Query},
+		}}},
 	}
+}
+
+func (p *prepared) Revalidate(_ context.Context) (domain.PreparedToolRequest, error) {
+	current, err := scope.Resolve(p.workspace, p.input.Path, false)
+	if err != nil {
+		return domain.PreparedToolRequest{}, fmt.Errorf("re-resolve search path: %w", err)
+	}
+	info, err := os.Stat(current.Path)
+	if err != nil {
+		return domain.PreparedToolRequest{}, fmt.Errorf("stat search path: %w", err)
+	}
+	if !info.IsDir() {
+		return domain.PreparedToolRequest{}, fmt.Errorf("search path is not a directory: %s", current.Path)
+	}
+	p.target, p.identity = current, info
+	return p.Preview(), nil
 }
 
 func (p *prepared) Execute(ctx context.Context) domain.ToolResult {
@@ -177,6 +215,7 @@ func (p *prepared) Execute(ctx context.Context) domain.ToolResult {
 	}
 
 	buffer := output.New(p.output)
+	defer buffer.Close()
 	var truncated bool
 	if p.rgPath == "" {
 		truncated, err = runFallback(ctx, buffer, root, p.input, p.maxMatches)

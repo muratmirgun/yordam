@@ -46,6 +46,7 @@ const (
 
 const (
 	contextBreakpoint = 100
+	maxDraftID        = ^uint64(0)
 	focusComposer     = "composer"
 	focusContext      = "context"
 	focusModal        = "modal"
@@ -85,6 +86,8 @@ type Model struct {
 	modeCursor         int
 	modelCursor        int
 	pendingDraft       string
+	pendingDraftID     uint64
+	nextDraftID        uint64
 
 	conversation components.Conversation
 	composer     components.Composer
@@ -140,6 +143,7 @@ func NewModel(options Options) Model {
 		palette:            components.NewPalette(),
 		spinner:            spinner.New(spinner.WithSpinner(spinner.MiniDot)),
 		models:             append([]domain.ModelSelection(nil), options.Models...),
+		nextDraftID:        1,
 	}
 	for index, configured := range model.models {
 		if configured == options.Selection {
