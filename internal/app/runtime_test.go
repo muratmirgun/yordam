@@ -802,11 +802,14 @@ func TestAppRunCompactProtocolSubscriptionDoesNotLeakTerminalEvents(t *testing.T
 	awaitTerminal := func(command Command, requireAccepted bool) {
 		t.Helper()
 		application.Commands() <- command
-		accepted, terminals := false, 0
+		accepted, terminals, contextState := false, 0, false
 		deadline := time.After(20 * time.Second)
 		for terminals == 0 {
 			select {
 			case event := <-application.Events():
+				if event.Kind == EventState && event.Context != nil {
+					contextState = true
+				}
 				if event.Kind == EventTurnAccepted {
 					accepted = true
 				}
@@ -822,6 +825,9 @@ func TestAppRunCompactProtocolSubscriptionDoesNotLeakTerminalEvents(t *testing.T
 		}
 		if requireAccepted && !accepted {
 			t.Fatalf("%s terminal arrived before its accepted event", command.Kind)
+		}
+		if !contextState {
+			t.Fatalf("%s did not receive durable context state before terminal", command.Kind)
 		}
 		select {
 		case event := <-application.Events():
