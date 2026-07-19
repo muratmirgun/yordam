@@ -151,6 +151,43 @@ func TestRuntimeBrokerSnapshotReconstructsDurableCompactionContext(t *testing.T)
 	}
 }
 
+func TestContextProjectionPolicyUsesImmutableGeneration(t *testing.T) {
+	plan := func(g protocol.RuntimeGenerationID, input, window, output int64) protocol.EventRecord {
+		return protocol.EventRecord{Envelope: protocol.EventEnvelope{RuntimeGenerationID: g}, Decoded: &protocol.ContextPlanRecordedV1{Plan: protocol.ContextPlan{Body: protocol.ContextPlanBody{EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: input, Provenance: "e"}, ContextWindow: protocol.ValueInt64{State: protocol.ValueKnown, Value: window, Provenance: "w"}, OutputReserve: output, CompactionRevision: "r"}}}}
+	}
+	manifest := func(auto bool, reserve int64) protocol.RuntimeGenerationManifest {
+		limits := protocol.RuntimeLimits{AutoCompact: auto}
+		if reserve > 0 {
+			limits.CompactReserveTokens = protocol.ValueInt64{State: protocol.ValueKnown, Value: reserve, Provenance: "c"}
+		}
+		return protocol.RuntimeGenerationManifest{Body: protocol.RuntimeGenerationBody{Limits: limits}}
+	}
+	for _, tc := range []struct {
+		name                  string
+		m                     protocol.RuntimeGenerationManifest
+		input, window, output int64
+		reason                string
+	}{{"disabled", manifest(false, 0), 1, 9000, 1, "disabled"}, {"below", manifest(true, 0), 1, 9000, 1, "below_threshold"}, {"threshold", manifest(true, 0), 6952, 9000, 0, "threshold_reached"}, {"invalid", manifest(true, 9000), 1, 9000, 1, "invalid_budget"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.m.ID = "A"
+			p := contextProjectionProjector{generations: map[protocol.RuntimeGenerationID]protocol.RuntimeGenerationManifest{"A": tc.m}}
+			got, err := p.Apply(p.Zero(protocol.JournalRef{}), plan("A", tc.input, tc.window, tc.output))
+			if err != nil || got.AutoReason != tc.reason {
+				t.Fatalf("%+v %v", got, err)
+			}
+		})
+	}
+	p := contextProjectionProjector{generations: map[protocol.RuntimeGenerationID]protocol.RuntimeGenerationManifest{"A": manifest(false, 0)}, bootstrap: protocol.RuntimeGenerationManifest{ID: "B", Body: manifest(true, 0).Body}}
+	got, _ := p.Apply(p.Zero(protocol.JournalRef{}), plan("A", 1, 9000, 1))
+	if got.AutoReason != "disabled" {
+		t.Fatalf("old generation=%+v", got)
+	}
+	got, _ = p.Apply(p.Zero(protocol.JournalRef{}), plan("missing", 1, 9000, 1))
+	if got.AutoReason != "unknown_generation" || got.ReserveTokens.State != protocol.ValueUnknown {
+		t.Fatalf("missing=%+v", got)
+	}
+}
+
 func TestRuntimeSetReadyReturnsConfigurationErrorBeforeCompatibilityBypass(t *testing.T) {
 	configuration := configurationError("/home/user/.config/yordam/config.jsonc", "configuration is invalid; edit the file and run /reload", nil)
 	set := RuntimeSet{ConfigurationError: configuration, unchecked: true}
