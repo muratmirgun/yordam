@@ -50,7 +50,7 @@ func Select(events []protocol.EventRecord, head protocol.CommittedCursor, trigge
 	}
 	start := 0
 	if priorThrough, ok := latestCompactionThrough(committed, head); ok {
-		start = int(priorThrough)
+		start = priorThrough + 1
 	}
 	cutoff := len(committed) - recentSuffixEvents - 1
 	if start > cutoff {
@@ -142,26 +142,37 @@ func committedEvents(events []protocol.EventRecord, head protocol.CommittedCurso
 		return nil, ErrNothingToCompact
 	}
 	committed := make([]protocol.EventRecord, 0, len(events))
-	expected := uint64(1)
-	for _, record := range events {
+	var previous uint64
+	for index, record := range events {
+		if record.Legacy != nil && record.Envelope.Seq == 0 && record.Envelope.EventID == "" {
+			record.Envelope = protocol.EventEnvelope{
+				SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1, JournalKind: head.JournalKind, JournalID: head.JournalID,
+				EventID: record.Legacy.EventID, SessionID: record.Legacy.SessionID, Seq: record.Legacy.Seq, Time: record.Legacy.Time,
+				Kind: record.Legacy.Kind, TransactionID: protocol.TransactionID("legacy:" + string(record.Legacy.EventID)), Payload: protocol.CloneRawMessage(record.Legacy.Payload),
+			}
+		}
 		envelope := record.Envelope
-		if envelope.JournalKind != head.JournalKind || envelope.JournalID != head.JournalID || envelope.SessionID != protocol.SessionID(head.JournalID) || envelope.EventID == "" || envelope.TransactionID == "" || envelope.Seq != expected {
-			return nil, fmt.Errorf("events are not a contiguous committed session journal")
+		if envelope.JournalKind != head.JournalKind || envelope.JournalID != head.JournalID || envelope.SessionID != protocol.SessionID(head.JournalID) || envelope.EventID == "" || envelope.TransactionID == "" {
+			return nil, fmt.Errorf("events are not a valid committed session journal projection: event identity at %d journal=%s/%s session=%s id=%s transaction=%s", index, envelope.JournalKind, envelope.JournalID, envelope.SessionID, envelope.EventID, envelope.TransactionID)
 		}
 		if envelope.Seq > head.CommitSeq {
-			break
+			return nil, fmt.Errorf("events are not a valid committed session journal projection: event %d is beyond head %d", envelope.Seq, head.CommitSeq)
+		}
+		if (index == 0 && envelope.Seq != 1) || (index > 0 && (envelope.Seq <= previous || envelope.Seq-previous > 2)) {
+			return nil, fmt.Errorf("events are not a valid committed session journal projection")
 		}
 		committed = append(committed, protocol.CloneEventRecord(record))
-		expected++
+		previous = envelope.Seq
 	}
-	if len(committed) == 0 || uint64(len(committed)) != head.CommitSeq || committed[len(committed)-1].Envelope.TransactionID != head.TransactionID {
+	last := committed[len(committed)-1].Envelope
+	if last.TransactionID != head.TransactionID || (head.CommitSeq != last.Seq && head.CommitSeq != last.Seq+1) {
 		return nil, fmt.Errorf("committed head is not present in event sequence")
 	}
 	return committed, nil
 }
 
-func latestCompactionThrough(events []protocol.EventRecord, head protocol.CommittedCursor) (uint64, bool) {
-	var latest uint64
+func latestCompactionThrough(events []protocol.EventRecord, head protocol.CommittedCursor) (int, bool) {
+	latest := -1
 	found := false
 	for _, record := range events {
 		if record.Envelope.Kind != protocol.EventContextCompacted {
@@ -171,11 +182,24 @@ func latestCompactionThrough(events []protocol.EventRecord, head protocol.Commit
 		if !ok || value.From.Validate() != nil || value.Through.Validate() != nil || value.From.JournalKind != head.JournalKind || value.From.JournalID != head.JournalID || value.Through.JournalKind != head.JournalKind || value.Through.JournalID != head.JournalID || value.From.CommitSeq > value.Through.CommitSeq || value.Through.CommitSeq >= record.Envelope.Seq {
 			continue
 		}
-		if !found || value.Through.CommitSeq > latest {
-			latest, found = value.Through.CommitSeq, true
+		index, present := eventIndexAtCursor(events, value.Through)
+		if !present {
+			continue
+		}
+		if !found || value.Through.CommitSeq > events[latest].Envelope.Seq {
+			latest, found = index, true
 		}
 	}
 	return latest, found
+}
+
+func eventIndexAtCursor(events []protocol.EventRecord, cursor protocol.CommittedCursor) (int, bool) {
+	for index, record := range events {
+		if record.Envelope.Seq == cursor.CommitSeq && record.Envelope.TransactionID == cursor.TransactionID {
+			return index, true
+		}
+	}
+	return 0, false
 }
 
 func decodedCompaction(record protocol.EventRecord) (*protocol.ContextCompactedV1, bool) {

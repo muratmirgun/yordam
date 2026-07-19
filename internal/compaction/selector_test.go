@@ -82,6 +82,111 @@ func TestSelectRejectsEventsOutsideCommittedHead(t *testing.T) {
 	}
 }
 
+func TestSelectAcceptsMarkerGapProjectionAndPreservesPhysicalCursors(t *testing.T) {
+	t.Parallel()
+	events := []protocol.EventRecord{
+		markerSelectionEvent(1, "tx-1", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "one"}),
+		markerSelectionEvent(2, "tx-1", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "two"}),
+		markerSelectionEvent(3, "tx-1", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "three"}),
+		markerSelectionEvent(5, "tx-2", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "four"}),
+		markerSelectionEvent(6, "tx-2", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "five"}),
+		markerSelectionEvent(8, "tx-3", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "six"}),
+	}
+	head := markerSelectionCursor(9, "tx-3")
+
+	selection, err := compaction.Select(events, head, compaction.TriggerManual, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.From != markerSelectionCursor(1, "tx-1") || selection.Through != markerSelectionCursor(2, "tx-1") {
+		t.Fatalf("selection physical range=%+v", selection)
+	}
+}
+
+func TestSelectAcceptsMixedLegacyPrefixAndMarkerGapProjection(t *testing.T) {
+	t.Parallel()
+	legacyPayload := json.RawMessage(`{"legacy":true}`)
+	events := []protocol.EventRecord{
+		{Legacy: &protocol.LegacySource{SchemaVersion: 1, EventID: "legacy-1", SessionID: "session", Seq: 1, Time: time.Unix(1, 0).UTC(), Kind: "session_created", Payload: legacyPayload}},
+		markerSelectionEvent(2, "tx-2", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "two"}),
+		markerSelectionEvent(3, "tx-2", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "three"}),
+		markerSelectionEvent(5, "tx-3", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "four"}),
+		markerSelectionEvent(6, "tx-3", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "five"}),
+		markerSelectionEvent(8, "tx-4", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "six"}),
+	}
+
+	selection, err := compaction.Select(events, markerSelectionCursor(9, "tx-4"), compaction.TriggerManual, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.From != markerSelectionCursor(1, "legacy:legacy-1") || selection.Through != markerSelectionCursor(2, "tx-2") {
+		t.Fatalf("selection physical range=%+v", selection)
+	}
+	if !strings.Contains(sourcesText(selection.Sources), `"legacy":true`) {
+		t.Fatalf("legacy payload was not preserved in normalized sources: %q", sourcesText(selection.Sources))
+	}
+}
+
+func TestSelectMapsPriorCompactionThroughCursorInsteadOfUsingPhysicalSequenceAsIndex(t *testing.T) {
+	t.Parallel()
+	events := []protocol.EventRecord{
+		markerSelectionEvent(1, "tx-1", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "one"}),
+		markerSelectionEvent(2, "tx-1", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "two"}),
+		markerSelectionEvent(3, "tx-1", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "three"}),
+		markerSelectionEvent(5, "tx-2", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "four"}),
+		markerSelectionEvent(6, "tx-2", protocol.EventContextCompacted, &protocol.ContextCompactedV1{From: markerSelectionCursor(1, "tx-1"), Through: markerSelectionCursor(5, "tx-2"), SummaryEvidenceID: "summary", Revision: "revision"}),
+		markerSelectionEvent(8, "tx-3", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "five"}),
+		markerSelectionEvent(9, "tx-3", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "six"}),
+		markerSelectionEvent(11, "tx-4", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "seven"}),
+		markerSelectionEvent(12, "tx-4", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "eight"}),
+		markerSelectionEvent(13, "tx-4", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "nine"}),
+		markerSelectionEvent(14, "tx-4", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "ten"}),
+	}
+
+	selection, err := compaction.Select(events, markerSelectionCursor(15, "tx-4"), compaction.TriggerManual, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.From != markerSelectionCursor(6, "tx-2") || selection.Through != markerSelectionCursor(9, "tx-3") {
+		t.Fatalf("selection range=%+v", selection)
+	}
+}
+
+func TestSelectRejectsInvalidMarkerGapProjection(t *testing.T) {
+	t.Parallel()
+	valid := []protocol.EventRecord{
+		markerSelectionEvent(1, "tx-1", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "one"}),
+		markerSelectionEvent(2, "tx-1", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "two"}),
+		markerSelectionEvent(3, "tx-1", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "three"}),
+		markerSelectionEvent(5, "tx-2", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "four"}),
+		markerSelectionEvent(6, "tx-2", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "five"}),
+		markerSelectionEvent(8, "tx-3", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "six"}),
+	}
+	for name, mutate := range map[string]func([]protocol.EventRecord, *protocol.CommittedCursor){
+		"duplicate": func(events []protocol.EventRecord, _ *protocol.CommittedCursor) {
+			events[4].Envelope.Seq = events[3].Envelope.Seq
+		},
+		"out of order": func(events []protocol.EventRecord, _ *protocol.CommittedCursor) {
+			events[4], events[5] = events[5], events[4]
+		},
+		"impossible gap": func(events []protocol.EventRecord, _ *protocol.CommittedCursor) { events[3].Envelope.Seq = 6 },
+		"beyond head":    func(events []protocol.EventRecord, _ *protocol.CommittedCursor) { events[5].Envelope.Seq = 10 },
+		"identity mismatch": func(events []protocol.EventRecord, _ *protocol.CommittedCursor) {
+			events[2].Envelope.SessionID = "other"
+		},
+		"head not final transaction": func(_ []protocol.EventRecord, head *protocol.CommittedCursor) { head.TransactionID = "tx-2" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			events := protocol.DeepCopy(valid)
+			head := markerSelectionCursor(9, "tx-3")
+			mutate(events, &head)
+			if _, err := compaction.Select(events, head, compaction.TriggerManual, 0); err == nil {
+				t.Fatal("invalid marker-gap projection was accepted")
+			}
+		})
+	}
+}
+
 func TestSelectBoundsNormalizedSourcesWithAnExplicitLimit(t *testing.T) {
 	t.Parallel()
 	events := make([]protocol.EventRecord, 0, 15)
@@ -209,6 +314,16 @@ func selectionTaskEvent(sequence uint64, task protocol.TaskID, kind string, deco
 
 func selectionCursor(sequence uint64) protocol.CommittedCursor {
 	return protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "session", CommitSeq: sequence, TransactionID: protocol.TransactionID(fmt.Sprintf("tx-%d", sequence))}
+}
+
+func markerSelectionEvent(sequence uint64, transaction protocol.TransactionID, kind string, decoded any) protocol.EventRecord {
+	event := selectionEvent(sequence, kind, decoded)
+	event.Envelope.TransactionID = transaction
+	return event
+}
+
+func markerSelectionCursor(sequence uint64, transaction protocol.TransactionID) protocol.CommittedCursor {
+	return protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "session", CommitSeq: sequence, TransactionID: transaction}
 }
 
 func sameIDs(got, want []protocol.EventID) bool {

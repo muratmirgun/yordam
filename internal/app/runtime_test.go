@@ -276,7 +276,8 @@ func TestProductionLegacyCommandUsesApplicationProtocolAndRealCursorProjection(t
 	var providerRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		response.Header().Set("Content-Type", "text/event-stream")
-		if providerRequests.Add(1) == 1 {
+		switch providerRequests.Add(1) {
+		case 1:
 			arguments := `{"path":"protocol-evidence.txt","create":true,"new_content":"committed evidence\n"}`
 			fmt.Fprintf(response, "data: {\"id\":\"request-production-tool\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"edit-production\",\"function\":{\"name\":\"edit\",\"arguments\":%q}}]}}]}\n\n", arguments)
 			fmt.Fprintln(response, `data: {"id":"request-production-tool","choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
@@ -284,8 +285,11 @@ func TestProductionLegacyCommandUsesApplicationProtocolAndRealCursorProjection(t
 			fmt.Fprintln(response, "data: [DONE]")
 			fmt.Fprintln(response)
 			return
+		case 2:
+			fmt.Fprintln(response, `data: {"id":"request-production","choices":[{"delta":{"content":"protocol reply"},"finish_reason":"stop"}]}`)
+		default:
+			fmt.Fprintln(response, `data: {"id":"request-production-compact","choices":[{"delta":{"content":"{\"goal\":\"compact\",\"constraints\":[],\"decisions\":[],\"files\":[],\"commands_and_tests\":[],\"unresolved\":[],\"children\":[],\"skills\":[],\"unknown_effects\":[]}"},"finish_reason":"stop"}]}`)
 		}
-		fmt.Fprintln(response, `data: {"id":"request-production","choices":[{"delta":{"content":"protocol reply"},"finish_reason":"stop"}]}`)
 		fmt.Fprintln(response)
 		fmt.Fprintln(response, "data: [DONE]")
 		fmt.Fprintln(response)
@@ -438,6 +442,30 @@ completed:
 	if !reflect.DeepEqual(current.Durable, headless.Durable) || !reflect.DeepEqual(tuiSemantic, legacySemantic) {
 		t.Fatalf("consumer equivalence tui=%v legacy=%v headless=%+v current=%+v", tuiSemantic, legacySemantic, headless.Durable, current.Durable)
 	}
+	application.Commands() <- Command{Kind: CommandCompact}
+	for {
+		select {
+		case event := <-application.Events():
+			if event.Kind == EventError || event.Kind == EventTurnInterrupted {
+				inspection, _ := store.InspectSession(t.Context(), protocol.SessionID(bootstrapSnapshot.Session.ID))
+				t.Fatalf("production compact failed: %+v head=%+v events=%v", event, inspection.Journal.Head, inspectionSequenceRefs(inspection.Journal.Events))
+			}
+			if event.Kind == EventTurnCompleted {
+				goto compacted
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatal("timed out waiting for production compact")
+		}
+	}
+
+compacted:
+	compactedInspection, err := store.InspectSession(t.Context(), protocol.SessionID(bootstrapSnapshot.Session.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(inspectionKinds(compactedInspection.Journal.Events), protocol.EventContextCompacted) {
+		t.Fatalf("legacy compact missed canonical compaction event: %v", inspectionKinds(compactedInspection.Journal.Events))
+	}
 	application.Commands() <- Command{Kind: CommandShutdown}
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -465,6 +493,14 @@ func inspectionKinds(events []protocol.EventRecord) []string {
 		kinds = append(kinds, event.Envelope.Kind)
 	}
 	return kinds
+}
+
+func inspectionSequenceRefs(events []protocol.EventRecord) []string {
+	values := make([]string, 0, len(events))
+	for _, event := range events {
+		values = append(values, fmt.Sprintf("%d/%s", event.Envelope.Seq, event.Envelope.TransactionID))
+	}
+	return values
 }
 
 func countString(values []string, target string) int {
