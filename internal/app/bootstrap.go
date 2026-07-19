@@ -236,9 +236,13 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 
 	var contextState *protocol.ContextProjectionV1
 	if runtimeSet.ApplicationService != nil {
-		if durable, sub, snapErr := runtimeSet.ApplicationService.SnapshotAndSubscribe(ctx, protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(session.ID), Consumer: "bootstrap_context", QueueCapacity: 1}); snapErr == nil {
-			_ = sub.Close()
-			contextState, _ = DurableContext(durable)
+		durable, snapErr := runtimeSet.ApplicationService.Snapshot(ctx, protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(session.ID), Consumer: "bootstrap_context", QueueCapacity: 1})
+		if snapErr != nil {
+			return nil, Snapshot{}, fmt.Errorf("snapshot durable context: %w", snapErr)
+		}
+		contextState, snapErr = DurableContext(durable)
+		if snapErr != nil {
+			return nil, Snapshot{}, fmt.Errorf("decode durable context: %w", snapErr)
 		}
 	}
 	return application, Snapshot{

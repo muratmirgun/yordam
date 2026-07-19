@@ -243,6 +243,7 @@ type brokerSource struct {
 	initialSession   protocol.CommittedCursor
 	heads            map[protocol.JournalRef]protocol.CommittedCursor
 	records          map[protocol.JournalRef][]protocol.EventRecord
+	contexts         map[protocol.JournalID]protocol.ContextProjectionV1
 	pauseEntered     chan struct{}
 	pauseRelease     chan struct{}
 	durable          chan struct{}
@@ -251,7 +252,7 @@ type brokerSource struct {
 func newBrokerSource() *brokerSource {
 	workspace := protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "workspace-1"}
 	session := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-1"}
-	s := &brokerSource{workspace: workspace, session: session, heads: make(map[protocol.JournalRef]protocol.CommittedCursor), records: make(map[protocol.JournalRef][]protocol.EventRecord), durable: make(chan struct{}, 32)}
+	s := &brokerSource{workspace: workspace, session: session, heads: make(map[protocol.JournalRef]protocol.CommittedCursor), records: make(map[protocol.JournalRef][]protocol.EventRecord), contexts: make(map[protocol.JournalID]protocol.ContextProjectionV1), durable: make(chan struct{}, 32)}
 	s.initialWorkspace = committedCursor(workspace, 1, "workspace-initial")
 	s.initialSession = committedCursor(session, 1, "session-initial")
 	s.heads[workspace], s.heads[session] = s.initialWorkspace, s.initialSession
@@ -284,7 +285,17 @@ func (s *brokerSource) Project(_ context.Context, vector app.SnapshotVector) (pr
 		<-s.pauseRelease
 	}
 	data, _ := json.Marshal(vector)
-	return protocol.DurableProjection{Workspace: protocol.ProjectionView{ID: string(s.workspace.ID), Kind: "workspace", Status: "ready", State: protocol.ValueKnown, Data: data}}, protocol.RuntimeProjection{}, nil
+	durable := protocol.DurableProjection{Workspace: protocol.ProjectionView{ID: string(s.workspace.ID), Kind: "workspace", Status: "ready", State: protocol.ValueKnown, Data: data}}
+	if vector.SelectedSession != nil {
+		if state, ok := s.contexts[vector.SelectedSession.JournalID]; ok {
+			contextData, err := json.Marshal(protocol.DeepCopy(state))
+			if err != nil {
+				return protocol.DurableProjection{}, protocol.RuntimeProjection{}, err
+			}
+			durable.Context = protocol.ProjectionView{ID: string(vector.SelectedSession.JournalID), Kind: "context", Status: "ready", State: protocol.ValueKnown, Data: contextData}
+		}
+	}
+	return durable, protocol.RuntimeProjection{}, nil
 }
 func (s *brokerSource) pauseSnapshot() (<-chan struct{}, chan struct{}) {
 	s.pauseEntered, s.pauseRelease = make(chan struct{}), make(chan struct{})

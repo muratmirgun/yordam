@@ -18,6 +18,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/cli"
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
 func TestBootstrapComposesCanonicalRedactedRuntime(t *testing.T) {
@@ -104,6 +105,9 @@ func TestBootstrapComposesCanonicalRedactedRuntime(t *testing.T) {
 	}
 	if snapshot.Session.ID == "" || snapshot.Session.Mode != domain.ModeAsk || snapshot.Session.Selection != (domain.ModelSelection{Profile: "primary", Model: "model-a"}) {
 		t.Fatalf("session=%+v", snapshot.Session)
+	}
+	if snapshot.Context == nil || snapshot.Context.AutoReason != "unknown_context_window" || snapshot.Context.EstimatedInputTokens.State != protocol.ValueUnknown || snapshot.Context.ContextWindow.State != protocol.ValueUnknown || snapshot.Context.ReserveTokens.State != protocol.ValueUnknown {
+		t.Fatalf("bootstrap durable context=%+v", snapshot.Context)
 	}
 	wantModels := []domain.ModelSelection{
 		{Profile: "primary", Model: "model-a"},

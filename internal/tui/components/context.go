@@ -102,13 +102,20 @@ func (c *Context) SetCompactionContext(state protocol.ContextProjectionV1) {
 	if c.compaction != nil {
 		state = mergeCompactionContext(*c.compaction, state)
 	}
-	c.compaction = &state
+	copy := protocol.DeepCopy(state)
+	c.compaction = &copy
 }
 
 func mergeCompactionContext(old, next protocol.ContextProjectionV1) protocol.ContextProjectionV1 {
-	if next.AutoReason == "" {
-		next.AutoReason, next.AutoAvailable = old.AutoReason, old.AutoAvailable
+	// A non-empty reason is the durable snapshot marker: snapshots always carry
+	// a policy conclusion, including disabled and unknown states. Replace rather
+	// than merge one so switching sessions cannot retain a prior range or
+	// revision. Live plan and completion events intentionally omit it and merge
+	// only their respective facts below.
+	if next.AutoReason != "" {
+		return next
 	}
+	next.AutoReason, next.AutoAvailable = old.AutoReason, old.AutoAvailable
 	if next.EstimatedInputTokens.State == "" {
 		next.EstimatedInputTokens = old.EstimatedInputTokens
 	}
@@ -118,7 +125,10 @@ func mergeCompactionContext(old, next protocol.ContextProjectionV1) protocol.Con
 	if next.ReserveTokens.State == "" {
 		next.ReserveTokens = old.ReserveTokens
 	}
-	if next.OutputReserve == 0 {
+	// A context-plan event always has at least one typed plan fact. That marker
+	// lets zero remain meaningful for OutputReserve while completion-only events
+	// preserve the prior plan value.
+	if next.EstimatedInputTokens.State == "" && next.ContextWindow.State == "" {
 		next.OutputReserve = old.OutputReserve
 	}
 	if next.Revision == "" {
