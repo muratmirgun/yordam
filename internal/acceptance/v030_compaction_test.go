@@ -102,6 +102,9 @@ func runV030GoTest(t *testing.T, pkg, testName string) {
 }
 
 func v030TopLevelInventoryMatches(output, want string) int {
+	if strings.Contains(want, "/") {
+		return 0
+	}
 	matches := 0
 	for _, line := range strings.Split(output, "\n") {
 		if line == want {
