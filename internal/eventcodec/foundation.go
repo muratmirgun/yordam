@@ -92,6 +92,12 @@ func FoundationDescriptors() []Descriptor {
 			ValidateSemantic: func(payload any) error {
 				return validateFoundationSemantic(kind, payload)
 			},
+			ValidateEnvelope: func(envelope protocol.EventEnvelope, payload any) error {
+				if kind != protocol.EventContextCompacted {
+					return nil
+				}
+				return validateContextCompactionEnvelope(envelope, payload)
+			},
 			AuthorizationCritical: entry.auth,
 			RedactionClass:        entry.redaction,
 			ProjectionDomains:     append([]string(nil), entry.domains...),
@@ -161,9 +167,7 @@ func validateFoundationSemantic(kind string, payload any) error {
 			}
 		}
 	case *protocol.ContextCompactedV1:
-		if value.From.Validate() != nil || value.Through.Validate() != nil || value.SummaryEvidenceID == "" || value.Revision == "" || value.From.JournalKind != value.Through.JournalKind || value.From.JournalID != value.Through.JournalID || value.From.CommitSeq > value.Through.CommitSeq {
-			return fmt.Errorf("invalid context compaction range")
-		}
+		return value.Validate()
 	case *protocol.FileChangePlannedV1:
 		return validateActionPlan(value.Plan)
 	case *protocol.FileChangedV1:
@@ -369,6 +373,20 @@ func validateFoundationSemantic(kind string, payload any) error {
 		if value.TransactionID == "" || value.FirstSeq == 0 || value.LastSeq < value.FirstSeq || uint64(value.EventCount) != value.LastSeq-value.FirstSeq+1 || value.Digest.Validate() != nil {
 			return fmt.Errorf("transaction marker is invalid")
 		}
+	}
+	return nil
+}
+
+func validateContextCompactionEnvelope(envelope protocol.EventEnvelope, payload any) error {
+	value, ok := payload.(*protocol.ContextCompactedV1)
+	if !ok || value == nil {
+		return fmt.Errorf("context compaction payload type %T", payload)
+	}
+	if err := value.Validate(); err != nil {
+		return err
+	}
+	if envelope.JournalKind != protocol.JournalSession || envelope.SessionID == "" || envelope.JournalID != protocol.JournalID(envelope.SessionID) || value.From.JournalID != envelope.JournalID || value.Through.JournalID != envelope.JournalID || value.Through.CommitSeq >= envelope.Seq {
+		return fmt.Errorf("context compaction is not anchored before its event")
 	}
 	return nil
 }

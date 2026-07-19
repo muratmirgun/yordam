@@ -20,6 +20,7 @@ type Descriptor struct {
 	New                   func() any
 	ValidateStructural    func(any) error
 	ValidateSemantic      func(any) error
+	ValidateEnvelope      func(protocol.EventEnvelope, any) error
 	AuthorizationCritical bool
 	RedactionClass        string
 	ProjectionDomains     []string
@@ -113,6 +114,11 @@ func (r *Registry) Decode(rawEnvelope json.RawMessage) (protocol.EventRecord, er
 		return record, fmt.Errorf("payload structure %s@%d: %w", descriptor.Kind, descriptor.Version, err)
 	}
 	record.Decoded = protocol.DeepCopy(decoded)
+	if descriptor.ValidateEnvelope != nil {
+		if err := descriptor.ValidateEnvelope(record.Envelope, record.Decoded); err != nil {
+			return record, fmt.Errorf("event envelope %s@%d: %w", descriptor.Kind, descriptor.Version, err)
+		}
+	}
 	if err := validateJournalFamily(record.Envelope, record.Decoded); err != nil {
 		return record, err
 	}
@@ -148,6 +154,11 @@ func (r *Registry) Validate(record protocol.EventRecord) error {
 	}
 	if !reflect.DeepEqual(record.Decoded, fresh) {
 		return fmt.Errorf("decoded payload does not match envelope payload")
+	}
+	if descriptor.ValidateEnvelope != nil {
+		if err := descriptor.ValidateEnvelope(record.Envelope, record.Decoded); err != nil {
+			return fmt.Errorf("event envelope %s@%d: %w", descriptor.Kind, descriptor.Version, err)
+		}
 	}
 	if err := validateJournalFamily(record.Envelope, record.Decoded); err != nil {
 		return err

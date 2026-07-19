@@ -18,6 +18,50 @@ type descriptorAliasPayload struct {
 	Mutable   json.RawMessage `json:"mutable"`
 }
 
+type envelopeValidationPayload struct {
+	Value string `json:"value"`
+}
+
+func TestRegistryRunsEnvelopeValidationForDecodeAndRoundTripValidation(t *testing.T) {
+	calls := 0
+	registry, err := eventcodec.New([]eventcodec.Descriptor{
+		{
+			Kind: "hooked", Version: 1, New: func() any { return new(envelopeValidationPayload) },
+			ValidateEnvelope: func(event protocol.EventEnvelope, payload any) error {
+				calls++
+				if event.Seq == 2 || payload.(*envelopeValidationPayload).Value != "ok" {
+					return errors.New("rejected by envelope validator")
+				}
+				return nil
+			},
+		},
+		{Kind: "unhooked", Version: 1, New: func() any { return new(envelopeValidationPayload) }},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := registry.Decode(envelope("hooked", envelopeValidationPayload{Value: "ok"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("decode validation calls=%d", calls)
+	}
+	if err := registry.Validate(record); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("round-trip validation calls=%d", calls)
+	}
+	record.Envelope.Seq = 2
+	if err := registry.Validate(record); err == nil {
+		t.Fatal("semantic validation accepted invalid envelope")
+	}
+	if _, err := registry.Decode(envelope("unhooked", envelopeValidationPayload{Value: "ok"})); err != nil {
+		t.Fatalf("nil envelope validator changed descriptor behavior: %v", err)
+	}
+}
+
 func envelope(kind string, payload any) json.RawMessage {
 	raw, err := json.Marshal(payload)
 	if err != nil {

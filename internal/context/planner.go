@@ -34,10 +34,11 @@ type Request struct {
 
 type boundedPlanner struct {
 	toolExposureRevision string
+	summaries            SummaryResolver
 }
 
-func NewPlanner(toolExposureRevision string) Planner {
-	return &boundedPlanner{toolExposureRevision: toolExposureRevision}
+func NewPlanner(toolExposureRevision string, summaries SummaryResolver) Planner {
+	return &boundedPlanner{toolExposureRevision: toolExposureRevision, summaries: summaries}
 }
 
 func (p *boundedPlanner) Plan(ctx stdcontext.Context, request Request) (protocol.ContextPlan, error) {
@@ -61,7 +62,7 @@ func (p *boundedPlanner) Plan(ctx stdcontext.Context, request Request) (protocol
 	}
 
 	sources := protocol.DeepCopy(request.SystemInstructions)
-	eventSources, compacted, compactionRevision, err := adaptEvents(request.Events)
+	eventSources, compacted, compactionRevision, err := adaptEvents(ctx, request.Session, p.summaries, request.Events)
 	if err != nil {
 		return protocol.ContextPlan{}, err
 	}
@@ -124,20 +125,27 @@ type legacyCompactionPayload struct {
 	Summary    string `json:"summary"`
 }
 
-func adaptEvents(events []protocol.EventRecord) ([]protocol.ContentSource, []protocol.ExcludedContentSource, string, error) {
-	compactionIndex := -1
-	through := uint64(0)
-	compactionRevision := defaultCompactionRevision
-	var summary string
+func adaptEvents(ctx stdcontext.Context, session protocol.SessionID, summaries SummaryResolver, events []protocol.EventRecord) ([]protocol.ContentSource, []protocol.ExcludedContentSource, string, error) {
+	type compaction struct {
+		index    int
+		from     uint64
+		through  uint64
+		revision string
+		summary  string
+		evidence protocol.EvidenceID
+		legacy   bool
+	}
+	selected := compaction{index: -1}
 	for index, event := range events {
 		if event.Envelope.Kind != protocol.EventContextCompacted {
 			continue
 		}
 		if event.Legacy == nil {
-			if decoded, ok := contextCompaction(event); ok && decoded.Revision != "" {
-				compactionIndex, through, summary = -1, 0, ""
-				compactionRevision = decoded.Revision
+			decoded, ok := contextCompaction(event)
+			if !ok || !validNativeCompaction(event, session, decoded) {
+				continue
 			}
+			selected = compaction{index: index, from: decoded.From.CommitSeq, through: decoded.Through.CommitSeq, revision: decoded.Revision, evidence: decoded.SummaryEvidenceID}
 			continue
 		}
 		var payload legacyCompactionPayload
@@ -148,18 +156,37 @@ func adaptEvents(events []protocol.EventRecord) ([]protocol.ContentSource, []pro
 		if decoded, ok := contextCompaction(event); ok && decoded.Revision != "" {
 			candidateRevision = decoded.Revision
 		}
-		compactionIndex, through, summary = index, payload.ThroughSeq, payload.Summary
-		compactionRevision = candidateRevision
+		selected = compaction{index: index, from: payload.FromSeq, through: payload.ThroughSeq, revision: candidateRevision, summary: payload.Summary, legacy: true}
 	}
+	if selected.index < 0 {
+		return adaptEventSuffix(events, -1, 0, 0, defaultCompactionRevision, protocol.ContentSource{})
+	}
+	var summarySource protocol.ContentSource
+	if selected.legacy {
+		var err error
+		summarySource, err = contentSource(string(events[selected.index].Envelope.EventID)+":summary", "compaction_summary", "legacy_context_compaction", []protocol.ContentBlock{{Kind: protocol.ContentText, Text: selected.summary}})
+		if err != nil {
+			return nil, nil, "", err
+		}
+	} else {
+		if summaries == nil {
+			return adaptEventSuffix(events, -1, 0, 0, defaultCompactionRevision, protocol.ContentSource{})
+		}
+		resolved, err := summaries.ResolveCompactionSummary(ctx, session, selected.evidence)
+		if err != nil || !validSummarySource(resolved, selected.evidence) {
+			return adaptEventSuffix(events, -1, 0, 0, defaultCompactionRevision, protocol.ContentSource{})
+		}
+		summarySource = resolved
+	}
+	return adaptEventSuffix(events, selected.index, selected.from, selected.through, selected.revision, summarySource)
+}
+
+func adaptEventSuffix(events []protocol.EventRecord, compactionIndex int, from, through uint64, compactionRevision string, summary protocol.ContentSource) ([]protocol.ContentSource, []protocol.ExcludedContentSource, string, error) {
 	sources := make([]protocol.ContentSource, 0, len(events)+1)
 	excluded := make([]protocol.ExcludedContentSource, 0)
 	for index, event := range events {
 		if index == compactionIndex {
-			source, err := contentSource(string(event.Envelope.EventID)+":summary", "compaction_summary", "legacy_context_compaction", []protocol.ContentBlock{{Kind: protocol.ContentText, Text: summary}})
-			if err != nil {
-				return nil, nil, "", err
-			}
-			sources = append(sources, source)
+			sources = append(sources, protocol.DeepCopy(summary))
 			continue
 		}
 		var blocks []protocol.ContentBlock
@@ -191,13 +218,27 @@ func adaptEvents(events []protocol.EventRecord) ([]protocol.ContentSource, []pro
 		if err != nil {
 			return nil, nil, "", err
 		}
-		if compactionIndex >= 0 && event.Envelope.Seq <= through {
+		if compactionIndex >= 0 && event.Envelope.Seq >= from && event.Envelope.Seq <= through {
 			excluded = append(excluded, protocol.ExcludedContentSource{ID: source.ID, Reason: ExcludedCompacted, Digest: source.Digest})
 			continue
 		}
 		sources = append(sources, source)
 	}
 	return sources, excluded, compactionRevision, nil
+}
+
+func validNativeCompaction(event protocol.EventRecord, session protocol.SessionID, payload protocol.ContextCompactedV1) bool {
+	if payload.Validate() != nil || event.Envelope.JournalKind != protocol.JournalSession || event.Envelope.SessionID != session || event.Envelope.JournalID != protocol.JournalID(session) || payload.From.JournalID != event.Envelope.JournalID || payload.Through.JournalID != event.Envelope.JournalID || payload.Through.CommitSeq >= event.Envelope.Seq {
+		return false
+	}
+	return true
+}
+
+func validSummarySource(source protocol.ContentSource, evidenceID protocol.EvidenceID) bool {
+	if source.ID != string(evidenceID) || source.Kind != "compaction_summary" || source.Scope != "session" || source.Provenance != "evidence:"+string(evidenceID) || len(source.Content) != 1 || source.Content[0].Kind != protocol.ContentText || source.Validate() != nil {
+		return false
+	}
+	return len(source.Content[0].Text) <= MaxCompactionSummaryBytes
 }
 
 func contextCompaction(event protocol.EventRecord) (protocol.ContextCompactedV1, bool) {

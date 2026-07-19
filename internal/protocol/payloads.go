@@ -185,6 +185,13 @@ type ContextCompactedV1 struct {
 	Revision          string          `json:"revision"`
 }
 
+func (v ContextCompactedV1) Validate() error {
+	if v.From.Validate() != nil || v.Through.Validate() != nil || v.From.JournalKind != JournalSession || v.Through.JournalKind != JournalSession || v.From.JournalID != v.Through.JournalID || v.SummaryEvidenceID == "" || v.Revision == "" || v.From.CommitSeq > v.Through.CommitSeq {
+		return fmt.Errorf("invalid context compaction range")
+	}
+	return nil
+}
+
 type FileChangePlannedV1 struct {
 	Plan           ActionPlan `json:"plan"`
 	DiffEvidenceID EvidenceID `json:"diff_evidence_id,omitempty"`

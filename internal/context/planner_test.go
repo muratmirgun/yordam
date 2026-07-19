@@ -17,7 +17,7 @@ func TestContextPlanRecordsProvenanceBudgetAndDigest(t *testing.T) {
 		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
 		SystemInstructions: []protocol.ContentSource{system}, Model: model, OutputReserve: 56,
 	}
-	planner := contextplanner.NewPlanner("tools-r1")
+	planner := contextplanner.NewPlanner("tools-r1", nil)
 	plan, err := planner.Plan(stdcontext.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +52,7 @@ func TestContextPlanAdaptsEventTranscriptAndLegacyCompaction(t *testing.T) {
 		contextEvent("event-new", 3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "new"}),
 		contextEvent("event-assistant", 4, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "answer"}}}),
 	}
-	plan, err := contextplanner.NewPlanner("tools-r1").Plan(stdcontext.Background(), contextplanner.Request{
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
 		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
 		Events: events, Model: contextModel(1024), OutputReserve: 64,
 	})
@@ -69,7 +69,7 @@ func TestContextPlanAdaptsEventTranscriptAndLegacyCompaction(t *testing.T) {
 
 func TestContextPlanDecodesEventPayloadWhenProjectionIsUnavailable(t *testing.T) {
 	record := protocol.EventRecord{Envelope: protocol.EventEnvelope{EventID: "event-raw", Seq: 1, Kind: protocol.EventUserMessage, Payload: json.RawMessage(`{"content":"from raw"}`)}}
-	plan, err := contextplanner.NewPlanner("tools-r1").Plan(stdcontext.Background(), contextplanner.Request{
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
 		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
 		Events: []protocol.EventRecord{record}, Model: contextModel(1024), OutputReserve: 64,
 	})
@@ -81,20 +81,20 @@ func TestContextPlanDecodesEventPayloadWhenProjectionIsUnavailable(t *testing.T)
 	}
 }
 
-func TestContextPlanRecordsNativeCompactionRevisionWithoutDroppingUnavailableSummary(t *testing.T) {
+func TestContextPlanFailsClosedForMalformedNativeCompaction(t *testing.T) {
 	events := []protocol.EventRecord{
 		contextEvent("event-old", 1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old"}),
 		contextEvent("event-compact", 2, protocol.EventContextCompacted, &protocol.ContextCompactedV1{Revision: "compact-r2", SummaryEvidenceID: "summary-evidence"}),
 		contextEvent("event-new", 3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "new"}),
 	}
-	plan, err := contextplanner.NewPlanner("tools-r1").Plan(stdcontext.Background(), contextplanner.Request{
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
 		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
 		Events: events, Model: contextModel(1024), OutputReserve: 64,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Body.CompactionRevision != "compact-r2" || len(plan.Body.Sources) != 2 || plan.Body.Sources[0].Content[0].Text != "old" || plan.Body.Sources[1].Content[0].Text != "new" {
+	if plan.Body.CompactionRevision != "none" || len(plan.Body.Sources) != 2 || plan.Body.Sources[0].Content[0].Text != "old" || plan.Body.Sources[1].Content[0].Text != "new" {
 		t.Fatalf("plan=%#v", plan)
 	}
 }
@@ -115,7 +115,7 @@ func TestContextPlanIgnoresMalformedLaterLegacyCompaction(t *testing.T) {
 		},
 		contextEvent("event-latest", 5, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "latest"}),
 	}
-	plan, err := contextplanner.NewPlanner("tools-r1").Plan(stdcontext.Background(), contextplanner.Request{
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
 		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
 		Events: events, Model: contextModel(1024), OutputReserve: 64,
 	})
@@ -137,7 +137,7 @@ func TestContextPlanExcludesSourcesBeyondKnownBudget(t *testing.T) {
 		SystemInstructions: []protocol.ContentSource{source(t, "first", strings.Repeat("a", 16), "configured"), source(t, "second", strings.Repeat("b", 20), "configured")},
 		Model:              contextModel(12), OutputReserve: 6,
 	}
-	plan, err := contextplanner.NewPlanner("tools-r1").Plan(stdcontext.Background(), request)
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}

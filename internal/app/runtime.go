@@ -355,7 +355,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 	}
 	service, err := orchestrator.NewService(orchestrator.Dependencies{
 		Lane: b.lane, Repository: b.store, TurnLeases: b.store,
-		Context: contextplanner.NewPlanner(toolCatalogRevision), Providers: providerCatalog, Provider: providerService,
+		Context: contextplanner.NewPlanner(toolCatalogRevision, contextplanner.NewEvidenceSummaryResolver(evidenceStore)), Providers: providerCatalog, Provider: providerService,
 		Tools: toolService, Authorization: authorizer, Approver: approverBridge,
 		Evidence: evidenceStore, Recovery: recoveryRecorder{Tools: toolService, Store: recoveryStore},
 		Verification: verification.NewService(time.Now), Projection: recoveryProjection{Repository: b.store},
