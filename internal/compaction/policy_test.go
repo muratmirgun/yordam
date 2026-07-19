@@ -1,6 +1,7 @@
 package compaction_test
 
 import (
+	"math"
 	"testing"
 
 	"github.com/muratmirgun/yordam/internal/compaction"
@@ -50,6 +51,8 @@ func TestEvaluateRejectsInvalidBudgets(t *testing.T) {
 		{name: "negative estimated input", estimated: -1, output: 0, policy: compaction.Policy{AutoCompact: true}},
 		{name: "negative output reserve", estimated: 0, output: -1, policy: compaction.Policy{AutoCompact: true}},
 		{name: "reserve and output do not fit", estimated: 0, output: 1_500, policy: compaction.Policy{AutoCompact: true, CompactReserveTokens: &reserve}},
+		{name: "reserve and output overflow", estimated: 0, output: math.MaxInt64, policy: compaction.Policy{AutoCompact: true, CompactReserveTokens: &reserve}},
+		{name: "estimated input and output overflow", estimated: math.MaxInt64, output: 1, policy: compaction.Policy{AutoCompact: true}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

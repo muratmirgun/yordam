@@ -88,20 +88,70 @@ func TestSelectBoundsNormalizedSourcesWithAnExplicitLimit(t *testing.T) {
 	for sequence := uint64(1); sequence <= 15; sequence++ {
 		events = append(events, selectionEvent(sequence, protocol.EventUserMessage, &protocol.UserMessageV1{Content: strings.Repeat("x", 80)}))
 	}
-	selection, err := compaction.Select(events, selectionCursor(15), compaction.TriggerManual, 700)
+	selection, err := compaction.Select(events, selectionCursor(15), compaction.TriggerManual, 3_000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selection.From.CommitSeq <= 1 || selection.Through.CommitSeq != 11 || sourcesByteLength(selection.Sources) > 700 {
-		t.Fatalf("selection=%+v bytes=%d", selection, sourcesByteLength(selection.Sources))
+	if selection.From.CommitSeq <= 1 || selection.Through.CommitSeq != 11 {
+		t.Fatalf("selection=%+v", selection)
+	}
+	request, err := compaction.BuildSummaryRequest(selection, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(request.Messages[1].Blocks[0].Text); got > 3_000 {
+		t.Fatalf("model-visible request bytes=%d", got)
+	}
+}
+
+func TestSelectTracksTaskAndOutcomeFactsByIdentity(t *testing.T) {
+	t.Parallel()
+	events := []protocol.EventRecord{
+		selectionTaskEvent(1, "task-a", protocol.EventTaskCreated, &protocol.TaskCreatedV1{Goal: "a", OutcomeContractID: "contract-a", ContractVersion: 1}),
+		selectionTaskEvent(2, "task-b", protocol.EventTaskCreated, &protocol.TaskCreatedV1{Goal: "b", OutcomeContractID: "contract-b", ContractVersion: 1}),
+		selectionTaskEvent(3, "task-a", protocol.EventTaskStatusChanged, &protocol.TaskStatusChangedV1{From: string(protocol.TaskRunning), To: string(protocol.TaskCompleted)}),
+		selectionTaskEvent(4, "task-a", protocol.EventTaskStatusChanged, &protocol.TaskStatusChangedV1{From: string(protocol.TaskCompleted), To: string(protocol.TaskReopened)}),
+		selectionTaskEvent(5, "task-a", protocol.EventOutcomeContractDeclared, &protocol.OutcomeContractDeclaredV1{OutcomeContractID: "contract-a", Version: 1, Goal: "a", Source: "user", Frozen: true}),
+		selectionTaskEvent(6, "task-b", protocol.EventOutcomeContractDeclared, &protocol.OutcomeContractDeclaredV1{OutcomeContractID: "contract-b", Version: 1, Goal: "b", Source: "user", Frozen: true}),
+		selectionTaskEvent(7, "task-a", protocol.EventOutcomeFinalAssessed, &protocol.OutcomeFinalAssessedV1{OutcomeContractID: "contract-a", ContractVersion: 1, Status: "passed"}),
+		selectionTaskEvent(8, "task-b", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+		selectionTaskEvent(9, "task-b", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
+		selectionTaskEvent(10, "task-b", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent three"}),
+	}
+	selection, err := compaction.Select(events, selectionCursor(10), compaction.TriggerManual, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := selection.RetainedEventIDs, []protocol.EventID{"event-2", "event-4", "event-6", "event-7", "event-8", "event-9", "event-10"}; !sameIDs(got, want) {
+		t.Fatalf("retained=%v want=%v", got, want)
+	}
+}
+
+func TestSelectRejectsLimitThatCannotFitRequiredSafetyFacts(t *testing.T) {
+	t.Parallel()
+	events := []protocol.EventRecord{
+		selectionTaskEvent(1, "task", protocol.EventTaskCreated, &protocol.TaskCreatedV1{Goal: strings.Repeat("required-goal ", 40), OutcomeContractID: "contract", ContractVersion: 1}),
+		selectionTaskEvent(2, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "older"}),
+		selectionTaskEvent(3, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "older"}),
+		selectionTaskEvent(4, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "older"}),
+		selectionTaskEvent(5, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: strings.Repeat("recent ", 40)}),
+		selectionTaskEvent(6, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: strings.Repeat("recent ", 40)}),
+	}
+	_, err := compaction.Select(events, selectionCursor(6), compaction.TriggerManual, 128)
+	if err == nil || errors.Is(err, compaction.ErrNothingToCompact) {
+		t.Fatalf("unsafe selection limit error=%v", err)
 	}
 }
 
 func selectionEvent(sequence uint64, kind string, decoded any) protocol.EventRecord {
+	return selectionTaskEvent(sequence, "", kind, decoded)
+}
+
+func selectionTaskEvent(sequence uint64, task protocol.TaskID, kind string, decoded any) protocol.EventRecord {
 	payload, _ := json.Marshal(decoded)
 	return protocol.EventRecord{Envelope: protocol.EventEnvelope{
 		SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1, JournalKind: protocol.JournalSession, JournalID: "session", SessionID: "session",
-		EventID: protocol.EventID(fmt.Sprintf("event-%d", sequence)), Seq: sequence, Time: time.Unix(int64(sequence), 0).UTC(), Kind: kind, TransactionID: protocol.TransactionID(fmt.Sprintf("tx-%d", sequence)), Payload: payload,
+		EventID: protocol.EventID(fmt.Sprintf("event-%d", sequence)), Seq: sequence, Time: time.Unix(int64(sequence), 0).UTC(), Kind: kind, TaskID: task, TransactionID: protocol.TransactionID(fmt.Sprintf("tx-%d", sequence)), Payload: payload,
 	}, Decoded: decoded}
 }
 
@@ -129,14 +179,4 @@ func sourcesText(sources []protocol.ContentSource) string {
 		}
 	}
 	return strings.Join(values, "\n")
-}
-
-func sourcesByteLength(sources []protocol.ContentSource) int {
-	total := 0
-	for _, source := range sources {
-		for _, block := range source.Content {
-			total += len(block.Text)
-		}
-	}
-	return total
 }

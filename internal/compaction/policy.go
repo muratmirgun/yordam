@@ -3,6 +3,7 @@ package compaction
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
@@ -38,6 +39,9 @@ func Evaluate(estimatedInput, outputReserve int64, window protocol.ValueInt64, p
 	if estimatedInput < 0 || outputReserve < 0 {
 		return invalid("negative input or output reserve")
 	}
+	if estimatedInput > math.MaxInt64-outputReserve {
+		return invalid("input and output reserve overflow")
+	}
 	if policy.CompactReserveTokens != nil && *policy.CompactReserveTokens <= 0 {
 		return invalid("non-positive configured reserve")
 	}
@@ -57,11 +61,11 @@ func Evaluate(estimatedInput, outputReserve int64, window protocol.ValueInt64, p
 	if policy.CompactReserveTokens != nil {
 		reserve = *policy.CompactReserveTokens
 	}
-	if reserve+outputReserve >= window.Value {
+	if reserve >= window.Value || outputReserve >= window.Value-reserve {
 		return invalid("compact and output reserves do not fit")
 	}
 	decision := Decision{Available: true, ReserveTokens: reserve, Reason: "below_threshold"}
-	if estimatedInput+outputReserve >= window.Value-reserve {
+	if estimatedInput >= window.Value-reserve-outputReserve {
 		decision.ShouldCompact = true
 		decision.Reason = "threshold_reached"
 	}

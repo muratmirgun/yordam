@@ -26,6 +26,7 @@ type Selection struct {
 	SummarizedEventIDs []protocol.EventID
 	Sources            []protocol.ContentSource
 	SourceDigest       protocol.Digest
+	InputLimitBytes    int
 }
 
 // Select chooses an older, contiguous committed range. It intentionally has no
@@ -63,33 +64,15 @@ func Select(events []protocol.EventRecord, head protocol.CommittedCursor, trigge
 		}
 		sources = append(sources, source)
 	}
-	selectedStart, included, err := boundedSelectionSources(committed, sources, start, cutoff, manualInputBytes)
+	selection, err := boundedSelection(committed, sources, start, cutoff, trigger, manualInputBytes)
 	if err != nil {
 		return Selection{}, err
-	}
-	boundedSources := make([]protocol.ContentSource, 0, len(included))
-	for index, source := range sources {
-		if _, ok := included[index]; ok {
-			boundedSources = append(boundedSources, source)
-		}
-	}
-	digest, err := SourceDigest(boundedSources)
-	if err != nil {
-		return Selection{}, err
-	}
-	selection := Selection{
-		From:               cursorFor(committed[selectedStart]),
-		Through:            cursorFor(committed[cutoff]),
-		Trigger:            trigger,
-		Sources:            boundedSources,
-		SourceDigest:       digest,
-		SummarizedEventIDs: eventIDs(committed[selectedStart : cutoff+1]),
 	}
 	selection.RetainedEventIDs = retainedIDs(committed, cutoff)
 	return cloneSelection(selection), nil
 }
 
-func boundedSelectionSources(events []protocol.EventRecord, sources []protocol.ContentSource, start, cutoff, limit int) (int, map[int]struct{}, error) {
+func boundedSelection(events []protocol.EventRecord, sources []protocol.ContentSource, start, cutoff int, trigger Trigger, limit int) (Selection, error) {
 	included := make(map[int]struct{}, len(events))
 	for index := cutoff + 1; index < len(events); index++ {
 		included[index] = struct{}{}
@@ -101,31 +84,53 @@ func boundedSelectionSources(events []protocol.EventRecord, sources []protocol.C
 	for _, record := range activeSafetyFacts(events) {
 		included[positions[record.Envelope.EventID]] = struct{}{}
 	}
-	used := 0
-	for index := range included {
-		used += sourceSize(sources[index])
-	}
-	if used > limit {
-		return 0, nil, fmt.Errorf("required compaction safety facts exceed %d bytes", limit)
-	}
 	selectedStart := cutoff + 1
 	for index := cutoff; index >= start; index-- {
-		if _, already := included[index]; already {
-			selectedStart = index
-			continue
+		_, already := included[index]
+		if !already {
+			included[index] = struct{}{}
 		}
-		candidate := sourceSize(sources[index])
-		if used+candidate > limit {
+		candidate, err := selectionFromIndexes(events, sources, included, index, cutoff, trigger, limit)
+		if err != nil {
+			return Selection{}, err
+		}
+		input, err := summaryRequestInput(candidate, nil)
+		if err != nil {
+			return Selection{}, err
+		}
+		if len(input) > limit {
+			if !already {
+				delete(included, index)
+			}
+			if already || selectedStart > cutoff {
+				return Selection{}, fmt.Errorf("required compaction safety facts exceed %d bytes", limit)
+			}
 			break
 		}
-		included[index] = struct{}{}
-		used += candidate
 		selectedStart = index
 	}
 	if selectedStart > cutoff {
-		return 0, nil, ErrNothingToCompact
+		return Selection{}, ErrNothingToCompact
 	}
-	return selectedStart, included, nil
+	return selectionFromIndexes(events, sources, included, selectedStart, cutoff, trigger, limit)
+}
+
+func selectionFromIndexes(events []protocol.EventRecord, sources []protocol.ContentSource, included map[int]struct{}, start, cutoff int, trigger Trigger, limit int) (Selection, error) {
+	boundedSources := make([]protocol.ContentSource, 0, len(included))
+	for index, source := range sources {
+		if _, ok := included[index]; ok {
+			boundedSources = append(boundedSources, source)
+		}
+	}
+	digest, err := SourceDigest(boundedSources)
+	if err != nil {
+		return Selection{}, err
+	}
+	return Selection{
+		From: cursorFor(events[start]), Through: cursorFor(events[cutoff]), Trigger: trigger,
+		Sources: boundedSources, SourceDigest: digest, InputLimitBytes: limit,
+		SummarizedEventIDs: eventIDs(events[start : cutoff+1]),
+	}, nil
 }
 
 func SourceDigest(sources []protocol.ContentSource) (protocol.Digest, error) {
@@ -202,21 +207,31 @@ func retainedIDs(events []protocol.EventRecord, cutoff int) []protocol.EventID {
 }
 
 func activeSafetyFacts(events []protocol.EventRecord) []protocol.EventRecord {
-	var tasks, outcomes []protocol.EventRecord
+	tasks := map[string]protocol.EventRecord{}
+	outcomes := map[string]protocol.EventRecord{}
 	requests := map[string]protocol.EventRecord{}
 	resolved := map[string]struct{}{}
 	for _, record := range events {
 		switch record.Envelope.Kind {
 		case protocol.EventTaskCreated:
-			tasks = append(tasks, record)
+			tasks[taskIdentity(record)] = record
 		case protocol.EventTaskStatusChanged:
-			if state, ok := record.Decoded.(*protocol.StateChangedV1); ok && (state.To == string(protocol.TaskCompleted) || state.To == string(protocol.TaskFailed) || state.To == string(protocol.TaskCancelled)) {
-				tasks = nil
+			if state, ok := taskStatus(record); ok {
+				key := taskIdentity(record)
+				if terminalTaskState(state.To) {
+					delete(tasks, key)
+				} else {
+					tasks[key] = record
+				}
 			}
 		case protocol.EventOutcomeContractDeclared, protocol.EventOutcomeContractAmended:
-			outcomes = append(outcomes, record)
+			if key, ok := outcomeIdentity(record); ok {
+				outcomes[key] = record
+			}
 		case protocol.EventOutcomeFinalAssessed:
-			outcomes = nil
+			if key, ok := outcomeIdentity(record); ok {
+				delete(outcomes, key)
+			}
 		case protocol.EventAuthorizationRequested:
 			if value, ok := authorizationRequest(record); ok && value != "" {
 				requests[value] = record
@@ -227,8 +242,13 @@ func activeSafetyFacts(events []protocol.EventRecord) []protocol.EventRecord {
 			}
 		}
 	}
-	result := append([]protocol.EventRecord{}, tasks...)
-	result = append(result, outcomes...)
+	result := make([]protocol.EventRecord, 0, len(tasks)+len(outcomes)+len(requests))
+	for _, record := range tasks {
+		result = append(result, record)
+	}
+	for _, record := range outcomes {
+		result = append(result, record)
+	}
 	for id, record := range requests {
 		if _, ok := resolved[id]; !ok {
 			result = append(result, record)
@@ -236,6 +256,47 @@ func activeSafetyFacts(events []protocol.EventRecord) []protocol.EventRecord {
 	}
 	sort.SliceStable(result, func(i, j int) bool { return result[i].Envelope.Seq < result[j].Envelope.Seq })
 	return result
+}
+
+func taskIdentity(record protocol.EventRecord) string {
+	if record.Envelope.TaskID != "" {
+		return string(record.Envelope.TaskID)
+	}
+	return "event:" + string(record.Envelope.EventID)
+}
+
+func taskStatus(record protocol.EventRecord) (*protocol.TaskStatusChangedV1, bool) {
+	switch value := record.Decoded.(type) {
+	case *protocol.TaskStatusChangedV1:
+		return value, value != nil
+	case protocol.TaskStatusChangedV1:
+		return &value, true
+	default:
+		return nil, false
+	}
+}
+
+func terminalTaskState(state string) bool {
+	return state == string(protocol.TaskCompleted) || state == string(protocol.TaskFailed) || state == string(protocol.TaskCancelled)
+}
+
+func outcomeIdentity(record protocol.EventRecord) (string, bool) {
+	switch value := record.Decoded.(type) {
+	case *protocol.OutcomeContractDeclaredV1:
+		return string(value.OutcomeContractID), value != nil && value.OutcomeContractID != ""
+	case protocol.OutcomeContractDeclaredV1:
+		return string(value.OutcomeContractID), value.OutcomeContractID != ""
+	case *protocol.OutcomeContractAmendedV1:
+		return string(value.OutcomeContractID), value != nil && value.OutcomeContractID != ""
+	case protocol.OutcomeContractAmendedV1:
+		return string(value.OutcomeContractID), value.OutcomeContractID != ""
+	case *protocol.OutcomeFinalAssessedV1:
+		return string(value.OutcomeContractID), value != nil && value.OutcomeContractID != ""
+	case protocol.OutcomeFinalAssessedV1:
+		return string(value.OutcomeContractID), value.OutcomeContractID != ""
+	default:
+		return "", false
+	}
 }
 
 func authorizationRequest(record protocol.EventRecord) (string, bool) {
@@ -356,24 +417,6 @@ func eventIDs(events []protocol.EventRecord) []protocol.EventID {
 		ids[index] = events[index].Envelope.EventID
 	}
 	return ids
-}
-
-func sourcesSize(sources []protocol.ContentSource) int {
-	total := 0
-	for _, source := range sources {
-		for _, block := range source.Content {
-			total += len(block.Text)
-		}
-	}
-	return total
-}
-
-func sourceSize(source protocol.ContentSource) int {
-	total := 0
-	for _, block := range source.Content {
-		total += len(block.Text)
-	}
-	return total
 }
 
 func cloneSelection(selection Selection) Selection { return protocol.DeepCopy(selection) }

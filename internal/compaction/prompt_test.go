@@ -29,6 +29,16 @@ func TestBuildSummaryRequestCarriesContractSelectionAndPriorSummary(t *testing.T
 	}
 }
 
+func TestBuildSummaryRequestRejectsPriorThatExceedsSelectionInputLimit(t *testing.T) {
+	t.Parallel()
+	selection := promptSelection(t)
+	selection.InputLimitBytes = 600
+	prior := promptSource(t, "prior", strings.Repeat("p", 600))
+	if _, err := compaction.BuildSummaryRequest(selection, &prior); err == nil {
+		t.Fatal("accepted prior content beyond the model-visible selection limit")
+	}
+}
+
 func TestParseSummaryRequiresExactCanonicalContractAndBounds(t *testing.T) {
 	t.Parallel()
 	valid := []byte(`{"skills":[],"goal":"ship","constraints":[],"decisions":[],"files":[],"commands_and_tests":[],"unresolved":[],"children":[],"unknown_effects":[]}`)

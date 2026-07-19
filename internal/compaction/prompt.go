@@ -26,27 +26,46 @@ func BuildSummaryRequest(selection Selection, prior *protocol.ContentSource) (pr
 	if err := validateSelection(selection); err != nil {
 		return protocol.ModelRequest{}, err
 	}
-	priorText := "none"
 	if prior != nil {
 		if err := prior.Validate(); err != nil {
 			return protocol.ModelRequest{}, fmt.Errorf("invalid prior compaction summary: %w", err)
 		}
-		raw, err := canonicaljson.Marshal(prior.Content)
-		if err != nil {
-			return protocol.ModelRequest{}, err
-		}
-		priorText = string(raw)
 	}
-	sources, err := canonicaljson.Marshal(selection.Sources)
+	input, err := summaryRequestInput(selection, prior)
 	if err != nil {
 		return protocol.ModelRequest{}, err
 	}
+	if len(input) > effectiveInputLimit(selection) {
+		return protocol.ModelRequest{}, fmt.Errorf("compaction summary input exceeds %d bytes", effectiveInputLimit(selection))
+	}
 	contract := `Return only canonical JSON with exactly these fields: {"goal":"","constraints":[],"decisions":[],"files":[],"commands_and_tests":[],"unresolved":[],"children":[],"skills":[],"unknown_effects":[]}. Do not add keys or prose.`
-	input := fmt.Sprintf("range_from=%s\nrange_through=%s\nsource_digest=%s:%s\nprior_summary=%s\nnormalized_sources=%s", cursorLabel(selection.From), cursorLabel(selection.Through), selection.SourceDigest.Algorithm, selection.SourceDigest.Value, priorText, sources)
 	return protocol.ModelRequest{RequestID: "compaction-summary-v1", Messages: []protocol.ModelMessage{
 		{Role: "system", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: contract}}},
-		{Role: "user", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: input}}},
+		{Role: "user", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: string(input)}}},
 	}}, nil
+}
+
+type summaryRequestBody struct {
+	From         protocol.CommittedCursor `json:"from"`
+	Through      protocol.CommittedCursor `json:"through"`
+	SourceDigest protocol.Digest          `json:"source_digest"`
+	Prior        *protocol.ContentSource  `json:"prior_summary,omitempty"`
+	Sources      []protocol.ContentSource `json:"normalized_sources"`
+}
+
+// summaryRequestInput is the sole model-visible user-body serialization. Select
+// sizes this canonical representation without a prior summary; BuildSummaryRequest
+// repeats it with an optional prior and rejects any resulting excess. Fixed system
+// contract instructions are intentionally outside Selection.InputLimitBytes.
+func summaryRequestInput(selection Selection, prior *protocol.ContentSource) ([]byte, error) {
+	return canonicaljson.Marshal(summaryRequestBody{From: selection.From, Through: selection.Through, SourceDigest: selection.SourceDigest, Prior: prior, Sources: selection.Sources})
+}
+
+func effectiveInputLimit(selection Selection) int {
+	if selection.InputLimitBytes > 0 {
+		return selection.InputLimitBytes
+	}
+	return DefaultManualInputBytes
 }
 
 // ParseSummary admits only the exact structured summary contract and returns its
@@ -141,8 +160,4 @@ func validateSelection(selection Selection) error {
 		return fmt.Errorf("compaction selection source digest mismatch")
 	}
 	return nil
-}
-
-func cursorLabel(cursor protocol.CommittedCursor) string {
-	return fmt.Sprintf("%s/%s/%d/%s", cursor.JournalKind, cursor.JournalID, cursor.CommitSeq, cursor.TransactionID)
 }
