@@ -48,7 +48,7 @@ type LegacyAdapter struct {
 	pending             map[protocol.CommandID]Command
 	turns               map[protocol.TurnID]Command
 	compactions         map[protocol.ActivityID]string
-	manualCompactQueued bool
+	compactionFacts     map[protocol.ActivityID]compactionFacts
 }
 
 func NewLegacyAdapter(options LegacyAdapterOptions) *LegacyAdapter {
@@ -60,7 +60,7 @@ func NewLegacyAdapter(options LegacyAdapterOptions) *LegacyAdapter {
 	}
 	return &LegacyAdapter{
 		actor: options.Actor, selectedSessionID: options.SelectedSessionID, cursor: options.Cursor, runtimeGenerationID: options.RuntimeGenerationID, now: options.Now,
-		pending: make(map[protocol.CommandID]Command), turns: make(map[protocol.TurnID]Command), compactions: make(map[protocol.ActivityID]string),
+		pending: make(map[protocol.CommandID]Command), turns: make(map[protocol.TurnID]Command), compactions: make(map[protocol.ActivityID]string), compactionFacts: make(map[protocol.ActivityID]compactionFacts),
 	}
 }
 
@@ -118,11 +118,6 @@ func (a *LegacyAdapter) Command(command Command) (protocol.Command, error) {
 	if command.Kind == CommandStartTurn {
 		a.pendingMu.Lock()
 		a.pending[applicationCommand.CommandID] = command
-		a.pendingMu.Unlock()
-	}
-	if command.Kind == CommandCompact {
-		a.pendingMu.Lock()
-		a.manualCompactQueued = true
 		a.pendingMu.Unlock()
 	}
 	return applicationCommand, nil
@@ -274,14 +269,11 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 		if err := json.Unmarshal(event.Payload, &planned); err != nil {
 			return Event{}, err
 		}
-		if planned.Kind != "provider" || planned.Purpose != "summarize stable context" || event.Correlation.ActivityID == "" {
+		if planned.CompactionTrigger == "" || event.Correlation.ActivityID == "" {
 			break
 		}
-		trigger := "automatic"
+		trigger := planned.CompactionTrigger
 		a.pendingMu.Lock()
-		if a.manualCompactQueued {
-			trigger, a.manualCompactQueued = "manual", false
-		}
 		a.compactions[event.Correlation.ActivityID] = trigger
 		a.pendingMu.Unlock()
 		legacy.Kind, legacy.Message = EventCompactionStarted, trigger+":preparing"
@@ -293,6 +285,13 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 		}
 	case protocol.EventActivitySucceeded:
 		if trigger, ok := a.compactionTrigger(event.Correlation.ActivityID); ok {
+			var outcome protocol.ActivityOutcomeV1
+			if err := json.Unmarshal(event.Payload, &outcome); err != nil {
+				return Event{}, err
+			}
+			a.pendingMu.Lock()
+			a.compactionFacts[event.Correlation.ActivityID] = compactionFacts{usage: outcome.Usage, outputBytes: outcome.OutputBytes}
+			a.pendingMu.Unlock()
 			legacy.Kind, legacy.Message = EventCompactionProgress, trigger+":persisting"
 			legacy.Compaction = &protocol.CompactionEventV1{Trigger: trigger, Stage: protocol.CompactionPersisting, Usage: unknownCompactionUsage()}
 		}
@@ -320,7 +319,12 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 		}
 		rangeValue := protocol.CompactionRange{From: compacted.From, Through: compacted.Through}
 		legacy.Kind, legacy.Message = EventCompactionCompleted, fmt.Sprintf("%s:%d–%d", rangeValue.From.JournalID, rangeValue.From.CommitSeq, rangeValue.Through.CommitSeq)
-		legacy.Compaction = &protocol.CompactionEventV1{Trigger: trigger, Stage: protocol.CompactionCompleted, Range: &rangeValue, Usage: unknownCompactionUsage(), Revision: compacted.Revision, SummaryEvidenceID: compacted.SummaryEvidenceID}
+		facts := a.takeCompactionFacts(event.Correlation.ActivityID)
+		usage := unknownCompactionUsage()
+		if facts.usage != nil {
+			usage = *facts.usage
+		}
+		legacy.Compaction = &protocol.CompactionEventV1{Trigger: trigger, Stage: protocol.CompactionCompleted, Range: &rangeValue, Usage: usage, SummaryBytes: facts.outputBytes, Revision: compacted.Revision, SummaryEvidenceID: compacted.SummaryEvidenceID}
 		legacy.Context = &protocol.ContextProjectionV1{Revision: compacted.Revision, SummaryEvidenceID: compacted.SummaryEvidenceID, LatestRange: &rangeValue}
 		a.finishCompaction(event.Correlation.ActivityID)
 	default:
@@ -354,7 +358,19 @@ func (a *LegacyAdapter) compactionTrigger(id protocol.ActivityID) (string, bool)
 func (a *LegacyAdapter) finishCompaction(id protocol.ActivityID) {
 	a.pendingMu.Lock()
 	delete(a.compactions, id)
+	delete(a.compactionFacts, id)
 	a.pendingMu.Unlock()
+}
+
+type compactionFacts struct {
+	usage       *protocol.ModelUsage
+	outputBytes int64
+}
+
+func (a *LegacyAdapter) takeCompactionFacts(id protocol.ActivityID) compactionFacts {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	return a.compactionFacts[id]
 }
 
 func strictUnmarshal(raw json.RawMessage, destination any) error {

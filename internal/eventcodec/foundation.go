@@ -230,6 +230,9 @@ func validateFoundationSemantic(kind string, payload any) error {
 		if err := sortedEvidenceIDs(value.InputEvidenceIDs); err != nil {
 			return err
 		}
+		if value.CompactionTrigger != "" && value.CompactionTrigger != "manual" && value.CompactionTrigger != "automatic" {
+			return fmt.Errorf("invalid compaction trigger")
+		}
 		if value.Plan != nil {
 			return validateActionPlan(*value.Plan)
 		}
@@ -258,6 +261,12 @@ func validateFoundationSemantic(kind string, payload any) error {
 		}[kind]
 		if want != "" && value.Status != want {
 			return fmt.Errorf("activity outcome status %q does not match event %q", value.Status, kind)
+		}
+		if value.OutputBytes < 0 {
+			return fmt.Errorf("activity output bytes is invalid")
+		}
+		if value.Usage != nil {
+			return value.Usage.Validate()
 		}
 		return sortedEvidenceIDs(value.OutputEvidenceIDs)
 	case *protocol.ProviderCapabilityDecidedV1:

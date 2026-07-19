@@ -129,13 +129,13 @@ func TestRuntimeBrokerSnapshotReconstructsDurableCompactionContext(t *testing.T)
 		t.Fatal(err)
 	}
 	appended, err := builder.store.AppendBatch(t.Context(), journal.AppendRequest{Journal: ref, ExpectedHead: head, TransactionID: "context", Compatibility: &journal.CompatibilityDeclaration{ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: head}, Events: []protocol.ProposedEvent{
-		{EventID: "context-plan", Time: time.Unix(1, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventContextPlanRecorded, SessionID: protocol.SessionID(ref.ID), Payload: planPayload},
+		{EventID: "context-plan", Time: time.Unix(1, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventContextPlanRecorded, SessionID: protocol.SessionID(ref.ID), RuntimeGenerationID: "test-generation", Payload: planPayload},
 		{EventID: "context-compacted", Time: time.Unix(2, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventContextCompacted, SessionID: protocol.SessionID(ref.ID), Payload: compactPayload},
 	}})
 	if err != nil || appended.Status != journal.AppendCommitted {
 		t.Fatalf("append=%+v err=%v", appended, err)
 	}
-	durable, _, err := (runtimeBrokerSource{Repository: builder.store, Workspace: workspaceRef}).Project(t.Context(), SnapshotVector{WorkspaceControl: workspaceHead, SelectedSession: &appended.Cursor})
+	durable, _, err := (runtimeBrokerSource{Repository: builder.store, Workspace: workspaceRef, Manifest: protocol.RuntimeGenerationManifest{ID: "test-generation", Body: protocol.RuntimeGenerationBody{Limits: protocol.RuntimeLimits{AutoCompact: true}}}}).Project(t.Context(), SnapshotVector{WorkspaceControl: workspaceHead, SelectedSession: &appended.Cursor})
 	if err != nil {
 		t.Fatal(err)
 	}

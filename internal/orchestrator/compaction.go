@@ -94,7 +94,7 @@ func (s *Service) RunCompaction(ctx context.Context, request CompactRequest) (re
 		return CompactResult{}, err
 	}
 	planned, err := s.compactionEvents(request, activityID, "planned", []compactionEventValue{
-		{protocol.EventActivityPlanned, protocol.ActivityPlannedV1{Kind: "provider", Purpose: "summarize stable context", PurposeActor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}, Source: "provider", RequestedProfile: "network", EffectiveProfile: "network"}},
+		{protocol.EventActivityPlanned, protocol.ActivityPlannedV1{Kind: "provider", Purpose: "summarize stable context", PurposeActor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}, Source: "provider", RequestedProfile: "network", EffectiveProfile: "network", CompactionTrigger: string(request.Trigger)}},
 		{protocol.EventAuthorizationRequested, protocol.AuthorizationRequestedV1{Request: authorizationRequest}},
 	})
 	if err != nil {
@@ -136,7 +136,7 @@ func (s *Service) RunCompaction(ctx context.Context, request CompactRequest) (re
 		return CompactResult{}, err
 	}
 	final, err := s.compactionEvents(request, activityID, "completed", []compactionEventValue{
-		{protocol.EventActivitySucceeded, protocol.ActivityOutcomeV1{Status: "succeeded", OutputEvidenceIDs: []protocol.EvidenceID{evidence.Body.ID}}},
+		{protocol.EventActivitySucceeded, protocol.ActivityOutcomeV1{Status: "succeeded", OutputEvidenceIDs: []protocol.EvidenceID{evidence.Body.ID}, Usage: &usage, OutputBytes: evidence.Body.Size}},
 		{protocol.EventContextCompacted, protocol.ContextCompactedV1{From: selection.From, Through: selection.Through, SummaryEvidenceID: evidence.Body.ID, Revision: revision}},
 		{protocol.EventCommandCompleted, completed},
 	})
@@ -214,7 +214,7 @@ func (s *Service) compactWithinTurn(ctx context.Context, request StartTurnReques
 		kind    string
 		payload any
 	}{
-		{protocol.EventActivityPlanned, protocol.ActivityPlannedV1{Kind: "provider", Purpose: "summarize stable context", PurposeActor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}, Source: "provider", RequestedProfile: "network", EffectiveProfile: "network"}},
+		{protocol.EventActivityPlanned, protocol.ActivityPlannedV1{Kind: "provider", Purpose: "summarize stable context", PurposeActor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}, Source: "provider", RequestedProfile: "network", EffectiveProfile: "network", CompactionTrigger: string(compaction.TriggerAutomatic)}},
 		{protocol.EventAuthorizationRequested, protocol.AuthorizationRequestedV1{Request: authorizationRequest}},
 	})
 	if err != nil {
@@ -233,7 +233,7 @@ func (s *Service) compactWithinTurn(ctx context.Context, request StartTurnReques
 	if err != nil {
 		return false, err
 	}
-	summary, _, err := s.collectCompactionSummary(ctx, request.Runtime.ID, stream)
+	summary, usage, err := s.collectCompactionSummary(ctx, request.Runtime.ID, stream)
 	if err != nil {
 		return false, err
 	}
@@ -249,7 +249,7 @@ func (s *Service) compactWithinTurn(ctx context.Context, request StartTurnReques
 		kind    string
 		payload any
 	}{
-		{protocol.EventActivitySucceeded, protocol.ActivityOutcomeV1{Status: "succeeded", OutputEvidenceIDs: []protocol.EvidenceID{evidence.Body.ID}}},
+		{protocol.EventActivitySucceeded, protocol.ActivityOutcomeV1{Status: "succeeded", OutputEvidenceIDs: []protocol.EvidenceID{evidence.Body.ID}, Usage: &usage, OutputBytes: evidence.Body.Size}},
 		{protocol.EventContextCompacted, protocol.ContextCompactedV1{From: selection.From, Through: selection.Through, SummaryEvidenceID: evidence.Body.ID, Revision: revision}},
 	})
 	if err != nil {

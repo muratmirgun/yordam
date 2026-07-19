@@ -281,14 +281,15 @@ type TurnTerminalV1 struct {
 }
 
 type ActivityPlannedV1 struct {
-	Kind             string       `json:"kind"`
-	Purpose          string       `json:"purpose"`
-	PurposeActor     ActorRef     `json:"purpose_actor"`
-	Source           string       `json:"source"`
-	Plan             *ActionPlan  `json:"plan,omitempty"`
-	InputEvidenceIDs []EvidenceID `json:"input_evidence_ids,omitempty"`
-	RequestedProfile string       `json:"requested_profile"`
-	EffectiveProfile string       `json:"effective_profile"`
+	Kind              string       `json:"kind"`
+	Purpose           string       `json:"purpose"`
+	PurposeActor      ActorRef     `json:"purpose_actor"`
+	Source            string       `json:"source"`
+	Plan              *ActionPlan  `json:"plan,omitempty"`
+	InputEvidenceIDs  []EvidenceID `json:"input_evidence_ids,omitempty"`
+	RequestedProfile  string       `json:"requested_profile"`
+	EffectiveProfile  string       `json:"effective_profile"`
+	CompactionTrigger string       `json:"compaction_trigger,omitempty"`
 }
 
 type ActivityAuthorizedV1 struct {
@@ -324,6 +325,8 @@ type ActivityOutcomeV1 struct {
 	ErrorCode         string       `json:"error_code,omitempty"`
 	OutputEvidenceIDs []EvidenceID `json:"output_evidence_ids,omitempty"`
 	UnknownEffects    []SubjectRef `json:"unknown_effects,omitempty"`
+	Usage             *ModelUsage  `json:"usage,omitempty"`
+	OutputBytes       int64        `json:"output_bytes,omitempty"`
 }
 
 type ProviderCapabilityDecidedV1 struct {

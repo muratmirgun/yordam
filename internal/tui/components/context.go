@@ -110,6 +110,7 @@ func (c Context) CompactionStage() protocol.CompactionStage {
 	}
 	return c.progress.Stage
 }
+func (c *Context) ClearCompactionProgress() { c.progress = nil }
 
 func (c *Context) show(tab ContextTab) {
 	c.active = tab

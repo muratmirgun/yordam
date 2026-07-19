@@ -430,6 +430,10 @@ func (s runtimeBrokerSource) Project(ctx context.Context, vector SnapshotVector)
 	known := func(id, kind, status string, data json.RawMessage) protocol.ProjectionView {
 		return protocol.ProjectionView{ID: id, Kind: kind, Status: status, State: protocol.ValueKnown, Data: protocol.CloneRawMessage(data)}
 	}
+	generations, generationErr := projection.New[map[protocol.RuntimeGenerationID]protocol.RuntimeGenerationManifest](s.Repository, generationCatalogProjector{}, nil).At(ctx, workspaceRef, vector.WorkspaceControl)
+	if generationErr != nil {
+		return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("project runtime generations at cursor: %w", generationErr)
+	}
 	durable := protocol.DurableProjection{
 		Workspace:  known(string(workspaceRef.ID), "workspace", "ready", workspaceData),
 		Activities: []protocol.ProjectionView{}, Provider: unknown("provider", "provider"), MCP: []protocol.ProjectionView{},
@@ -507,7 +511,7 @@ func (s runtimeBrokerSource) Project(ctx context.Context, vector SnapshotVector)
 			durable.Evidence = append(durable.Evidence, known(string(evidenceID), "evidence", string(availability), data))
 		}
 		durable.RecoveryDiagnostics = protocol.DeepCopy(tasks.State.Diagnostics)
-		contextState, contextErr := projection.New[protocol.ContextProjectionV1](s.Repository, contextProjectionProjector{limits: s.Manifest.Body.Limits}, nil).At(ctx, ref, *vector.SelectedSession)
+		contextState, contextErr := projection.New[protocol.ContextProjectionV1](s.Repository, contextProjectionProjector{generations: generations.State, bootstrap: s.Manifest}, nil).At(ctx, ref, *vector.SelectedSession)
 		if contextErr != nil {
 			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("project context at cursor: %w", contextErr)
 		}
@@ -521,7 +525,23 @@ func (s runtimeBrokerSource) Project(ctx context.Context, vector SnapshotVector)
 	return durable, runtime, nil
 }
 
-type contextProjectionProjector struct{ limits protocol.RuntimeLimits }
+type generationCatalogProjector struct{}
+
+func (generationCatalogProjector) Version() uint32 { return 1 }
+func (generationCatalogProjector) Zero(protocol.JournalRef) map[protocol.RuntimeGenerationID]protocol.RuntimeGenerationManifest {
+	return map[protocol.RuntimeGenerationID]protocol.RuntimeGenerationManifest{}
+}
+func (generationCatalogProjector) Apply(state map[protocol.RuntimeGenerationID]protocol.RuntimeGenerationManifest, record protocol.EventRecord) (map[protocol.RuntimeGenerationID]protocol.RuntimeGenerationManifest, error) {
+	if value, ok := record.Decoded.(*protocol.RuntimeGenerationActivatedV1); ok {
+		state[value.Manifest.ID] = protocol.DeepCopy(value.Manifest)
+	}
+	return state, nil
+}
+
+type contextProjectionProjector struct {
+	generations map[protocol.RuntimeGenerationID]protocol.RuntimeGenerationManifest
+	bootstrap   protocol.RuntimeGenerationManifest
+}
 
 func (contextProjectionProjector) Version() uint32 { return 1 }
 func (contextProjectionProjector) Zero(protocol.JournalRef) protocol.ContextProjectionV1 {
@@ -531,6 +551,14 @@ func (p contextProjectionProjector) Apply(state protocol.ContextProjectionV1, re
 	switch value := record.Decoded.(type) {
 	case *protocol.ContextPlanRecordedV1:
 		state.EstimatedInputTokens, state.ContextWindow, state.OutputReserve, state.Revision = value.Plan.Body.EstimatedInputTokens, value.Plan.Body.ContextWindow, value.Plan.Body.OutputReserve, value.Plan.Body.CompactionRevision
+		manifest, ok := p.generations[record.Envelope.RuntimeGenerationID]
+		if !ok && p.bootstrap.ID != "" && p.bootstrap.ID == record.Envelope.RuntimeGenerationID {
+			manifest, ok = p.bootstrap, true
+		}
+		if !ok {
+			state.AutoAvailable, state.AutoReason, state.ReserveTokens = false, "unknown_generation", protocol.ValueInt64{State: protocol.ValueUnknown}
+			return state, nil
+		}
 		if value.Plan.Body.ContextWindow.State != protocol.ValueKnown {
 			state.AutoAvailable, state.AutoReason = false, "unknown_context_window"
 			return state, nil
@@ -539,11 +567,11 @@ func (p contextProjectionProjector) Apply(state protocol.ContextProjectionV1, re
 		if reserve < 2048 {
 			reserve = 2048
 		}
-		if p.limits.CompactReserveTokens.State == protocol.ValueKnown {
-			reserve = p.limits.CompactReserveTokens.Value
+		if manifest.Body.Limits.CompactReserveTokens.State == protocol.ValueKnown {
+			reserve = manifest.Body.Limits.CompactReserveTokens.Value
 		}
 		state.ReserveTokens = protocol.ValueInt64{State: protocol.ValueKnown, Value: reserve, Provenance: "compaction_policy"}
-		if !p.limits.AutoCompact && p.limits != (protocol.RuntimeLimits{}) {
+		if !manifest.Body.Limits.AutoCompact {
 			state.AutoAvailable, state.AutoReason = false, "disabled"
 		} else {
 			state.AutoAvailable, state.AutoReason = true, "below_threshold"

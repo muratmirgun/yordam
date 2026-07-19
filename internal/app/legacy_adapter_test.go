@@ -55,7 +55,7 @@ func TestApplicationLegacyAdapterProjectsManualCompactionLifecycleWithoutProvide
 		body string
 		want app.EventKind
 	}{
-		{protocol.EventActivityPlanned, `{"kind":"provider","purpose":"summarize stable context"}`, app.EventKind("compaction_started")},
+		{protocol.EventActivityPlanned, `{"kind":"provider","purpose":"summarize stable context","compaction_trigger":"manual"}`, app.EventKind("compaction_started")},
 		{protocol.EventActivityStarted, `{}`, app.EventKind("compaction_progress")},
 		{protocol.EventActivitySucceeded, `{"status":"succeeded"}`, app.EventKind("compaction_progress")},
 		{protocol.EventContextCompacted, `{"from":{"journal_kind":"session","journal_id":"session-1","commit_seq":1,"transaction_id":"tx-1"},"through":{"journal_kind":"session","journal_id":"session-1","commit_seq":4,"transaction_id":"tx-4"},"summary_evidence_id":"summary-1","revision":"r1","summary":"provider-secret-body"}`, app.EventKind("compaction_completed")},
@@ -89,7 +89,7 @@ func TestApplicationLegacyAdapterProjectsAutomaticCompactionCancelledAndUncertai
 		t.Run(terminal.want, func(t *testing.T) {
 			adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{Actor: protocol.ActorRef{ID: "user-1", Kind: protocol.ActorUser}})
 			activityID := protocol.ActivityID("auto-" + terminal.want)
-			if _, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityPlanned, activityID, `{"kind":"provider","purpose":"summarize stable context"}`)); err != nil {
+			if _, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityPlanned, activityID, `{"kind":"provider","purpose":"summarize stable context","compaction_trigger":"automatic"}`)); err != nil {
 				t.Fatal(err)
 			}
 			legacy, err := adapter.Event(compactionApplicationEvent(terminal.kind, activityID, `{}`))

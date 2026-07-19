@@ -67,6 +67,7 @@ func (model Model) handleAppEvent(event app.Event) Model {
 		if event.Compaction != nil && event.Compaction.Error != nil {
 			model.conversation.Append(components.BlockError, event.Compaction.Error.Message)
 		}
+		model.context.ClearCompactionProgress()
 	case app.EventState:
 		if event.Runtime.Kind != "" {
 			model = model.setTurnActive(true)
@@ -78,6 +79,7 @@ func (model Model) handleAppEvent(event app.Event) Model {
 			model = model.replaceModels(event.Models, event.Selection)
 		}
 	case app.EventTurnAccepted:
+		model.context.ClearCompactionProgress()
 		if model.matchesPendingDraft(event) {
 			draft := event.Draft
 			if draft == "" {
