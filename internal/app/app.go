@@ -298,7 +298,9 @@ func (a *App) Run(ctx context.Context) error {
 						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 						continue
 					}
-					go consumeLegacyProtocolEvents(ctx, subscription, activeSet.LegacyAdapter, protocolEvents, false)
+					// The operation result owns successful turn completion so it can
+					// clear activeOperation before publishing the sole terminal event.
+					go consumeLegacyProtocolEvents(ctx, subscription, activeSet.LegacyAdapter, protocolEvents, true)
 					go func() {
 						result, executeErr := activeSet.ApplicationService.Execute(turnCtx, applicationCommand)
 						if executeErr == nil && result.Error != nil {
@@ -518,9 +520,6 @@ func (a *App) Run(ctx context.Context) error {
 					event.Replay = refreshed
 					event.Session = a.session
 				}
-			}
-			if result.throughProtocol && result.err == nil {
-				event.Kind = ""
 			}
 			if event.Kind != "" && !a.publish(ctx, event) {
 				if !shutdownRequested {

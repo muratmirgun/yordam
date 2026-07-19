@@ -99,7 +99,38 @@ func (c *Context) ShowWorkspaceChanges(changes *domain.WorkspaceChanges) {
 }
 
 func (c *Context) SetCompactionContext(state protocol.ContextProjectionV1) {
+	if c.compaction != nil {
+		state = mergeCompactionContext(*c.compaction, state)
+	}
 	c.compaction = &state
+}
+
+func mergeCompactionContext(old, next protocol.ContextProjectionV1) protocol.ContextProjectionV1 {
+	if next.AutoReason == "" {
+		next.AutoReason, next.AutoAvailable = old.AutoReason, old.AutoAvailable
+	}
+	if next.EstimatedInputTokens.State == "" {
+		next.EstimatedInputTokens = old.EstimatedInputTokens
+	}
+	if next.ContextWindow.State == "" {
+		next.ContextWindow = old.ContextWindow
+	}
+	if next.ReserveTokens.State == "" {
+		next.ReserveTokens = old.ReserveTokens
+	}
+	if next.OutputReserve == 0 {
+		next.OutputReserve = old.OutputReserve
+	}
+	if next.Revision == "" {
+		next.Revision = old.Revision
+	}
+	if next.SummaryEvidenceID == "" {
+		next.SummaryEvidenceID = old.SummaryEvidenceID
+	}
+	if next.LatestRange == nil {
+		next.LatestRange = old.LatestRange
+	}
+	return next
 }
 func (c *Context) SetCompactionProgress(progress protocol.CompactionEventV1) {
 	c.progress = &progress
