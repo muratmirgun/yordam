@@ -209,10 +209,6 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("selected model %q/%q is not in runtime generation %q", request.ProviderID, request.ModelID, request.Runtime.ID)
 	}
 	requirements := []protocol.CapabilityRequirement{}
-	history, err := s.readFullHistory(ctx, state.ref)
-	if err != nil {
-		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
-	}
 	instructions, err := s.deps.Instructions.SystemInstructions(ctx, request.Runtime.ID, request.Runtime.Body.InstructionRevision, request.SessionID)
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
@@ -234,12 +230,36 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("system instruction source: %w", err)
 		}
 	}
-	contextPlan, err := s.deps.Context.Plan(ctx, contextplanner.Request{
-		Session: request.SessionID, TaskID: state.taskID, OutcomeContractID: state.contractID, OutcomeContractVersion: 2,
-		Events: history, SystemInstructions: instructions, Model: model,
-	})
-	if err != nil {
-		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+	var contextPlan protocol.ContextPlan
+	for rebuild := 0; ; rebuild++ {
+		history, historyErr := s.readFullHistory(ctx, state.ref)
+		if historyErr != nil {
+			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, historyErr
+		}
+		contextPlan, err = s.deps.Context.Plan(ctx, contextplanner.Request{
+			Session: request.SessionID, TaskID: state.taskID, OutcomeContractID: state.contractID, OutcomeContractVersion: 2,
+			Events: history, SystemInstructions: instructions, Model: model,
+		})
+		if err != nil {
+			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+		}
+		if rebuild != 0 {
+			break
+		}
+		decision, policyErr := automaticCompactionDecision(contextPlan, request.Runtime.Body.Limits)
+		if policyErr != nil {
+			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, policyErr
+		}
+		if !decision.ShouldCompact {
+			break
+		}
+		compacted, compactErr := s.compactWithinTurn(ctx, request, state, state.head, history)
+		if compactErr != nil {
+			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, compactErr
+		}
+		if !compacted {
+			break
+		}
 	}
 	state.contextPlanDigest = contextPlan.Digest
 	plan, err := s.deps.Providers.Negotiate(model.ProviderID, model.ModelID, requirements, request.Runtime.Body.ToolCatalogRevision)
@@ -1126,8 +1146,14 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 		turnKind, turnStatus = protocol.EventTurnInterrupted, "interrupted"
 		commandStatus, taskTo = "interrupted", string(protocol.TaskCancelled)
 		reason, code = "turn orchestration interrupted", "turn_interrupted"
-	} else if !state.taskRunning {
-		taskTo = string(protocol.TaskCancelled)
+	} else {
+		var providerFailure *providerFailureError
+		if errors.As(cause, &providerFailure) && providerFailure.code == "context_too_large" {
+			reason, code = "provider context is too large; compact or reduce the request", "context_too_large"
+		}
+		if !state.taskRunning {
+			taskTo = string(protocol.TaskCancelled)
+		}
 	}
 	activityStatus := "failed"
 	if denied != nil {
@@ -1487,7 +1513,7 @@ func (s *Service) collectProviderStream(ctx context.Context, generation protocol
 				if sanitizeErr != nil {
 					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, sanitizeErr
 				}
-				return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("provider error %s: %s", code, messageText)
+				return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, &providerFailureError{code: code, message: messageText}
 			}
 		}
 	}
@@ -1585,6 +1611,7 @@ type turnState struct {
 	activeActivityID  protocol.ActivityID
 	activeStarted     bool
 	activeDispatched  bool
+	compactedSources  map[protocol.Digest]struct{}
 }
 
 type authorizationDeniedError struct{ reason string }
@@ -1596,13 +1623,23 @@ func (e *authorizationDeniedError) Error() string {
 	return "authorization denied: " + e.reason
 }
 
+type providerFailureError struct {
+	code    string
+	message string
+}
+
+func (e *providerFailureError) Error() string {
+	return fmt.Sprintf("provider error %s: %s", e.code, e.message)
+}
+
 func newTurnState(request StartTurnRequest) turnState {
 	return turnState{
 		ref:  protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(request.SessionID)},
 		head: request.ExpectedHead, command: request.Command,
-		taskID:     protocol.TaskID(stableID("task", string(request.Command.CommandID))),
-		turnID:     protocol.TurnID(stableID("turn", string(request.Command.CommandID))),
-		contractID: protocol.OutcomeContractID(stableID("contract", string(request.Command.CommandID))),
+		taskID:           protocol.TaskID(stableID("task", string(request.Command.CommandID))),
+		turnID:           protocol.TurnID(stableID("turn", string(request.Command.CommandID))),
+		contractID:       protocol.OutcomeContractID(stableID("contract", string(request.Command.CommandID))),
+		compactedSources: make(map[protocol.Digest]struct{}),
 	}
 }
 
@@ -1689,7 +1726,16 @@ func eventID(commandID protocol.CommandID, label string, index int, kind string)
 }
 
 func (s *Service) append(ctx context.Context, state *turnState, label string, events []protocol.ProposedEvent) error {
-	if err := validateProposedEvents(events, state.ref); err != nil {
+	validate := validateProposedEvents
+	for _, event := range events {
+		if event.Kind == protocol.EventContextCompacted {
+			validate = func(events []protocol.ProposedEvent, ref protocol.JournalRef) error {
+				return validateCompactionProposedEvents(events, ref, state.head.CommitSeq+1)
+			}
+			break
+		}
+	}
+	if err := validate(events, state.ref); err != nil {
 		return err
 	}
 	transactionID := protocol.TransactionID(stableID("transaction", string(state.command.CommandID), label))

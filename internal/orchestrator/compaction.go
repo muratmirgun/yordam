@@ -166,6 +166,120 @@ type compactionState struct {
 	activityTerminal bool
 	evidence         protocol.EvidenceRecord
 }
+
+// compactWithinTurn compacts one safe source range while the caller retains
+// the turn's lane and lease. It deliberately uses the turn state and append
+// path directly: calling RunCompaction here would try to acquire both again.
+func (s *Service) compactWithinTurn(ctx context.Context, request StartTurnRequest, state *turnState, head protocol.CommittedCursor, history []protocol.EventRecord) (bool, error) {
+	if state == nil || state.head != head {
+		return false, fmt.Errorf("automatic compaction turn head changed")
+	}
+	selection, err := compaction.Select(history, head, compaction.TriggerAutomatic, 0)
+	if errors.Is(err, compaction.ErrNothingToCompact) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if _, alreadyCompacted := state.compactedSources[selection.SourceDigest]; alreadyCompacted {
+		return false, nil
+	}
+	model, ok := selectedRuntimeModel(request)
+	if !ok {
+		return false, fmt.Errorf("selected model %q/%q is not in runtime generation %q", request.ProviderID, request.ModelID, request.Runtime.ID)
+	}
+	plan, err := s.deps.Providers.Negotiate(model.ProviderID, model.ModelID, nil, request.Runtime.Body.ToolCatalogRevision)
+	if err != nil {
+		return false, err
+	}
+	modelRequest, err := compaction.BuildSummaryRequest(selection, nil)
+	if err != nil {
+		return false, err
+	}
+	modelRequest.RequestID = stableID("compaction-request", string(request.Command.CommandID), selection.SourceDigest.Value, string(request.Runtime.ID))
+	modelRequest.ProviderID, modelRequest.ModelID, modelRequest.Plan = model.ProviderID, model.ModelID, plan
+	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "automatic-compaction", selection.SourceDigest.Value, string(request.Runtime.ID)))
+	callID := stableID("compaction-call", string(request.Command.CommandID), "automatic", selection.SourceDigest.Value, string(request.Runtime.ID))
+	label := "automatic-compaction-" + selection.SourceDigest.Value
+	compactRequest := CompactRequest{Command: request.Command, SessionID: request.SessionID, ExpectedHead: head, ProviderID: request.ProviderID, ModelID: request.ModelID, Runtime: request.Runtime, Trigger: compaction.TriggerAutomatic}
+	handle, err := s.deps.Provider.Prepare(ctx, activityID, callID, modelRequest, selection.SourceDigest)
+	if err != nil {
+		return false, err
+	}
+	authorizationRequest, err := providerAuthorizationRequest(request, state, activityID, callID, modelRequest, selection.SourceDigest)
+	if err != nil {
+		return false, err
+	}
+	planned, err := s.activityEvents(*state, request.Runtime.ID, activityID, label+"-planned", []struct {
+		kind    string
+		payload any
+	}{
+		{protocol.EventActivityPlanned, protocol.ActivityPlannedV1{Kind: "provider", Purpose: "summarize stable context", PurposeActor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}, Source: "provider", RequestedProfile: "network", EffectiveProfile: "network"}},
+		{protocol.EventAuthorizationRequested, protocol.AuthorizationRequestedV1{Request: authorizationRequest}},
+	})
+	if err != nil {
+		return false, err
+	}
+	if err := s.append(ctx, state, label+"-planned", planned); err != nil {
+		return false, err
+	}
+	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
+	token, err := s.authorizeActivity(ctx, request, state, activityID, callID, label, authorizationRequest)
+	if err != nil {
+		return false, err
+	}
+	state.activeDispatched = true
+	stream, err := s.deps.Provider.Stream(ctx, handle, token)
+	if err != nil {
+		return false, err
+	}
+	summary, _, err := s.collectCompactionSummary(ctx, request.Runtime.ID, stream)
+	if err != nil {
+		return false, err
+	}
+	revision, err := compaction.Revision(selection, summary)
+	if err != nil {
+		return false, err
+	}
+	evidence, err := s.recordCompactionEvidence(ctx, compactRequest, activityID, selection, summary)
+	if err != nil {
+		return false, err
+	}
+	completed, err := s.activityEvents(*state, request.Runtime.ID, activityID, label+"-completed", []struct {
+		kind    string
+		payload any
+	}{
+		{protocol.EventActivitySucceeded, protocol.ActivityOutcomeV1{Status: "succeeded", OutputEvidenceIDs: []protocol.EvidenceID{evidence.Body.ID}}},
+		{protocol.EventContextCompacted, protocol.ContextCompactedV1{From: selection.From, Through: selection.Through, SummaryEvidenceID: evidence.Body.ID, Revision: revision}},
+	})
+	if err != nil {
+		return false, err
+	}
+	if err := s.append(ctx, state, label+"-completed", completed); err != nil {
+		return false, err
+	}
+	state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+	state.compactedSources[selection.SourceDigest] = struct{}{}
+	return true, nil
+}
+
+func automaticCompactionDecision(plan protocol.ContextPlan, limits protocol.RuntimeLimits) (compaction.Decision, error) {
+	policy := compaction.Policy{AutoCompact: limits.AutoCompact}
+	if limits.CompactReserveTokens != (protocol.ValueInt64{}) {
+		if err := limits.CompactReserveTokens.Validate(); err != nil {
+			return compaction.Decision{Reason: "invalid_budget"}, fmt.Errorf("invalid automatic compaction reserve: %w", err)
+		}
+		if limits.CompactReserveTokens.State == protocol.ValueKnown {
+			reserve := limits.CompactReserveTokens.Value
+			policy.CompactReserveTokens = &reserve
+		}
+	}
+	if err := plan.Body.EstimatedInputTokens.Validate(); err != nil {
+		return compaction.Decision{Reason: "invalid_budget"}, fmt.Errorf("invalid automatic compaction input estimate: %w", err)
+	}
+	return compaction.Evaluate(plan.Body.EstimatedInputTokens.Value, plan.Body.OutputReserve, plan.Body.ContextWindow, policy)
+}
+
 type compactionEventValue struct {
 	kind    string
 	payload any

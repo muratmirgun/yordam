@@ -311,6 +311,7 @@ type compactionRepository struct {
 	appendStatus   journal.AppendStatus
 	lookup         journal.TransactionState
 	transactions   map[protocol.TransactionID]journal.CommittedTransaction
+	appendMarkers  bool
 }
 
 func newCompactionRepository(t *testing.T, log *recordLog) *compactionRepository {
@@ -326,6 +327,12 @@ func newCompactionRepository(t *testing.T, log *recordLog) *compactionRepository
 	}
 	r.head = protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 6, TransactionID: "tx-6"}
 	return r
+}
+
+func newAutomaticCompactionRepository(t *testing.T, log *recordLog) *compactionRepository {
+	repository := newCompactionRepository(t, log)
+	repository.appendMarkers = true
+	return repository
 }
 
 func (r *compactionRepository) Inspect(context.Context, protocol.JournalRef) (journal.Inspection, error) {
@@ -365,6 +372,16 @@ func (r *compactionRepository) AppendBatch(_ context.Context, request journal.Ap
 		envelope := protocol.EventEnvelope{SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: event.PayloadVersion, JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, EventID: event.EventID, SessionID: event.SessionID, Seq: seq, Time: event.Time, Kind: event.Kind, TaskID: event.TaskID, TurnID: event.TurnID, ActivityID: event.ActivityID, Actor: protocol.DeepCopy(event.Actor), RuntimeGenerationID: event.RuntimeGenerationID, TransactionID: request.TransactionID, Payload: protocol.DeepCopy(event.Payload)}
 		r.events = append(r.events, protocol.EventRecord{Envelope: envelope})
 		envelopes = append(envelopes, envelope)
+	}
+	if r.appendMarkers {
+		markerSeq := r.head.CommitSeq + uint64(len(request.Events)) + 1
+		marker := protocol.EventEnvelope{
+			SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1, JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
+			EventID: protocol.EventID(fmt.Sprintf("marker-%d", markerSeq)), SessionID: protocol.SessionID(request.Journal.ID), Seq: markerSeq,
+			Time: time.Now().UTC(), Kind: protocol.EventTransactionCommitted, RuntimeGenerationID: request.Events[0].RuntimeGenerationID,
+			TransactionID: request.TransactionID, Payload: json.RawMessage(`{"transaction_id":"test"}`),
+		}
+		r.events = append(r.events, protocol.EventRecord{Envelope: marker})
 	}
 	r.head = protocol.CommittedCursor{JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, CommitSeq: r.head.CommitSeq + uint64(len(request.Events)) + 1, TransactionID: request.TransactionID}
 	r.transactions[request.TransactionID] = journal.CommittedTransaction{Journal: request.Journal, TransactionID: request.TransactionID, Cursor: r.head, Events: protocol.DeepCopy(envelopes)}

@@ -1,9 +1,11 @@
 package protocol
 
 type RuntimeLimits struct {
-	MaxToolCalls             int   `json:"max_tool_calls"`
-	ShellTimeoutNanos        int64 `json:"shell_timeout_nanos"`
-	ApplicationQueueCapacity int   `json:"application_queue_capacity"`
+	MaxToolCalls             int        `json:"max_tool_calls"`
+	ShellTimeoutNanos        int64      `json:"shell_timeout_nanos"`
+	ApplicationQueueCapacity int        `json:"application_queue_capacity"`
+	AutoCompact              bool       `json:"auto_compact"`
+	CompactReserveTokens     ValueInt64 `json:"compact_reserve_tokens"`
 }
 
 type RuntimeGenerationBody struct {
