@@ -1322,7 +1322,7 @@ func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription,
 			case compactTerminals <- event:
 			case <-ctx.Done():
 			}
-			continue
+			return
 		}
 		// Automatic compaction is nested inside an active turn. Its lifecycle
 		// terminal updates durable context but must not make the TUI idle before
@@ -1334,7 +1334,7 @@ func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription,
 				case <-ctx.Done():
 				}
 			}
-			return
+			continue
 		}
 		if suppressTerminal && legacyTerminalEvent(event.Kind) {
 			return
