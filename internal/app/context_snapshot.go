@@ -71,6 +71,8 @@ func validateDurableContext(state protocol.ContextProjectionV1) error {
 		if from.Validate() != nil || through.Validate() != nil || from.JournalKind != protocol.JournalSession || through.JournalKind != protocol.JournalSession || from.JournalID != through.JournalID || from.CommitSeq > through.CommitSeq || state.SummaryEvidenceID == "" || state.Revision == "" {
 			return fmt.Errorf("invalid durable context range")
 		}
+	} else if state.SummaryEvidenceID != "" {
+		return fmt.Errorf("durable context evidence requires range")
 	}
 	return nil
 }

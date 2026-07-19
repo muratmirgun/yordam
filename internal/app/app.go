@@ -424,13 +424,7 @@ func (a *App) Run(ctx context.Context) error {
 						awaitTerminal := executeErr == nil && result.Error == nil
 						var terminal *Event
 						if executeErr == nil && result.Error != nil {
-							stage := protocol.CompactionFailed
-							if result.Error.Code == "cancelled" {
-								stage = protocol.CompactionCancelled
-							} else if result.Error.Code == "commit_uncertain" {
-								stage = protocol.CompactionUncertain
-							}
-							terminal = &Event{Kind: EventCompactionFailed, Message: result.Error.Message, Code: result.Error.Code, Compaction: &protocol.CompactionEventV1{Trigger: "manual", Stage: stage, Usage: unknownCompactionUsage(), Error: protocol.DeepCopy(result.Error)}}
+							terminal = serializableCompactionFailure(*result.Error)
 							executeErr = errors.New(result.Error.Message)
 						}
 						if awaitTerminal {
@@ -586,6 +580,16 @@ func (a *App) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func serializableCompactionFailure(public protocol.PublicError) *Event {
+	stage := protocol.CompactionFailed
+	if public.Code == "cancelled" {
+		stage = protocol.CompactionCancelled
+	} else if public.Code == "commit_uncertain" {
+		stage = protocol.CompactionUncertain
+	}
+	return &Event{Kind: EventCompactionFailed, Message: public.Message, Code: public.Code, Compaction: &protocol.CompactionEventV1{Trigger: "manual", Stage: stage, Usage: unknownCompactionUsage(), Error: protocol.DeepCopy(&public)}}
 }
 
 type sessionHeadReader interface {
