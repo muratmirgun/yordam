@@ -277,7 +277,18 @@ func taskStatus(record protocol.EventRecord) (*protocol.TaskStatusChangedV1, boo
 }
 
 func terminalTaskState(state string) bool {
-	return state == string(protocol.TaskCompleted) || state == string(protocol.TaskFailed) || state == string(protocol.TaskCancelled)
+	switch protocol.TaskState(state) {
+	case protocol.TaskVerified,
+		protocol.TaskCompletedWithWaivers,
+		protocol.TaskPartial,
+		protocol.TaskCompleted,
+		protocol.TaskFailed,
+		protocol.TaskUnknown,
+		protocol.TaskCancelled:
+		return true
+	default:
+		return false
+	}
 }
 
 func outcomeIdentity(record protocol.EventRecord) (string, bool) {

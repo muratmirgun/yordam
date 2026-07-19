@@ -143,6 +143,58 @@ func TestSelectRejectsLimitThatCannotFitRequiredSafetyFacts(t *testing.T) {
 	}
 }
 
+func TestSelectClearsEveryTerminalTaskState(t *testing.T) {
+	t.Parallel()
+	terminals := []protocol.TaskState{
+		protocol.TaskVerified,
+		protocol.TaskCompletedWithWaivers,
+		protocol.TaskPartial,
+		protocol.TaskCompleted,
+		protocol.TaskFailed,
+		protocol.TaskUnknown,
+		protocol.TaskCancelled,
+	}
+	for _, terminal := range terminals {
+		t.Run(string(terminal), func(t *testing.T) {
+			events := []protocol.EventRecord{
+				selectionTaskEvent(1, "task", protocol.EventTaskCreated, &protocol.TaskCreatedV1{Goal: "must not remain active", OutcomeContractID: "contract", ContractVersion: 1}),
+				selectionTaskEvent(2, "task", protocol.EventTaskStatusChanged, &protocol.TaskStatusChangedV1{From: string(protocol.TaskRunning), To: string(terminal)}),
+				selectionTaskEvent(3, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+				selectionTaskEvent(4, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
+				selectionTaskEvent(5, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent three"}),
+				selectionTaskEvent(6, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent four"}),
+			}
+			selection, err := compaction.Select(events, selectionCursor(6), compaction.TriggerManual, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if containsID(selection.RetainedEventIDs, "event-1") || containsID(selection.RetainedEventIDs, "event-2") {
+				t.Fatalf("terminal state %q retained the task-created active fact: %v", terminal, selection.RetainedEventIDs)
+			}
+		})
+	}
+}
+
+func TestSelectReopenedTaskRestoresActiveRetentionAfterTerminal(t *testing.T) {
+	t.Parallel()
+	events := []protocol.EventRecord{
+		selectionTaskEvent(1, "task", protocol.EventTaskCreated, &protocol.TaskCreatedV1{Goal: "reopen me", OutcomeContractID: "contract", ContractVersion: 1}),
+		selectionTaskEvent(2, "task", protocol.EventTaskStatusChanged, &protocol.TaskStatusChangedV1{From: string(protocol.TaskRunning), To: string(protocol.TaskVerified)}),
+		selectionTaskEvent(3, "task", protocol.EventTaskStatusChanged, &protocol.TaskStatusChangedV1{From: string(protocol.TaskVerified), To: string(protocol.TaskReopened)}),
+		selectionTaskEvent(4, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+		selectionTaskEvent(5, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
+		selectionTaskEvent(6, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent three"}),
+		selectionTaskEvent(7, "task", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent four"}),
+	}
+	selection, err := compaction.Select(events, selectionCursor(7), compaction.TriggerManual, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsID(selection.RetainedEventIDs, "event-3") || containsID(selection.RetainedEventIDs, "event-1") {
+		t.Fatalf("reopened task facts=%v", selection.RetainedEventIDs)
+	}
+}
+
 func selectionEvent(sequence uint64, kind string, decoded any) protocol.EventRecord {
 	return selectionTaskEvent(sequence, "", kind, decoded)
 }
@@ -169,6 +221,15 @@ func sameIDs(got, want []protocol.EventID) bool {
 		}
 	}
 	return true
+}
+
+func containsID(ids []protocol.EventID, want protocol.EventID) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
 }
 
 func sourcesText(sources []protocol.ContentSource) string {
