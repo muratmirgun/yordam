@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 	"github.com/muratmirgun/yordam/internal/workspace"
 )
@@ -92,6 +93,24 @@ func TestContextShowsCompactionHintWhenNoCompactionStateIsKnown(t *testing.T) {
 	for _, want := range []string{"CONTEXT", "Auto compaction: unavailable", "/compact"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("view missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestContextCompactionLabelsAndPolicyReasons(t *testing.T) {
+	for _, reason := range []string{"disabled", "unknown_context_window", "unknown_generation", "invalid_budget", "below_threshold", "threshold_reached"} {
+		panel := components.NewContext()
+		panel.SetCompactionContext(protocol.ContextProjectionV1{AutoReason: reason, EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 100}, ContextWindow: protocol.ValueInt64{State: protocol.ValueKnown, Value: 1000}, ReserveTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 50}})
+		if !strings.Contains(panel.View(), "Auto compaction: "+reason) {
+			t.Fatalf("reason=%s view=%s", reason, panel.View())
+		}
+	}
+	for _, trigger := range []string{"manual", "automatic"} {
+		panel := components.NewContext()
+		panel.SetCompactionContext(protocol.ContextProjectionV1{})
+		panel.SetCompactionProgress(protocol.CompactionEventV1{Trigger: trigger, Stage: protocol.CompactionPreparing})
+		if !strings.Contains(panel.View(), "Compaction ("+trigger+"): preparing") {
+			t.Fatal(panel.View())
 		}
 	}
 }

@@ -99,10 +99,10 @@ func (c *Context) ShowWorkspaceChanges(changes *domain.WorkspaceChanges) {
 }
 
 func (c *Context) SetCompactionContext(state protocol.ContextProjectionV1) {
-	c.compaction = protocol.DeepCopy(&state)
+	c.compaction = &state
 }
 func (c *Context) SetCompactionProgress(progress protocol.CompactionEventV1) {
-	c.progress = protocol.DeepCopy(&progress)
+	c.progress = &progress
 }
 func (c Context) CompactionStage() protocol.CompactionStage {
 	if c.progress == nil {
@@ -215,7 +215,7 @@ func (c Context) compactionSummary() string {
 		lines = append(lines, "Revision: "+s.Revision)
 	}
 	if c.progress != nil {
-		lines = append(lines, "Compaction: "+string(c.progress.Stage))
+		lines = append(lines, "Compaction ("+c.progress.Trigger+"): "+string(c.progress.Stage))
 	}
 	return strings.Join(lines, "\n")
 }
