@@ -69,6 +69,9 @@ func (model Model) handleAppEvent(event app.Event) Model {
 		}
 		model.context.ClearCompactionProgress()
 	case app.EventState:
+		if event.Runtime.Kind == "" {
+			model.context.ClearCompactionProgress()
+		}
 		if event.Runtime.Kind != "" {
 			model = model.setTurnActive(true)
 			model = model.setTurnProgress(progressWaiting)

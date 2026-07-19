@@ -12,11 +12,41 @@ import (
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/tui"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 	"github.com/muratmirgun/yordam/internal/workspace"
 )
+
+func TestCompactionTerminalReset(t *testing.T) {
+	for _, terminal := range []protocol.CompactionStage{protocol.CompactionCompleted, protocol.CompactionFailed, protocol.CompactionCancelled, protocol.CompactionUncertain} {
+		t.Run(string(terminal), func(t *testing.T) {
+			model := tui.NewModel(tui.OptionsForTest())
+			model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventCompactionStarted, Compaction: &protocol.CompactionEventV1{Stage: protocol.CompactionSummarizing}})
+			model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventCompactionFailed, Compaction: &protocol.CompactionEventV1{Stage: terminal, Error: &protocol.PublicError{Message: "safe terminal"}}})
+			if strings.Contains(model.View().Content, "Compacting context:") {
+				t.Fatalf("terminal progress rendered: %s", model.View().Content)
+			}
+			model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTextDelta, Runtime: agent.RuntimeEvent{Text: "next"}})
+			if strings.Contains(model.View().Content, "Compacting context:") {
+				t.Fatalf("progress survived next turn: %s", model.View().Content)
+			}
+		})
+	}
+}
+
+func TestContextResumeClearsCompactionProgress(t *testing.T) {
+	model := tui.NewModel(tui.OptionsForTest())
+	model = tui.OpenContextForTest(model)
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventCompactionProgress, Compaction: &protocol.CompactionEventV1{Stage: protocol.CompactionPersisting}})
+	r := protocol.CompactionRange{From: protocol.CommittedCursor{JournalID: "s", CommitSeq: 1}, Through: protocol.CommittedCursor{JournalID: "s", CommitSeq: 2}}
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventState, Context: &protocol.ContextProjectionV1{Revision: "r1", LatestRange: &r}})
+	view := model.View().Content
+	if strings.Contains(view, "Compacting context:") || !strings.Contains(view, "r1") {
+		t.Fatalf("resume=%s", view)
+	}
+}
 
 func TestAdaptiveContextLayout(t *testing.T) {
 	model := tui.NewModel(tui.OptionsForTest())
