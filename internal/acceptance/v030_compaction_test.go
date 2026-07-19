@@ -170,7 +170,13 @@ func assertV030RealJournalCompactionAndRestart(t *testing.T) {
 	restartedDone := runV030App(t, restarted)
 	publicFailure := sendV030Failure(t, restarted, app.Command{Kind: app.CommandCompact})
 	shutdownV030App(t, restarted, restartedDone)
-	assertV030SecretAbsent(t, publicFailure, sentinel, providerKey)
+	if len(requests) != 3 {
+		t.Fatalf("provider refusal was not dispatched: requests=%d", len(requests))
+	}
+	if publicFailure.code != "compaction_failed" {
+		t.Fatalf("provider refusal terminal code=%q want compaction_failed", publicFailure.code)
+	}
+	assertV030SecretAbsent(t, publicFailure.visible, sentinel, providerKey)
 	store := jsonl.New(dataDir, jsonl.Options{})
 	inspection, err := store.InspectSession(t.Context(), protocol.SessionID(snapshot.Session.ID))
 	if err != nil {
@@ -233,7 +239,12 @@ func shutdownV030App(t *testing.T, application *app.App, done <-chan error) {
 	}
 }
 
-func sendV030Failure(t *testing.T, application *app.App, command app.Command) string {
+type v030PublicFailure struct {
+	code    string
+	visible string
+}
+
+func sendV030Failure(t *testing.T, application *app.App, command app.Command) v030PublicFailure {
 	t.Helper()
 	application.Commands() <- command
 	deadline := time.NewTimer(15 * time.Second)
@@ -247,9 +258,12 @@ func sendV030Failure(t *testing.T, application *app.App, command app.Command) st
 			}
 			if event.Kind == app.EventError || event.Kind == app.EventCompactionFailed {
 				if event.Compaction != nil && event.Compaction.Error != nil {
-					return string(raw) + event.Compaction.Error.Message
+					return v030PublicFailure{code: event.Compaction.Error.Code, visible: string(raw) + event.Compaction.Error.Message}
 				}
-				return string(raw) + event.Err.Error()
+				if event.Err != nil {
+					return v030PublicFailure{code: event.Code, visible: string(raw) + event.Err.Error()}
+				}
+				return v030PublicFailure{code: event.Code, visible: string(raw) + event.Message}
 			}
 		case <-deadline.C:
 			t.Fatal("timed out waiting for public provider refusal")
