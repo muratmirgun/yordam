@@ -559,22 +559,17 @@ func (p contextProjectionProjector) Apply(state protocol.ContextProjectionV1, re
 			state.AutoAvailable, state.AutoReason, state.ReserveTokens = false, "unknown_generation", protocol.ValueInt64{State: protocol.ValueUnknown}
 			return state, nil
 		}
-		if value.Plan.Body.ContextWindow.State != protocol.ValueKnown {
-			state.AutoAvailable, state.AutoReason = false, "unknown_context_window"
-			return state, nil
-		}
-		reserve := value.Plan.Body.ContextWindow.Value / 10
-		if reserve < 2048 {
-			reserve = 2048
-		}
+		policy := compaction.Policy{AutoCompact: manifest.Body.Limits.AutoCompact}
 		if manifest.Body.Limits.CompactReserveTokens.State == protocol.ValueKnown {
-			reserve = manifest.Body.Limits.CompactReserveTokens.Value
+			reserve := manifest.Body.Limits.CompactReserveTokens.Value
+			policy.CompactReserveTokens = &reserve
 		}
-		state.ReserveTokens = protocol.ValueInt64{State: protocol.ValueKnown, Value: reserve, Provenance: "compaction_policy"}
-		if !manifest.Body.Limits.AutoCompact {
-			state.AutoAvailable, state.AutoReason = false, "disabled"
+		decision, err := compaction.Evaluate(value.Plan.Body.EstimatedInputTokens.Value, value.Plan.Body.OutputReserve, value.Plan.Body.ContextWindow, policy)
+		state.AutoAvailable, state.AutoReason = decision.Available, decision.Reason
+		if err == nil && decision.Available {
+			state.ReserveTokens = protocol.ValueInt64{State: protocol.ValueKnown, Value: decision.ReserveTokens, Provenance: "compaction_policy"}
 		} else {
-			state.AutoAvailable, state.AutoReason = true, "below_threshold"
+			state.ReserveTokens = protocol.ValueInt64{State: protocol.ValueUnknown}
 		}
 	case *protocol.ContextCompactedV1:
 		r := protocol.CompactionRange{From: value.From, Through: value.Through}
