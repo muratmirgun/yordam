@@ -257,12 +257,10 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 		if err := json.Unmarshal(event.Payload, &recorded); err != nil {
 			return Event{}, err
 		}
-		state := protocol.ContextProjectionV1{AutoAvailable: recorded.Plan.Body.ContextWindow.State == protocol.ValueKnown, EstimatedInputTokens: recorded.Plan.Body.EstimatedInputTokens, ContextWindow: recorded.Plan.Body.ContextWindow, OutputReserve: recorded.Plan.Body.OutputReserve, Revision: recorded.Plan.Body.CompactionRevision}
-		if state.AutoAvailable {
-			state.AutoReason = "below_threshold"
-		} else {
-			state.AutoReason = "unknown_context_window"
-		}
+		// Policy conclusions belong to the immutable generation-aware snapshot
+		// projection. A live plan event carries facts only, never a guess based
+		// on the currently selected generation.
+		state := protocol.ContextProjectionV1{EstimatedInputTokens: recorded.Plan.Body.EstimatedInputTokens, ContextWindow: recorded.Plan.Body.ContextWindow, OutputReserve: recorded.Plan.Body.OutputReserve, Revision: recorded.Plan.Body.CompactionRevision}
 		legacy.Kind, legacy.Context = EventState, &state
 	case protocol.EventActivityPlanned:
 		var planned protocol.ActivityPlannedV1
