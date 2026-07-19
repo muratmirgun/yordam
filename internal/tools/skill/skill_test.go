@@ -11,11 +11,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/skills"
+	"github.com/muratmirgun/yordam/internal/tooling"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 )
 
@@ -109,6 +111,36 @@ func TestSkillOutputIsBoundedAndRedactsRegisteredSecrets(t *testing.T) {
 	}
 }
 
+func TestSkillGenerationAdmissionRedactsJSONEscapedSecretsBeforeEncoding(t *testing.T) {
+	for _, value := range []string{`quote"value`, `slash\\value`, "tab\tvalue", "line\nbreak"} {
+		t.Run(fmt.Sprintf("%q", value), func(t *testing.T) {
+			workspace := t.TempDir()
+			content := []byte("---\nname: go-testing\ndescription: Test Go changes.\n---\n" + strings.Repeat(value+" ", 7000))
+			catalog := testCatalog(t, workspace, content, protocol.SkillSourceGlobal, "")
+			registry := secret.NewRegistry()
+			lease, err := registry.Acquire("generation", [][]byte{[]byte(value)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lease.Close()
+			artifacts := &recordingArtifacts{}
+			prepared, err := New(catalog, output.Options{SessionID: "s", Artifacts: artifacts, Admission: lease}).Prepare(context.Background(), domain.ToolRequest{CallID: "c", Name: "skill", Input: json.RawMessage(`{"name":"go-testing"}`)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := prepared.Execute(context.Background())
+			escaped, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			needle := string(escaped[1 : len(escaped)-1])
+			if result.Status != domain.ToolSucceeded || len(result.ArtifactIDs) != 1 || strings.Contains(result.Content, value) || strings.Contains(result.Content, needle) || strings.Contains(string(artifacts.data), value) || strings.Contains(string(artifacts.data), needle) {
+				t.Fatalf("result=%#v artifact=%q escaped=%q", result, artifacts.data, needle)
+			}
+		})
+	}
+}
+
 func TestSkillClosedAdmissionAndCancellationFailClosed(t *testing.T) {
 	workspace := t.TempDir()
 	catalog := testCatalog(t, workspace, []byte("---\nname: go-testing\ndescription: Test Go changes.\n---\nbody\n"), protocol.SkillSourceGlobal, "")
@@ -136,6 +168,21 @@ func TestSkillClosedAdmissionAndCancellationFailClosed(t *testing.T) {
 	result := prepared.Execute(ctx)
 	if result.Status != domain.ToolCancelled || result.ErrorKind != domain.ErrorCancelled || result.Content != "" || len(result.ArtifactIDs) != 0 {
 		t.Fatalf("cancelled result=%#v", result)
+	}
+	retiredRegistry := secret.NewRegistry()
+	retired, err := retiredRegistry.Acquire("retired", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := retiredRegistry.Retire("retired"); err != nil {
+		t.Fatal(err)
+	}
+	retiredPrepared, err := New(catalog, output.Options{SessionID: "s", Artifacts: discardArtifacts{}, Admission: retired}).Prepare(context.Background(), domain.ToolRequest{CallID: "retired", Name: "skill", Input: json.RawMessage(`{"name":"go-testing"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := retiredPrepared.Execute(context.Background()); result.Status != domain.ToolFailed || result.Content == "" {
+		t.Fatalf("retired lease result=%#v", result)
 	}
 }
 
@@ -190,6 +237,20 @@ func TestSkillLoadsCatalogExactlyOnceAndNeverAfterPrepare(t *testing.T) {
 	}
 }
 
+func TestSkillRejectsLoadedEntryOutsideFrozenActiveSnapshot(t *testing.T) {
+	workspace := t.TempDir()
+	base := testCatalog(t, workspace, []byte("---\nname: go-testing\ndescription: Test Go changes.\n---\nbody\n"), protocol.SkillSourceGlobal, "")
+	loaded, ok := base.Load("go-testing")
+	if !ok {
+		t.Fatal("missing fixture skill")
+	}
+	malicious := &maliciousCatalog{snapshot: base.Snapshot(), loaded: loaded}
+	malicious.loaded.Content = []byte("---\nname: go-testing\ndescription: Test Go changes.\n---\nforged body\n")
+	if _, err := New(malicious, output.Options{SessionID: "s", Artifacts: discardArtifacts{}}).Prepare(context.Background(), domain.ToolRequest{CallID: "c", Name: "skill", Input: json.RawMessage(`{"name":"go-testing"}`)}); err == nil {
+		t.Fatal("catalog entry with mismatched digest was accepted")
+	}
+}
+
 func TestSkillDescriptorAndClassificationAreCanonical(t *testing.T) {
 	workspace := t.TempDir()
 	tool := New(testCatalog(t, workspace, []byte("---\nname: go-testing\ndescription: Test Go changes.\n---\nbody\n"), protocol.SkillSourceGlobal, ""), output.Options{SessionID: "s", Artifacts: discardArtifacts{}})
@@ -200,6 +261,28 @@ func TestSkillDescriptorAndClassificationAreCanonical(t *testing.T) {
 	canonical := tool.CanonicalDescriptor()
 	if !reflect.DeepEqual(canonical, BuiltinDescriptor()) || canonical.Body.Identity != (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "skill"}) || tool.TrustedClassification().Effect != "observation" || tool.TrustedClassification().Mutation != "read_only" {
 		t.Fatalf("canonical=%#v classification=%#v", canonical, tool.TrustedClassification())
+	}
+}
+
+func TestSkillPlannerRevalidatesAndExecutesThroughTooling(t *testing.T) {
+	workspace := t.TempDir()
+	catalog := testCatalog(t, workspace, []byte("---\nname: go-testing\ndescription: Test Go changes.\n---\nplanner body\n"), protocol.SkillSourceGlobal, "")
+	toolCatalog, err := tooling.NewCatalog("revision", New(catalog, output.Options{SessionID: "s", Artifacts: discardArtifacts{}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := tooling.NewService(toolCatalog, passDispatchGate{})
+	request := tooling.PlanRequest{TurnID: "turn", ActivityID: "activity", CallID: "call", Alias: "skill", Arguments: json.RawMessage(`{"name":"go-testing"}`), RuntimeGenerationID: "generation"}
+	handle, plan, err := service.Plan(context.Background(), request)
+	if err != nil || plan.Body.Effect != "observation" {
+		t.Fatalf("plan=%#v err=%v", plan, err)
+	}
+	if _, changed, err := service.Revalidate(context.Background(), handle); err != nil || changed {
+		t.Fatalf("revalidate changed=%v err=%v", changed, err)
+	}
+	result, err := service.Execute(context.Background(), handle, authorization.CommittedToken{})
+	if err != nil || result.ToolResult.Status != string(domain.ToolSucceeded) || !strings.Contains(result.ToolResult.Text, "planner body") {
+		t.Fatalf("result=%#v err=%v", result, err)
 	}
 }
 
@@ -218,6 +301,27 @@ func slicesEqual(left, right []protocol.ResourceAttribute) bool {
 type countingCatalog struct {
 	skills.Catalog
 	loads int
+}
+
+type maliciousCatalog struct {
+	snapshot protocol.SkillCatalogSnapshot
+	loaded   skills.LoadedSkill
+}
+
+func (c *maliciousCatalog) Snapshot() protocol.SkillCatalogSnapshot {
+	return protocol.DeepCopy(c.snapshot)
+}
+func (c *maliciousCatalog) Metadata() []protocol.SkillDescriptor {
+	return protocol.DeepCopy(c.snapshot.Active)
+}
+func (c *maliciousCatalog) Load(string) (skills.LoadedSkill, bool) {
+	return protocol.DeepCopy(c.loaded), true
+}
+
+type passDispatchGate struct{}
+
+func (passDispatchGate) Dispatch(ctx context.Context, _ authorization.CommittedToken, _ authorization.DispatchBinding, callback func(context.Context) error) error {
+	return callback(ctx)
 }
 
 func (c *countingCatalog) Load(name string) (skills.LoadedSkill, bool) {

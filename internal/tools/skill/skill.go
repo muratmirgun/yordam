@@ -4,6 +4,8 @@ package skill
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/skills"
 	toolset "github.com/muratmirgun/yordam/internal/tools"
 	"github.com/muratmirgun/yordam/internal/tools/output"
@@ -65,6 +68,16 @@ func BuiltinDescriptor() protocol.ToolDescriptor {
 }
 
 func (t *Tool) Prepare(ctx context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
+	return t.prepare(ctx, request)
+}
+
+// Plan is intentionally the same frozen capture as Prepare: a skill is a
+// logical catalog object, so planning must not defer loading to dispatch.
+func (t *Tool) Plan(ctx context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
+	return t.prepare(ctx, request)
+}
+
+func (t *Tool) prepare(ctx context.Context, request domain.ToolRequest) (ports.PreparedTool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -76,13 +89,33 @@ func (t *Tool) Prepare(ctx context.Context, request domain.ToolRequest) (ports.P
 		return nil, fmt.Errorf("skill input: invalid name")
 	}
 	loaded, ok := t.catalog.Load(parsed.Name)
-	if !ok || loaded.Identity.Validate() != nil || loaded.Identity.Name != parsed.Name || loaded.Description == "" {
+	if !ok || !validLoadedSkill(t.catalog.Snapshot(), parsed.Name, loaded) {
 		return nil, fmt.Errorf("skill input: unavailable skill %q", parsed.Name)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return &prepared{request: request, loaded: protocol.DeepCopy(loaded), output: t.output}, nil
+}
+
+func validLoadedSkill(snapshot protocol.SkillCatalogSnapshot, name string, loaded skills.LoadedSkill) bool {
+	if snapshot.Validate() != nil || loaded.Identity.Validate() != nil || loaded.Identity.Name != name || loaded.Description == "" || len(loaded.Content) > skills.MaxSkillBytes {
+		return false
+	}
+	metadata, normalized, err := skills.Parse(name, loaded.Content)
+	if err != nil || metadata.Name != name || metadata.Description != loaded.Description || !bytes.Equal(normalized, loaded.Content) {
+		return false
+	}
+	sum := sha256.Sum256(loaded.Content)
+	if loaded.Identity.ContentDigest != (protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hex.EncodeToString(sum[:])}) {
+		return false
+	}
+	for _, active := range snapshot.Active {
+		if active.Identity == loaded.Identity && active.Description == loaded.Description && active.State == protocol.SkillStateActive {
+			return true
+		}
+	}
+	return false
 }
 
 type prepared struct {
@@ -133,8 +166,13 @@ func (p *prepared) Execute(ctx context.Context) domain.ToolResult {
 	if err := ctx.Err(); err != nil {
 		return cancelled(p.request.CallID, started, err)
 	}
-	identity := protocol.DeepCopy(p.loaded.Identity)
-	body, err := canonicaljson.Marshal(resultBody{Identity: identity, Description: p.loaded.Description, Source: identity.Source, Digest: identity.ContentDigest, Provenance: provenance{CanonicalPath: identity.CanonicalPath, WorkspaceID: identity.WorkspaceID, RuntimeGenerationID: identity.RuntimeGenerationID}, Content: string(p.loaded.Content)})
+	redactor, closeRedactor, err := p.outputRedactor()
+	if err != nil {
+		return failed(p.request.CallID, started, fmt.Errorf("bind skill output redaction: %w", err))
+	}
+	defer closeRedactor()
+	identity := redactedIdentity(protocol.DeepCopy(p.loaded.Identity), redactor)
+	body, err := canonicaljson.Marshal(resultBody{Identity: identity, Description: redactor.String(p.loaded.Description), Source: protocol.SkillSource(redactor.String(string(identity.Source))), Digest: protocol.Digest{Algorithm: redactor.String(identity.ContentDigest.Algorithm), Value: redactor.String(identity.ContentDigest.Value)}, Provenance: provenance{CanonicalPath: redactor.String(identity.CanonicalPath), WorkspaceID: protocol.WorkspaceID(redactor.String(string(identity.WorkspaceID))), RuntimeGenerationID: protocol.RuntimeGenerationID(redactor.String(string(identity.RuntimeGenerationID)))}, Content: redactor.String(string(p.loaded.Content))})
 	if err != nil {
 		return failed(p.request.CallID, started, fmt.Errorf("encode skill output: %w", err))
 	}
@@ -161,6 +199,31 @@ func (p *prepared) Execute(ctx context.Context) domain.ToolResult {
 	}
 	result.CallID, result.Duration = p.request.CallID, time.Since(started)
 	return result
+}
+
+func (p *prepared) outputRedactor() (secret.Redacting, func(), error) {
+	if p.output.Admission != nil {
+		lease, err := p.output.Admission.Derive()
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return lease, func() { _ = lease.Close() }, nil
+	}
+	if p.output.Redact != nil {
+		return p.output.Redact, func() {}, nil
+	}
+	return secret.New(), func() {}, nil
+}
+
+func redactedIdentity(identity protocol.SkillIdentity, redactor secret.Redacting) protocol.SkillIdentity {
+	identity.Name = redactor.String(identity.Name)
+	identity.Source = protocol.SkillSource(redactor.String(string(identity.Source)))
+	identity.CanonicalPath = redactor.String(identity.CanonicalPath)
+	identity.WorkspaceID = protocol.WorkspaceID(redactor.String(string(identity.WorkspaceID)))
+	identity.ContentDigest.Algorithm = redactor.String(identity.ContentDigest.Algorithm)
+	identity.ContentDigest.Value = redactor.String(identity.ContentDigest.Value)
+	identity.RuntimeGenerationID = protocol.RuntimeGenerationID(redactor.String(string(identity.RuntimeGenerationID)))
+	return identity
 }
 
 func decodeStrict(raw json.RawMessage, destination any) error {

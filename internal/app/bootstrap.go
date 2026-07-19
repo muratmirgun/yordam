@@ -349,11 +349,41 @@ func recoverBootstrapSession(ctx context.Context, store *jsonl.Store, runtime Ru
 }
 
 func loadBootstrapConfig(options BootstrapOptions) (config.Config, string, error) {
-	cfg, err := config.Load(config.LoadOptions{ConfigPath: options.ConfigPath})
+	configPath, err := canonicalConfigPath(options.ConfigPath)
 	if err != nil {
-		return config.Config{}, options.ConfigPath, configurationError(options.ConfigPath, fmt.Sprintf("configuration is invalid (%v); edit the file and run /reload", err), err)
+		return config.Config{}, options.ConfigPath, configurationError(options.ConfigPath, fmt.Sprintf("configuration path is invalid (%v)", err), err)
 	}
-	return cfg, options.ConfigPath, nil
+	cfg, err := config.Load(config.LoadOptions{ConfigPath: configPath})
+	if err != nil {
+		return config.Config{}, configPath, configurationError(configPath, fmt.Sprintf("configuration is invalid (%v); edit the file and run /reload", err), err)
+	}
+	return cfg, configPath, nil
+}
+
+// canonicalConfigPath freezes a stable on-disk configuration identity before
+// the runtime derives the adjacent global skills directory. Resolving this
+// once prevents a relative path or symlink from changing the skill root on a
+// later reload.
+func canonicalConfigPath(path string) (string, error) {
+	if path == "" {
+		var err error
+		path, err = config.DefaultConfigPath()
+		if err != nil {
+			return "", err
+		}
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Clean(abs))
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(resolved) || filepath.Clean(resolved) != resolved {
+		return "", fmt.Errorf("non-canonical config path")
+	}
+	return resolved, nil
 }
 
 func appendBootstrapSelection(ctx context.Context, runtime RuntimeSet, store sessionStore, session *domain.Session, replay *domain.SessionReplay, selection domain.ModelSelection) error {

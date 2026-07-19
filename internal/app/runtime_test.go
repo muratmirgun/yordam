@@ -91,6 +91,54 @@ func TestRuntimeModelDescriptorsContextWindowProvenance(t *testing.T) {
 	}
 }
 
+func TestLoadBootstrapConfigCanonicalizesRelativeConfigPath(t *testing.T) {
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "config.jsonc")
+	if err := config.SaveGlobal(path, loadRuntimeConfig(t, "https://example.invalid/v1", 120)); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(directory)
+	_, canonical, err := loadBootstrapConfig(BootstrapOptions{ConfigPath: "config.jsonc"})
+	if err != nil || canonical != path {
+		t.Fatalf("canonical=%q path=%q err=%v", canonical, path, err)
+	}
+}
+
+func TestBootstrapReloadUsesCanonicalRelativeConfigSkillRoot(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "relative-config-key")
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "config.jsonc")
+	if err := config.SaveGlobal(path, loadRuntimeConfig(t, "https://example.invalid/v1", 120)); err != nil {
+		t.Fatal(err)
+	}
+	writeRuntimeSkill(t, filepath.Join(directory, "skills", "go-testing", "SKILL.md"), "Global skill.", "relative-root-body")
+	workspace := t.TempDir()
+	t.Chdir(directory)
+	application, snapshot, err := Bootstrap(t.Context(), BootstrapOptions{ConfigPath: "config.jsonc", CWD: workspace, CLI: cli.Options{Mode: domain.ModeAsk, DataDir: t.TempDir(), MaxToolCalls: 32, ShellTimeout: time.Second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer application.runtimeSet.retireSecrets()
+	if application.runtimeSet.configPath != path || application.reloadRuntime == nil {
+		t.Fatalf("runtime path=%q reload=%v", application.runtimeSet.configPath, application.reloadRuntime)
+	}
+	reloaded, err := application.reloadRuntime(t.Context(), snapshot.Session.Selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloaded.retireSecrets()
+	loaded, ok := reloaded.Skills.Load("go-testing")
+	if !ok || !strings.Contains(string(loaded.Content), "relative-root-body") {
+		t.Fatalf("loaded=%#v ok=%v", loaded, ok)
+	}
+}
+
 func TestRuntimeBrokerSnapshotReconstructsDurableCompactionContext(t *testing.T) {
 	builder := newRuntimeBuilderForTest(t, nil)
 	t.Setenv("PRIMARY_KEY", "primary-test-key")
