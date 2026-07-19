@@ -2,10 +2,10 @@ package app
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
@@ -43,7 +43,6 @@ type LegacyAdapter struct {
 	cursor              func() *protocol.CommandExpectation
 	runtimeGenerationID protocol.RuntimeGenerationID
 	now                 func() time.Time
-	sequence            atomic.Uint64
 	pendingMu           sync.Mutex
 	pending             map[protocol.CommandID]Command
 	turns               map[protocol.TurnID]Command
@@ -76,15 +75,14 @@ func (a *LegacyAdapter) Command(command Command) (protocol.Command, error) {
 	if err != nil {
 		return protocol.Command{}, err
 	}
-	sequence := a.sequence.Add(1)
-	commandID := protocol.CommandID(fmt.Sprintf("legacy-command-%d", sequence))
-	idempotencyKey := fmt.Sprintf("legacy-%d", sequence)
 	var expectation *protocol.CommandExpectation
 	if a.cursor != nil {
 		expectation = protocol.DeepCopy(a.cursor())
 	} else if a.selectedSessionID != "" {
 		expectation = &protocol.CommandExpectation{SelectedSessionID: a.selectedSessionID}
 	}
+	var commandID protocol.CommandID
+	var idempotencyKey string
 	if command.Kind == CommandCompact {
 		if expectation == nil || expectation.SelectedSessionID == "" || expectation.Session == nil {
 			return protocol.Command{}, fmt.Errorf("compact command requires a selected session cursor")
@@ -99,6 +97,13 @@ func (a *LegacyAdapter) Command(command Command) (protocol.Command, error) {
 			return protocol.Command{}, digestErr
 		}
 		commandID = protocol.CommandID("legacy-compact-" + identity.Value)
+		idempotencyKey = string(commandID)
+	} else {
+		random := make([]byte, 16)
+		if _, err := rand.Read(random); err != nil {
+			return protocol.Command{}, err
+		}
+		commandID = protocol.CommandID(fmt.Sprintf("legacy-command-%x", random))
 		idempotencyKey = string(commandID)
 	}
 	applicationCommand := protocol.Command{

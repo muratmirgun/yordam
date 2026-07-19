@@ -197,6 +197,22 @@ func TestApplicationLegacyAdapterCompactIdentityBindsCursorAndGeneration(t *test
 	}
 }
 
+func TestApplicationLegacyAdapterStartTurnIdentityIsUniqueAfterRestart(t *testing.T) {
+	firstAdapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{Actor: protocol.ActorRef{ID: "user-1", Kind: protocol.ActorUser}, RuntimeGenerationID: "same-runtime-after-process-restart"})
+	secondAdapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{Actor: protocol.ActorRef{ID: "user-1", Kind: protocol.ActorUser}, RuntimeGenerationID: "same-runtime-after-process-restart"})
+	first, err := firstAdapter.Command(app.Command{Kind: app.CommandStartTurn, Prompt: "resume"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := secondAdapter.Command(app.Command{Kind: app.CommandStartTurn, Prompt: "resume"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.CommandID == second.CommandID || first.IdempotencyKey == second.IdempotencyKey {
+		t.Fatalf("restart reused normal turn identity: first=%+v second=%+v", first, second)
+	}
+}
+
 func adapterCursor(session protocol.SessionID, cursor protocol.CommittedCursor) func() *protocol.CommandExpectation {
 	return func() *protocol.CommandExpectation {
 		return &protocol.CommandExpectation{SelectedSessionID: session, Session: &cursor}

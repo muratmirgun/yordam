@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -34,55 +35,80 @@ func TestV030Compaction(t *testing.T) {
 		assertV030RealJournalCompactionAndRestart(t)
 	})
 	t.Run("automatic_threshold_disabled_and_unknown_window", func(t *testing.T) {
-		runV030GoTest(t, "./internal/orchestrator", "TestAutomaticCompactionPolicyThresholds", `^TestAutomaticCompactionPolicyThresholds$`)
-		runV030GoTest(t, "./internal/compaction", "TestEvaluateThresholdsAndReserves", `^TestEvaluate(ThresholdsAndReserves|RejectsInvalidBudgets)$`)
+		runV030GoTest(t, "./internal/orchestrator", "TestAutomaticCompactionPolicyThresholds")
+		runV030GoTest(t, "./internal/compaction", "TestEvaluateThresholdsAndReserves")
+		runV030GoTest(t, "./internal/compaction", "TestEvaluateRejectsInvalidBudgets")
 	})
 	t.Run("prior_summary_suffix_and_large_tool_references", func(t *testing.T) {
-		runV030GoTest(t, "./internal/compaction", "TestSelectRetainsSafetyFactsAndBoundsInputDeterministically", `^TestSelectRetainsSafetyFactsAndBoundsInputDeterministically$`)
-		runV030GoTest(t, "./internal/context", "TestContextPlanReconstructsLatestValidNativeSummary", `^TestContextPlan(ReconstructsLatestValidNativeSummary|AdaptsEventTranscriptAndLegacyCompaction)$`)
+		runV030GoTest(t, "./internal/compaction", "TestSelectRetainsSafetyFactsAndBoundsInputDeterministically")
+		runV030GoTest(t, "./internal/context", "TestContextPlanReconstructsLatestValidNativeSummary")
+		runV030GoTest(t, "./internal/context", "TestContextPlanAdaptsEventTranscriptAndLegacyCompaction")
 	})
 	t.Run("provider_refusal_and_context_too_large_are_terminal_without_retry", func(t *testing.T) {
-		runV030GoTest(t, "./internal/orchestrator", "TestRunCompactionFaultsDoNotLeaveTheLaneHeldOrRepeatProviderEgress", `^TestRunCompactionFaultsDoNotLeaveTheLaneHeldOrRepeatProviderEgress/provider_refusal$`)
-		runV030GoTest(t, "./internal/orchestrator", "TestAutomaticCompactionFailuresAreTerminalAndNeverRetry", `^TestAutomaticCompactionFailuresAreTerminalAndNeverRetry$`)
-		runV030GoTest(t, "./internal/tui/components", "TestContextTooLargeShowsCompactAction", `^TestContextTooLargeShowsCompactAction$`)
+		runV030GoTest(t, "./internal/orchestrator", "TestRunCompactionIsIdleOnlyAndIdempotent")
+		runV030GoTest(t, "./internal/orchestrator", "TestRunCompactionFaultsDoNotLeaveTheLaneHeldOrRepeatProviderEgress")
+		runV030GoTest(t, "./internal/orchestrator", "TestAutomaticCompactionFailuresAreTerminalAndNeverRetry")
+		runV030GoTest(t, "./internal/tui/components", "TestContextTooLargeShowsCompactAction")
 	})
 	t.Run("cancellation_evidence_failure_and_commit_recovery_boundaries", func(t *testing.T) {
-		runV030GoTest(t, "./internal/orchestrator", "TestRunCompactionCancellationBeforeAndDuringStream", `^TestRunCompactionCancellationBeforeAndDuringStream$`)
-		runV030GoTest(t, "./internal/orchestrator", "TestRunCompactionFaultsDoNotLeaveTheLaneHeldOrRepeatProviderEgress", `^TestRunCompactionFaultsDoNotLeaveTheLaneHeldOrRepeatProviderEgress/(evidence_failure|known_non_commit|commit_unknown)$`)
-		runV030GoTest(t, "./internal/orchestrator", "TestCommitUnknownResolutionAdoptsProvenCommitForEveryCaller", `^TestCommitUnknownResolution(ReturnsTypedUncertaintyWithoutResend|AdoptsProvenCommitForEveryCaller)$`)
+		runV030GoTest(t, "./internal/orchestrator", "TestRunCompactionCancellationBeforeAndDuringStream")
+		runV030GoTest(t, "./internal/orchestrator", "TestCommitUnknownResolutionAdoptsProvenCommitForEveryCaller")
+		runV030GoTest(t, "./internal/orchestrator", "TestCommitUnknownResolutionReturnsTypedUncertaintyWithoutResend")
 	})
 	t.Run("restart_reconstructs_verified_evidence_and_preserves_suffix", func(t *testing.T) {
-		runV030GoTest(t, "./internal/context", "TestEvidenceSummaryResolverFailsClosedToEarlierValidCompaction", `^Test(EvidenceSummaryResolverFailsClosedToEarlierValidCompaction|ContextPlanKeepsEarlierResolvableSummaryWhenLaterEvidenceIsMissing)$`)
-		runV030GoTest(t, "./internal/session/jsonl", "TestExplicitRecoveryPreservesTailAndCommitsDiagnostic", `^TestExplicitRecoveryPreservesTailAndCommitsDiagnostic$`)
+		runV030GoTest(t, "./internal/context", "TestEvidenceSummaryResolverFailsClosedToEarlierValidCompaction")
+		runV030GoTest(t, "./internal/context", "TestContextPlanKeepsEarlierResolvableSummaryWhenLaterEvidenceIsMissing")
+		runV030GoTest(t, "./internal/session/jsonl", "TestExplicitRecoveryPreservesTailAndCommitsDiagnostic")
 	})
 	t.Run("secret_absence_across_provider_evidence_events_tui_logs_and_public_errors", func(t *testing.T) {
-		runV030GoTest(t, "./internal/orchestrator", "TestProviderSplitSecretNeverAppearsInDurableEvents", `^TestProviderSplitSecretNeverAppearsInDurableEvents$`)
-		runV030GoTest(t, "./internal/app", "TestPublishRedactsEquivalentTextFieldsWithActiveBinding", `^Test(PublishRedactsEquivalentTextFieldsWithActiveBinding|ProductionCompactProtocolSerializesCancelledContext)$`)
-		runV030GoTest(t, "./internal/tui", "TestConfiguredSecretPromptIsRedactedBeforeConversationRendering", `^TestConfiguredSecretPromptIsRedactedBeforeConversationRendering$`)
+		runV030GoTest(t, "./internal/orchestrator", "TestProviderSplitSecretNeverAppearsInDurableEvents")
+		runV030GoTest(t, "./internal/app", "TestPublishRedactsEquivalentTextFieldsWithActiveBinding")
+		runV030GoTest(t, "./internal/app", "TestProductionCompactProtocolSerializesCancelledContext")
+		runV030GoTest(t, "./internal/tui", "TestConfiguredSecretPromptIsRedactedBeforeConversationRendering")
 	})
 	t.Run("public_documentation_contract", func(t *testing.T) {
-		runV030GoTest(t, "./internal/repolint", "TestV030CompactionDocumentation", `^TestV030CompactionDocumentation$`)
+		runV030GoTest(t, "./internal/repolint", "TestV030CompactionDocumentation")
 	})
 }
 
-func runV030GoTest(t *testing.T, pkg, inventory, pattern string) {
+func TestV030GoTestInventoryRequiresAnExactTopLevelName(t *testing.T) {
+	output := "TestExact\nTestExact/subtest\nok\texample.test\t0.01s\n"
+	if got := v030TopLevelInventoryMatches(output, "TestExact"); got != 1 {
+		t.Fatalf("exact top-level matches=%d want=1", got)
+	}
+	if got := v030TopLevelInventoryMatches(output, "TestExact/subtest"); got != 0 {
+		t.Fatalf("subtest matches=%d want=0", got)
+	}
+}
+
+func runV030GoTest(t *testing.T, pkg, testName string) {
 	t.Helper()
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
-	listed := exec.CommandContext(t.Context(), "go", "test", pkg, "-list", "^"+inventory+"$")
+	listed := exec.CommandContext(t.Context(), "go", "test", pkg, "-list", "^"+regexp.QuoteMeta(testName)+"$")
 	listed.Dir = root
 	output, err := listed.CombinedOutput()
-	if err != nil || !strings.Contains(string(output), inventory) {
-		t.Fatalf("package=%s inventory=%s: %v\n%s", pkg, inventory, err, output)
+	if err != nil || v030TopLevelInventoryMatches(string(output), testName) != 1 {
+		t.Fatalf("package=%s test=%s: %v\n%s", pkg, testName, err, output)
 	}
-	command := exec.CommandContext(t.Context(), "go", "test", pkg, "-run", pattern, "-count=1")
+	command := exec.CommandContext(t.Context(), "go", "test", pkg, "-run", "^"+regexp.QuoteMeta(testName)+"$", "-count=1")
 	command.Dir = root
 	output, err = command.CombinedOutput()
 	if err != nil {
-		t.Fatalf("package=%s pattern=%s: %v\n%s", pkg, pattern, err, output)
+		t.Fatalf("package=%s test=%s: %v\n%s", pkg, testName, err, output)
 	}
+}
+
+func v030TopLevelInventoryMatches(output, want string) int {
+	matches := 0
+	for _, line := range strings.Split(output, "\n") {
+		if line == want {
+			matches++
+		}
+	}
+	return matches
 }
 
 func assertV030RealJournalCompactionAndRestart(t *testing.T) {
@@ -96,16 +122,16 @@ func assertV030RealJournalCompactionAndRestart(t *testing.T) {
 	if err := os.Mkdir(workspace, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	var requests []string
+	var requests []v030ProviderRequest
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		body, err := io.ReadAll(request.Body)
 		if err != nil {
 			t.Error(err)
 			return
 		}
-		requests = append(requests, string(body))
+		requests = append(requests, v030ProviderRequest{body: string(body), authorization: request.Header.Get("Authorization")})
 		response.Header().Set("Content-Type", "text/event-stream")
-		if len(requests) == 3 {
+		if len(requests) == 6 {
 			response.WriteHeader(http.StatusBadRequest)
 			_, _ = io.WriteString(response, "provider refusal "+sentinel)
 			return
@@ -114,6 +140,15 @@ func assertV030RealJournalCompactionAndRestart(t *testing.T) {
 		switch len(requests) {
 		case 2:
 			content = `{"goal":"summary goal","constraints":[],"decisions":[],"files":[],"commands_and_tests":[],"unresolved":[],"children":[],"skills":[],"unknown_effects":[]}`
+		case 4:
+			content = "restarted normal reply"
+		case 5:
+			content = "post-restart history reply"
+		default:
+			if len(requests) > 6 {
+				http.Error(response, "unexpected provider request", http.StatusInternalServerError)
+				return
+			}
 		}
 		_, _ = fmt.Fprintf(response, "data: {\"id\":\"v030-provider\",\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", content)
 		_, _ = io.WriteString(response, "data: {\"id\":\"v030-provider\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
@@ -142,6 +177,7 @@ func assertV030RealJournalCompactionAndRestart(t *testing.T) {
 	}
 	prefixDigest := sha256.Sum256(prefix)
 	visible += sendV030Command(t, application, app.Command{Kind: app.CommandCompact}, app.EventCompactionCompleted)
+	visible += sendV030Command(t, application, app.Command{Kind: app.CommandStartTurn, Prompt: "persist uncompacted suffix"}, app.EventTurnCompleted)
 	shutdownV030App(t, application, done)
 	after, err := os.ReadFile(eventsPath)
 	if err != nil {
@@ -150,9 +186,10 @@ func assertV030RealJournalCompactionAndRestart(t *testing.T) {
 	if len(after) <= len(prefix) || !bytes.Equal(after[:len(prefix)], prefix) || sha256.Sum256(after[:len(prefix)]) != prefixDigest {
 		t.Fatal("real source journal prefix was rewritten by compaction")
 	}
-	if len(requests) != 2 || strings.Contains(requests[1], sentinel) || strings.Contains(requests[1], providerKey) {
+	if len(requests) != 3 || strings.Contains(requests[1].body, sentinel) || strings.Contains(requests[1].body, providerKey) {
 		t.Fatalf("admitted summary request=%q requests=%d", requests, len(requests))
 	}
+	assertV030ProviderRequestBoundary(t, requests, providerKey, sentinel)
 	assertV030SecretAbsent(t, visible, sentinel, providerKey)
 	assertV030SecretAbsent(t, string(after), sentinel, providerKey)
 	assertV030SecretAbsent(t, readV030File(t, debugLog), sentinel, providerKey)
@@ -168,14 +205,24 @@ func assertV030RealJournalCompactionAndRestart(t *testing.T) {
 	panel.SetCompactionContext(*restart.Context)
 	assertV030SecretAbsent(t, panel.View(), sentinel, providerKey)
 	restartedDone := runV030App(t, restarted)
+	resumedVisible := sendV030Command(t, restarted, app.Command{Kind: app.CommandStartTurn, Prompt: "use reconstructed context"}, app.EventTurnCompleted)
+	if len(requests) != 4 {
+		t.Fatalf("restart did not dispatch a normal provider turn: requests=%d", len(requests))
+	}
+	if !strings.Contains(requests[3].body, "summary goal") || !strings.Contains(requests[3].body, "ordinary suffix reply") {
+		t.Fatalf("restart provider context omitted stored summary or exact suffix: %q", requests[3].body)
+	}
+	visible += resumedVisible
+	visible += sendV030Command(t, restarted, app.Command{Kind: app.CommandStartTurn, Prompt: "create post-restart history"}, app.EventTurnCompleted)
 	publicFailure := sendV030Failure(t, restarted, app.Command{Kind: app.CommandCompact})
 	shutdownV030App(t, restarted, restartedDone)
-	if len(requests) != 3 {
+	if len(requests) != 6 {
 		t.Fatalf("provider refusal was not dispatched: requests=%d", len(requests))
 	}
 	if publicFailure.code != "compaction_failed" {
 		t.Fatalf("provider refusal terminal code=%q want compaction_failed", publicFailure.code)
 	}
+	assertV030ProviderRequestBoundary(t, requests, providerKey, sentinel)
 	assertV030SecretAbsent(t, publicFailure.visible, sentinel, providerKey)
 	store := jsonl.New(dataDir, jsonl.Options{})
 	inspection, err := store.InspectSession(t.Context(), protocol.SessionID(snapshot.Session.ID))
@@ -188,6 +235,21 @@ func assertV030RealJournalCompactionAndRestart(t *testing.T) {
 	assertV030SecretAbsent(t, visible, sentinel, providerKey)
 	assertV030TreeOmits(t, root, sentinel)
 	assertV030TreeOmits(t, root, providerKey)
+}
+
+type v030ProviderRequest struct {
+	body          string
+	authorization string
+}
+
+func assertV030ProviderRequestBoundary(t *testing.T, requests []v030ProviderRequest, providerKey, sentinel string) {
+	t.Helper()
+	for index, request := range requests {
+		if request.authorization != "Bearer "+providerKey {
+			t.Fatalf("provider request %d authorization=%q want configured Bearer key", index+1, request.authorization)
+		}
+		assertV030SecretAbsent(t, request.body, providerKey, sentinel)
+	}
 }
 
 func runV030App(t *testing.T, application *app.App) <-chan error {
