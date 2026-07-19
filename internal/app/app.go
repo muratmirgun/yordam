@@ -421,11 +421,18 @@ func (a *App) Run(ctx context.Context) error {
 					go consumeLegacyProtocolEvents(compactCtx, subscription, activeSet.LegacyAdapter, protocolEvents, true, compactTerminals)
 					go func() {
 						result, executeErr := activeSet.ApplicationService.Execute(compactCtx, applicationCommand)
-						awaitTerminal := executeErr == nil || result.Error != nil
+						awaitTerminal := executeErr == nil && result.Error == nil
+						var terminal *Event
 						if executeErr == nil && result.Error != nil {
+							stage := protocol.CompactionFailed
+							if result.Error.Code == "cancelled" {
+								stage = protocol.CompactionCancelled
+							} else if result.Error.Code == "commit_uncertain" {
+								stage = protocol.CompactionUncertain
+							}
+							terminal = &Event{Kind: EventCompactionFailed, Message: result.Error.Message, Code: result.Error.Code, Compaction: &protocol.CompactionEventV1{Trigger: "manual", Stage: stage, Usage: unknownCompactionUsage(), Error: protocol.DeepCopy(result.Error)}}
 							executeErr = errors.New(result.Error.Message)
 						}
-						var terminal *Event
 						if awaitTerminal {
 							select {
 							case event := <-compactTerminals:
@@ -1298,6 +1305,18 @@ func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription,
 			select {
 			case compactTerminals <- event:
 			case <-ctx.Done():
+			}
+			return
+		}
+		// Automatic compaction is nested inside an active turn. Its lifecycle
+		// terminal updates durable context but must not make the TUI idle before
+		// the owning turn result arrives.
+		if compactTerminals == nil && suppressTerminal && (event.Kind == EventCompactionCompleted || event.Kind == EventCompactionFailed) {
+			if event.Context != nil {
+				select {
+				case destination <- Event{Kind: EventState, Context: event.Context}:
+				case <-ctx.Done():
+				}
 			}
 			return
 		}
