@@ -967,7 +967,20 @@ func (a *App) openSession(ctx context.Context, sessionID string) bool {
 	if policy != nil {
 		a.policy = policy
 	}
-	return a.publish(ctx, a.stateEvent())
+	event := a.stateEvent()
+	if a.runtimeSet.ApplicationService != nil {
+		snapshot, sub, snapshotErr := a.runtimeSet.ApplicationService.SnapshotAndSubscribe(ctx, protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(a.session.ID), Consumer: "session_context", QueueCapacity: 1})
+		if snapshotErr != nil {
+			return a.publish(ctx, Event{Kind: EventError, Err: snapshotErr, Message: "refresh durable context", NonTerminal: true})
+		}
+		_ = sub.Close()
+		contextState, contextErr := DurableContext(snapshot)
+		if contextErr != nil {
+			return a.publish(ctx, Event{Kind: EventError, Err: contextErr, Message: "invalid durable context", NonTerminal: true})
+		}
+		event.Context = contextState
+	}
+	return a.publish(ctx, event)
 }
 
 func (a *App) modelConfigured(selection domain.ModelSelection) bool {
