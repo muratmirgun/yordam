@@ -3,8 +3,6 @@ package tui_test
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -793,7 +791,7 @@ func TestGoldenViews(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		t.Run(test.wantLayout+"-"+filepath.Base(goldenPath(test.width)), func(t *testing.T) {
+		t.Run(test.wantLayout+"-"+tui.WidthStringForTest(test.width), func(t *testing.T) {
 			model := tui.GoldenModelForTest(test.width, test.height)
 			if got := model.LayoutForTest(); got != test.wantLayout {
 				t.Fatalf("layout=%q want=%q", got, test.wantLayout)
@@ -824,19 +822,15 @@ func TestGoldenViews(t *testing.T) {
 				}
 			}
 
-			want, err := os.ReadFile(goldenPath(test.width))
-			if err != nil {
-				t.Fatal(err)
+			want, ok := goldenView(test.width)
+			if !ok {
+				t.Fatalf("golden view missing for width %d", test.width)
 			}
-			if view.Content != string(want) {
-				t.Fatalf("view does not match golden %s\n--- want ---\n%s\n--- got ---\n%s", goldenPath(test.width), want, view.Content)
+			if view.Content != want {
+				t.Fatalf("view does not match golden for width %d\n--- want ---\n%s\n--- got ---\n%s", test.width, want, view.Content)
 			}
 		})
 	}
-}
-
-func goldenPath(width int) string {
-	return filepath.Join("testdata", "view-"+tui.WidthStringForTest(width)+".golden")
 }
 
 func keyMessage(value string) tea.KeyPressMsg {

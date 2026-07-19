@@ -354,17 +354,9 @@ func buildYordam(t *testing.T) string {
 	return ptyfixture.CachedYordam(t)
 }
 
-func repositoryRoot() string {
-	return ptyfixture.RepositoryRoot()
-}
-
 func readSSEFixture(t *testing.T) string {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join(repositoryRoot(), "internal", "tui", "testdata", "scripted-sse.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(raw)
+	return ptyfixture.ScriptedSSE()
 }
 
 func newSSEServer(t *testing.T, fixture string) *httptest.Server {

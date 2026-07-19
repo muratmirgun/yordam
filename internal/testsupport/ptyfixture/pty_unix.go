@@ -27,6 +27,10 @@ type Session struct {
 	output             bytes.Buffer
 }
 
+const scriptedSSE = "data: {\"choices\":[{\"delta\":{\"content\":\"scripted PTY response\"}}]}\n\ndata: [DONE]\n"
+
+func ScriptedSSE() string { return scriptedSSE }
+
 func Start(t testing.TB, binary, workspace string, environment []string, arguments ...string) *Session {
 	return start(t, nil, binary, workspace, environment, arguments...)
 }
