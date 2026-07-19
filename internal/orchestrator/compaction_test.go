@@ -42,18 +42,18 @@ func TestRunCompactionLifecycleOrdersAuthorizationEvidenceAndNativeEvent(t *test
 		"lane.acquire(compaction)", "append(command.accepted)", "provider.negotiate", "provider.prepare",
 		"append(activity.planned,authorization.requested)", "authorization.decide",
 		"append(authorization.decided,activity.authorized)", "append(authorization.decision_consumed,activity.started)",
-		"authorization.issue", "authorization.dispatch", "provider.stream", "evidence.put", "append(context.compacted,command.completed)", "lane.release",
+		"authorization.issue", "provider.stream", "evidence.put", "append(activity.succeeded,context.compacted,command.completed)", "lane.release",
 	}
 	if !containsContiguous(got, want) {
 		t.Fatalf("ordering:\n got=%v\nwant=%v", got, want)
 	}
 	requests := repository.appendRequests()
 	last := requests[len(requests)-1]
-	if len(last.Events) != 2 || last.Events[0].Kind != protocol.EventContextCompacted || last.Events[0].RuntimeGenerationID != request.Runtime.ID || last.Events[0].Actor == nil || last.Events[0].Actor.ID != "orchestrator" || last.Events[0].Actor.Kind != protocol.ActorSystem {
+	if len(last.Events) != 3 || last.Events[0].Kind != protocol.EventActivitySucceeded || last.Events[1].Kind != protocol.EventContextCompacted || last.Events[1].RuntimeGenerationID != request.Runtime.ID || last.Events[1].Actor == nil || last.Events[1].Actor.ID != "orchestrator" || last.Events[1].Actor.Kind != protocol.ActorSystem {
 		t.Fatalf("final events=%#v", last.Events)
 	}
 	var payload protocol.ContextCompactedV1
-	if err := json.Unmarshal(last.Events[0].Payload, &payload); err != nil {
+	if err := json.Unmarshal(last.Events[1].Payload, &payload); err != nil {
 		t.Fatal(err)
 	}
 	if payload.From != result.From || payload.Through != result.Through || payload.SummaryEvidenceID != result.SummaryEvidence.Body.ID || payload.Revision != result.Revision {
@@ -80,6 +80,63 @@ func TestRunCompactionLifecycleOrdersAuthorizationEvidenceAndNativeEvent(t *test
 		t.Fatalf("revision=%q verified=%q error=%v", payload.Revision, verifiedRevision, err)
 	}
 	validateAppendRequests(t, requests)
+}
+
+func TestRunCompactionAcceptedReplayIsTypedUncertainAndDoesNotResend(t *testing.T) {
+	repository := newCompactionRepository(t, &recordLog{})
+	request := validCompactRequest(t, repository.head)
+	provider := &compactionProvider{}
+	service := newCompactionService(t, repository, &recordLog{}, provider, &compactionEvidence{})
+	if _, err := repository.AppendBatch(context.Background(), journal.AppendRequest{Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(request.SessionID)}, ExpectedHead: request.ExpectedHead, TransactionID: "accepted-only", Events: []protocol.ProposedEvent{compactionCommandAccepted(request)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunCompaction(context.Background(), request); !errors.Is(err, ErrCommitUncertain) {
+		t.Fatalf("accepted replay error=%v", err)
+	}
+	if provider.streams.Load() != 0 {
+		t.Fatalf("accepted replay resent provider request: %d", provider.streams.Load())
+	}
+}
+
+func TestRunCompactionFailedReplayReturnsTerminalErrorWithoutResend(t *testing.T) {
+	repository := newCompactionRepository(t, &recordLog{})
+	request := validCompactRequest(t, repository.head)
+	provider := &compactionProvider{refuse: true}
+	service := newCompactionService(t, repository, &recordLog{}, provider, &compactionEvidence{})
+	if _, err := service.RunCompaction(context.Background(), request); err == nil {
+		t.Fatal("provider refusal was ignored")
+	}
+	if _, err := service.RunCompaction(context.Background(), request); err == nil || errors.Is(err, ErrCommitUncertain) {
+		t.Fatalf("terminal replay error=%v", err)
+	}
+	if provider.streams.Load() != 1 {
+		t.Fatalf("terminal replay resent provider request: %d", provider.streams.Load())
+	}
+}
+
+func TestRunCompactionUsesRealProviderAndAuthorizationDispatchExactlyOnce(t *testing.T) {
+	repository := newCompactionRepository(t, &recordLog{})
+	request := validCompactRequest(t, repository.head)
+	catalog := provider.NewCatalog("providers-a", []protocol.ModelDescriptor{validModelDescriptor(request.Runtime.ID)})
+	gate := authorization.NewService(repository)
+	adapter := &compactionRecordingAdapter{}
+	providerService, err := provider.NewService(catalog, []provider.Adapter{adapter}, gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(Dependencies{Admission: passthroughAdmission{}, Lane: NewOperationLane(), Repository: repository, Providers: catalog, Provider: providerService, Authorization: realCompactionAuthorization{gate: gate}, Evidence: &compactionEvidence{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunCompaction(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunCompaction(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.starts.Load() != 1 {
+		t.Fatalf("adapter starts=%d", adapter.starts.Load())
+	}
 }
 
 func TestRunCompactionIsIdleOnlyAndIdempotent(t *testing.T) {
@@ -168,6 +225,13 @@ func TestRunCompactionFaultsDoNotLeaveTheLaneHeldOrRepeatProviderEgress(t *testi
 				t.Fatalf("compaction lane remains held: %v", err)
 			}
 			lease.Release()
+			kinds := flattenAppendKinds(repository.appendRequests())
+			if !test.wantUncertain && !containsString(kinds, protocol.EventCommandCompleted) {
+				t.Fatalf("proven failure was not terminalized: %v", kinds)
+			}
+			if test.wantUncertain && containsString(kinds, protocol.EventCommandCompleted) {
+				t.Fatalf("uncertain final append speculatively terminalized: %v", kinds)
+			}
 			if evidence.err == nil && (test.name == "append conflict" || test.name == "known non commit" || test.name == "commit unknown") && evidence.candidate.ID == "" {
 				t.Fatal("durable orphan evidence was not retained for inspectability")
 			}
@@ -179,6 +243,15 @@ func TestRunCompactionFaultsDoNotLeaveTheLaneHeldOrRepeatProviderEgress(t *testi
 			}
 		})
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRunCompactionCancellationBeforeAndDuringStream(t *testing.T) {
@@ -237,12 +310,13 @@ type compactionRepository struct {
 	failAppendAt   int
 	appendStatus   journal.AppendStatus
 	lookup         journal.TransactionState
+	transactions   map[protocol.TransactionID]journal.CommittedTransaction
 }
 
 func newCompactionRepository(t *testing.T, log *recordLog) *compactionRepository {
 	t.Helper()
 	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-a"}
-	r := &compactionRepository{log: log, lookup: journal.TransactionNotCommitted}
+	r := &compactionRepository{log: log, lookup: journal.TransactionNotCommitted, transactions: make(map[protocol.TransactionID]journal.CommittedTransaction)}
 	for seq := uint64(1); seq <= 6; seq++ {
 		payload, err := canonicaljson.Marshal(protocol.UserMessageV1{Content: fmt.Sprintf("message-%d", seq)})
 		if err != nil {
@@ -279,16 +353,21 @@ func (r *compactionRepository) AppendBatch(_ context.Context, request journal.Ap
 		return journal.AppendResult{Status: journal.AppendConflict, CurrentHead: r.head}, nil
 	}
 	if r.failAppendAt > 0 && len(r.requests)+1 == r.failAppendAt {
+		r.failAppendAt = 0
 		return journal.AppendResult{Status: r.appendStatus, CurrentHead: r.head}, errors.New("append fault")
 	}
 	r.requests = append(r.requests, protocol.DeepCopy(request))
 	kinds := make([]string, len(request.Events))
+	envelopes := make([]protocol.EventEnvelope, 0, len(request.Events))
 	for index, event := range request.Events {
 		seq := r.head.CommitSeq + uint64(index) + 1
 		kinds[index] = event.Kind
-		r.events = append(r.events, protocol.EventRecord{Envelope: protocol.EventEnvelope{SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: event.PayloadVersion, JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, EventID: event.EventID, SessionID: event.SessionID, Seq: seq, Time: event.Time, Kind: event.Kind, TaskID: event.TaskID, TurnID: event.TurnID, ActivityID: event.ActivityID, Actor: protocol.DeepCopy(event.Actor), RuntimeGenerationID: event.RuntimeGenerationID, TransactionID: request.TransactionID, Payload: protocol.DeepCopy(event.Payload)}})
+		envelope := protocol.EventEnvelope{SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: event.PayloadVersion, JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, EventID: event.EventID, SessionID: event.SessionID, Seq: seq, Time: event.Time, Kind: event.Kind, TaskID: event.TaskID, TurnID: event.TurnID, ActivityID: event.ActivityID, Actor: protocol.DeepCopy(event.Actor), RuntimeGenerationID: event.RuntimeGenerationID, TransactionID: request.TransactionID, Payload: protocol.DeepCopy(event.Payload)}
+		r.events = append(r.events, protocol.EventRecord{Envelope: envelope})
+		envelopes = append(envelopes, envelope)
 	}
 	r.head = protocol.CommittedCursor{JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, CommitSeq: r.head.CommitSeq + uint64(len(request.Events)) + 1, TransactionID: request.TransactionID}
+	r.transactions[request.TransactionID] = journal.CommittedTransaction{Journal: request.Journal, TransactionID: request.TransactionID, Cursor: r.head, Events: protocol.DeepCopy(envelopes)}
 	if r.log != nil {
 		r.log.add("append(" + strings.Join(kinds, ",") + ")")
 	}
@@ -299,8 +378,14 @@ func (r *compactionRepository) LookupTransaction(context.Context, protocol.Journ
 	defer r.mu.Unlock()
 	return journal.TransactionLookup{State: r.lookup}, nil
 }
-func (r *compactionRepository) ReadCommittedTransaction(context.Context, protocol.JournalRef, protocol.TransactionID) (journal.CommittedTransaction, error) {
-	return journal.CommittedTransaction{}, errors.New("not committed")
+func (r *compactionRepository) ReadCommittedTransaction(_ context.Context, _ protocol.JournalRef, id protocol.TransactionID) (journal.CommittedTransaction, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	transaction, ok := r.transactions[id]
+	if !ok {
+		return journal.CommittedTransaction{}, errors.New("not committed")
+	}
+	return protocol.DeepCopy(transaction), nil
 }
 func (r *compactionRepository) Recover(context.Context, journal.RecoveryRequest) (journal.RecoveryResult, error) {
 	return journal.RecoveryResult{}, nil
@@ -318,6 +403,28 @@ type compactionProvider struct {
 	block   chan struct{}
 	streams atomic.Int64
 	request protocol.ModelRequest
+}
+
+type compactionRecordingAdapter struct{ starts atomic.Int64 }
+
+func (*compactionRecordingAdapter) Kind() string { return "test" }
+func (a *compactionRecordingAdapter) Normalize(_ context.Context, request protocol.ModelRequest) (provider.PreparedRequest, error) {
+	return provider.NewPreparedRequest(a.Kind(), request)
+}
+func (a *compactionRecordingAdapter) StartPrepared(_ context.Context, prepared provider.PreparedRequest) (<-chan protocol.ModelEvent, error) {
+	var request protocol.ModelRequest
+	if err := prepared.Decode(a.Kind(), &request); err != nil {
+		return nil, err
+	}
+	if request.ProviderID != "provider-a" || request.ModelID != "model-a" {
+		return nil, fmt.Errorf("provider request identity drift")
+	}
+	a.starts.Add(1)
+	stream := make(chan protocol.ModelEvent, 2)
+	stream <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: string(validCompactionSummary)}}
+	stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "stop"}}
+	close(stream)
+	return stream, nil
 }
 
 func (p *compactionProvider) Prepare(_ context.Context, _ protocol.ActivityID, _ string, request protocol.ModelRequest, _ protocol.Digest) (provider.ProviderHandle, error) {
@@ -387,6 +494,24 @@ func (e *compactionEvidence) Put(_ context.Context, candidate protocol.EvidenceC
 type compactionAuthorization struct {
 	log   *recordLog
 	nonce atomic.Int64
+}
+
+type realCompactionAuthorization struct {
+	gate  *authorization.Service
+	nonce atomic.Int64
+}
+
+func (a realCompactionAuthorization) Decide(_ context.Context, request protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error) {
+	return protocol.AuthorizationDecision{Request: request, Action: "allow", Scope: protocol.CanonicalAuthorizationScope{Capability: request.Action, Source: request.Source, Resources: request.Resources, Constraints: []protocol.AuthorizationConstraint{}}, Constraints: []protocol.AuthorizationConstraint{}, Lifetime: protocol.AuthorizationLifetimeOnce, PolicySource: "test", PolicyGeneration: request.PolicyGeneration, Reason: "allowed", DecidedAt: time.Now().UTC(), PlanDigest: request.PlanDigest, DecisionNonce: protocol.DecisionNonce(fmt.Sprintf("real-nonce-%d", a.nonce.Add(1)))}, nil
+}
+func (a realCompactionAuthorization) ResolveInteractive(_ context.Context, request protocol.AuthorizationRequest, decision protocol.AuthorizationDecision, response protocol.ApprovalResponse) (protocol.AuthorizationDecision, error) {
+	return a.gate.ResolveInteractive(request, decision, response)
+}
+func (a realCompactionAuthorization) Issue(ctx context.Context, reference authorization.CommitReference) (authorization.CommittedToken, error) {
+	return a.gate.Issue(ctx, reference)
+}
+func (a realCompactionAuthorization) Dispatch(ctx context.Context, token authorization.CommittedToken, binding authorization.DispatchBinding, callback func(context.Context) error) error {
+	return a.gate.Dispatch(ctx, token, binding, callback)
 }
 
 func (a *compactionAuthorization) Decide(_ context.Context, request protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error) {

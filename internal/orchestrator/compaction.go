@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,11 +12,12 @@ import (
 	"github.com/muratmirgun/yordam/internal/compaction"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/provider"
 )
 
 // RunCompaction summarizes a stable, older range of a session. The provider is
 // reached only after the authorization decision and activity start are durable.
-func (s *Service) RunCompaction(ctx context.Context, request CompactRequest) (CompactResult, error) {
+func (s *Service) RunCompaction(ctx context.Context, request CompactRequest) (result CompactResult, runErr error) {
 	if err := validateCompactRequest(request); err != nil {
 		return CompactResult{}, err
 	}
@@ -56,9 +58,18 @@ func (s *Service) RunCompaction(ctx context.Context, request CompactRequest) (Co
 		return CompactResult{}, err
 	}
 	state := compactionState{ref: ref, head: request.ExpectedHead, command: request.Command}
+	defer func() {
+		if !state.accepted || state.terminal || runErr == nil || errors.Is(runErr, ErrCommitUncertain) {
+			return
+		}
+		if terminalErr := s.terminalizeCompactionFailure(context.WithoutCancel(ctx), request, &state, runErr); terminalErr != nil {
+			runErr = errors.Join(runErr, terminalErr)
+		}
+	}()
 	if err := s.appendCompaction(ctx, &state, "accepted", []protocol.ProposedEvent{compactionCommandAccepted(request)}); err != nil {
 		return CompactResult{}, err
 	}
+	state.accepted = true
 
 	model, _ := selectedCompactRuntimeModel(request)
 	plan, err := s.deps.Providers.Negotiate(model.ProviderID, model.ModelID, nil, request.Runtime.Body.ToolCatalogRevision)
@@ -72,6 +83,7 @@ func (s *Service) RunCompaction(ctx context.Context, request CompactRequest) (Co
 	modelRequest.RequestID = stableID("compaction-request", string(request.Command.CommandID), selection.SourceDigest.Value, string(request.Runtime.ID))
 	modelRequest.ProviderID, modelRequest.ModelID, modelRequest.Plan = model.ProviderID, model.ModelID, plan
 	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "compaction", selection.SourceDigest.Value, string(request.Runtime.ID)))
+	state.activityID = activityID
 	callID := stableID("compaction-call", string(request.Command.CommandID), selection.SourceDigest.Value, string(request.Runtime.ID))
 	handle, err := s.deps.Provider.Prepare(ctx, activityID, callID, modelRequest, selection.SourceDigest)
 	if err != nil {
@@ -91,17 +103,14 @@ func (s *Service) RunCompaction(ctx context.Context, request CompactRequest) (Co
 	if err := s.appendCompaction(ctx, &state, "planned", planned); err != nil {
 		return CompactResult{}, err
 	}
+	state.activityPlanned = true
 	token, err := s.authorizeCompaction(ctx, request, &state, activityID, callID, authorizationRequest)
 	if err != nil {
 		return CompactResult{}, err
 	}
+	state.activityStarted = true
 
-	var stream <-chan protocol.ModelEvent
-	err = s.deps.Authorization.Dispatch(ctx, token, authorization.DispatchBinding{Kind: "provider", HandleID: callID, ActivityID: activityID, CallID: callID, PlanDigest: authorizationRequest.PlanDigest, RequestDigest: authorizationRequest.RequestDigest, DispatchDigest: authorizationRequest.DispatchDigest, RuntimeGenerationID: request.Runtime.ID}, func(dispatchCtx context.Context) error {
-		var streamErr error
-		stream, streamErr = s.deps.Provider.Stream(dispatchCtx, handle, token)
-		return streamErr
-	})
+	stream, err := s.deps.Provider.Stream(ctx, handle, token)
 	if err != nil {
 		return CompactResult{}, err
 	}
@@ -117,15 +126,17 @@ func (s *Service) RunCompaction(ctx context.Context, request CompactRequest) (Co
 	if err != nil {
 		return CompactResult{}, err
 	}
+	state.evidence = evidence
 
 	transactionID := protocol.TransactionID(stableID("transaction", string(request.Command.CommandID), selection.SourceDigest.Value, string(request.Runtime.ID)))
-	finalCursor := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: state.head.CommitSeq + 3, TransactionID: transactionID}
-	result := CompactResult{Cursor: finalCursor, SummaryEvidence: evidence, From: selection.From, Through: selection.Through, Revision: revision, Usage: usage}
+	finalCursor := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: state.head.CommitSeq + 4, TransactionID: transactionID}
+	result = CompactResult{Cursor: finalCursor, SummaryEvidence: evidence, From: selection.From, Through: selection.Through, Revision: revision, Usage: usage}
 	completed, err := compactCommandCompleted(request, result)
 	if err != nil {
 		return CompactResult{}, err
 	}
 	final, err := s.compactionEvents(request, activityID, "completed", []compactionEventValue{
+		{protocol.EventActivitySucceeded, protocol.ActivityOutcomeV1{Status: "succeeded", OutputEvidenceIDs: []protocol.EvidenceID{evidence.Body.ID}}},
 		{protocol.EventContextCompacted, protocol.ContextCompactedV1{From: selection.From, Through: selection.Through, SummaryEvidenceID: evidence.Body.ID, Revision: revision}},
 		{protocol.EventCommandCompleted, completed},
 	})
@@ -133,18 +144,27 @@ func (s *Service) RunCompaction(ctx context.Context, request CompactRequest) (Co
 		return CompactResult{}, err
 	}
 	if err := s.appendCompactionWithTransaction(ctx, &state, transactionID, final); err != nil {
+		state.terminal = state.head == finalCursor
 		return CompactResult{}, err
 	}
 	if state.head != finalCursor {
 		return CompactResult{}, fmt.Errorf("compaction cursor prediction mismatch")
 	}
+	state.terminal = true
 	return result, nil
 }
 
 type compactionState struct {
-	ref     protocol.JournalRef
-	head    protocol.CommittedCursor
-	command CommandMetadata
+	ref              protocol.JournalRef
+	head             protocol.CommittedCursor
+	command          CommandMetadata
+	accepted         bool
+	terminal         bool
+	activityID       protocol.ActivityID
+	activityPlanned  bool
+	activityStarted  bool
+	activityTerminal bool
+	evidence         protocol.EvidenceRecord
 }
 type compactionEventValue struct {
 	kind    string
@@ -192,6 +212,54 @@ func (s *Service) appendCompactionWithTransaction(ctx context.Context, state *co
 	return nil
 }
 
+func (s *Service) terminalizeCompactionFailure(ctx context.Context, request CompactRequest, state *compactionState, cause error) error {
+	status, code, message := "failed", "compaction_failed", "context compaction failed"
+	activityKind, activityStatus := protocol.EventActivityFailed, "failed"
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		status, code, message = "interrupted", "compaction_interrupted", "context compaction interrupted"
+		activityKind, activityStatus = protocol.EventActivityCancelled, "cancelled"
+	}
+	var denied *authorizationDeniedError
+	if errors.As(cause, &denied) {
+		status, code, message = "denied", "authorization_denied", "compaction authorization denied"
+		activityKind, activityStatus = protocol.EventActivityDenied, "denied"
+	}
+	values := make([]compactionEventValue, 0, 2)
+	if state.activityPlanned && !state.activityTerminal && state.activityID != "" {
+		outcome := protocol.ActivityOutcomeV1{Status: activityStatus}
+		if state.evidence.Body.ID != "" {
+			activityKind, outcome.Status, outcome.OutputEvidenceIDs = protocol.EventActivitySucceeded, "succeeded", []protocol.EvidenceID{state.evidence.Body.ID}
+		}
+		values = append(values, compactionEventValue{activityKind, outcome})
+	}
+	transactionID := protocol.TransactionID(stableID("transaction", string(state.command.CommandID), "compaction", "failure-terminal"))
+	finalCursor := protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + uint64(len(values)) + 2, TransactionID: transactionID}
+	payload, err := canonicaljson.Marshal(struct {
+		Status string `json:"status"`
+	}{status})
+	if err != nil {
+		return err
+	}
+	commandResult := protocol.CommandResult{ProtocolVersion: protocol.ApplicationProtocolVersion, CommandID: state.command.CommandID, Status: status, RequestDigest: state.command.RequestDigest, Cursor: protocol.ApplicationCursor{SelectedSession: &finalCursor}, PayloadVersion: 1, Payload: payload, Error: &protocol.PublicError{Code: code, Message: message, Retryable: false}}
+	raw, err := canonicaljson.Marshal(commandResult)
+	if err != nil {
+		return err
+	}
+	values = append(values, compactionEventValue{protocol.EventCommandCompleted, protocol.CommandCompletedV1{CommandID: state.command.CommandID, RequestDigest: state.command.RequestDigest, Status: status, Result: raw, Error: commandResult.Error}})
+	events, err := s.compactionEvents(request, state.activityID, "failure-terminal", values)
+	if err != nil {
+		return err
+	}
+	if err := s.appendCompactionWithTransaction(ctx, state, transactionID, events); err != nil {
+		return err
+	}
+	if state.head != finalCursor {
+		return fmt.Errorf("compaction failure cursor prediction mismatch")
+	}
+	state.terminal = true
+	return nil
+}
+
 func (s *Service) authorizeCompaction(ctx context.Context, request CompactRequest, state *compactionState, activityID protocol.ActivityID, callID string, authRequest protocol.AuthorizationRequest) (authorization.CommittedToken, error) {
 	decision, err := s.deps.Authorization.Decide(ctx, authRequest)
 	if err != nil {
@@ -214,6 +282,14 @@ func (s *Service) authorizeCompaction(ctx context.Context, request CompactReques
 		return authorization.CommittedToken{}, err
 	}
 	if decision.Action != "allow" {
+		deniedEvents, eventErr := s.compactionEvents(request, activityID, "decision", []compactionEventValue{{protocol.EventAuthorizationDecided, protocol.AuthorizationDecidedV1{Decision: decision}}, {protocol.EventActivityDenied, protocol.ActivityOutcomeV1{Status: "denied"}}})
+		if eventErr != nil {
+			return authorization.CommittedToken{}, eventErr
+		}
+		if appendErr := s.appendCompaction(ctx, state, "decision", deniedEvents); appendErr != nil {
+			return authorization.CommittedToken{}, appendErr
+		}
+		state.activityTerminal = true
 		return authorization.CommittedToken{}, &authorizationDeniedError{reason: decision.Reason}
 	}
 	decisionEventID := eventID(request.Command.CommandID, "compaction-decision", 0, protocol.EventAuthorizationDecided)
@@ -245,11 +321,7 @@ func compactionAuthorizationRequest(request CompactRequest, activityID protocol.
 	if err != nil {
 		return protocol.AuthorizationRequest{}, err
 	}
-	dispatchDigest, err := canonicaljson.Digest(struct {
-		Request    protocol.Digest
-		Source     protocol.Digest
-		Generation protocol.RuntimeGenerationID
-	}{requestDigest, selection.SourceDigest, request.Runtime.ID})
+	dispatchDigest, err := provider.DispatchDigest(requestDigest, selection.SourceDigest, modelRequest.Plan.Digest, request.Runtime.ID)
 	if err != nil {
 		return protocol.AuthorizationRequest{}, err
 	}
@@ -261,7 +333,15 @@ func compactionAuthorizationRequest(request CompactRequest, activityID protocol.
 }
 
 func (s *Service) recordCompactionEvidence(ctx context.Context, request CompactRequest, activityID protocol.ActivityID, selection compaction.Selection, summary []byte) (protocol.EvidenceRecord, error) {
-	candidate := protocol.EvidenceCandidate{ID: protocol.EvidenceID(stableID("evidence", string(request.Command.CommandID), selection.SourceDigest.Value, string(request.Runtime.ID))), Kind: "context_summary", WorkspaceID: protocol.WorkspaceID(request.SessionID), SessionID: request.SessionID, MediaType: "application/json", ProducingActivityID: activityID, Actor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}, Subject: protocol.SubjectRef{Kind: "context_range", ID: fmt.Sprintf("%d-%d", selection.From.CommitSeq, selection.Through.CommitSeq)}, Content: summary, Limit: compaction.MaxSummaryBytes}
+	binding, err := compaction.NewEvidenceBinding(selection)
+	if err != nil {
+		return protocol.EvidenceRecord{}, err
+	}
+	encodedBinding, err := compaction.EncodeEvidenceBinding(binding)
+	if err != nil {
+		return protocol.EvidenceRecord{}, err
+	}
+	candidate := protocol.EvidenceCandidate{ID: protocol.EvidenceID(stableID("evidence", string(request.Command.CommandID), selection.SourceDigest.Value, string(request.Runtime.ID))), Kind: "context_summary", WorkspaceID: protocol.WorkspaceID(request.SessionID), SessionID: request.SessionID, MediaType: "application/json", ProducingActivityID: activityID, Actor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}, Subject: protocol.SubjectRef{Kind: "context_compaction_summary", ID: encodedBinding}, Content: summary, Limit: compaction.MaxSummaryBytes}
 	record, err := s.deps.Evidence.Put(ctx, candidate)
 	if err != nil {
 		return protocol.EvidenceRecord{}, err
@@ -357,7 +437,13 @@ func compactCommandCompleted(request CompactRequest, result CompactResult) (prot
 }
 func compactResultFromCommand(command protocol.CommandResult) (CompactResult, error) {
 	if command.Status == "accepted" {
-		return CompactResult{}, nil
+		return CompactResult{}, fmt.Errorf("compaction command is accepted but not terminal: %w", ErrCommitUncertain)
+	}
+	if command.Status != "completed" {
+		if command.Error != nil {
+			return CompactResult{}, fmt.Errorf("compaction command %s: %s", command.Status, command.Error.Message)
+		}
+		return CompactResult{}, fmt.Errorf("compaction command ended with %s", command.Status)
 	}
 	var payload compactCommandPayload
 	if err := jsonUnmarshal(command.Payload, &payload); err != nil {

@@ -24,6 +24,10 @@ func (r *fakeSummaryResolver) ResolveCompactionSummary(_ stdcontext.Context, _ p
 	return r.sources[id], nil
 }
 
+func (r *fakeSummaryResolver) ResolveVerifiedCompactionSummary(ctx stdcontext.Context, reference protocol.ContextCompactionReference) (protocol.ContentSource, error) {
+	return r.ResolveCompactionSummary(ctx, reference.SessionID, reference.SummaryEvidenceID)
+}
+
 func TestContextPlanReconstructsLatestValidNativeSummary(t *testing.T) {
 	resolver := &fakeSummaryResolver{sources: map[protocol.EvidenceID]protocol.ContentSource{
 		"summary": summarySource(t, "summary", "native summary"),

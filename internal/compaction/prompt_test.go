@@ -90,6 +90,38 @@ func TestRevisionUsesCanonicalSelectionAndSummaryOnly(t *testing.T) {
 	}
 }
 
+func TestEvidenceBindingPreservesExactCursorsAndVerifiesRevision(t *testing.T) {
+	t.Parallel()
+	selection := promptSelection(t)
+	selection.From.TransactionID = "from-transaction"
+	selection.Through.TransactionID = "through-transaction"
+	summary, err := compaction.ParseSummary([]byte(`{"goal":"ship","constraints":[],"decisions":[],"files":[],"commands_and_tests":[],"unresolved":[],"children":[],"skills":[],"unknown_effects":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := compaction.NewEvidenceBinding(selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := compaction.EncodeEvidenceBinding(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := compaction.DecodeEvidenceBinding(encoded)
+	if err != nil || decoded != binding {
+		t.Fatalf("decoded=%+v binding=%+v err=%v", decoded, binding, err)
+	}
+	revision, err := compaction.RevisionForBinding(decoded, summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded.Through.TransactionID = "other"
+	changed, err := compaction.RevisionForBinding(decoded, summary)
+	if err != nil || changed == revision {
+		t.Fatalf("revision=%q changed=%q err=%v", revision, changed, err)
+	}
+}
+
 func promptSelection(t *testing.T) compaction.Selection {
 	t.Helper()
 	source := promptSource(t, "event-1", "journal facts")

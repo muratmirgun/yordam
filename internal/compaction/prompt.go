@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -51,6 +52,63 @@ type summaryRequestBody struct {
 	SourceDigest protocol.Digest          `json:"source_digest"`
 	Prior        *protocol.ContentSource  `json:"prior_summary,omitempty"`
 	Sources      []protocol.ContentSource `json:"normalized_sources"`
+}
+
+// EvidenceBinding is immutable metadata persisted alongside a summary blob.
+// It binds activation to the exact committed cursors, including transaction
+// IDs, rather than merely their sequence numbers.
+type EvidenceBinding struct {
+	ContractVersion string                   `json:"contract_version"`
+	From            protocol.CommittedCursor `json:"from"`
+	Through         protocol.CommittedCursor `json:"through"`
+	SourceDigest    protocol.Digest          `json:"source_digest"`
+}
+
+func NewEvidenceBinding(selection Selection) (EvidenceBinding, error) {
+	if err := validateSelection(selection); err != nil {
+		return EvidenceBinding{}, err
+	}
+	return EvidenceBinding{ContractVersion: SummaryContractVersion, From: selection.From, Through: selection.Through, SourceDigest: selection.SourceDigest}, nil
+}
+
+func (b EvidenceBinding) Validate() error {
+	if b.ContractVersion != SummaryContractVersion || b.From.Validate() != nil || b.Through.Validate() != nil || b.From.JournalKind != protocol.JournalSession || b.Through.JournalKind != protocol.JournalSession || b.From.JournalKind != b.Through.JournalKind || b.From.JournalID != b.Through.JournalID || b.From.CommitSeq > b.Through.CommitSeq || b.SourceDigest.Validate() != nil {
+		return fmt.Errorf("invalid compaction evidence binding")
+	}
+	return nil
+}
+
+func EncodeEvidenceBinding(binding EvidenceBinding) (string, error) {
+	if err := binding.Validate(); err != nil {
+		return "", err
+	}
+	raw, err := canonicaljson.Marshal(binding)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func DecodeEvidenceBinding(encoded string) (EvidenceBinding, error) {
+	if encoded == "" {
+		return EvidenceBinding{}, fmt.Errorf("empty compaction evidence binding")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return EvidenceBinding{}, fmt.Errorf("decode compaction evidence binding: %w", err)
+	}
+	var binding EvidenceBinding
+	if err := json.Unmarshal(raw, &binding); err != nil {
+		return EvidenceBinding{}, fmt.Errorf("decode compaction evidence binding: %w", err)
+	}
+	canonical, err := canonicaljson.Marshal(binding)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		return EvidenceBinding{}, fmt.Errorf("non-canonical compaction evidence binding")
+	}
+	if err := binding.Validate(); err != nil {
+		return EvidenceBinding{}, err
+	}
+	return binding, nil
 }
 
 // summaryRequestInput is the sole model-visible user-body serialization. Select
@@ -123,6 +181,19 @@ func Revision(selection Selection, admitted []byte) (string, error) {
 	if err := validateSelection(selection); err != nil {
 		return "", err
 	}
+	binding, err := NewEvidenceBinding(selection)
+	if err != nil {
+		return "", err
+	}
+	return RevisionForBinding(binding, admitted)
+}
+
+// RevisionForBinding verifies immutable evidence metadata and admitted summary
+// bytes at activation time.
+func RevisionForBinding(binding EvidenceBinding, admitted []byte) (string, error) {
+	if err := binding.Validate(); err != nil {
+		return "", err
+	}
 	canonical, err := ParseSummary(admitted)
 	if err != nil {
 		return "", err
@@ -137,7 +208,7 @@ func Revision(selection Selection, admitted []byte) (string, error) {
 		Through         protocol.CommittedCursor `json:"through"`
 		SourceDigest    protocol.Digest          `json:"source_digest"`
 		SummaryDigest   protocol.Digest          `json:"summary_digest"`
-	}{SummaryContractVersion, selection.From, selection.Through, selection.SourceDigest, summaryDigest}
+	}{binding.ContractVersion, binding.From, binding.Through, binding.SourceDigest, summaryDigest}
 	digest, err := canonicaljson.Digest(body)
 	if err != nil {
 		return "", err

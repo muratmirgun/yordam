@@ -127,13 +127,15 @@ type legacyCompactionPayload struct {
 
 func adaptEvents(ctx stdcontext.Context, session protocol.SessionID, summaries SummaryResolver, events []protocol.EventRecord) ([]protocol.ContentSource, []protocol.ExcludedContentSource, string, error) {
 	type compaction struct {
-		index    int
-		from     uint64
-		through  uint64
-		revision string
-		summary  string
-		evidence protocol.EvidenceID
-		legacy   bool
+		index         int
+		from          uint64
+		through       uint64
+		fromCursor    protocol.CommittedCursor
+		throughCursor protocol.CommittedCursor
+		revision      string
+		summary       string
+		evidence      protocol.EvidenceID
+		legacy        bool
 	}
 	candidates := make([]compaction, 0)
 	for index, event := range events {
@@ -145,7 +147,7 @@ func adaptEvents(ctx stdcontext.Context, session protocol.SessionID, summaries S
 			if !ok || !validNativeCompaction(event, session, decoded) {
 				continue
 			}
-			candidates = append(candidates, compaction{index: index, from: decoded.From.CommitSeq, through: decoded.Through.CommitSeq, revision: decoded.Revision, evidence: decoded.SummaryEvidenceID})
+			candidates = append(candidates, compaction{index: index, from: decoded.From.CommitSeq, through: decoded.Through.CommitSeq, fromCursor: decoded.From, throughCursor: decoded.Through, revision: decoded.Revision, evidence: decoded.SummaryEvidenceID})
 			continue
 		}
 		var payload legacyCompactionPayload
@@ -167,10 +169,11 @@ func adaptEvents(ctx stdcontext.Context, session protocol.SessionID, summaries S
 			}
 			return adaptEventSuffix(events, selected.index, selected.from, selected.through, selected.revision, summarySource)
 		}
-		if summaries == nil {
+		verified, ok := summaries.(VerifiedSummaryResolver)
+		if !ok {
 			continue
 		}
-		resolved, err := summaries.ResolveCompactionSummary(ctx, session, selected.evidence)
+		resolved, err := verified.ResolveVerifiedCompactionSummary(ctx, protocol.ContextCompactionReference{SessionID: session, From: selected.fromCursor, Through: selected.throughCursor, SummaryEvidenceID: selected.evidence, Revision: selected.revision})
 		if err != nil || !validSummarySource(resolved, selected.evidence) {
 			continue
 		}
