@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +101,52 @@ func TestApplicationLegacyAdapterProjectsAutomaticCompactionCancelledAndUncertai
 				t.Fatalf("terminal=%+v", legacy)
 			}
 		})
+	}
+}
+
+func TestApplicationLegacyAdapterCompactionFactsStayBoundToActivityID(t *testing.T) {
+	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{Actor: protocol.ActorRef{ID: "user", Kind: protocol.ActorUser}})
+	for _, item := range []struct {
+		id      protocol.ActivityID
+		trigger string
+	}{{"A", "manual"}, {"B", "automatic"}, {"C", ""}} {
+		body := `{"kind":"provider","purpose":"summarize stable context"}`
+		if item.trigger != "" {
+			body = body[:len(body)-1] + `,"compaction_trigger":"` + item.trigger + `"}`
+		}
+		if got, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityPlanned, item.id, body)); err != nil || (item.trigger == "" && got.Kind != "") || (item.trigger != "" && got.Kind != app.EventCompactionStarted) {
+			t.Fatalf("plan %s=%+v err=%v", item.id, got, err)
+		}
+	}
+	for _, item := range []struct {
+		id           protocol.ActivityID
+		usage, bytes int64
+		trigger      string
+	}{{"B", 22, 222, "automatic"}, {"A", 11, 111, "manual"}} {
+		outcome := fmt.Sprintf(`{"status":"succeeded","output_bytes":%d,"usage":{"input":{"state":"provider_reported","value":%d},"output":{"state":"unknown"},"cached":{"state":"unknown"},"cache_write":{"state":"unknown"},"reasoning":{"state":"unknown"}}}`, item.bytes, item.usage)
+		if _, err := adapter.Event(compactionApplicationEvent(protocol.EventActivitySucceeded, item.id, outcome)); err != nil {
+			t.Fatal(err)
+		}
+		compact := fmt.Sprintf(`{"from":{"journal_kind":"session","journal_id":"session-1","commit_seq":1,"transaction_id":"t"},"through":{"journal_kind":"session","journal_id":"session-1","commit_seq":%d,"transaction_id":"t"},"summary_evidence_id":"e-%s","revision":"r-%s"}`, item.bytes, item.id, item.id)
+		got, err := adapter.Event(compactionApplicationEvent(protocol.EventContextCompacted, item.id, compact))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Compaction == nil || got.Compaction.Trigger != item.trigger || got.Compaction.SummaryBytes != item.bytes || got.Compaction.Usage.Input.Value != item.usage || got.Compaction.Revision != "r-"+string(item.id) {
+			t.Fatalf("facts crossed: %+v", got.Compaction)
+		}
+	}
+}
+
+func TestApplicationLegacyAdapterContextPlanDoesNotGuessPolicy(t *testing.T) {
+	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{Actor: protocol.ActorRef{ID: "user", Kind: protocol.ActorUser}})
+	plan := `{"plan":{"body":{"sources":[],"excluded":[],"estimated_input_tokens":{"state":"known","value":1,"provenance":"e"},"output_reserve":1,"context_window":{"state":"known","value":9,"provenance":"c"},"compaction_revision":"r","tool_exposure_revision":"t"},"digest":{"algorithm":"sha256","value":"x"}}}`
+	got, err := adapter.Event(compactionApplicationEvent(protocol.EventContextPlanRecorded, "", plan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Context == nil || got.Context.AutoAvailable || got.Context.AutoReason != "" {
+		t.Fatalf("live plan guessed policy: %+v", got.Context)
 	}
 }
 
