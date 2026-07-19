@@ -46,6 +46,12 @@ var defaultTemplate = []byte(`{
     // "compactReserveTokens": 8192
   },
 
+  "skills": {
+    // Project skills may come from the repository and need your trust.
+    // Omit projectPolicy to ask before using project skills.
+    // Supported values: ask, allow, deny.
+  },
+
   "limits": {
     "maxToolCalls": 32,
     "shellTimeoutSeconds": 120
@@ -188,6 +194,7 @@ func marshalConfig(cfg Config) ([]byte, error) {
 			AutoCompact:          boolPointer(cfg.Context.AutoCompact),
 			CompactReserveTokens: cloneInt64(cfg.Context.CompactReserveTokens),
 		},
+		Skills: documentSkills{ProjectPolicy: projectSkillPolicyPointer(cfg.Skills.ProjectPolicy)},
 	}
 	for name, profile := range cfg.Profiles {
 		models := make(map[string]documentModel, len(profile.Models))
@@ -210,6 +217,8 @@ func marshalConfig(cfg Config) ([]byte, error) {
 }
 
 func boolPointer(value bool) *bool { return &value }
+
+func projectSkillPolicyPointer(value ProjectSkillPolicy) *ProjectSkillPolicy { return &value }
 
 func cloneInt64FromMap(values map[string]int64, key string) *int64 {
 	value, ok := values[key]

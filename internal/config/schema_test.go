@@ -32,6 +32,15 @@ func TestPublishedSchemaMatchesRuntimeValidation(t *testing.T) {
 		{name: "options unknown field", body: strings.Replace(validConfig, `"apiKeyEnv": "PRIMARY_KEY",`, `"apiKeyEnv": "PRIMARY_KEY", "apiKey": "literal",`, 1)},
 		{name: "model unknown field", body: strings.Replace(validConfig, `{"name": "Model A"}`, `{"name": "Model A", "extra": true}`, 1)},
 		{name: "limits unknown field", body: strings.Replace(validConfig, `"maxToolCalls": 32`, `"maxToolCalls": 32, "extra": true`, 1)},
+		{name: "skills default", body: validConfig, schemaValid: true, runtimeValid: true},
+		{name: "skills ask", body: withSkills(validConfig, `{"projectPolicy": "ask"}`), schemaValid: true, runtimeValid: true},
+		{name: "skills allow", body: withSkills(validConfig, `{"projectPolicy": "allow"}`), schemaValid: true, runtimeValid: true},
+		{name: "skills deny", body: withSkills(validConfig, `{"projectPolicy": "deny"}`), schemaValid: true, runtimeValid: true},
+		{name: "skills empty", body: withSkills(validConfig, `{"projectPolicy": ""}`)},
+		{name: "skills mixed case", body: withSkills(validConfig, `{"projectPolicy": "Allow"}`)},
+		{name: "skills unknown policy", body: withSkills(validConfig, `{"projectPolicy": "always"}`)},
+		{name: "skills null policy", body: withSkills(validConfig, `{"projectPolicy": null}`)},
+		{name: "skills unknown field", body: withSkills(validConfig, `{"extra": true}`)},
 		{name: "tool-call lower boundary", body: strings.Replace(validConfig, `"maxToolCalls": 32`, `"maxToolCalls": 1`, 1), schemaValid: true, runtimeValid: true},
 		{name: "tool-call upper boundary", body: strings.Replace(validConfig, `"maxToolCalls": 32`, `"maxToolCalls": 128`, 1), schemaValid: true, runtimeValid: true},
 		{name: "shell timeout lower boundary", body: strings.Replace(validConfig, `"shellTimeoutSeconds": 120`, `"shellTimeoutSeconds": 1`, 1), schemaValid: true, runtimeValid: true},
@@ -72,6 +81,7 @@ func TestPublishedSchemaMatchesRuntimeValidation(t *testing.T) {
 		{name: "case-variant model name", body: strings.Replace(exactConfig, `"name":"Model A"`, `"NAME":"Model A"`, 1)},
 		{name: "case-variant max tool calls", body: strings.Replace(exactConfig, `"maxToolCalls":`, `"MAXTOOLCALLS":`, 1)},
 		{name: "case-variant shell timeout", body: strings.Replace(exactConfig, `"shellTimeoutSeconds":`, `"SHELLTIMEOUTSECONDS":`, 1)},
+		{name: "case-variant skill policy", body: withSkills(exactConfig, `{"projectPolicy":"ASK"}`)},
 	}
 
 	for _, test := range tests {

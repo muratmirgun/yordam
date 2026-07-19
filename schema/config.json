@@ -20,7 +20,8 @@
       "additionalProperties": {"$ref": "#/$defs/provider"}
     },
     "limits": {"$ref": "#/$defs/limits"},
-    "context": {"$ref": "#/$defs/context"}
+    "context": {"$ref": "#/$defs/context"},
+    "skills": {"$ref": "#/$defs/skills"}
   },
   "$defs": {
     "provider": {
@@ -74,6 +75,13 @@
       "properties": {
         "autoCompact": {"type": "boolean", "default": true},
         "compactReserveTokens": {"type": "integer", "minimum": 1}
+      }
+    },
+    "skills": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "projectPolicy": {"type": "string", "enum": ["ask", "allow", "deny"], "default": "ask"}
       }
     }
   }

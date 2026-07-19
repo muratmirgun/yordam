@@ -38,6 +38,8 @@ func TestEnsureGlobalCreatesSecureEnvironmentOnlyTemplate(t *testing.T) {
 		`"baseURL": "https://api.openai.com/v1"`,
 		`"apiKeyEnv": "OPENAI_API_KEY"`,
 		`// Format: provider/model`,
+		`// Project skills may come from the repository and need your trust.`,
+		`// Omit projectPolicy to ask before using project skills.`,
 	} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("template missing %q:\n%s", want, raw)
@@ -45,6 +47,9 @@ func TestEnsureGlobalCreatesSecureEnvironmentOnlyTemplate(t *testing.T) {
 	}
 	if strings.Contains(string(raw), `"apiKey"`) || strings.Contains(string(raw), "actual-secret") {
 		t.Fatal("template persisted a literal API key")
+	}
+	if strings.Contains(string(raw), `"projectPolicy": "allow"`) {
+		t.Fatal("template implicitly enables project skills")
 	}
 }
 
@@ -212,6 +217,7 @@ func savedConfig() config.Config {
 		MaxToolCalls:        64,
 		ShellTimeoutSeconds: 300,
 		Context:             config.ContextConfig{AutoCompact: true, CompactReserveTokens: &reserve},
+		Skills:              config.SkillConfig{ProjectPolicy: config.ProjectSkillsAsk},
 	}
 }
 

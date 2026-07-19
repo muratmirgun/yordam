@@ -135,6 +135,54 @@ func TestLoadContextCompactionDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadSkillProjectPolicy(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want config.ProjectSkillPolicy
+	}{
+		{name: "omitted defaults to ask", body: validConfig, want: config.ProjectSkillsAsk},
+		{name: "ask", body: withSkills(validConfig, `{"projectPolicy": "ask"}`), want: config.ProjectSkillsAsk},
+		{name: "allow", body: withSkills(validConfig, `{"projectPolicy": "allow"}`), want: config.ProjectSkillsAllow},
+		{name: "deny", body: withSkills(validConfig, `{"projectPolicy": "deny"}`), want: config.ProjectSkillsDeny},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, test.body)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Skills.ProjectPolicy; got != test.want {
+				t.Fatalf("project policy=%q want=%q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidSkillProjectPolicy(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "empty", body: withSkills(validConfig, `{"projectPolicy": ""}`), want: "projectPolicy must be ask, allow, or deny"},
+		{name: "mixed case", body: withSkills(validConfig, `{"projectPolicy": "Allow"}`), want: "projectPolicy must be ask, allow, or deny"},
+		{name: "unknown", body: withSkills(validConfig, `{"projectPolicy": "always"}`), want: "projectPolicy must be ask, allow, or deny"},
+		{name: "null", body: withSkills(validConfig, `{"projectPolicy": null}`), want: "projectPolicy must not be null"},
+		{name: "unknown skills key", body: withSkills(validConfig, `{"extra": true}`), want: `unknown field "extra"`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, test.body)})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error=%v want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadConfiguredContextWindow(t *testing.T) {
 	cfg, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, withModelContextWindow(validConfig, "model-a", 128000))})
 	if err != nil {
@@ -392,6 +440,10 @@ func writeConfig(t *testing.T, body string) string {
 
 func withContext(body, context string) string {
 	return strings.Replace(body, `"limits":`, `"context": `+context+`, "limits":`, 1)
+}
+
+func withSkills(body, skills string) string {
+	return strings.Replace(body, `"limits":`, `"skills": `+skills+`, "limits":`, 1)
 }
 
 func withModelContextWindow(body, model string, window int64) string {

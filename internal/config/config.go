@@ -38,12 +38,25 @@ type ContextConfig struct {
 	CompactReserveTokens *int64
 }
 
+type ProjectSkillPolicy string
+
+const (
+	ProjectSkillsAsk   ProjectSkillPolicy = "ask"
+	ProjectSkillsAllow ProjectSkillPolicy = "allow"
+	ProjectSkillsDeny  ProjectSkillPolicy = "deny"
+)
+
+type SkillConfig struct {
+	ProjectPolicy ProjectSkillPolicy
+}
+
 type Config struct {
 	ActiveProfile       string
 	Profiles            map[string]Profile
 	MaxToolCalls        int
 	ShellTimeoutSeconds int
 	Context             ContextConfig
+	Skills              SkillConfig
 	raw                 []byte
 	lookupEnv           func(string) (string, bool)
 }
@@ -76,6 +89,7 @@ type document struct {
 	Provider map[string]documentProvider `json:"provider"`
 	Limits   documentLimits              `json:"limits,omitempty"`
 	Context  documentContext             `json:"context,omitempty"`
+	Skills   documentSkills              `json:"skills,omitempty"`
 }
 
 type documentProvider struct {
@@ -104,8 +118,12 @@ type documentContext struct {
 	CompactReserveTokens *int64 `json:"compactReserveTokens,omitempty"`
 }
 
+type documentSkills struct {
+	ProjectPolicy *ProjectSkillPolicy `json:"projectPolicy,omitempty"`
+}
+
 func (d *document) UnmarshalJSON(data []byte) error {
-	fields, err := decodeExactObject(data, "$schema", "model", "provider", "limits", "context")
+	fields, err := decodeExactObject(data, "$schema", "model", "provider", "limits", "context", "skills")
 	if err != nil {
 		return err
 	}
@@ -122,7 +140,10 @@ func (d *document) UnmarshalJSON(data []byte) error {
 	if err := decodeField(fields, "limits", &d.Limits); err != nil {
 		return err
 	}
-	return decodeField(fields, "context", &d.Context)
+	if err := decodeField(fields, "context", &d.Context); err != nil {
+		return err
+	}
+	return decodeField(fields, "skills", &d.Skills)
 }
 
 func (d *documentProvider) UnmarshalJSON(data []byte) error {
@@ -217,6 +238,22 @@ func (d *documentContext) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (d *documentSkills) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "projectPolicy")
+	if err != nil {
+		return err
+	}
+	*d = documentSkills{}
+	if _, ok := fields["projectPolicy"]; ok {
+		var value ProjectSkillPolicy
+		if err := decodeField(fields, "projectPolicy", &value); err != nil {
+			return err
+		}
+		d.ProjectPolicy = &value
+	}
+	return nil
+}
+
 func decodeExactObject(data []byte, allowed ...string) (map[string]json.RawMessage, error) {
 	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
 		return nil, fmt.Errorf("object must not be null")
@@ -307,6 +344,7 @@ func normalizeDocument(decoded document) (Config, error) {
 		MaxToolCalls:        defaultMaxToolCalls,
 		ShellTimeoutSeconds: defaultShellTimeoutSeconds,
 		Context:             ContextConfig{AutoCompact: true},
+		Skills:              SkillConfig{ProjectPolicy: ProjectSkillsAsk},
 	}
 	if decoded.Limits.MaxToolCalls != nil {
 		cfg.MaxToolCalls = *decoded.Limits.MaxToolCalls
@@ -318,6 +356,9 @@ func normalizeDocument(decoded document) (Config, error) {
 		cfg.Context.AutoCompact = *decoded.Context.AutoCompact
 	}
 	cfg.Context.CompactReserveTokens = cloneInt64(decoded.Context.CompactReserveTokens)
+	if decoded.Skills.ProjectPolicy != nil {
+		cfg.Skills.ProjectPolicy = *decoded.Skills.ProjectPolicy
+	}
 	for id, provider := range decoded.Provider {
 		if id == "" {
 			return Config{}, fmt.Errorf("provider ID is empty")
@@ -371,6 +412,9 @@ func (c Config) Validate() error {
 	}
 	if c.Context.CompactReserveTokens != nil && *c.Context.CompactReserveTokens <= 0 {
 		return fmt.Errorf("compactReserveTokens must be positive")
+	}
+	if c.Skills.ProjectPolicy != ProjectSkillsAsk && c.Skills.ProjectPolicy != ProjectSkillsAllow && c.Skills.ProjectPolicy != ProjectSkillsDeny {
+		return fmt.Errorf("projectPolicy must be ask, allow, or deny")
 	}
 	profile, ok := c.Profiles[c.ActiveProfile]
 	if !ok {
