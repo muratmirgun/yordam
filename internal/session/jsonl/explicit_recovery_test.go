@@ -41,7 +41,7 @@ type recoveryInspectionDetails struct {
 func TestExplicitRecoveryPreservesTailAndCommitsDiagnostic(t *testing.T) {
 	fixture := copyFixture(t, "v1-truncated-final")
 	store := openFixtureStore(fixture)
-	beforeSource := snapshotTree(t, filepath.Join("testdata", "foundation"))
+	beforeSource := snapshotTree(t, fixture.sourceRoot)
 	inspection, request := recoveryRequestForFixture(t, store, "operation-recover-tail", "txn-recover-tail")
 	tail := readObservedTail(t, fixture, inspection)
 
@@ -73,7 +73,7 @@ func TestExplicitRecoveryPreservesTailAndCommitsDiagnostic(t *testing.T) {
 	if !after.Journal.Writable || !containsEventKind(after.Journal.Events, protocol.EventRecoveryDiagnostic) || !containsEventKind(after.Journal.Events, protocol.EventMigrationCompatibilityDeclared) {
 		t.Fatalf("recovered inspection=%+v", after)
 	}
-	if got := snapshotTree(t, filepath.Join("testdata", "foundation")); !reflect.DeepEqual(got, beforeSource) {
+	if got := snapshotTree(t, fixture.sourceRoot); !reflect.DeepEqual(got, beforeSource) {
 		t.Fatal("explicit recovery changed immutable source fixtures")
 	}
 }

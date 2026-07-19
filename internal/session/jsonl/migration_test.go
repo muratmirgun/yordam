@@ -18,6 +18,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/testsupport/foundationfixture"
 )
 
 const fixtureSessionID = protocol.SessionID("01ARZ3NDEKTSV4RRFFQ69G5FAV")
@@ -43,6 +44,7 @@ type fixtureWant struct {
 }
 
 type fixtureMaterialization struct {
+	sourceRoot string
 	root       string
 	sessionDir string
 	want       fixtureWant
@@ -55,53 +57,15 @@ func (fixturePassthroughEncoder) EncodeProposed(event protocol.ProposedEvent) (j
 }
 
 func TestFoundationFixtureInventory(t *testing.T) {
-	const fixtureRoot = "testdata/foundation"
-	manifestRaw, err := os.ReadFile(filepath.Join(fixtureRoot, "fixtures.sha256"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := make(map[string]string)
-	for lineNumber, line := range strings.Split(strings.TrimSpace(string(manifestRaw)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 || len(fields[0]) != sha256.Size*2 || fields[0] != strings.ToLower(fields[0]) {
-			t.Fatalf("manifest line %d is invalid: %q", lineNumber+1, line)
-		}
-		if _, err := hex.DecodeString(fields[0]); err != nil {
-			t.Fatalf("manifest line %d digest: %v", lineNumber+1, err)
-		}
-		if _, duplicate := want[fields[1]]; duplicate {
-			t.Fatalf("duplicate fixture manifest path %q", fields[1])
-		}
-		want[filepath.ToSlash(fields[1])] = fields[0]
+	const wantDigest = "c20a9601d4a87b7105c2938d57abd9591bef932bd157d563f3cc5d5dd39ccaeb"
+	if got := foundationfixture.Digest(); got != wantDigest {
+		t.Fatalf("foundation fixture digest=%q want %q", got, wantDigest)
 	}
 
-	got := make(map[string]string)
-	err = filepath.WalkDir(fixtureRoot, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() || entry.Name() == "fixtures.sha256" {
-			return nil
-		}
-		relative, err := filepath.Rel(fixtureRoot, path)
-		if err != nil {
-			return err
-		}
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		digest := sha256.Sum256(raw)
-		got[filepath.ToSlash(relative)] = hex.EncodeToString(digest[:])
-		return nil
-	})
-	if err != nil {
+	fixtureRoot := t.TempDir()
+	if err := foundationfixture.Materialize(fixtureRoot, foundationFixtureNames...); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("fixture inventory mismatch\ngot:  %v\nwant: %v", got, want)
-	}
-
 	entries, err := os.ReadDir(fixtureRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -343,7 +307,11 @@ func TestV1UpcastFirstV2AppendDeclaresCompatibilityOnce(t *testing.T) {
 
 func copyFixture(t *testing.T, name string) fixtureMaterialization {
 	t.Helper()
-	source := filepath.Join("testdata", "foundation", name)
+	sourceRoot := t.TempDir()
+	if err := foundationfixture.Materialize(sourceRoot, name); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(sourceRoot, name)
 	workspacePath := t.TempDir()
 	workspace, err := WorkspaceFromPath(workspacePath)
 	if err != nil {
@@ -380,7 +348,7 @@ func copyFixture(t *testing.T, name string) fixtureMaterialization {
 	if err := json.Unmarshal(wantRaw, &want); err != nil {
 		t.Fatal(err)
 	}
-	return fixtureMaterialization{root: root, sessionDir: sessionDir, want: want}
+	return fixtureMaterialization{sourceRoot: sourceRoot, root: root, sessionDir: sessionDir, want: want}
 }
 
 func openFixtureStore(fixture fixtureMaterialization) *Store {
