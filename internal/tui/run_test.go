@@ -11,7 +11,29 @@ import (
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/cli"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
+
+func TestPrepareRunRestoresDurableCompactionContext(t *testing.T) {
+	originalEnsure, originalBootstrap := ensureGlobal, bootstrap
+	t.Cleanup(func() { ensureGlobal, bootstrap = originalEnsure, originalBootstrap })
+	ensureGlobal = func() (string, bool, error) { return "x", false, nil }
+	r := protocol.CompactionRange{From: protocol.CommittedCursor{JournalID: "session-range", CommitSeq: 17}, Through: protocol.CommittedCursor{JournalID: "session-range", CommitSeq: 42}}
+	bootstrap = func(context.Context, app.BootstrapOptions) (*app.App, app.Snapshot, error) {
+		return app.New(app.Options{}), app.Snapshot{Workspace: domain.Workspace{CanonicalPath: "/w"}, Session: domain.Session{Mode: domain.ModeAsk}, Context: &protocol.ContextProjectionV1{AutoReason: "below_threshold", EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 1}, ContextWindow: protocol.ValueInt64{State: protocol.ValueKnown, Value: 100}, ReserveTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 2}, LatestRange: &r, Revision: "revision-7"}}, nil
+	}
+	_, m, err := prepareRun(t.Context(), cli.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m = m.openContext()
+	view := m.View().Content
+	for _, want := range []string{"session-range:17–42", "revision-7", "/compact"} {
+		if !strings.Contains(view, want) {
+			t.Fatal(view)
+		}
+	}
+}
 
 func TestRunCreatesTemplateAndStartsNormalConversation(t *testing.T) {
 	originalEnsureGlobal, originalBootstrap, originalNewProgram := ensureGlobal, bootstrap, newProgram
