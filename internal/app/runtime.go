@@ -338,7 +338,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		}
 	}
 	broker, err := NewBroker(BrokerOptions{
-		Source: runtimeBrokerSource{Repository: b.store, Workspace: workspaceControl, Generation: generationID},
+		Source: runtimeBrokerSource{Repository: b.store, Workspace: workspaceControl, Generation: generationID, Manifest: manifest},
 		Epoch:  string(generationID), DefaultQueueCapacity: 64, MaxQueueCapacity: 1024,
 	})
 	if err != nil {

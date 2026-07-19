@@ -6,6 +6,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
 type ContextTab string
@@ -21,12 +22,14 @@ const (
 var contextTabs = [...]ContextTab{ContextDiff, ContextTool, ContextError}
 
 type Context struct {
-	active   ContextTab
-	expanded bool
-	open     bool
-	diff     string
-	tool     string
-	error    string
+	active     ContextTab
+	expanded   bool
+	open       bool
+	diff       string
+	tool       string
+	error      string
+	compaction *protocol.ContextProjectionV1
+	progress   *protocol.CompactionEventV1
 }
 
 func NewContext() Context {
@@ -95,6 +98,19 @@ func (c *Context) ShowWorkspaceChanges(changes *domain.WorkspaceChanges) {
 	c.ShowTool("shell changes", "Git status\n"+status+"\nGit diff\n"+diff)
 }
 
+func (c *Context) SetCompactionContext(state protocol.ContextProjectionV1) {
+	c.compaction = protocol.DeepCopy(&state)
+}
+func (c *Context) SetCompactionProgress(progress protocol.CompactionEventV1) {
+	c.progress = protocol.DeepCopy(&progress)
+}
+func (c Context) CompactionStage() protocol.CompactionStage {
+	if c.progress == nil {
+		return ""
+	}
+	return c.progress.Stage
+}
+
 func (c *Context) show(tab ContextTab) {
 	c.active = tab
 	c.expanded = true
@@ -155,9 +171,9 @@ func (c Context) View() string {
 			labels[index] = "[" + labels[index] + "]"
 		}
 	}
-	header := strings.Join(labels, " | ")
+	header := "CONTEXT\n" + c.compactionSummary() + "\n" + strings.Join(labels, " | ")
 	if !c.expanded {
-		return header + "\nEnter: expand | Esc: close"
+		return header + "\nEnter: expand | Esc: close | /compact"
 	}
 	var body string
 	switch c.active {
@@ -171,5 +187,34 @@ func (c Context) View() string {
 	if body == "" {
 		body = "Context"
 	}
-	return header + "\n" + body + "\nEnter: collapse | Esc: close"
+	return header + "\n" + body + "\nEnter: collapse | Esc: close | /compact"
+}
+
+func (c Context) compactionSummary() string {
+	if c.compaction == nil {
+		return "Auto compaction: unavailable"
+	}
+	s := c.compaction
+	lines := []string{"Auto compaction: " + map[bool]string{true: "available", false: s.AutoReason}[s.AutoAvailable]}
+	if !s.AutoAvailable && s.AutoReason == "" {
+		lines[0] = "Auto compaction: unavailable"
+	}
+	if s.EstimatedInputTokens.State == protocol.ValueKnown && s.ContextWindow.State == protocol.ValueKnown {
+		lines = append(lines, fmt.Sprintf("Context: %d / %d tokens", s.EstimatedInputTokens.Value, s.ContextWindow.Value))
+	} else {
+		lines = append(lines, "Context: window unknown")
+	}
+	if s.ReserveTokens.State == protocol.ValueKnown {
+		lines = append(lines, fmt.Sprintf("Reserve: %d tokens", s.ReserveTokens.Value))
+	}
+	if s.LatestRange != nil {
+		lines = append(lines, fmt.Sprintf("Latest compacted: %s:%d–%d", s.LatestRange.From.JournalID, s.LatestRange.From.CommitSeq, s.LatestRange.Through.CommitSeq))
+	}
+	if s.Revision != "" {
+		lines = append(lines, "Revision: "+s.Revision)
+	}
+	if c.progress != nil {
+		lines = append(lines, "Compaction: "+string(c.progress.Stage))
+	}
+	return strings.Join(lines, "\n")
 }

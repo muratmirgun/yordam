@@ -88,6 +88,69 @@ func TestRuntimeModelDescriptorsContextWindowProvenance(t *testing.T) {
 	}
 }
 
+func TestRuntimeBrokerSnapshotReconstructsDurableCompactionContext(t *testing.T) {
+	builder := newRuntimeBuilderForTest(t, nil)
+	t.Setenv("PRIMARY_KEY", "primary-test-key")
+	if _, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{}); err != nil {
+		t.Fatal(err)
+	}
+	workspaceRef, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceSeed, err := canonicaljson.Marshal(protocol.ControlOperationTerminalV1{ControlOperationID: "seed", Status: "interrupted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seeded, err := builder.store.AppendBatch(t.Context(), journal.AppendRequest{Journal: workspaceRef, TransactionID: "seed", Events: []protocol.ProposedEvent{{EventID: "seed", Time: time.Unix(1, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventControlOperationInterrupted, Payload: workspaceSeed}}})
+	if err != nil || seeded.Status != journal.AppendCommitted {
+		t.Fatalf("seed=%+v err=%v", seeded, err)
+	}
+	workspaceHead, err := builder.store.Head(t.Context(), workspaceRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(builder.activeSession.get())}
+	head, err := builder.store.Head(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planBody := protocol.ContextPlanBody{Sources: []protocol.ContentSource{}, Excluded: []protocol.ExcludedContentSource{}, EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 900, Provenance: "estimator"}, OutputReserve: 100, ContextWindow: protocol.ValueInt64{State: protocol.ValueKnown, Value: 9000, Provenance: "configured_claim"}, CompactionRevision: "prior-r", ToolExposureRevision: "tools-r1"}
+	planDigest, err := canonicaljson.Digest(planBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPayload, err := canonicaljson.Marshal(protocol.ContextPlanRecordedV1{Plan: protocol.ContextPlan{Body: planBody, Digest: planDigest}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compactPayload, err := canonicaljson.Marshal(protocol.ContextCompactedV1{From: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: ref.ID, CommitSeq: 1, TransactionID: "ctx"}, Through: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: ref.ID, CommitSeq: 1, TransactionID: "ctx"}, SummaryEvidenceID: "evidence-1", Revision: "r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appended, err := builder.store.AppendBatch(t.Context(), journal.AppendRequest{Journal: ref, ExpectedHead: head, TransactionID: "context", Compatibility: &journal.CompatibilityDeclaration{ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: head}, Events: []protocol.ProposedEvent{
+		{EventID: "context-plan", Time: time.Unix(1, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventContextPlanRecorded, SessionID: protocol.SessionID(ref.ID), Payload: planPayload},
+		{EventID: "context-compacted", Time: time.Unix(2, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventContextCompacted, SessionID: protocol.SessionID(ref.ID), Payload: compactPayload},
+	}})
+	if err != nil || appended.Status != journal.AppendCommitted {
+		t.Fatalf("append=%+v err=%v", appended, err)
+	}
+	durable, _, err := (runtimeBrokerSource{Repository: builder.store, Workspace: workspaceRef}).Project(t.Context(), SnapshotVector{WorkspaceControl: workspaceHead, SelectedSession: &appended.Cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contextState protocol.ContextProjectionV1
+	if err := json.Unmarshal(durable.Context.Data, &contextState); err != nil {
+		t.Fatal(err)
+	}
+	if !contextState.AutoAvailable || contextState.AutoReason != "below_threshold" || contextState.EstimatedInputTokens.Value != 900 || contextState.ContextWindow.Value != 9000 || contextState.ReserveTokens.Value != 2048 || contextState.Revision != "r1" || contextState.SummaryEvidenceID != "evidence-1" || contextState.LatestRange == nil || contextState.LatestRange.Through.CommitSeq != 1 {
+		t.Fatalf("context=%+v", contextState)
+	}
+	if strings.Contains(string(durable.Context.Data), "provider-body-sentinel") || strings.Contains(string(durable.Context.Data), "summary-body-sentinel") {
+		t.Fatalf("context leaked content: %s", durable.Context.Data)
+	}
+}
+
 func TestRuntimeSetReadyReturnsConfigurationErrorBeforeCompatibilityBypass(t *testing.T) {
 	configuration := configurationError("/home/user/.config/yordam/config.jsonc", "configuration is invalid; edit the file and run /reload", nil)
 	set := RuntimeSet{ConfigurationError: configuration, unchecked: true}
@@ -210,8 +273,8 @@ func TestRuntimeReloadKeepsCapturedGenerationDependenciesImmutable(t *testing.T)
 	selection := cfg.DefaultSelection()
 	application := New(Options{
 		RuntimeSet: first, Sessions: builder.store, Workspace: builder.workspace, WorkspaceControl: workspaceControl,
-		Session: domain.Session{ID: builder.activeSession.get(), Workspace: builder.workspace, Selection: selection},
-		Replay:  domain.SessionReplay{Session: domain.Session{ID: builder.activeSession.get(), Workspace: builder.workspace, Selection: selection}},
+		Session:     domain.Session{ID: builder.activeSession.get(), Workspace: builder.workspace, Selection: selection},
+		Replay:      domain.SessionReplay{Session: domain.Session{ID: builder.activeSession.get(), Workspace: builder.workspace, Selection: selection}},
 		EventBuffer: 1,
 	})
 	application.completeReload(t.Context(), operationResult{kind: operationReload, runtimeSet: second})
@@ -345,7 +408,7 @@ func TestProductionCompactProtocolRequiresIdleSessionWithoutProviderEgress(t *te
 	appended, err := builder.store.AppendBatch(t.Context(), journal.AppendRequest{
 		Journal: ref, ExpectedHead: head, TransactionID: "active-turn",
 		Compatibility: &journal.CompatibilityDeclaration{ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: head},
-		Events: []protocol.ProposedEvent{{EventID: "active-turn-accepted", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventTurnAccepted, SessionID: protocol.SessionID(ref.ID), TurnID: "active-turn", Payload: payload}},
+		Events:        []protocol.ProposedEvent{{EventID: "active-turn-accepted", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventTurnAccepted, SessionID: protocol.SessionID(ref.ID), TurnID: "active-turn", Payload: payload}},
 	})
 	if err != nil || appended.Status != journal.AppendCommitted {
 		t.Fatalf("append=%+v err=%v", appended, err)

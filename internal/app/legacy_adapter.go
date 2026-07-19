@@ -47,6 +47,8 @@ type LegacyAdapter struct {
 	pendingMu           sync.Mutex
 	pending             map[protocol.CommandID]Command
 	turns               map[protocol.TurnID]Command
+	compactions         map[protocol.ActivityID]string
+	manualCompactQueued bool
 }
 
 func NewLegacyAdapter(options LegacyAdapterOptions) *LegacyAdapter {
@@ -58,7 +60,7 @@ func NewLegacyAdapter(options LegacyAdapterOptions) *LegacyAdapter {
 	}
 	return &LegacyAdapter{
 		actor: options.Actor, selectedSessionID: options.SelectedSessionID, cursor: options.Cursor, runtimeGenerationID: options.RuntimeGenerationID, now: options.Now,
-		pending: make(map[protocol.CommandID]Command), turns: make(map[protocol.TurnID]Command),
+		pending: make(map[protocol.CommandID]Command), turns: make(map[protocol.TurnID]Command), compactions: make(map[protocol.ActivityID]string),
 	}
 }
 
@@ -116,6 +118,11 @@ func (a *LegacyAdapter) Command(command Command) (protocol.Command, error) {
 	if command.Kind == CommandStartTurn {
 		a.pendingMu.Lock()
 		a.pending[applicationCommand.CommandID] = command
+		a.pendingMu.Unlock()
+	}
+	if command.Kind == CommandCompact {
+		a.pendingMu.Lock()
+		a.manualCompactQueued = true
 		a.pendingMu.Unlock()
 	}
 	return applicationCommand, nil
@@ -250,6 +257,72 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 		}
 		legacy.Kind = EventState
 		legacy.Selection = domain.ModelSelection{Profile: string(changed.ProviderID), Model: string(changed.ModelID)}
+	case protocol.EventContextPlanRecorded:
+		var recorded protocol.ContextPlanRecordedV1
+		if err := json.Unmarshal(event.Payload, &recorded); err != nil {
+			return Event{}, err
+		}
+		state := protocol.ContextProjectionV1{AutoAvailable: recorded.Plan.Body.ContextWindow.State == protocol.ValueKnown, EstimatedInputTokens: recorded.Plan.Body.EstimatedInputTokens, ContextWindow: recorded.Plan.Body.ContextWindow, OutputReserve: recorded.Plan.Body.OutputReserve, Revision: recorded.Plan.Body.CompactionRevision}
+		if state.AutoAvailable {
+			state.AutoReason = "below_threshold"
+		} else {
+			state.AutoReason = "unknown_context_window"
+		}
+		legacy.Kind, legacy.Context = EventState, &state
+	case protocol.EventActivityPlanned:
+		var planned protocol.ActivityPlannedV1
+		if err := json.Unmarshal(event.Payload, &planned); err != nil {
+			return Event{}, err
+		}
+		if planned.Kind != "provider" || planned.Purpose != "summarize stable context" || event.Correlation.ActivityID == "" {
+			break
+		}
+		trigger := "automatic"
+		a.pendingMu.Lock()
+		if a.manualCompactQueued {
+			trigger, a.manualCompactQueued = "manual", false
+		}
+		a.compactions[event.Correlation.ActivityID] = trigger
+		a.pendingMu.Unlock()
+		legacy.Kind, legacy.Message = EventCompactionStarted, trigger+":preparing"
+		legacy.Compaction = &protocol.CompactionEventV1{Trigger: trigger, Stage: protocol.CompactionPreparing, Usage: unknownCompactionUsage()}
+	case protocol.EventActivityStarted:
+		if trigger, ok := a.compactionTrigger(event.Correlation.ActivityID); ok {
+			legacy.Kind, legacy.Message = EventCompactionProgress, trigger+":summarizing"
+			legacy.Compaction = &protocol.CompactionEventV1{Trigger: trigger, Stage: protocol.CompactionSummarizing, Usage: unknownCompactionUsage()}
+		}
+	case protocol.EventActivitySucceeded:
+		if trigger, ok := a.compactionTrigger(event.Correlation.ActivityID); ok {
+			legacy.Kind, legacy.Message = EventCompactionProgress, trigger+":persisting"
+			legacy.Compaction = &protocol.CompactionEventV1{Trigger: trigger, Stage: protocol.CompactionPersisting, Usage: unknownCompactionUsage()}
+		}
+	case protocol.EventActivityFailed, protocol.EventActivityDenied, protocol.EventActivityCancelled, protocol.EventActivityInterruptedNoEffect, protocol.EventActivityUncertain:
+		if trigger, ok := a.compactionTrigger(event.Correlation.ActivityID); ok {
+			stage, code, message := protocol.CompactionFailed, "compaction_failed", "context compaction failed"
+			if event.Kind == protocol.EventActivityCancelled || event.Kind == protocol.EventActivityInterruptedNoEffect {
+				stage, code, message = protocol.CompactionCancelled, "cancelled", "compaction was cancelled"
+			}
+			if event.Kind == protocol.EventActivityUncertain {
+				stage, code, message = protocol.CompactionUncertain, "commit_uncertain", "compaction outcome is uncertain"
+			}
+			legacy.Kind, legacy.Message = EventCompactionFailed, message
+			legacy.Compaction = &protocol.CompactionEventV1{Trigger: trigger, Stage: stage, Usage: unknownCompactionUsage(), Error: &protocol.PublicError{Code: code, Message: message}}
+			a.finishCompaction(event.Correlation.ActivityID)
+		}
+	case protocol.EventContextCompacted:
+		var compacted protocol.ContextCompactedV1
+		if err := json.Unmarshal(event.Payload, &compacted); err != nil {
+			return Event{}, err
+		}
+		trigger, ok := a.compactionTrigger(event.Correlation.ActivityID)
+		if !ok {
+			break
+		}
+		rangeValue := protocol.CompactionRange{From: compacted.From, Through: compacted.Through}
+		legacy.Kind, legacy.Message = EventCompactionCompleted, fmt.Sprintf("%s:%d–%d", rangeValue.From.JournalID, rangeValue.From.CommitSeq, rangeValue.Through.CommitSeq)
+		legacy.Compaction = &protocol.CompactionEventV1{Trigger: trigger, Stage: protocol.CompactionCompleted, Range: &rangeValue, Usage: unknownCompactionUsage(), Revision: compacted.Revision, SummaryEvidenceID: compacted.SummaryEvidenceID}
+		legacy.Context = &protocol.ContextProjectionV1{Revision: compacted.Revision, SummaryEvidenceID: compacted.SummaryEvidenceID, LatestRange: &rangeValue}
+		a.finishCompaction(event.Correlation.ActivityID)
 	default:
 		legacy.Kind = ""
 	}
@@ -266,6 +339,22 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 		legacy.Err = nil
 	}
 	return legacy, nil
+}
+
+func unknownCompactionUsage() protocol.ModelUsage {
+	unknown := protocol.UsageValue{State: protocol.UsageUnknown}
+	return protocol.ModelUsage{Input: unknown, Output: unknown, Cached: unknown, CacheWrite: unknown, Reasoning: unknown}
+}
+func (a *LegacyAdapter) compactionTrigger(id protocol.ActivityID) (string, bool) {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	trigger, ok := a.compactions[id]
+	return trigger, ok
+}
+func (a *LegacyAdapter) finishCompaction(id protocol.ActivityID) {
+	a.pendingMu.Lock()
+	delete(a.compactions, id)
+	a.pendingMu.Unlock()
 }
 
 func strictUnmarshal(raw json.RawMessage, destination any) error {

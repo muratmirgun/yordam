@@ -176,6 +176,50 @@ type ProjectionView struct {
 	Data   json.RawMessage `json:"data"`
 }
 
+type CompactionStage string
+
+const (
+	CompactionPreparing   CompactionStage = "preparing"
+	CompactionSummarizing CompactionStage = "summarizing"
+	CompactionPersisting  CompactionStage = "persisting"
+	CompactionCompleted   CompactionStage = "completed"
+	CompactionCancelled   CompactionStage = "cancelled"
+	CompactionUncertain   CompactionStage = "uncertain"
+	CompactionFailed      CompactionStage = "failed"
+)
+
+type CompactionRange struct {
+	From    CommittedCursor `json:"from"`
+	Through CommittedCursor `json:"through"`
+}
+
+// ContextProjectionV1 is reconstructible context metadata. It intentionally
+// excludes summary/provider bodies and internal errors.
+type ContextProjectionV1 struct {
+	AutoAvailable        bool             `json:"auto_available"`
+	AutoReason           string           `json:"auto_reason"`
+	EstimatedInputTokens ValueInt64       `json:"estimated_input_tokens"`
+	ContextWindow        ValueInt64       `json:"context_window"`
+	OutputReserve        int64            `json:"output_reserve"`
+	ReserveTokens        ValueInt64       `json:"reserve_tokens"`
+	Revision             string           `json:"revision,omitempty"`
+	SummaryEvidenceID    EvidenceID       `json:"summary_evidence_id,omitempty"`
+	LatestRange          *CompactionRange `json:"latest_range,omitempty"`
+}
+
+// CompactionEventV1 is the public compaction lifecycle payload. It contains
+// only stable facts and a redacted PublicError, never provider/summary text.
+type CompactionEventV1 struct {
+	Trigger           string           `json:"trigger"`
+	Stage             CompactionStage  `json:"stage"`
+	Range             *CompactionRange `json:"range,omitempty"`
+	SummaryBytes      int64            `json:"summary_bytes"`
+	Usage             ModelUsage       `json:"usage"`
+	Revision          string           `json:"revision,omitempty"`
+	SummaryEvidenceID EvidenceID       `json:"summary_evidence_id,omitempty"`
+	Error             *PublicError     `json:"error,omitempty"`
+}
+
 type DurableProjection struct {
 	Workspace           ProjectionView   `json:"workspace"`
 	SelectedSession     *ProjectionView  `json:"selected_session,omitempty"`

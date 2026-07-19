@@ -8,6 +8,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 )
 
@@ -29,6 +30,10 @@ const (
 	EventNotice              EventKind = "notice"
 	EventError               EventKind = "error"
 	EventRejected            EventKind = "rejected"
+	EventCompactionStarted   EventKind = "compaction_started"
+	EventCompactionProgress  EventKind = "compaction_progress"
+	EventCompactionCompleted EventKind = "compaction_completed"
+	EventCompactionFailed    EventKind = "compaction_failed"
 )
 
 type Event struct {
@@ -47,6 +52,8 @@ type Event struct {
 	Models      []domain.ModelSelection
 	Draft       string
 	Applied     bool
+	Context     *protocol.ContextProjectionV1
+	Compaction  *protocol.CompactionEventV1
 }
 
 func sanitizePublishedEvent(redactor secret.Redacting, event Event) (Event, error) {

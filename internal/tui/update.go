@@ -49,7 +49,24 @@ func (model Model) updateMessage(message tea.Msg) Model {
 }
 
 func (model Model) handleAppEvent(event app.Event) Model {
+	if event.Context != nil {
+		model.context.SetCompactionContext(*event.Context)
+	}
 	switch event.Kind {
+	case app.EventCompactionStarted, app.EventCompactionProgress:
+		if event.Compaction != nil {
+			model.context.SetCompactionProgress(*event.Compaction)
+		}
+		model = model.setTurnActive(true)
+		model = model.setTurnProgress(progressWaiting)
+	case app.EventCompactionCompleted, app.EventCompactionFailed:
+		if event.Compaction != nil {
+			model.context.SetCompactionProgress(*event.Compaction)
+		}
+		model = model.setTurnActive(false)
+		if event.Compaction != nil && event.Compaction.Error != nil {
+			model.conversation.Append(components.BlockError, event.Compaction.Error.Message)
+		}
 	case app.EventState:
 		if event.Runtime.Kind != "" {
 			model = model.setTurnActive(true)

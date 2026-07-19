@@ -9,36 +9,38 @@ import (
 var goldenViews = map[int]string{
 	80: `Command bridge | /Users/murat/oss/t~ommand-bridge-demo | mode: ask | local/gpt-5
 --------------------------------------------------------------------------------
+CONTEXT
+Auto compaction: unavailable
 [diff] | tool | error
 DIFF internal/app/app.go
 @@ -1,3 +1,3 @@
 -old bridge
 +typed command bridge
-Enter: collapse | Esc: close
+Enter: collapse | Esc: close | /compact
 `,
 	120: `Command bridge | /Users/murat/oss/tui-yordam-v0.1/workspaces/command-bridge-demo | mode: ask | local/gpt-5
 ------------------------------------------------------------------------------------------------------------------------
-USER                                                                           | [diff] | tool | error
-Inspect internal/app/app.go.                                                   | DIFF internal/app/app.go
-                                                                               | @@ -1,3 +1,3 @@
-ASSISTANT                                                                      | -old bridge
-The command bridge keeps UI and runtime separate.                              | +typed command bridge
-                                                                               | Enter: collapse | Esc: close
-TOOL read [completed]                                                          |
-internal/app/app.go:1-40                                                       |
+USER                                                                           | CONTEXT
+Inspect internal/app/app.go.                                                   | Auto compaction: unavailable
+                                                                               | [diff] | tool | error
+ASSISTANT                                                                      | DIFF internal/app/app.go
+The command bridge keeps UI and runtime separate.                              | @@ -1,3 +1,3 @@
+                                                                               | -old bridge
+TOOL read [completed]                                                          | +typed command bridge
+internal/app/app.go:1-40                                                       | Enter: collapse | Esc: close | /compact
 ------------------------------------------------------------------------------------------------------------------------
 ┃ Ask Yordam
 `,
 	160: `Command bridge | /Users/murat/oss/tui-yordam-v0.1/workspaces/command-bridge-demo | mode: ask | local/gpt-5
 ----------------------------------------------------------------------------------------------------------------------------------------------------------------
-USER                                                                                                     | [diff] | tool | error
-Inspect internal/app/app.go.                                                                             | DIFF internal/app/app.go
-                                                                                                         | @@ -1,3 +1,3 @@
-ASSISTANT                                                                                                | -old bridge
-The command bridge keeps UI and runtime separate.                                                        | +typed command bridge
-                                                                                                         | Enter: collapse | Esc: close
-TOOL read [completed]                                                                                    |
-internal/app/app.go:1-40                                                                                 |
+USER                                                                                                     | CONTEXT
+Inspect internal/app/app.go.                                                                             | Auto compaction: unavailable
+                                                                                                         | [diff] | tool | error
+ASSISTANT                                                                                                | DIFF internal/app/app.go
+The command bridge keeps UI and runtime separate.                                                        | @@ -1,3 +1,3 @@
+                                                                                                         | -old bridge
+TOOL read [completed]                                                                                    | +typed command bridge
+internal/app/app.go:1-40                                                                                 | Enter: collapse | Esc: close | /compact
 ----------------------------------------------------------------------------------------------------------------------------------------------------------------
 ┃ Ask Yordam
 `,
@@ -51,9 +53,9 @@ func goldenView(width int) (string, bool) {
 
 func TestGoldenViewFixturesAreStable(t *testing.T) {
 	wantHashes := map[int]string{
-		80:  "d17a5cdf3802eaa46ebb55d89b8f84c718f3c6d3e733e723bc7e491a5d52ce7b",
-		120: "9cc5a002c6d54c846bc0276dc0a015fd90f87c860c689ff0e03f30c527d0ad35",
-		160: "c2ae70b230c41db36e6a3a0b601c5add6c75a5cb70b05c2ca71fbb6543f53a03",
+		80:  "bda97e79e7a3f82e6878d1b7e06cd6c87cc199ee71bcf4aa675dbd46d8c45ef6",
+		120: "d52598bd9a0ac95d77e5baf8d7393fa1d61f9aa2b786645b39b1d7e75321c8cb",
+		160: "67f33ecb7fbf6310368ff4be947951a2e691eed455889c2ab36f20772617080a",
 	}
 
 	for width, wantHash := range wantHashes {

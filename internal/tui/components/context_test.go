@@ -84,3 +84,14 @@ func TestContextTooLargeShowsCompactAction(t *testing.T) {
 		}
 	}
 }
+
+func TestContextShowsCompactionHintWhenNoCompactionStateIsKnown(t *testing.T) {
+	panel := components.NewContext()
+
+	view := panel.View()
+	for _, want := range []string{"CONTEXT", "Auto compaction: unavailable", "/compact"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view missing %q:\n%s", want, view)
+		}
+	}
+}

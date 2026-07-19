@@ -397,6 +397,7 @@ type runtimeBrokerSource struct {
 	Repository journal.Repository
 	Workspace  protocol.JournalRef
 	Generation protocol.RuntimeGenerationID
+	Manifest   protocol.RuntimeGenerationManifest
 }
 
 func (s runtimeBrokerSource) WorkspaceControl() protocol.JournalRef { return s.Workspace }
@@ -506,9 +507,52 @@ func (s runtimeBrokerSource) Project(ctx context.Context, vector SnapshotVector)
 			durable.Evidence = append(durable.Evidence, known(string(evidenceID), "evidence", string(availability), data))
 		}
 		durable.RecoveryDiagnostics = protocol.DeepCopy(tasks.State.Diagnostics)
+		contextState, contextErr := projection.New[protocol.ContextProjectionV1](s.Repository, contextProjectionProjector{limits: s.Manifest.Body.Limits}, nil).At(ctx, ref, *vector.SelectedSession)
+		if contextErr != nil {
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("project context at cursor: %w", contextErr)
+		}
+		contextData, marshalErr := canonicaljson.Marshal(contextState.State)
+		if marshalErr != nil {
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, marshalErr
+		}
+		durable.Context = known(string(ref.ID), "context", "ready", contextData)
 	}
 	runtime := protocol.RuntimeProjection{RuntimeGenerationID: s.Generation, ActiveStreams: []protocol.ProjectionView{}, Connections: []protocol.ProjectionView{}, RevocationEpoch: workspaceAuthorization.State.RevocationEpoch}
 	return durable, runtime, nil
+}
+
+type contextProjectionProjector struct{ limits protocol.RuntimeLimits }
+
+func (contextProjectionProjector) Version() uint32 { return 1 }
+func (contextProjectionProjector) Zero(protocol.JournalRef) protocol.ContextProjectionV1 {
+	return protocol.ContextProjectionV1{AutoReason: "unknown_context_window", EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueUnknown}, ContextWindow: protocol.ValueInt64{State: protocol.ValueUnknown}, ReserveTokens: protocol.ValueInt64{State: protocol.ValueUnknown}}
+}
+func (p contextProjectionProjector) Apply(state protocol.ContextProjectionV1, record protocol.EventRecord) (protocol.ContextProjectionV1, error) {
+	switch value := record.Decoded.(type) {
+	case *protocol.ContextPlanRecordedV1:
+		state.EstimatedInputTokens, state.ContextWindow, state.OutputReserve, state.Revision = value.Plan.Body.EstimatedInputTokens, value.Plan.Body.ContextWindow, value.Plan.Body.OutputReserve, value.Plan.Body.CompactionRevision
+		if value.Plan.Body.ContextWindow.State != protocol.ValueKnown {
+			state.AutoAvailable, state.AutoReason = false, "unknown_context_window"
+			return state, nil
+		}
+		reserve := value.Plan.Body.ContextWindow.Value / 10
+		if reserve < 2048 {
+			reserve = 2048
+		}
+		if p.limits.CompactReserveTokens.State == protocol.ValueKnown {
+			reserve = p.limits.CompactReserveTokens.Value
+		}
+		state.ReserveTokens = protocol.ValueInt64{State: protocol.ValueKnown, Value: reserve, Provenance: "compaction_policy"}
+		if !p.limits.AutoCompact && p.limits != (protocol.RuntimeLimits{}) {
+			state.AutoAvailable, state.AutoReason = false, "disabled"
+		} else {
+			state.AutoAvailable, state.AutoReason = true, "below_threshold"
+		}
+	case *protocol.ContextCompactedV1:
+		r := protocol.CompactionRange{From: value.From, Through: value.Through}
+		state.LatestRange, state.Revision, state.SummaryEvidenceID = &r, value.Revision, value.SummaryEvidenceID
+	}
+	return state, nil
 }
 
 type runtimeCommandDispatcher struct {

@@ -59,6 +59,9 @@ func (model Model) renderBody(width int) string {
 }
 
 func (model Model) renderProgress() string {
+	if stage := model.context.CompactionStage(); stage != "" && model.turnActive {
+		return model.spinner.View() + " Compacting context: " + string(stage) + "..."
+	}
 	var label string
 	switch model.turnProgress {
 	case progressWaiting:
