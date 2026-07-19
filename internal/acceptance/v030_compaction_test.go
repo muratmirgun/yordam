@@ -26,6 +26,12 @@ import (
 	"github.com/muratmirgun/yordam/internal/tui/components"
 )
 
+// The fixture drives a real app bootstrap, JSONL restart, and provider stream.
+// Race instrumentation consistently exceeds its former 15-second per-operation
+// deadline, so keep each operation bounded well below the repository's
+// established two-minute whole-fixture budget.
+const v030FixtureOperationDeadline = 45 * time.Second
+
 // TestV030Compaction is intentionally runnable without build tags so release
 // operators can execute the command documented in the v0.3 acceptance brief.
 // Its subprocesses exercise production packages with deterministic provider
@@ -172,15 +178,15 @@ func assertV030RealJournalCompactionAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := runV030App(t, application)
-	visible := sendV030Command(t, application, app.Command{Kind: app.CommandStartTurn, Prompt: "compact this " + sentinel}, app.EventTurnCompleted)
+	visible := sendV030Command(t, "initial normal turn", application, app.Command{Kind: app.CommandStartTurn, Prompt: "compact this " + sentinel}, app.EventTurnCompleted)
 	eventsPath := filepath.Join(dataDir, "workspaces", snapshot.Workspace.ID, "sessions", snapshot.Session.ID, "events.jsonl")
 	prefix, err := os.ReadFile(eventsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	prefixDigest := sha256.Sum256(prefix)
-	visible += sendV030Command(t, application, app.Command{Kind: app.CommandCompact}, app.EventCompactionCompleted)
-	visible += sendV030Command(t, application, app.Command{Kind: app.CommandStartTurn, Prompt: "persist uncompacted suffix"}, app.EventTurnCompleted)
+	visible += sendV030Command(t, "initial manual compaction", application, app.Command{Kind: app.CommandCompact}, app.EventCompactionCompleted)
+	visible += sendV030Command(t, "post-compaction suffix", application, app.Command{Kind: app.CommandStartTurn, Prompt: "persist uncompacted suffix"}, app.EventTurnCompleted)
 	shutdownV030App(t, application, done)
 	after, err := os.ReadFile(eventsPath)
 	if err != nil {
@@ -208,7 +214,7 @@ func assertV030RealJournalCompactionAndRestart(t *testing.T) {
 	panel.SetCompactionContext(*restart.Context)
 	assertV030SecretAbsent(t, panel.View(), sentinel, providerKey)
 	restartedDone := runV030App(t, restarted)
-	resumedVisible := sendV030Command(t, restarted, app.Command{Kind: app.CommandStartTurn, Prompt: "use reconstructed context"}, app.EventTurnCompleted)
+	resumedVisible := sendV030Command(t, "restart reconstructed turn", restarted, app.Command{Kind: app.CommandStartTurn, Prompt: "use reconstructed context"}, app.EventTurnCompleted)
 	if len(requests) != 4 {
 		t.Fatalf("restart did not dispatch a normal provider turn: requests=%d", len(requests))
 	}
@@ -216,8 +222,8 @@ func assertV030RealJournalCompactionAndRestart(t *testing.T) {
 		t.Fatalf("restart provider context omitted stored summary or exact suffix: %q", requests[3].body)
 	}
 	visible += resumedVisible
-	visible += sendV030Command(t, restarted, app.Command{Kind: app.CommandStartTurn, Prompt: "create post-restart history"}, app.EventTurnCompleted)
-	publicFailure := sendV030Failure(t, restarted, app.Command{Kind: app.CommandCompact})
+	visible += sendV030Command(t, "post-restart history", restarted, app.Command{Kind: app.CommandStartTurn, Prompt: "create post-restart history"}, app.EventTurnCompleted)
+	publicFailure := sendV030Failure(t, "post-restart manual refusal", restarted, app.Command{Kind: app.CommandCompact})
 	shutdownV030App(t, restarted, restartedDone)
 	if len(requests) != 6 {
 		t.Fatalf("provider refusal was not dispatched: requests=%d", len(requests))
@@ -262,10 +268,10 @@ func runV030App(t *testing.T, application *app.App) <-chan error {
 	return done
 }
 
-func sendV030Command(t *testing.T, application *app.App, command app.Command, terminal app.EventKind) string {
+func sendV030Command(t *testing.T, phase string, application *app.App, command app.Command, terminal app.EventKind) string {
 	t.Helper()
 	application.Commands() <- command
-	deadline := time.NewTimer(15 * time.Second)
+	deadline := time.NewTimer(v030FixtureOperationDeadline)
 	defer deadline.Stop()
 	var visible strings.Builder
 	for {
@@ -286,7 +292,7 @@ func sendV030Command(t *testing.T, application *app.App, command app.Command, te
 				return visible.String()
 			}
 		case <-deadline.C:
-			t.Fatalf("timed out waiting for %s", terminal)
+			t.Fatalf("phase=%s command=%s prompt=%q timed out waiting for %s after %s", phase, command.Kind, command.Prompt, terminal, v030FixtureOperationDeadline)
 		}
 	}
 }
@@ -309,10 +315,10 @@ type v030PublicFailure struct {
 	visible string
 }
 
-func sendV030Failure(t *testing.T, application *app.App, command app.Command) v030PublicFailure {
+func sendV030Failure(t *testing.T, phase string, application *app.App, command app.Command) v030PublicFailure {
 	t.Helper()
 	application.Commands() <- command
-	deadline := time.NewTimer(15 * time.Second)
+	deadline := time.NewTimer(v030FixtureOperationDeadline)
 	defer deadline.Stop()
 	for {
 		select {
@@ -331,7 +337,7 @@ func sendV030Failure(t *testing.T, application *app.App, command app.Command) v0
 				return v030PublicFailure{code: event.Code, visible: string(raw) + event.Message}
 			}
 		case <-deadline.C:
-			t.Fatal("timed out waiting for public provider refusal")
+			t.Fatalf("phase=%s command=%s prompt=%q timed out waiting for public provider refusal after %s", phase, command.Kind, command.Prompt, v030FixtureOperationDeadline)
 		}
 	}
 }
