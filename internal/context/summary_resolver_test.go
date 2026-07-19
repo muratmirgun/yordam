@@ -98,6 +98,33 @@ func TestContextPlanKeepsEarlierNativeSummaryWhenLaterEventIsInvalid(t *testing.
 	}
 }
 
+func TestContextPlanKeepsEarlierResolvableSummaryWhenLaterEvidenceIsMissing(t *testing.T) {
+	resolver := &fakeSummaryResolver{
+		sources: map[protocol.EvidenceID]protocol.ContentSource{
+			"earlier": summarySource(t, "earlier", "earlier summary"),
+		},
+		errors: map[protocol.EvidenceID]error{"later": fmt.Errorf("missing")},
+	}
+	events := []protocol.EventRecord{
+		contextEvent("old", 1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old"}),
+		nativeCompactionEvent("earlier-compact", 2, "session", 1, 1, "earlier", "native-r1"),
+		contextEvent("middle", 3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "middle"}),
+		nativeCompactionEvent("later-compact", 4, "session", 1, 3, "later", "native-r2"),
+		contextEvent("new", 5, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "new"}),
+	}
+
+	plan, err := contextplanner.NewPlanner("tools-r1", resolver).Plan(stdcontext.Background(), contextplanner.Request{
+		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
+		Events: events, Model: contextModel(1024), OutputReserve: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolver.calls != 2 || plan.Body.CompactionRevision != "native-r1" || len(plan.Body.Sources) != 3 || plan.Body.Sources[0].Provenance != "evidence:earlier" || plan.Body.Sources[1].ID != "middle" || plan.Body.Sources[2].ID != "new" {
+		t.Fatalf("resolver calls=%d plan=%#v", resolver.calls, plan)
+	}
+}
+
 func nativeCompactionEvent(id protocol.EventID, seq uint64, session protocol.SessionID, from, through uint64, evidence protocol.EvidenceID, revision string) protocol.EventRecord {
 	cursor := func(commitSeq uint64) protocol.CommittedCursor {
 		return protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(session), CommitSeq: commitSeq, TransactionID: "transaction"}

@@ -135,7 +135,7 @@ func adaptEvents(ctx stdcontext.Context, session protocol.SessionID, summaries S
 		evidence protocol.EvidenceID
 		legacy   bool
 	}
-	selected := compaction{index: -1}
+	candidates := make([]compaction, 0)
 	for index, event := range events {
 		if event.Envelope.Kind != protocol.EventContextCompacted {
 			continue
@@ -145,7 +145,7 @@ func adaptEvents(ctx stdcontext.Context, session protocol.SessionID, summaries S
 			if !ok || !validNativeCompaction(event, session, decoded) {
 				continue
 			}
-			selected = compaction{index: index, from: decoded.From.CommitSeq, through: decoded.Through.CommitSeq, revision: decoded.Revision, evidence: decoded.SummaryEvidenceID}
+			candidates = append(candidates, compaction{index: index, from: decoded.From.CommitSeq, through: decoded.Through.CommitSeq, revision: decoded.Revision, evidence: decoded.SummaryEvidenceID})
 			continue
 		}
 		var payload legacyCompactionPayload
@@ -156,29 +156,27 @@ func adaptEvents(ctx stdcontext.Context, session protocol.SessionID, summaries S
 		if decoded, ok := contextCompaction(event); ok && decoded.Revision != "" {
 			candidateRevision = decoded.Revision
 		}
-		selected = compaction{index: index, from: payload.FromSeq, through: payload.ThroughSeq, revision: candidateRevision, summary: payload.Summary, legacy: true}
+		candidates = append(candidates, compaction{index: index, from: payload.FromSeq, through: payload.ThroughSeq, revision: candidateRevision, summary: payload.Summary, legacy: true})
 	}
-	if selected.index < 0 {
-		return adaptEventSuffix(events, -1, 0, 0, defaultCompactionRevision, protocol.ContentSource{})
-	}
-	var summarySource protocol.ContentSource
-	if selected.legacy {
-		var err error
-		summarySource, err = contentSource(string(events[selected.index].Envelope.EventID)+":summary", "compaction_summary", "legacy_context_compaction", []protocol.ContentBlock{{Kind: protocol.ContentText, Text: selected.summary}})
-		if err != nil {
-			return nil, nil, "", err
+	for index := len(candidates) - 1; index >= 0; index-- {
+		selected := candidates[index]
+		if selected.legacy {
+			summarySource, err := contentSource(string(events[selected.index].Envelope.EventID)+":summary", "compaction_summary", "legacy_context_compaction", []protocol.ContentBlock{{Kind: protocol.ContentText, Text: selected.summary}})
+			if err != nil {
+				return nil, nil, "", err
+			}
+			return adaptEventSuffix(events, selected.index, selected.from, selected.through, selected.revision, summarySource)
 		}
-	} else {
 		if summaries == nil {
-			return adaptEventSuffix(events, -1, 0, 0, defaultCompactionRevision, protocol.ContentSource{})
+			continue
 		}
 		resolved, err := summaries.ResolveCompactionSummary(ctx, session, selected.evidence)
 		if err != nil || !validSummarySource(resolved, selected.evidence) {
-			return adaptEventSuffix(events, -1, 0, 0, defaultCompactionRevision, protocol.ContentSource{})
+			continue
 		}
-		summarySource = resolved
+		return adaptEventSuffix(events, selected.index, selected.from, selected.through, selected.revision, resolved)
 	}
-	return adaptEventSuffix(events, selected.index, selected.from, selected.through, selected.revision, summarySource)
+	return adaptEventSuffix(events, -1, 0, 0, defaultCompactionRevision, protocol.ContentSource{})
 }
 
 func adaptEventSuffix(events []protocol.EventRecord, compactionIndex int, from, through uint64, compactionRevision string, summary protocol.ContentSource) ([]protocol.ContentSource, []protocol.ExcludedContentSource, string, error) {
