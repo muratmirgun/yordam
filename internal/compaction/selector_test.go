@@ -146,6 +146,31 @@ func TestSelectAcceptsContiguousLegacyProjection(t *testing.T) {
 	}
 }
 
+func TestSelectAcceptsArbitraryLegacyPrefixBeforeMarkerBackedV2(t *testing.T) {
+	t.Parallel()
+	legacy := func(sequence uint64) protocol.EventRecord {
+		return protocol.EventRecord{Legacy: &protocol.LegacySource{
+			SchemaVersion: 1, EventID: protocol.EventID(fmt.Sprintf("legacy-%d", sequence)), SessionID: "session", Seq: sequence,
+			Time: time.Unix(int64(sequence), 0).UTC(), Kind: protocol.EventUserMessage,
+			Payload: json.RawMessage(fmt.Sprintf(`{"content":"legacy-%d"}`, sequence)),
+		}}
+	}
+	events := []protocol.EventRecord{
+		legacy(1), legacy(2), legacy(3),
+		markerSelectionEvent(4, "tx-4", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "v2 four"}),
+		markerSelectionEvent(5, "tx-4", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "v2 five"}),
+		markerSelectionEvent(7, "tx-7", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "v2 seven"}),
+		markerSelectionEvent(8, "tx-7", protocol.EventUserMessage, &protocol.UserMessageV1{Content: "v2 eight"}),
+	}
+	selection, err := compaction.Select(events, markerSelectionCursor(9, "tx-7"), compaction.TriggerManual, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.From != markerSelectionCursor(1, "legacy:legacy-1") || selection.Through != markerSelectionCursor(3, "legacy:legacy-3") {
+		t.Fatalf("selection physical range=%+v", selection)
+	}
+}
+
 func TestSelectMapsPriorCompactionThroughCursorInsteadOfUsingPhysicalSequenceAsIndex(t *testing.T) {
 	t.Parallel()
 	events := []protocol.EventRecord{

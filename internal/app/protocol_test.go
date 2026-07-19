@@ -125,7 +125,7 @@ func TestCommandIdempotencyReplaysDurableResultAndConflictsOnChangedPrincipal(t 
 	}
 }
 
-func TestProtocolExecuteSerializesDispatcherFailures(t *testing.T) {
+func TestProtocolExecutePropagatesDispatcherInfrastructureFailures(t *testing.T) {
 	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-1"}
 	head := committedCursor(ref, 1, "initial")
 	backend := &memoryCommandBackend{
@@ -147,7 +147,48 @@ func TestProtocolExecuteSerializesDispatcherFailures(t *testing.T) {
 	}
 
 	result, err := service.Execute(t.Context(), command)
-	if err != nil || result.Error == nil || result.Error.Code != "command_failed" || result.Error.Retryable || strings.Contains(result.Error.Message, "provider") {
+	if !errors.Is(err, backend.dispatchErr) || !reflect.DeepEqual(result, protocol.CommandResult{}) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestProtocolExecuteSerializesClassifiedDispatcherFailures(t *testing.T) {
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-1"}
+	head := committedCursor(ref, 1, "initial")
+	backend := &memoryCommandBackend{head: head, results: make(map[protocol.CommandID]protocol.CommandResult), digests: make(map[protocol.CommandID]protocol.Digest), dispatchErr: orchestrator.ErrCommitUncertain}
+	service, err := app.NewProtocolService(app.ProtocolServiceOptions{Orchestrator: backend, Dispatcher: backend, WorkspaceControl: protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "workspace-1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := applicationCommand(t, "command-uncertain", string(app.CommandStartTurn), protocol.StartTurnCommandV1{Prompt: "hello"})
+	command.Expected.Session = &head
+	command.RequestDigest, err = app.CanonicalRequestDigest(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Execute(t.Context(), command)
+	if err != nil || result.Error == nil || result.Error.Code != "commit_uncertain" || result.Error.Retryable {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestProtocolExecutePropagatesLookupInfrastructureFailure(t *testing.T) {
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-1"}
+	head := committedCursor(ref, 1, "initial")
+	lookupErr := errors.New("lookup transport unavailable")
+	backend := &memoryCommandBackend{head: head, results: make(map[protocol.CommandID]protocol.CommandResult), digests: make(map[protocol.CommandID]protocol.Digest), lookupErr: lookupErr}
+	service, err := app.NewProtocolService(app.ProtocolServiceOptions{Orchestrator: backend, Dispatcher: backend, WorkspaceControl: protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "workspace-1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := applicationCommand(t, "command-lookup-error", string(app.CommandStartTurn), protocol.StartTurnCommandV1{Prompt: "hello"})
+	command.Expected.Session = &head
+	command.RequestDigest, err = app.CanonicalRequestDigest(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Execute(t.Context(), command)
+	if !errors.Is(err, lookupErr) || !reflect.DeepEqual(result, protocol.CommandResult{}) {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }
@@ -159,12 +200,16 @@ type memoryCommandBackend struct {
 	digests      map[protocol.CommandID]protocol.Digest
 	dispatches   int
 	dispatchErr  error
+	lookupErr    error
 	lastMetadata orchestrator.CommandMetadata
 }
 
 func (b *memoryCommandBackend) LookupCommand(_ context.Context, _ protocol.JournalRef, id protocol.CommandID, digest protocol.Digest) (protocol.CommandResult, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.lookupErr != nil {
+		return protocol.CommandResult{}, false, b.lookupErr
+	}
 	known, ok := b.digests[id]
 	if ok && known != digest {
 		return protocol.CommandResult{}, false, orchestrator.ErrIdempotencyConflict

@@ -310,7 +310,7 @@ func (s *ProtocolService) Execute(ctx context.Context, command protocol.Command)
 			return failedCommand(command, codeIdempotencyConflict, "command ID was already used for a different request", false), nil
 		}
 		if errors.Is(lookupErr, context.Canceled) || errors.Is(lookupErr, context.DeadlineExceeded) {
-			return dispatchFailedCommand(command, lookupErr), nil
+			return failedCommand(command, "cancelled", "command execution was cancelled", false), nil
 		}
 		return protocol.CommandResult{}, lookupErr
 	} else if ok {
@@ -325,7 +325,7 @@ func (s *ProtocolService) Execute(ctx context.Context, command protocol.Command)
 	}
 	result, dispatchErr := s.dispatcher.DispatchCommand(ctx, metadata, protocol.CloneCommand(command), protocol.DeepCopy(decoded))
 	if dispatchErr != nil {
-		return dispatchFailedCommand(command, dispatchErr), nil
+		return commandFailureResult(command, dispatchErr)
 	}
 	return result, nil
 }
@@ -398,7 +398,7 @@ func (s *ProtocolService) executePure(ctx context.Context, command protocol.Comm
 		return failedCommand(command, codeIdempotencyConflict, "command ID was already used for a different request", false), nil
 	}
 	if err != nil {
-		return dispatchFailedCommand(command, err), nil
+		return commandFailureResult(command, err)
 	}
 	return result, nil
 }
@@ -427,15 +427,17 @@ func failedCommand(command protocol.Command, code, message string, retryable boo
 	}
 }
 
-func dispatchFailedCommand(command protocol.Command, err error) protocol.CommandResult {
+func commandFailureResult(command protocol.Command, err error) (protocol.CommandResult, error) {
 	switch {
 	case errors.Is(err, orchestrator.ErrCommitUncertain):
-		return failedCommand(command, "commit_uncertain", "command commit outcome is uncertain", false)
+		return failedCommand(command, "commit_uncertain", "command commit outcome is uncertain", false), nil
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		return failedCommand(command, "cancelled", "command execution was cancelled", false)
-	default:
-		return failedCommand(command, "command_failed", "command execution failed", false)
+		return failedCommand(command, "cancelled", "command execution was cancelled", false), nil
 	}
+	if code := ErrorCode(err); code != "" {
+		return failedCommand(command, code, err.Error(), false), nil
+	}
+	return protocol.CommandResult{}, err
 }
 
 func (s *ProtocolService) SnapshotAndSubscribe(ctx context.Context, request protocol.SnapshotRequest) (protocol.ApplicationSnapshot, Subscription, error) {

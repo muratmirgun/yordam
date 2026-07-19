@@ -298,7 +298,7 @@ func (a *App) Run(ctx context.Context) error {
 						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 						continue
 					}
-					go consumeLegacyProtocolEvents(ctx, subscription, activeSet.LegacyAdapter, protocolEvents)
+					go consumeLegacyProtocolEvents(ctx, subscription, activeSet.LegacyAdapter, protocolEvents, false)
 					go func() {
 						result, executeErr := activeSet.ApplicationService.Execute(turnCtx, applicationCommand)
 						if executeErr == nil && result.Error != nil {
@@ -383,7 +383,7 @@ func (a *App) Run(ctx context.Context) error {
 						a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error()})
 						continue
 					}
-					_, subscription, err := activeSet.ApplicationService.SnapshotAndSubscribe(ctx, protocol.SnapshotRequest{
+					_, subscription, err := activeSet.ApplicationService.SnapshotAndSubscribe(compactCtx, protocol.SnapshotRequest{
 						ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(a.session.ID), Consumer: "legacy_tui", QueueCapacity: 256,
 					})
 					if err != nil {
@@ -392,12 +392,14 @@ func (a *App) Run(ctx context.Context) error {
 						a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error()})
 						continue
 					}
-					go consumeLegacyProtocolEvents(ctx, subscription, activeSet.LegacyAdapter, protocolEvents)
+					go consumeLegacyProtocolEvents(compactCtx, subscription, activeSet.LegacyAdapter, protocolEvents, true)
 					go func() {
 						result, executeErr := activeSet.ApplicationService.Execute(compactCtx, applicationCommand)
 						if executeErr == nil && result.Error != nil {
 							executeErr = errors.New(result.Error.Message)
 						}
+						cancel()
+						_ = subscription.Close()
 						done <- operationResult{kind: operationCompact, err: executeErr}
 					}()
 					continue
@@ -1203,7 +1205,7 @@ func legacyTerminalEvent(kind EventKind) bool {
 	}
 }
 
-func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription, adapter *LegacyAdapter, destination chan<- Event) {
+func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription, adapter *LegacyAdapter, destination chan<- Event, suppressTerminal bool) {
 	defer subscription.Close()
 	for {
 		item, err := subscription.Next(ctx)
@@ -1243,6 +1245,9 @@ func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription,
 		}
 		if event.Kind == "" {
 			continue
+		}
+		if suppressTerminal && legacyTerminalEvent(event.Kind) {
+			return
 		}
 		select {
 		case destination <- event:

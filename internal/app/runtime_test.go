@@ -635,6 +635,87 @@ completed:
 	}
 }
 
+func TestAppRunCompactProtocolSubscriptionDoesNotLeakTerminalEvents(t *testing.T) {
+	var providerCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		content := "ordinary turn reply"
+		if providerCalls.Add(1) > 2 {
+			content = `{"goal":"compact","constraints":[],"decisions":[],"files":[],"commands_and_tests":[],"unresolved":[],"children":[],"skills":[],"unknown_effects":[]}`
+		}
+		fmt.Fprintf(response, "data: {\"id\":\"app-run-%d\",\"choices\":[{\"delta\":{\"content\":%q},\"finish_reason\":\"stop\"}]}\n\n", providerCalls.Load(), content)
+		fmt.Fprintln(response, "data: [DONE]")
+		fmt.Fprintln(response)
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.jsonc")
+	configBody := fmt.Sprintf(`{"model":"primary/model-a","provider":{"primary":{"options":{"baseURL":%q,"apiKeyEnv":"PRIMARY_KEY"},"models":{"model-a":{}}}}}`, server.URL)
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PRIMARY_KEY", "app-run-key")
+	application, _, err := Bootstrap(t.Context(), BootstrapOptions{
+		ConfigPath: configPath, CWD: root, HTTPClient: server.Client(),
+		CLI: cli.Options{Mode: domain.ModeAsk, DataDir: filepath.Join(root, "data"), MaxToolCalls: 32, ShellTimeout: time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- application.Run(ctx) }()
+
+	awaitTerminal := func(command Command, requireAccepted bool) {
+		t.Helper()
+		application.Commands() <- command
+		accepted, terminals := false, 0
+		deadline := time.After(20 * time.Second)
+		for terminals == 0 {
+			select {
+			case event := <-application.Events():
+				if event.Kind == EventTurnAccepted {
+					accepted = true
+				}
+				if event.Kind == EventTurnCompleted || event.Kind == EventTurnInterrupted || event.Kind == EventError {
+					terminals++
+					if event.Kind != EventTurnCompleted {
+						t.Fatalf("command %s terminal=%+v", command.Kind, event)
+					}
+				}
+			case <-deadline:
+				t.Fatalf("timed out waiting for %s terminal", command.Kind)
+			}
+		}
+		if requireAccepted && !accepted {
+			t.Fatalf("%s terminal arrived before its accepted event", command.Kind)
+		}
+		select {
+		case event := <-application.Events():
+			if event.Kind == EventTurnCompleted || event.Kind == EventTurnInterrupted || event.Kind == EventError {
+				t.Fatalf("duplicate terminal after %s: %+v", command.Kind, event)
+			}
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+
+	// Two completed turns create a sufficiently rich durable history for the
+	// first compact; the intervening turn makes the second compact meaningful.
+	awaitTerminal(Command{Kind: CommandStartTurn, Prompt: "one"}, true)
+	awaitTerminal(Command{Kind: CommandStartTurn, Prompt: "two"}, true)
+	awaitTerminal(Command{Kind: CommandCompact}, false)
+	awaitTerminal(Command{Kind: CommandStartTurn, Prompt: "after first compact"}, true)
+	awaitTerminal(Command{Kind: CommandCompact}, false)
+	awaitTerminal(Command{Kind: CommandStartTurn, Prompt: "after second compact"}, true)
+
+	application.Commands() <- Command{Kind: CommandShutdown}
+	if err := <-done; err != nil {
+		t.Fatalf("app shutdown: %v", err)
+	}
+}
+
 func legacyConsumerSemantic(event Event) []string {
 	switch event.Kind {
 	case EventState:

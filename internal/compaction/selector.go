@@ -165,6 +165,9 @@ func committedEvents(events []protocol.EventRecord, head protocol.CommittedCurso
 		if index == 0 && envelope.Seq != 1 {
 			return nil, fmt.Errorf("events are not a valid committed session journal projection")
 		}
+		if legacy && envelope.TransactionID != protocol.TransactionID("legacy:"+string(envelope.EventID)) {
+			return nil, fmt.Errorf("legacy event has an invalid derived transaction identity")
+		}
 		if !legacy {
 			legacyPrefix = false
 		} else if !legacyPrefix {
@@ -190,6 +193,12 @@ func committedEvents(events []protocol.EventRecord, head protocol.CommittedCurso
 		}
 		previousLegacy := committed[index-1].Legacy != nil && committed[index-1].Envelope.TransactionID == protocol.TransactionID("legacy:"+string(committed[index-1].Envelope.EventID))
 		currentLegacy := committed[index].Legacy != nil && committed[index].Envelope.TransactionID == protocol.TransactionID("legacy:"+string(committed[index].Envelope.EventID))
+		if previousLegacy && currentLegacy {
+			if current.Seq != previous.Seq+1 {
+				return nil, fmt.Errorf("legacy projection is not contiguous")
+			}
+			continue
+		}
 		if currentLegacy {
 			return nil, fmt.Errorf("legacy records may only form a contiguous prefix")
 		}
