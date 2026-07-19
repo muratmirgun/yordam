@@ -55,6 +55,7 @@ const (
 	EventContextPlanRecorded            = "context.plan_recorded"
 	EventContextUsageRecorded           = "context.usage_recorded"
 	EventRuntimeGenerationActivated     = "runtime_generation.activated"
+	EventProjectSkillTrustChanged       = "project_skill_trust_changed_v1"
 	EventControlOperationPlanned        = "control_operation.planned"
 	EventControlOperationAuthorized     = "control_operation.authorized"
 	EventControlOperationStarted        = "control_operation.started"

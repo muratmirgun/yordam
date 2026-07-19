@@ -58,6 +58,33 @@ func TestContextCompactionReferenceBindsSessionAndExactRange(t *testing.T) {
 	}
 }
 
+func TestFoundationRegistryAcceptsProjectSkillTrustOnlyInWorkspaceControl(t *testing.T) {
+	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := protocol.ProjectSkillTrustChangedV1{
+		WorkspaceID: "workspace", CatalogDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)}, Decision: "allow",
+	}
+	control := protocol.EventEnvelope{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", EventID: "skill-trust", Seq: 1, Time: time.Unix(1, 0).UTC(), Kind: protocol.EventProjectSkillTrustChanged, TransactionID: "transaction"}
+	if _, err := registry.Decode(envelopeFor(t, control, payload)); err != nil {
+		t.Fatalf("valid workspace-control trust event rejected: %v", err)
+	}
+	session := control
+	session.JournalKind, session.JournalID, session.SessionID = protocol.JournalSession, "session", "session"
+	if _, err := registry.Decode(envelopeFor(t, session, payload)); err == nil {
+		t.Fatal("project skill trust accepted outside workspace-control journal")
+	}
+	payload.Decision = "ask"
+	record, err := registry.Decode(envelopeFor(t, control, payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Validate(record); err == nil {
+		t.Fatal("unresolved skill trust policy accepted as durable decision")
+	}
+}
+
 func compactionPayload(session protocol.SessionID, from, through uint64) protocol.ContextCompactedV1 {
 	cursor := func(sequence uint64) protocol.CommittedCursor {
 		return protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(session), CommitSeq: sequence, TransactionID: "transaction"}

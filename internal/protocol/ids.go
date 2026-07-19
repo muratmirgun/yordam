@@ -20,6 +20,7 @@ const (
 	MaxStringBytes       = 1 << 20
 	MaxByteFieldBytes    = 1 << 20
 	MaxCollectionMembers = 4096
+	MaxActiveSkills      = 128
 
 	DigestSHA256 = "sha256"
 )

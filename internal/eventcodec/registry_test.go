@@ -430,8 +430,8 @@ func TestFoundationRegistryDeepCopiesInputAndDecodedPayload(t *testing.T) {
 func TestFoundationDescriptorsCoverEveryKindWithMetadata(t *testing.T) {
 	t.Parallel()
 	descriptors := eventcodec.FoundationDescriptors()
-	if len(descriptors) != 61 {
-		t.Fatalf("descriptor count=%d want=61", len(descriptors))
+	if len(descriptors) != 62 {
+		t.Fatalf("descriptor count=%d want=62", len(descriptors))
 	}
 	for _, descriptor := range descriptors {
 		if descriptor.Kind == "" || descriptor.Version != 1 || descriptor.New == nil || descriptor.ValidateStructural == nil || descriptor.ValidateSemantic == nil || descriptor.RedactionClass == "" || len(descriptor.ProjectionDomains) == 0 {

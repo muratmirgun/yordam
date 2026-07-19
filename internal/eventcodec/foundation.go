@@ -67,6 +67,7 @@ func FoundationDescriptors() []Descriptor {
 		{protocol.EventContextPlanRecorded, func() any { return new(protocol.ContextPlanRecordedV1) }, false, "sensitive", []string{"context"}},
 		{protocol.EventContextUsageRecorded, func() any { return new(protocol.ContextUsageRecordedV1) }, false, "public", []string{"usage", "context"}},
 		{protocol.EventRuntimeGenerationActivated, func() any { return new(protocol.RuntimeGenerationActivatedV1) }, true, "sensitive", []string{"runtime"}},
+		{protocol.EventProjectSkillTrustChanged, func() any { return new(protocol.ProjectSkillTrustChangedV1) }, true, "sensitive", []string{"skills", "permissions"}},
 		{protocol.EventControlOperationPlanned, func() any { return new(protocol.ControlOperationPlannedV1) }, true, "sensitive", []string{"control"}},
 		{protocol.EventControlOperationAuthorized, func() any { return new(protocol.ControlOperationAuthorizedV1) }, true, "sensitive", []string{"control", "permissions"}},
 		{protocol.EventControlOperationStarted, func() any { return new(protocol.ControlOperationStartedV1) }, true, "sensitive", []string{"control"}},
@@ -93,10 +94,15 @@ func FoundationDescriptors() []Descriptor {
 				return validateFoundationSemantic(kind, payload)
 			},
 			ValidateEnvelope: func(envelope protocol.EventEnvelope, payload any) error {
-				if kind != protocol.EventContextCompacted {
-					return nil
+				switch kind {
+				case protocol.EventContextCompacted:
+					return validateContextCompactionEnvelope(envelope, payload)
+				case protocol.EventProjectSkillTrustChanged:
+					if envelope.JournalKind != protocol.JournalWorkspaceControl {
+						return fmt.Errorf("project skill trust requires workspace-control journal")
+					}
 				}
-				return validateContextCompactionEnvelope(envelope, payload)
+				return nil
 			},
 			AuthorizationCritical: entry.auth,
 			RedactionClass:        entry.redaction,
@@ -167,6 +173,8 @@ func validateFoundationSemantic(kind string, payload any) error {
 			}
 		}
 	case *protocol.ContextCompactedV1:
+		return value.Validate()
+	case *protocol.ProjectSkillTrustChangedV1:
 		return value.Validate()
 	case *protocol.FileChangePlannedV1:
 		return validateActionPlan(value.Plan)
@@ -563,6 +571,32 @@ func validateManifest(manifest protocol.RuntimeGenerationManifest) error {
 	if manifest.ID == "" || manifest.Body.ProviderCatalogRevision == "" || manifest.Body.ToolCatalogRevision == "" || manifest.Body.InstructionRevision == "" || manifest.Body.PolicyGeneration == "" || manifest.Body.Limits.MaxToolCalls <= 0 || manifest.Body.Limits.ShellTimeoutNanos <= 0 || manifest.Body.Limits.ApplicationQueueCapacity <= 0 {
 		return fmt.Errorf("runtime generation manifest is incomplete")
 	}
+	if len(manifest.Body.Skills) > 0 && manifest.Body.SkillCatalogRevision == "" {
+		return fmt.Errorf("runtime skill catalog revision is required")
+	}
+	if len(manifest.Body.Skills) > protocol.MaxActiveSkills {
+		return fmt.Errorf("runtime skill catalog exceeds %d active skills", protocol.MaxActiveSkills)
+	}
+	previousSkill := ""
+	seenSkills := make(map[skillManifestIdentity]struct{}, len(manifest.Body.Skills))
+	for _, descriptor := range manifest.Body.Skills {
+		if err := descriptor.Validate(); err != nil {
+			return fmt.Errorf("skill descriptor: %w", err)
+		}
+		if descriptor.State != protocol.SkillStateActive || descriptor.Identity.RuntimeGenerationID != manifest.ID {
+			return fmt.Errorf("runtime skill descriptor is not active for this generation")
+		}
+		key := skillManifestIdentity{source: descriptor.Identity.Source, name: descriptor.Identity.Name}
+		if _, duplicate := seenSkills[key]; duplicate {
+			return fmt.Errorf("duplicate runtime skill descriptor")
+		}
+		sortKey := string(descriptor.Identity.Source) + "\x00" + descriptor.Identity.Name + "\x00" + descriptor.Identity.ContentDigest.Algorithm + "\x00" + descriptor.Identity.ContentDigest.Value
+		if previousSkill != "" && sortKey <= previousSkill {
+			return fmt.Errorf("runtime skill descriptors must be sorted")
+		}
+		previousSkill = sortKey
+		seenSkills[key] = struct{}{}
+	}
 	seenModels := make(map[string]struct{}, len(manifest.Body.Models))
 	for _, descriptor := range manifest.Body.Models {
 		if err := descriptor.Validate(); err != nil {
@@ -601,6 +635,11 @@ func validateManifest(manifest protocol.RuntimeGenerationManifest) error {
 		seenProfiles[profile] = struct{}{}
 	}
 	return requireDigest(manifest.Body, manifest.Digest)
+}
+
+type skillManifestIdentity struct {
+	source protocol.SkillSource
+	name   string
 }
 
 func requireDigest(body any, got protocol.Digest) error {
@@ -773,6 +812,7 @@ func validateAuthorizationJournal(envelope protocol.EventEnvelope, sessionID pro
 func controlOnlyKind(kind string) bool {
 	switch kind {
 	case protocol.EventRuntimeGenerationActivated,
+		protocol.EventProjectSkillTrustChanged,
 		protocol.EventControlOperationPlanned,
 		protocol.EventControlOperationAuthorized,
 		protocol.EventControlOperationStarted,

@@ -13,6 +13,8 @@ type RuntimeGenerationBody struct {
 	Models                  []ModelDescriptor `json:"models"`
 	ToolCatalogRevision     string            `json:"tool_catalog_revision"`
 	Tools                   []ToolDescriptor  `json:"tools"`
+	SkillCatalogRevision    string            `json:"skill_catalog_revision,omitempty"`
+	Skills                  []SkillDescriptor `json:"skills,omitempty"`
 	InstructionRevision     string            `json:"instruction_revision"`
 	PolicyGeneration        string            `json:"policy_generation"`
 	ExecutionProfiles       []string          `json:"execution_profiles"`

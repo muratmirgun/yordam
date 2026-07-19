@@ -221,23 +221,24 @@ type CompactionEventV1 struct {
 }
 
 type DurableProjection struct {
-	Workspace           ProjectionView   `json:"workspace"`
-	SelectedSession     *ProjectionView  `json:"selected_session,omitempty"`
-	Task                *ProjectionView  `json:"task,omitempty"`
-	Outcome             *ProjectionView  `json:"outcome,omitempty"`
-	Lineage             *ProjectionView  `json:"lineage,omitempty"`
-	Activities          []ProjectionView `json:"activities"`
-	Provider            ProjectionView   `json:"provider"`
-	MCP                 []ProjectionView `json:"mcp"`
-	Instructions        []ProjectionView `json:"instructions"`
-	Permissions         ProjectionView   `json:"permissions"`
-	Context             ProjectionView   `json:"context"`
-	Usage               ModelUsage       `json:"usage"`
-	Cost                CostValue        `json:"cost"`
-	Checkpoints         []ProjectionView `json:"checkpoints"`
-	Evidence            []ProjectionView `json:"evidence"`
-	Receipts            []ProjectionView `json:"receipts"`
-	RecoveryDiagnostics []Diagnostic     `json:"recovery_diagnostics"`
+	Workspace           ProjectionView       `json:"workspace"`
+	SelectedSession     *ProjectionView      `json:"selected_session,omitempty"`
+	Task                *ProjectionView      `json:"task,omitempty"`
+	Outcome             *ProjectionView      `json:"outcome,omitempty"`
+	Lineage             *ProjectionView      `json:"lineage,omitempty"`
+	Activities          []ProjectionView     `json:"activities"`
+	Provider            ProjectionView       `json:"provider"`
+	MCP                 []ProjectionView     `json:"mcp"`
+	Instructions        []ProjectionView     `json:"instructions"`
+	Skills              SkillCatalogSnapshot `json:"skills"`
+	Permissions         ProjectionView       `json:"permissions"`
+	Context             ProjectionView       `json:"context"`
+	Usage               ModelUsage           `json:"usage"`
+	Cost                CostValue            `json:"cost"`
+	Checkpoints         []ProjectionView     `json:"checkpoints"`
+	Evidence            []ProjectionView     `json:"evidence"`
+	Receipts            []ProjectionView     `json:"receipts"`
+	RecoveryDiagnostics []Diagnostic         `json:"recovery_diagnostics"`
 }
 
 type RuntimeProjection struct {
