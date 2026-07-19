@@ -60,6 +60,7 @@ func prepareRun(ctx context.Context, options cli.Options) (*app.App, Model, erro
 		Session:   snapshot.Session,
 		Replay:    snapshot.Replay,
 		Models:    snapshot.Models,
+		Context:   snapshot.Context,
 	})
 	if created {
 		model = model.handleAppEvent(app.Event{Kind: app.EventNotice, Message: "Created " + configPath + "; edit it and run /reload."})

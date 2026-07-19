@@ -42,6 +42,7 @@ type Snapshot struct {
 	Sessions           []domain.SessionSummary
 	Models             []domain.ModelSelection
 	ConfigurationError error
+	Context            *protocol.ContextProjectionV1
 }
 
 func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapshot, err error) {
@@ -233,6 +234,13 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 		}
 	}
 
+	var contextState *protocol.ContextProjectionV1
+	if runtimeSet.ApplicationService != nil {
+		if durable, sub, snapErr := runtimeSet.ApplicationService.SnapshotAndSubscribe(ctx, protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(session.ID), Consumer: "bootstrap_context", QueueCapacity: 1}); snapErr == nil {
+			_ = sub.Close()
+			contextState, _ = DurableContext(durable)
+		}
+	}
 	return application, Snapshot{
 		Workspace:          workspace,
 		Session:            session,
@@ -240,6 +248,7 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 		Sessions:           sessions,
 		Models:             append([]domain.ModelSelection(nil), runtimeSet.Models...),
 		ConfigurationError: configErr,
+		Context:            contextState,
 	}, nil
 }
 

@@ -266,7 +266,9 @@ func validateFoundationSemantic(kind string, payload any) error {
 			return fmt.Errorf("activity output bytes is invalid")
 		}
 		if value.Usage != nil {
-			return value.Usage.Validate()
+			if err := value.Usage.Validate(); err != nil {
+				return err
+			}
 		}
 		return sortedEvidenceIDs(value.OutputEvidenceIDs)
 	case *protocol.ProviderCapabilityDecidedV1:
