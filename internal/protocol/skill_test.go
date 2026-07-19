@@ -92,6 +92,12 @@ func TestSkillDescriptorValidatesStatesAndShadowTarget(t *testing.T) {
 	if err := invalid.Validate(); err == nil {
 		t.Fatal("same-source shadow accepted")
 	}
+	globalDescriptor := validSkillDescriptor(protocol.SkillSourceGlobal)
+	projectIdentity := validSkillIdentity(protocol.SkillSourceProject)
+	globalDescriptor.Shadows = &projectIdentity
+	if err := globalDescriptor.Validate(); err == nil {
+		t.Fatal("global skill shadowing a project skill accepted")
+	}
 }
 
 func TestSkillCatalogSnapshotRequiresStableBoundedLists(t *testing.T) {
@@ -112,6 +118,32 @@ func TestSkillCatalogSnapshotRequiresStableBoundedLists(t *testing.T) {
 	decodedEquivalent.Active = protocol.DeepCopy(catalog.Active)
 	if err := decodedEquivalent.Validate(); err != nil {
 		t.Fatalf("equivalent independently decoded active descriptor rejected: %v", err)
+	}
+	globalActive := validSkillDescriptor(protocol.SkillSourceGlobal)
+	projectActive := validSkillDescriptor(protocol.SkillSourceProject)
+	crossSourceActive := protocol.SkillCatalogSnapshot{
+		Revision: "skills-r1", Digest: protocolDigest('b'),
+		Active:     protocol.DeepCopy([]protocol.SkillDescriptor{globalActive, projectActive}),
+		Discovered: []protocol.SkillDescriptor{globalActive, projectActive},
+	}
+	if err := crossSourceActive.Validate(); err == nil {
+		t.Fatal("active catalog accepted the same canonical name from both sources")
+	}
+	projectAwaitingTrust := validSkillDescriptor(protocol.SkillSourceProject)
+	projectAwaitingTrust.State = protocol.SkillStateAwaitingTrust
+	beforeTrust := protocol.SkillCatalogSnapshot{
+		Revision: "skills-r1", Digest: protocolDigest('b'),
+		Active:     []protocol.SkillDescriptor{globalActive},
+		Discovered: []protocol.SkillDescriptor{globalActive, projectAwaitingTrust},
+	}
+	if err := beforeTrust.Validate(); err != nil {
+		t.Fatalf("global active plus project awaiting trust rejected: %v", err)
+	}
+	mixedGeneration := beforeTrust
+	mixedGeneration.Discovered = protocol.DeepCopy(beforeTrust.Discovered)
+	mixedGeneration.Discovered[1].Identity.RuntimeGenerationID = "other-generation"
+	if err := mixedGeneration.Validate(); err == nil {
+		t.Fatal("catalog accepted discovered skills from mixed runtime generations")
 	}
 
 	unsorted := catalog

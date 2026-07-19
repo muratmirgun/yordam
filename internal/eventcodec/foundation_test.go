@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/eventcodec"
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
@@ -70,6 +71,11 @@ func TestFoundationRegistryAcceptsProjectSkillTrustOnlyInWorkspaceControl(t *tes
 	if _, err := registry.Decode(envelopeFor(t, control, payload)); err != nil {
 		t.Fatalf("valid workspace-control trust event rejected: %v", err)
 	}
+	wrongWorkspace := control
+	wrongWorkspace.JournalID = "other-workspace"
+	if _, err := registry.Decode(envelopeFor(t, wrongWorkspace, payload)); err == nil {
+		t.Fatal("project skill trust accepted with a mismatched workspace-control journal ID")
+	}
 	session := control
 	session.JournalKind, session.JournalID, session.SessionID = protocol.JournalSession, "session", "session"
 	if _, err := registry.Decode(envelopeFor(t, session, payload)); err == nil {
@@ -82,6 +88,32 @@ func TestFoundationRegistryAcceptsProjectSkillTrustOnlyInWorkspaceControl(t *tes
 	}
 	if err := registry.Validate(record); err == nil {
 		t.Fatal("unresolved skill trust policy accepted as durable decision")
+	}
+}
+
+func TestFoundationRegistryRejectsDuplicateRuntimeSkillNamesAcrossSources(t *testing.T) {
+	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	global := protocol.SkillDescriptor{Identity: protocol.SkillIdentity{Name: "go-testing", Source: protocol.SkillSourceGlobal, CanonicalPath: "/global/go-testing/SKILL.md", ContentDigest: testDigest('a'), RuntimeGenerationID: "generation"}, Description: "global", State: protocol.SkillStateActive}
+	project := protocol.SkillDescriptor{Identity: protocol.SkillIdentity{Name: "go-testing", Source: protocol.SkillSourceProject, CanonicalPath: "/project/go-testing/SKILL.md", WorkspaceID: "workspace", ContentDigest: testDigest('b'), RuntimeGenerationID: "generation"}, Description: "project", State: protocol.SkillStateActive}
+	body := protocol.RuntimeGenerationBody{
+		ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{},
+		SkillCatalogRevision: "skills", Skills: []protocol.SkillDescriptor{global, project}, InstructionRevision: "instructions", PolicyGeneration: "policy",
+		ExecutionProfiles: []string{"restricted"}, Limits: protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1},
+	}
+	digest, err := canonicaljson.Digest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := protocol.RuntimeGenerationManifest{ID: "generation", Body: body, Digest: digest}
+	record, err := registry.Decode(envelopeFor(t, protocol.EventEnvelope{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", RuntimeGenerationID: "generation", Kind: protocol.EventRuntimeGenerationActivated}, protocol.RuntimeGenerationActivatedV1{Manifest: manifest}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Validate(record); err == nil {
+		t.Fatal("runtime manifest accepted active skills with the same canonical name across sources")
 	}
 }
 

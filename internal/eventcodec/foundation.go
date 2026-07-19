@@ -98,7 +98,8 @@ func FoundationDescriptors() []Descriptor {
 				case protocol.EventContextCompacted:
 					return validateContextCompactionEnvelope(envelope, payload)
 				case protocol.EventProjectSkillTrustChanged:
-					if envelope.JournalKind != protocol.JournalWorkspaceControl {
+					trust, ok := payload.(*protocol.ProjectSkillTrustChangedV1)
+					if !ok || envelope.JournalKind != protocol.JournalWorkspaceControl || envelope.JournalID != protocol.JournalID(trust.WorkspaceID) {
 						return fmt.Errorf("project skill trust requires workspace-control journal")
 					}
 				}
@@ -578,7 +579,7 @@ func validateManifest(manifest protocol.RuntimeGenerationManifest) error {
 		return fmt.Errorf("runtime skill catalog exceeds %d active skills", protocol.MaxActiveSkills)
 	}
 	previousSkill := ""
-	seenSkills := make(map[skillManifestIdentity]struct{}, len(manifest.Body.Skills))
+	seenSkills := make(map[string]struct{}, len(manifest.Body.Skills))
 	for _, descriptor := range manifest.Body.Skills {
 		if err := descriptor.Validate(); err != nil {
 			return fmt.Errorf("skill descriptor: %w", err)
@@ -586,8 +587,7 @@ func validateManifest(manifest protocol.RuntimeGenerationManifest) error {
 		if descriptor.State != protocol.SkillStateActive || descriptor.Identity.RuntimeGenerationID != manifest.ID {
 			return fmt.Errorf("runtime skill descriptor is not active for this generation")
 		}
-		key := skillManifestIdentity{source: descriptor.Identity.Source, name: descriptor.Identity.Name}
-		if _, duplicate := seenSkills[key]; duplicate {
+		if _, duplicate := seenSkills[descriptor.Identity.Name]; duplicate {
 			return fmt.Errorf("duplicate runtime skill descriptor")
 		}
 		sortKey := string(descriptor.Identity.Source) + "\x00" + descriptor.Identity.Name + "\x00" + descriptor.Identity.ContentDigest.Algorithm + "\x00" + descriptor.Identity.ContentDigest.Value
@@ -595,7 +595,7 @@ func validateManifest(manifest protocol.RuntimeGenerationManifest) error {
 			return fmt.Errorf("runtime skill descriptors must be sorted")
 		}
 		previousSkill = sortKey
-		seenSkills[key] = struct{}{}
+		seenSkills[descriptor.Identity.Name] = struct{}{}
 	}
 	seenModels := make(map[string]struct{}, len(manifest.Body.Models))
 	for _, descriptor := range manifest.Body.Models {
@@ -635,11 +635,6 @@ func validateManifest(manifest protocol.RuntimeGenerationManifest) error {
 		seenProfiles[profile] = struct{}{}
 	}
 	return requireDigest(manifest.Body, manifest.Digest)
-}
-
-type skillManifestIdentity struct {
-	source protocol.SkillSource
-	name   string
 }
 
 func requireDigest(body any, got protocol.Digest) error {

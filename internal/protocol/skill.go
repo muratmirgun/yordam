@@ -94,7 +94,7 @@ func (d SkillDescriptor) Validate() error {
 	if err := d.Shadows.Validate(); err != nil {
 		return fmt.Errorf("shadow identity: %w", err)
 	}
-	if d.Identity.Name != d.Shadows.Name || d.Identity.Source == d.Shadows.Source || d.Identity == *d.Shadows {
+	if d.Identity.Name != d.Shadows.Name || d.Identity.Source != SkillSourceProject || d.Shadows.Source != SkillSourceGlobal || d.Identity == *d.Shadows {
 		return fmt.Errorf("invalid skill shadow relationship")
 	}
 	if d.State != SkillStateActive {
@@ -134,29 +134,37 @@ func (s SkillCatalogSnapshot) Validate() error {
 		return fmt.Errorf("skill catalog exceeds %d active skills", MaxActiveSkills)
 	}
 	discovered := make(map[skillSourceName]SkillDescriptor, len(s.Discovered))
+	runtimeGenerationID := RuntimeGenerationID("")
 	if err := validateSkillDescriptorList(s.Discovered, "discovered", func(descriptor SkillDescriptor) error {
 		key := skillSourceName{source: descriptor.Identity.Source, name: descriptor.Identity.Name}
 		if _, duplicate := discovered[key]; duplicate {
 			return fmt.Errorf("duplicate discovered skill %s/%s", key.source, key.name)
+		}
+		if runtimeGenerationID == "" {
+			runtimeGenerationID = descriptor.Identity.RuntimeGenerationID
+		} else if descriptor.Identity.RuntimeGenerationID != runtimeGenerationID {
+			return fmt.Errorf("discovered skills span multiple runtime generations")
 		}
 		discovered[key] = descriptor
 		return nil
 	}); err != nil {
 		return err
 	}
+	activeNames := make(map[string]struct{}, len(s.Active))
 	active := make(map[skillSourceName]struct{}, len(s.Active))
 	if err := validateSkillDescriptorList(s.Active, "active", func(descriptor SkillDescriptor) error {
 		key := skillSourceName{source: descriptor.Identity.Source, name: descriptor.Identity.Name}
 		if descriptor.State != SkillStateActive {
 			return fmt.Errorf("active catalog contains non-active skill")
 		}
-		if _, duplicate := active[key]; duplicate {
-			return fmt.Errorf("duplicate active skill %s/%s", key.source, key.name)
+		if _, duplicate := activeNames[key.name]; duplicate {
+			return fmt.Errorf("duplicate active skill name %s", key.name)
 		}
 		found, exists := discovered[key]
 		if !exists || !sameSkillDescriptor(found, descriptor) {
 			return fmt.Errorf("active skill is not an exact discovered descriptor")
 		}
+		activeNames[key.name] = struct{}{}
 		active[key] = struct{}{}
 		return nil
 	}); err != nil {
