@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -101,6 +102,59 @@ func TestDiscoverRejectsExternalOrMissingProjectRoot(t *testing.T) {
 	options.ProjectRoot = ""
 	if _, err := Discover(context.Background(), options); err == nil {
 		t.Fatal("Discover() error = nil for missing project root")
+	}
+}
+
+func TestDiscoverPropagatesMidScanCancellation(t *testing.T) {
+	for _, boundary := range []string{"after-root-open", "after-file-open"} {
+		t.Run(boundary, func(t *testing.T) {
+			discoveryHookMu.Lock()
+			defer discoveryHookMu.Unlock()
+			global := canonicalTempDir(t)
+			options := skillOptions(t, global)
+			writeSkill(t, global, "go-testing", "description", "body\n")
+			ctx, cancel := context.WithCancel(context.Background())
+			discoveryHook = func(stage, _ string) {
+				if stage == boundary {
+					cancel()
+				}
+			}
+			defer func() { discoveryHook = nil; cancel() }()
+			result, err := Discover(ctx, options)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Discover() error = %v", err)
+			}
+			if len(result.Candidates) != 0 || len(result.Diagnostics) != 0 {
+				t.Fatalf("Discover() partial result = %#v", result)
+			}
+		})
+	}
+}
+
+func TestOpenRootedRegularNoFollowClosesLeafWhenDirectoryCloseFails(t *testing.T) {
+	discoveryHookMu.Lock()
+	defer discoveryHookMu.Unlock()
+	directory := canonicalTempDir(t)
+	path := writeSkill(t, directory, "go-testing", "description", "body\n")
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	expected, err := root.Lstat("SKILL.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := closeRootedDirectory
+	closeRootedDirectory = func(file *os.File) error {
+		if err := file.Close(); err != nil {
+			return err
+		}
+		return errors.New("forced directory close failure")
+	}
+	defer func() { closeRootedDirectory = original }()
+	if file, err := openRootedRegularNoFollow(root, "SKILL.md", expected); err == nil || file != nil {
+		t.Fatalf("openRootedRegularNoFollow() file/error = %v / %v", file, err)
 	}
 }
 

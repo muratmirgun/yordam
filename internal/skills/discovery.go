@@ -56,6 +56,9 @@ func Discover(ctx context.Context, options DiscoveryOptions) (Discovery, error) 
 		result.Candidates = append(result.Candidates, candidates...)
 		result.Diagnostics = append(result.Diagnostics, diagnostics...)
 	}
+	if err := ctx.Err(); err != nil {
+		return Discovery{}, err
+	}
 	sort.Slice(result.Candidates, func(left, right int) bool {
 		return candidateSortKey(result.Candidates[left]) < candidateSortKey(result.Candidates[right])
 	})
@@ -90,6 +93,9 @@ func discoverRoot(ctx context.Context, source protocol.SkillSource, path string,
 		return nil, nil, nil
 	}
 	root, missing, err := openRetainedRoot(ctx, path)
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if missing {
 		return nil, nil, nil
 	}
@@ -100,6 +106,9 @@ func discoverRoot(ctx context.Context, source protocol.SkillSource, path string,
 	defer root.guard.Close()
 	entries, err := rootedEntries(ctx, root.root)
 	if err != nil {
+		if cancellation := ctx.Err(); cancellation != nil {
+			return nil, nil, cancellation
+		}
 		return nil, []protocol.Diagnostic{skillDiagnostic(source, "root_rejected", path, "")}, nil
 	}
 	caseCounts := make(map[string]int, len(entries))
@@ -121,7 +130,13 @@ func discoverRoot(ctx context.Context, source protocol.SkillSource, path string,
 			diagnostics = append(diagnostics, skillDiagnostic(source, "ambiguous_name", root.path, name))
 			continue
 		}
-		record, diagnostic := scanEntry(ctx, root, source, name, options)
+		record, diagnostic, scanErr := scanEntry(ctx, root, source, name, options)
+		if scanErr != nil {
+			return nil, nil, scanErr
+		}
+		if cancellation := ctx.Err(); cancellation != nil {
+			return nil, nil, cancellation
+		}
 		record.name = name
 		if diagnostic != nil {
 			diagnostics = append(diagnostics, *diagnostic)
@@ -148,6 +163,9 @@ func discoverRoot(ctx context.Context, source protocol.SkillSource, path string,
 		}
 	}
 	if err := verifyRetainedRoot(ctx, root); err != nil {
+		if cancellation := ctx.Err(); cancellation != nil {
+			return nil, nil, cancellation
+		}
 		return nil, []protocol.Diagnostic{skillDiagnostic(source, "root_rejected", path, "")}, nil
 	}
 	candidates := make([]Candidate, 0, len(scanned))
@@ -155,6 +173,9 @@ func discoverRoot(ctx context.Context, source protocol.SkillSource, path string,
 		if !record.rejected {
 			candidates = append(candidates, record.candidate)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
 	}
 	return candidates, diagnostics, nil
 }
@@ -187,6 +208,11 @@ func openRetainedRoot(ctx context.Context, path string) (retainedRoot, bool, err
 	retained := retainedRoot{path: path, guard: guard, root: root, info: guardInfo}
 	if discoveryHook != nil {
 		discoveryHook("after-root-open", "")
+	}
+	if err := ctx.Err(); err != nil {
+		_ = root.Close()
+		_ = guard.Close()
+		return retainedRoot{}, false, err
 	}
 	if err := verifyRetainedRoot(ctx, retained); err != nil {
 		_ = root.Close()
@@ -223,6 +249,9 @@ func rootPathState(path string) rootPathStatus {
 }
 
 func verifyRetainedRoot(ctx context.Context, root retainedRoot) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if rootPathState(root.path) != rootPathSafe {
 		return errors.New("skill root path changed")
 	}
@@ -235,6 +264,9 @@ func verifyRetainedRoot(ctx context.Context, root retainedRoot) error {
 	if statErr != nil || closeErr != nil || !os.SameFile(root.info, freshInfo) {
 		return errors.New("skill root guard changed")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	checked, err := os.Lstat(root.path)
 	if err != nil || !checked.IsDir() || checked.Mode()&os.ModeSymlink != 0 || !os.SameFile(root.info, checked) {
 		return errors.New("skill root changed")
@@ -242,6 +274,9 @@ func verifyRetainedRoot(ctx context.Context, root retainedRoot) error {
 	guardInfo, err := root.guard.Stat()
 	if err != nil || !os.SameFile(root.info, guardInfo) {
 		return errors.New("retained root guard changed")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	opened, err := root.root.Open(".")
 	if err != nil {
@@ -271,74 +306,110 @@ func rootedEntries(ctx context.Context, root *os.Root) ([]os.DirEntry, error) {
 	return entries, nil
 }
 
-func scanEntry(ctx context.Context, root retainedRoot, source protocol.SkillSource, name string, options DiscoveryOptions) (scannedCandidate, *protocol.Diagnostic) {
+func scanEntry(ctx context.Context, root retainedRoot, source protocol.SkillSource, name string, options DiscoveryOptions) (scannedCandidate, *protocol.Diagnostic, error) {
 	checkedDirectory, err := root.root.Lstat(name)
 	if err != nil || !checkedDirectory.IsDir() || checkedDirectory.Mode()&os.ModeSymlink != 0 {
+		if cancellation := ctx.Err(); cancellation != nil {
+			return scannedCandidate{}, nil, cancellation
+		}
 		diagnostic := skillDiagnostic(source, "entry_rejected", root.path, name)
-		return scannedCandidate{}, &diagnostic
+		return scannedCandidate{}, &diagnostic, nil
 	}
 	if discoveryHook != nil {
 		discoveryHook("after-directory-inspect", name)
 	}
+	if err := ctx.Err(); err != nil {
+		return scannedCandidate{}, nil, err
+	}
 	directory, err := root.root.OpenRoot(name)
 	if err != nil {
+		if cancellation := ctx.Err(); cancellation != nil {
+			return scannedCandidate{}, nil, cancellation
+		}
 		diagnostic := skillDiagnostic(source, "entry_rejected", root.path, name)
-		return scannedCandidate{}, &diagnostic
+		return scannedCandidate{}, &diagnostic, nil
 	}
 	defer directory.Close()
 	openedDirectory, err := directory.Open(".")
 	if err != nil {
+		if cancellation := ctx.Err(); cancellation != nil {
+			return scannedCandidate{}, nil, cancellation
+		}
 		diagnostic := skillDiagnostic(source, "entry_rejected", root.path, name)
-		return scannedCandidate{}, &diagnostic
+		return scannedCandidate{}, &diagnostic, nil
 	}
 	openedDirectoryInfo, statErr := openedDirectory.Stat()
 	closeErr := openedDirectory.Close()
 	if statErr != nil || closeErr != nil || !os.SameFile(checkedDirectory, openedDirectoryInfo) || verifyDirectory(root.root, name, checkedDirectory) != nil {
+		if cancellation := ctx.Err(); cancellation != nil {
+			return scannedCandidate{}, nil, cancellation
+		}
 		diagnostic := skillDiagnostic(source, "entry_rejected", root.path, name)
-		return scannedCandidate{}, &diagnostic
+		return scannedCandidate{}, &diagnostic, nil
 	}
 	if err := verifyRetainedRoot(ctx, root); err != nil {
+		if cancellation := ctx.Err(); cancellation != nil {
+			return scannedCandidate{}, nil, cancellation
+		}
 		diagnostic := skillDiagnostic(source, "root_rejected", root.path, name)
-		return scannedCandidate{}, &diagnostic
+		return scannedCandidate{}, &diagnostic, nil
 	}
 	checkedFile, err := directory.Lstat("SKILL.md")
 	if err != nil || !checkedFile.Mode().IsRegular() || checkedFile.Mode()&os.ModeSymlink != 0 {
+		if cancellation := ctx.Err(); cancellation != nil {
+			return scannedCandidate{}, nil, cancellation
+		}
 		diagnostic := skillDiagnostic(source, "file_rejected", root.path, name)
-		return scannedCandidate{}, &diagnostic
+		return scannedCandidate{}, &diagnostic, nil
 	}
 	if discoveryHook != nil {
 		discoveryHook("after-file-inspect", name)
 	}
+	if err := ctx.Err(); err != nil {
+		return scannedCandidate{}, nil, err
+	}
 	file, err := openRootedRegularNoFollow(directory, "SKILL.md", checkedFile)
 	if err != nil {
+		if cancellation := ctx.Err(); cancellation != nil {
+			return scannedCandidate{}, nil, cancellation
+		}
 		diagnostic := skillDiagnostic(source, "file_rejected", root.path, name)
-		return scannedCandidate{}, &diagnostic
+		return scannedCandidate{}, &diagnostic, nil
 	}
 	defer file.Close()
 	openedFile, err := file.Stat()
 	if err != nil || !openedFile.Mode().IsRegular() || !os.SameFile(checkedFile, openedFile) || verifyFile(directory, "SKILL.md", checkedFile) != nil {
+		if cancellation := ctx.Err(); cancellation != nil {
+			return scannedCandidate{}, nil, cancellation
+		}
 		diagnostic := skillDiagnostic(source, "file_rejected", root.path, name)
-		return scannedCandidate{}, &diagnostic
+		return scannedCandidate{}, &diagnostic, nil
 	}
 	if discoveryHook != nil {
 		discoveryHook("after-file-open", name)
 	}
+	if err := ctx.Err(); err != nil {
+		return scannedCandidate{}, nil, err
+	}
 	raw, err := readBounded(ctx, file)
 	if err != nil || verifyFile(directory, "SKILL.md", checkedFile) != nil || verifyDirectory(root.root, name, checkedDirectory) != nil || verifyRetainedRoot(ctx, root) != nil {
+		if cancellation := ctx.Err(); cancellation != nil {
+			return scannedCandidate{}, nil, cancellation
+		}
 		diagnostic := skillDiagnostic(source, "file_rejected", root.path, name)
-		return scannedCandidate{}, &diagnostic
+		return scannedCandidate{}, &diagnostic, nil
 	}
 	metadata, content, err := Parse(name, raw)
 	if err != nil {
 		diagnostic := skillDiagnostic(source, "parse_rejected", root.path, name)
-		return scannedCandidate{leaf: openedFile, rejected: true}, &diagnostic
+		return scannedCandidate{leaf: openedFile, rejected: true}, &diagnostic, nil
 	}
 	sum := sha256.Sum256(content)
 	candidate := Candidate{Name: metadata.Name, Description: metadata.Description, Content: append([]byte(nil), content...), Source: source, CanonicalPath: filepath.Join(root.path, name, "SKILL.md"), ContentDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: fmt.Sprintf("%x", sum)}}
 	if source == protocol.SkillSourceProject {
 		candidate.WorkspaceID = protocol.WorkspaceID(options.Workspace.ID)
 	}
-	return scannedCandidate{candidate: candidate, leaf: openedFile}, nil
+	return scannedCandidate{candidate: candidate, leaf: openedFile}, nil, nil
 }
 
 func verifyDirectory(parent *os.Root, name string, expected os.FileInfo) error {

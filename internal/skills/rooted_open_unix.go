@@ -9,6 +9,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var closeRootedDirectory = func(file *os.File) error { return file.Close() }
+
 // openRootedRegularNoFollow opens a leaf relative to the retained directory
 // descriptor. O_NOFOLLOW and O_NONBLOCK make a replacement by a symlink or a
 // FIFO fail closed without following or blocking before identity verification.
@@ -18,12 +20,12 @@ func openRootedRegularNoFollow(root *os.Root, name string, expected os.FileInfo)
 		return nil, err
 	}
 	fd, openErr := unix.Openat(int(directory.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
-	closeErr := directory.Close()
-	if openErr != nil || closeErr != nil {
-		if openErr == nil {
-			openErr = closeErr
-		}
-		return nil, openErr
+	closeErr := closeRootedDirectory(directory)
+	if openErr != nil {
+		return nil, errors.Join(openErr, closeErr)
+	}
+	if closeErr != nil {
+		return nil, errors.Join(closeErr, unix.Close(fd))
 	}
 	file := os.NewFile(uintptr(fd), name)
 	info, err := file.Stat()
