@@ -76,7 +76,7 @@ func TestSerializableCompactionFailureMapsPublicErrors(t *testing.T) {
 	for _, tc := range []struct {
 		code  string
 		stage protocol.CompactionStage
-	}{{"ordinary_failure", protocol.CompactionFailed}, {"cancelled", protocol.CompactionCancelled}, {"commit_uncertain", protocol.CompactionUncertain}} {
+	}{{"ordinary_failure", protocol.CompactionFailed}, {"cancelled", protocol.CompactionCancelled}, {"compaction_interrupted", protocol.CompactionCancelled}, {"commit_uncertain", protocol.CompactionUncertain}} {
 		t.Run(tc.code, func(t *testing.T) {
 			got := serializableCompactionFailure(protocol.PublicError{Code: tc.code, Message: "safe message"})
 			if got == nil || got.Kind != EventCompactionFailed || got.Code != tc.code || got.Message != "safe message" || got.Compaction == nil || got.Compaction.Trigger != "manual" || got.Compaction.Stage != tc.stage || got.Compaction.Error == nil || got.Compaction.Error.Code != tc.code || got.Compaction.Error.Message != "safe message" || got.Compaction.Usage.Input.State != protocol.UsageUnknown {

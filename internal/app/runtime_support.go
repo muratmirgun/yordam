@@ -656,7 +656,10 @@ func (d runtimeCommandDispatcher) DispatchCommand(ctx context.Context, metadata 
 			ProviderID: providerID, ModelID: modelID,
 			Runtime: protocol.DeepCopy(d.Manifest), Trigger: compaction.TriggerManual,
 		})
-		result, ok, err := d.Orchestrator.LookupCommand(ctx, ref, metadata.CommandID, metadata.RequestDigest)
+		// RunCompaction persists an accepted command's cancellation terminal with
+		// context.WithoutCancel. Recover that exact durable result after the
+		// caller cancels; this lookup does not extend provider or execution work.
+		result, ok, err := d.Orchestrator.LookupCommand(context.WithoutCancel(ctx), ref, metadata.CommandID, metadata.RequestDigest)
 		if err != nil {
 			return protocol.CommandResult{}, err
 		}

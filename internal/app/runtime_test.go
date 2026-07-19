@@ -766,6 +766,107 @@ completed:
 	}
 }
 
+func TestAppRunCancelledProductionCompactPublishesOneInterruptedTerminal(t *testing.T) {
+	var blockCompaction atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		if blockCompaction.Load() {
+			<-request.Context().Done()
+			return
+		}
+		fmt.Fprintf(response, "data: {\"id\":\"cancelled-compact\",\"choices\":[{\"delta\":{\"content\":%q},\"finish_reason\":\"stop\"}]}\n\n", "ordinary turn reply")
+		fmt.Fprintln(response, "data: [DONE]")
+		fmt.Fprintln(response)
+	}))
+	defer server.Close()
+	t.Setenv("PRIMARY_KEY", "production-cancel-key")
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.jsonc")
+	configBody := fmt.Sprintf(`{"model":"primary/model-a","provider":{"primary":{"options":{"baseURL":%q,"apiKeyEnv":"PRIMARY_KEY"},"models":{"model-a":{}}}}}`, server.URL)
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	application, _, err := Bootstrap(t.Context(), BootstrapOptions{
+		ConfigPath: configPath, CWD: root, HTTPClient: server.Client(),
+		CLI: cli.Options{Mode: domain.ModeAsk, DataDir: filepath.Join(root, "data"), MaxToolCalls: 32, ShellTimeout: time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- application.Run(ctx) }()
+
+	awaitTurn := func(prompt string) {
+		t.Helper()
+		application.Commands() <- Command{Kind: CommandStartTurn, Prompt: prompt}
+		accepted := false
+		for {
+			select {
+			case event := <-application.Events():
+				switch event.Kind {
+				case EventError, EventTurnInterrupted, EventCompactionCompleted, EventCompactionFailed:
+					t.Fatalf("turn %q unexpected event=%+v", prompt, event)
+				case EventTurnAccepted:
+					accepted = true
+				case EventTurnCompleted:
+					if !accepted {
+						t.Fatalf("turn %q completed before acceptance", prompt)
+					}
+					return
+				}
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for turn %q: %v", prompt, ctx.Err())
+			}
+		}
+	}
+
+	// Build the durable history required for manual compaction, then make only
+	// the compact provider stream wait for cancellation.
+	awaitTurn("one")
+	awaitTurn("two")
+	blockCompaction.Store(true)
+	application.Commands() <- Command{Kind: CommandCompact}
+	cancelled, terminals := false, 0
+	for terminals == 0 {
+		select {
+		case event := <-application.Events():
+			switch event.Kind {
+			case EventError:
+				t.Fatalf("cancelled compact emitted generic error: %+v", event)
+			case EventCompactionStarted:
+				if event.Compaction != nil && event.Compaction.Trigger == "manual" && !cancelled {
+					cancelled = true
+					application.Commands() <- Command{Kind: CommandCancelTurn}
+				}
+			case EventCompactionCompleted:
+				t.Fatalf("cancelled compact completed: %+v", event)
+			case EventCompactionFailed:
+				terminals++
+				if !cancelled || event.Code != "compaction_interrupted" || event.Compaction == nil || event.Compaction.Stage != protocol.CompactionCancelled || event.Compaction.Error == nil || event.Compaction.Error.Code != "compaction_interrupted" {
+					t.Fatalf("cancelled compact terminal=%+v cancelled=%t", event, cancelled)
+				}
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for cancelled compact terminal: %v", ctx.Err())
+		}
+	}
+	blockCompaction.Store(false)
+	// A subsequent command proves the lane is clear and also catches a delayed
+	// duplicate compaction terminal before the next turn can complete.
+	awaitTurn("after cancelled compact")
+	application.Commands() <- Command{Kind: CommandShutdown}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out shutting down: %v", ctx.Err())
+	}
+}
+
 func TestAppRunCompactProtocolSubscriptionDoesNotLeakTerminalEvents(t *testing.T) {
 	var providerCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {

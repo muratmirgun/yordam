@@ -547,7 +547,7 @@ func (a *App) Run(ctx context.Context) error {
 					event.Kind = EventError
 				}
 			}
-			if a.sessions != nil && a.session.ID != "" && (result.kind == operationTurn || result.err == nil) {
+			if a.sessions != nil && a.session.ID != "" && (result.kind == operationTurn || result.err == nil || result.compactTerminal != nil) {
 				refreshed, err := a.inspectSession(ctx, a.session.ID)
 				if err != nil {
 					a.replayValid = false
@@ -584,7 +584,7 @@ func (a *App) Run(ctx context.Context) error {
 
 func serializableCompactionFailure(public protocol.PublicError) *Event {
 	stage := protocol.CompactionFailed
-	if public.Code == "cancelled" {
+	if public.Code == "cancelled" || public.Code == "compaction_interrupted" {
 		stage = protocol.CompactionCancelled
 	} else if public.Code == "commit_uncertain" {
 		stage = protocol.CompactionUncertain
