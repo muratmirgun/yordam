@@ -186,6 +186,37 @@ func TestContextProjectionPolicyUsesImmutableGeneration(t *testing.T) {
 	if got.AutoReason != "unknown_generation" || got.ReserveTokens.State != protocol.ValueUnknown {
 		t.Fatalf("missing=%+v", got)
 	}
+	known := manifest(true, 0)
+	known.ID = "A"
+	projector := contextProjectionProjector{generations: map[protocol.RuntimeGenerationID]protocol.RuntimeGenerationManifest{"A": known}}
+	got, _ = projector.Apply(projector.Zero(protocol.JournalRef{}), plan("A", 1, 9000, 1))
+	if !got.AutoAvailable || got.ReserveTokens.Value != 2048 || got.ReserveTokens.Provenance != "compaction_policy" {
+		t.Fatalf("default=%+v", got)
+	}
+	explicit := manifest(true, 3333)
+	explicit.ID = "A"
+	projector.generations["A"] = explicit
+	got, _ = projector.Apply(projector.Zero(protocol.JournalRef{}), plan("A", 1, 9000, 1))
+	if !got.AutoAvailable || got.ReserveTokens.Value != 3333 || got.ReserveTokens.Provenance != "compaction_policy" {
+		t.Fatalf("explicit=%+v", got)
+	}
+	unknown := plan("A", 1, 9000, 1)
+	unknown.Decoded.(*protocol.ContextPlanRecordedV1).Plan.Body.ContextWindow = protocol.ValueInt64{State: protocol.ValueUnknown}
+	got, _ = projector.Apply(projector.Zero(protocol.JournalRef{}), unknown)
+	if got.AutoAvailable || got.AutoReason != "unknown_context_window" || got.ReserveTokens.State != protocol.ValueUnknown {
+		t.Fatalf("unknown=%+v", got)
+	}
+	fallback := contextProjectionProjector{bootstrap: protocol.RuntimeGenerationManifest{ID: "B", Body: manifest(true, 0).Body}}
+	got, _ = fallback.Apply(fallback.Zero(protocol.JournalRef{}), plan("B", 1, 9000, 1))
+	if !got.AutoAvailable {
+		t.Fatalf("fallback=%+v", got)
+	}
+	state, _ := projector.Apply(projector.Zero(protocol.JournalRef{}), plan("A", 1, 9000, 1))
+	compact := &protocol.ContextCompactedV1{From: protocol.CommittedCursor{JournalID: "s", CommitSeq: 1}, Through: protocol.CommittedCursor{JournalID: "s", CommitSeq: 2}, SummaryEvidenceID: "e", Revision: "r2"}
+	state, _ = projector.Apply(state, protocol.EventRecord{Decoded: compact})
+	if state.Revision != "r2" || state.SummaryEvidenceID != "e" || state.LatestRange == nil || state.LatestRange.Through.CommitSeq != 2 {
+		t.Fatalf("sequential=%+v", state)
+	}
 }
 
 func TestRuntimeSetReadyReturnsConfigurationErrorBeforeCompatibilityBypass(t *testing.T) {
