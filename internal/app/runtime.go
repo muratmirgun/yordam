@@ -28,12 +28,14 @@ import (
 	"github.com/muratmirgun/yordam/internal/recovery"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
+	"github.com/muratmirgun/yordam/internal/skills"
 	"github.com/muratmirgun/yordam/internal/tooling"
 	edittool "github.com/muratmirgun/yordam/internal/tools/edit"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 	readtool "github.com/muratmirgun/yordam/internal/tools/read"
 	searchtool "github.com/muratmirgun/yordam/internal/tools/search"
 	shelltool "github.com/muratmirgun/yordam/internal/tools/shell"
+	skilltool "github.com/muratmirgun/yordam/internal/tools/skill"
 	"github.com/muratmirgun/yordam/internal/verification"
 )
 
@@ -53,6 +55,7 @@ type RuntimeSet struct {
 	ProviderCatalog      provider.Catalog
 	ProviderService      *provider.Service
 	ToolService          *tooling.Service
+	Skills               skills.Catalog
 	AuthorizationService orchestrator.AuthorizationService
 	Broker               *Broker
 	ApplicationService   *ProtocolService
@@ -102,7 +105,34 @@ func (s RuntimeSet) Validate() error {
 			return fmt.Errorf("runtime generation tool is invalid")
 		}
 	}
+	if s.Skills == nil {
+		return fmt.Errorf("runtime skill catalog is not configured")
+	}
+	snapshot := s.Skills.Snapshot()
+	if err := snapshot.Validate(); err != nil || snapshot.Revision != s.Manifest.Body.SkillCatalogRevision || !slices.EqualFunc(snapshot.Active, s.Manifest.Body.Skills, sameRuntimeSkillDescriptor) {
+		return fmt.Errorf("runtime skill catalog manifest binding is invalid")
+	}
+	for _, descriptor := range snapshot.Active {
+		if descriptor.State != protocol.SkillStateActive || descriptor.Identity.RuntimeGenerationID != s.Manifest.ID {
+			return fmt.Errorf("runtime active skill catalog generation binding is invalid")
+		}
+	}
+	for _, descriptor := range snapshot.Discovered {
+		if descriptor.Identity.RuntimeGenerationID != s.Manifest.ID {
+			return fmt.Errorf("runtime skill catalog generation binding is invalid")
+		}
+	}
 	return nil
+}
+
+func sameRuntimeSkillDescriptor(left, right protocol.SkillDescriptor) bool {
+	if left.Identity != right.Identity || left.Description != right.Description || left.State != right.State {
+		return false
+	}
+	if left.Shadows == nil || right.Shadows == nil {
+		return left.Shadows == nil && right.Shadows == nil
+	}
+	return *left.Shadows == *right.Shadows
 }
 
 type ReloadRuntime func(context.Context, domain.ModelSelection) (RuntimeSet, error)
@@ -256,6 +286,19 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		Redact:           admission,
 		Admission:        admission,
 	}
+	discovery, err := skills.Discover(context.Background(), skills.DiscoveryOptions{
+		Workspace:    b.workspace,
+		GlobalRoot:   filepath.Join(filepath.Dir(b.configPath), "skills"),
+		ProjectRoot:  filepath.Join(b.workspace.CanonicalPath, ".yordam", "skills"),
+		GenerationID: generationID,
+	})
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "discover skills", err)
+	}
+	skillCatalog, err := skills.Build(skills.BuildOptions{Discovery: discovery, Policy: cfg.Skills.ProjectPolicy, Workspace: b.workspace, Generation: generationID})
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "build skill catalog", err)
+	}
 	runnerAdmission, err := admission.Derive()
 	if err != nil {
 		return RuntimeSet{}, configurationError(b.configPath, "bind runner secret admission", err)
@@ -274,6 +317,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 	toolItems := []ports.Tool{
 		readtool.New(readtool.Options{Workspace: b.workspace.CanonicalPath, Output: outputOptions}),
 		searchtool.New(searchtool.Options{Workspace: b.workspace.CanonicalPath, Output: outputOptions}),
+		skilltool.New(skillCatalog, outputOptions),
 		edittool.New(edittool.Options{Workspace: b.workspace.CanonicalPath, Output: outputOptions}),
 		shelltool.New(shelltool.Options{
 			Workspace:       b.workspace.CanonicalPath,
@@ -314,6 +358,8 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		Models:                  protocol.DeepCopy(models),
 		ToolCatalogRevision:     toolCatalogRevision,
 		Tools:                   protocol.DeepCopy(toolDescriptors),
+		SkillCatalogRevision:    skillCatalog.Snapshot().Revision,
+		Skills:                  skillCatalog.Snapshot().Active,
 		InstructionRevision:     "system-v1",
 		PolicyGeneration:        "compatibility-v1",
 		ExecutionProfiles:       []string{"network", "restricted", "unsandboxed"},
@@ -338,7 +384,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		}
 	}
 	broker, err := NewBroker(BrokerOptions{
-		Source: runtimeBrokerSource{Repository: b.store, Workspace: workspaceControl, Generation: generationID, Manifest: manifest},
+		Source: runtimeBrokerSource{Repository: b.store, Workspace: workspaceControl, Generation: generationID, Manifest: manifest, Skills: skillCatalog},
 		Epoch:  string(generationID), DefaultQueueCapacity: 64, MaxQueueCapacity: 1024,
 	})
 	if err != nil {
@@ -457,6 +503,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		ProviderCatalog:      providerCatalog,
 		ProviderService:      providerService,
 		ToolService:          toolService,
+		Skills:               skillCatalog,
 		AuthorizationService: authorizer,
 		Broker:               broker,
 		ApplicationService:   applicationService,

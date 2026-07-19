@@ -315,8 +315,74 @@ func TestRuntimeBuilderBindsProvidersToolsLimitsAndCredentials(t *testing.T) {
 	if _, ok := set.Runtime.(*agent.OrchestratedRunner); !ok || set.Manifest.Body.Limits.MaxToolCalls != 7 || set.Manifest.Body.Limits.ShellTimeoutNanos != int64(time.Second) {
 		t.Fatalf("runtime=%T limits=%+v", set.Runtime, set.Manifest.Body.Limits)
 	}
-	if len(set.ProviderCatalog.List()) != 3 || len(set.Manifest.Body.Tools) != 4 {
+	if len(set.ProviderCatalog.List()) != 3 || len(set.Manifest.Body.Tools) != 5 {
 		t.Fatalf("provider models=%d tool descriptors=%d", len(set.ProviderCatalog.List()), len(set.Manifest.Body.Tools))
+	}
+}
+
+func TestRuntimeBuilderBindsCatalogSkillsToConfigAndWorkspaceRoots(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "skill-test-key")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	builder := newRuntimeBuilderForTest(t, nil)
+	configDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder.configPath = filepath.Join(configDir, "config.jsonc")
+	globalPath := filepath.Join(configDir, "skills", "go-testing", "SKILL.md")
+	projectPath := filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md")
+	writeRuntimeSkill(t, globalPath, "Global skill.", "global-generation-body")
+	writeRuntimeSkill(t, projectPath, "Project skill.", "project-generation-body")
+
+	for _, test := range []struct {
+		policy     config.ProjectSkillPolicy
+		wantSource protocol.SkillSource
+		wantBody   string
+	}{
+		{config.ProjectSkillsAllow, protocol.SkillSourceProject, "project-generation-body"},
+		{config.ProjectSkillsAsk, protocol.SkillSourceGlobal, "global-generation-body"},
+		{config.ProjectSkillsDeny, protocol.SkillSourceGlobal, "global-generation-body"},
+	} {
+		t.Run(string(test.policy), func(t *testing.T) {
+			candidate := cfg
+			candidate.Skills.ProjectPolicy = test.policy
+			set, err := builder.build(candidate, domain.ModelSelection{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot := set.Skills.Snapshot()
+			loaded, ok := set.Skills.Load("go-testing")
+			if !ok || loaded.Identity.Source != test.wantSource || !strings.Contains(string(loaded.Content), test.wantBody) || len(snapshot.Active) != 1 || !slices.EqualFunc(snapshot.Active, set.Manifest.Body.Skills, sameRuntimeSkillDescriptor) || set.Manifest.Body.SkillCatalogRevision != snapshot.Revision {
+				t.Fatalf("snapshot=%#v loaded=%#v manifest=%#v", snapshot, loaded, set.Manifest.Body)
+			}
+			for _, descriptor := range snapshot.Discovered {
+				if descriptor.Identity.RuntimeGenerationID != set.RuntimeGenerationID {
+					t.Fatalf("generation=%q descriptor=%#v", set.RuntimeGenerationID, descriptor)
+				}
+			}
+			aliases := make([]string, 0, len(set.Manifest.Body.Tools))
+			for _, descriptor := range set.Manifest.Body.Tools {
+				aliases = append(aliases, descriptor.Body.Identity.Name)
+			}
+			if !slices.Equal(aliases, []string{"read", "search", "skill", "edit", "shell"}) {
+				t.Fatalf("tool order=%v", aliases)
+			}
+			writeRuntimeSkill(t, projectPath, "Project skill.", "changed-after-build")
+			frozen, _ := set.Skills.Load("go-testing")
+			if !strings.Contains(string(frozen.Content), test.wantBody) {
+				t.Fatalf("built catalog mutated by source edit: %q", frozen.Content)
+			}
+		})
+	}
+}
+
+func writeRuntimeSkill(t *testing.T, path, description, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("---\nname: go-testing\ndescription: "+description+"\n---\n"+body+"\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

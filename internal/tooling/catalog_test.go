@@ -34,7 +34,7 @@ func TestCatalogAcceptsDynamicToolsRetainsBuiltinAliasOrderAndCopiesSchemas(t *t
 			t.Fatalf("real builtin %s has no explicit trusted classification wrapper", alias)
 		}
 	}
-	items := []ports.Tool{shellTool, catalogTool("inspect", schema), editTool, readTool, searchTool}
+	items := []ports.Tool{shellTool, catalogExternalTool("inspect", protocol.ToolIdentity{Source: "mcp", Authority: "example", Name: "inspect"}, trustedRemoteClassification()), editTool, catalogTool("skill", schema), readTool, searchTool}
 	catalog, err := NewCatalog("revision-1", items...)
 	if err != nil {
 		t.Fatal(err)
@@ -44,11 +44,11 @@ func TestCatalogAcceptsDynamicToolsRetainsBuiltinAliasOrderAndCopiesSchemas(t *t
 	for _, tool := range exposure.Tools {
 		aliases = append(aliases, tool.Alias)
 	}
-	want := []string{"read", "search", "edit", "shell", "inspect"}
+	want := []string{"read", "search", "skill", "edit", "shell", "inspect"}
 	if strings.Join(aliases, ",") != strings.Join(want, ",") {
 		t.Fatalf("aliases=%v", aliases)
 	}
-	for index, alias := range want[:4] {
+	for index, alias := range want[:2] {
 		identity := exposure.Aliases[index].Identity
 		if exposure.Tools[index].Alias != alias || identity != (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: alias}) {
 			t.Fatalf("binding[%d]=%#v", index, exposure.Aliases[index])
@@ -61,7 +61,7 @@ func TestCatalogAcceptsDynamicToolsRetainsBuiltinAliasOrderAndCopiesSchemas(t *t
 		t.Fatal("catalog exposure was mutable through returned values")
 	}
 	schema[0] = '['
-	if catalog.Expose().Tools[4].InputSchema[0] != '{' {
+	if catalog.Expose().Tools[2].InputSchema[0] != '{' {
 		t.Fatal("catalog retained caller-owned schema")
 	}
 }

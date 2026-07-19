@@ -27,7 +27,7 @@ type Catalog struct {
 	byAlias  map[string]catalogEntry
 }
 
-var builtinOrder = map[string]int{"read": 0, "search": 1, "edit": 2, "shell": 3}
+var builtinOrder = map[string]int{"read": 0, "search": 1, "skill": 2, "edit": 3, "shell": 4}
 
 func NewCatalog(revision string, tools ...ports.Tool) (*Catalog, error) {
 	if revision == "" {

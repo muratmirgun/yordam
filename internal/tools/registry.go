@@ -18,8 +18,9 @@ type Registry struct {
 var builtInRank = map[string]int{
 	"read":   0,
 	"search": 1,
-	"edit":   2,
-	"shell":  3,
+	"skill":  2,
+	"edit":   3,
+	"shell":  4,
 }
 
 const BuiltinSourceRevision = "builtin-v1"
@@ -47,6 +48,11 @@ func ReadClassification() domain.ToolClassification {
 }
 
 func SearchClassification() domain.ToolClassification { return ReadClassification() }
+
+// SkillClassification is observation-only but its resource is a frozen logical
+// catalog entry rather than a filesystem path. Permission validation binds all
+// identity attributes before it treats that entry as workspace-scoped.
+func SkillClassification() domain.ToolClassification { return ReadClassification() }
 
 func EditClassification() domain.ToolClassification {
 	return domain.ToolClassification{Effect: "mutation", Mutation: "file", ExecutionLoci: []string{"builtin"}, Boundary: "workspace", Reversibility: "preimage", VerificationCoverage: "preimage_and_postimage", Idempotency: "conditional", Retry: "never_after_dispatch", RequestedProfile: "restricted", EffectiveProfile: "restricted"}

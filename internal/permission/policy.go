@@ -3,9 +3,11 @@ package permission
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	skilltool "github.com/muratmirgun/yordam/internal/tools/skill"
 )
 
 type PolicyRule struct {
@@ -267,17 +270,79 @@ func deriveAuthorizationFacts(evaluation ports.EvaluationInput) authorizationFac
 	outside := request.Boundary == "filesystem_external" || request.Boundary == "network" || request.Boundary == "remote" || request.Boundary == "remote_or_unknown"
 	trustedSource := request.Source.Source == "builtin" && request.Source.Authority == "yordam"
 	filesystemInside, filesystemOnly := filesystemResourcesInside(evaluation.Permission.Workspace, request.Resources)
+	skillInside := trustedSkillResource(evaluation)
 	shellInside, shellShape := localProcessResourcesInside(evaluation.Permission.Workspace, request.Resources)
 	if process && (!shellShape || !shellInside) {
 		outside = true
 	}
-	observation := trustedDescriptor && descriptor.Body.Effect == "observation" && descriptor.Body.Mutation == "read_only" && request.Effect == "observation" && request.Boundary == "workspace" && filesystemInside
+	observation := trustedDescriptor && descriptor.Body.Effect == "observation" && descriptor.Body.Mutation == "read_only" && request.Effect == "observation" && request.Boundary == "workspace" && (filesystemInside || skillInside)
 	trustedPreviewDescriptor := descriptorMatchesPreviewRequest(descriptor, request) && descriptor.Body.ClassificationSource == "trusted_adapter" && trustedSource
 	trustedMutationPreview := trustedPreviewDescriptor && ((descriptor.Body.Mutation == "process" && request.ExecutionLocus == "process" && request.RequestedProfile == "unsandboxed" && request.EffectiveProfile == "unsandboxed" && shellShape && shellInside) ||
 		(descriptor.Body.Mutation == "file" && (request.ExecutionLocus == "builtin" || request.ExecutionLocus == "local") && request.Boundary == "workspace" && filesystemOnly && filesystemInside))
 	trustedLocalProcess := trustedDescriptor && trustedSource && descriptor.Body.Effect == "mutation" && descriptor.Body.Mutation == "process" && request.Effect == "mutation" && request.ExecutionLocus == "process" && request.RequestedProfile == "unsandboxed" && request.EffectiveProfile == "unsandboxed" && shellShape && shellInside
 	trustedBuiltinFileMutation := trustedDescriptor && trustedSource && descriptor.Body.Effect == "mutation" && descriptor.Body.Mutation == "file" && request.Effect == "mutation" && (request.ExecutionLocus == "builtin" || request.ExecutionLocus == "local") && request.Boundary == "workspace" && filesystemOnly && filesystemInside
 	return authorizationFacts{process: process, outside: outside, observation: observation, trustedMutationPreview: trustedMutationPreview, trustedLocalProcess: trustedLocalProcess, trustedBuiltinFileMutation: trustedBuiltinFileMutation}
+}
+
+// trustedSkillResource admits only the frozen logical skill shape produced by
+// the canonical built-in. It is deliberately narrower than filesystem reads:
+// there is no path authority and any malformed or mixed target remains ask or
+// deny according to mode.
+func trustedSkillResource(evaluation ports.EvaluationInput) bool {
+	request, descriptor := evaluation.Request, evaluation.Descriptor
+	expected := skilltool.BuiltinDescriptor()
+	if !reflect.DeepEqual(descriptor, expected) || request.Source != expected.Body.Identity || request.SourceRevision != expected.Body.SourceRevision || request.DescriptorDigest != expected.DescriptorDigest || request.Action != "skill" || request.ExecutionLocus != "builtin" || request.RequestedProfile != "restricted" || request.EffectiveProfile != "restricted" || request.Effect != "observation" || request.Boundary != "workspace" || request.Reversibility != "not_applicable" || request.VerificationCoverage != "full" || len(request.Resources) != 1 {
+		return false
+	}
+	resource := request.Resources[0]
+	if resource.Kind != "skill" || resource.ParentID != "" || !validSkillName(resource.CanonicalID) || !validSkillDigest(resource.Digest) || len(resource.Attributes) != 3 {
+		return false
+	}
+	attrs := resource.Attributes
+	if attrs[0] != (protocol.ResourceAttribute{Name: "runtime_generation", Value: string(request.RuntimeGenerationID)}) || attrs[1].Name != "source" || attrs[2].Name != "workspace_id" || attrs[1].Value != "global" && attrs[1].Value != "project" {
+		return false
+	}
+	if attrs[1].Value == "global" {
+		return attrs[2].Value == ""
+	}
+	return validProjectSkillWorkspace(evaluation.Permission.Workspace, attrs[2].Value)
+}
+
+func validProjectSkillWorkspace(workspace, id string) bool {
+	if !filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace || len(id) != 64 {
+		return false
+	}
+	sum := sha256.Sum256([]byte(workspace))
+	return id == hex.EncodeToString(sum[:])
+}
+
+func validSkillName(value string) bool {
+	if value == "" || value[0] == '-' || value[len(value)-1] == '-' {
+		return false
+	}
+	previousHyphen := false
+	for i := range value {
+		c := value[i]
+		if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' {
+			previousHyphen = false
+			continue
+		}
+		if c == '-' && !previousHyphen {
+			previousHyphen = true
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validSkillDigest(value string) bool {
+	if !strings.HasPrefix(value, "sha256:") || len(value) != len("sha256:")+64 {
+		return false
+	}
+	hexValue := strings.TrimPrefix(value, "sha256:")
+	_, err := hex.DecodeString(hexValue)
+	return err == nil && hexValue == strings.ToLower(hexValue)
 }
 
 func descriptorMatchesRequest(descriptor protocol.ToolDescriptor, request protocol.AuthorizationRequest) bool {
