@@ -331,6 +331,22 @@ type TrustedShellCommandV1 struct {
 	Enabled   bool   `json:"enabled"`
 }
 
+// SkillTrustCommandV1 records an explicit decision for the exact project
+// catalog the caller inspected. It is deliberately independent of permission
+// grants: trusting skill text only controls catalog activation.
+type SkillTrustCommandV1 struct {
+	WorkspaceID   WorkspaceID `json:"workspace_id"`
+	CatalogDigest Digest      `json:"catalog_digest"`
+	Decision      string      `json:"decision"`
+}
+
+func (c SkillTrustCommandV1) Validate() error {
+	if c.WorkspaceID == "" || c.CatalogDigest.Validate() != nil || (c.Decision != "allow" && c.Decision != "deny") {
+		return fmt.Errorf("invalid skill trust command")
+	}
+	return nil
+}
+
 type OpenSessionCommandV1 struct {
 	SessionID SessionID `json:"session_id"`
 }

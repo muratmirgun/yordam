@@ -81,6 +81,12 @@ func (a *LegacyAdapter) Command(command Command) (protocol.Command, error) {
 	} else if a.selectedSessionID != "" {
 		expectation = &protocol.CommandExpectation{SelectedSessionID: a.selectedSessionID}
 	}
+	// Trust controls are workspace-scoped. Deliberately drop a convenience
+	// selected-session cursor supplied by the normal runtime callback so the
+	// exact workspace decision cannot accidentally become session-bound.
+	if command.Kind == CommandTrustSkillCatalog && expectation != nil {
+		expectation = &protocol.CommandExpectation{WorkspaceControl: protocol.DeepCopy(expectation.WorkspaceControl)}
+	}
 	var commandID protocol.CommandID
 	var idempotencyKey string
 	if command.Kind == CommandCompact {
@@ -97,6 +103,20 @@ func (a *LegacyAdapter) Command(command Command) (protocol.Command, error) {
 			return protocol.Command{}, digestErr
 		}
 		commandID = protocol.CommandID("legacy-compact-" + identity.Value)
+		idempotencyKey = string(commandID)
+	} else if command.Kind == CommandTrustSkillCatalog {
+		if expectation == nil || expectation.WorkspaceControl == nil {
+			return protocol.Command{}, fmt.Errorf("skill trust command requires a workspace-control cursor")
+		}
+		identity, digestErr := canonicaljson.Digest(struct {
+			Workspace  protocol.CommittedCursor     `json:"workspace"`
+			Trust      protocol.SkillTrustCommandV1 `json:"trust"`
+			Generation protocol.RuntimeGenerationID `json:"generation"`
+		}{*expectation.WorkspaceControl, command.SkillTrust, a.runtimeGenerationID})
+		if digestErr != nil {
+			return protocol.Command{}, digestErr
+		}
+		commandID = protocol.CommandID("legacy-skill-trust-" + identity.Value)
 		idempotencyKey = string(commandID)
 	} else {
 		random := make([]byte, 16)
@@ -153,6 +173,8 @@ func (a *LegacyAdapter) commandPayload(command Command) (string, any, error) {
 		return string(CommandCompact), protocol.EmptyCommandV1{}, nil
 	case CommandReloadConfig:
 		return string(CommandReloadConfig), protocol.EmptyCommandV1{}, nil
+	case CommandTrustSkillCatalog:
+		return string(CommandTrustSkillCatalog), command.SkillTrust, nil
 	case CommandNewSession:
 		return string(CommandNewSession), protocol.EmptyCommandV1{}, nil
 	case CommandOpenSession:

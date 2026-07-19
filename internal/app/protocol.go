@@ -129,6 +129,7 @@ var commandPayloads = map[string]commandPayloadFactory{
 	string(CommandOpenSession):          func() any { return &protocol.OpenSessionCommandV1{} },
 	string(CommandCompact):              func() any { return &protocol.EmptyCommandV1{} },
 	string(CommandReloadConfig):         func() any { return &protocol.EmptyCommandV1{} },
+	string(CommandTrustSkillCatalog):    func() any { return &protocol.SkillTrustCommandV1{} },
 	string(CommandNewSession):           func() any { return &protocol.EmptyCommandV1{} },
 	string(CommandShutdown):             func() any { return &protocol.EmptyCommandV1{} },
 	CommandKindRequestSnapshot:          func() any { return &protocol.EmptyCommandV1{} },
@@ -258,6 +259,8 @@ func validateDecodedCommand(kind string, payload any) error {
 		if value.SessionID == "" {
 			return fmt.Errorf("session ID is required")
 		}
+	case *protocol.SkillTrustCommandV1:
+		return value.Validate()
 	case *protocol.EmptyCommandV1:
 	default:
 		return fmt.Errorf("unsupported decoded command %q", kind)
@@ -333,6 +336,7 @@ func (s *ProtocolService) Execute(ctx context.Context, command protocol.Command)
 
 func (s *ProtocolService) commandJournal(command protocol.Command, decoded any) (protocol.JournalRef, error) {
 	workspaceCommand := command.Kind == CommandKindStartControlOperation || command.Kind == string(CommandReloadConfig) ||
+		command.Kind == string(CommandTrustSkillCatalog) ||
 		command.Kind == string(CommandNewSession) || command.Kind == string(CommandOpenSession) ||
 		command.Kind == string(CommandChangeMode) || command.Kind == string(CommandChangeModel) ||
 		command.Kind == string(CommandAcknowledgeAutoShell) ||

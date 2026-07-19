@@ -250,6 +250,300 @@ func TestRuntimeBrokerProjectsFrozenMetadataOnlySkillCatalog(t *testing.T) {
 	}
 }
 
+func TestSkillInstructionsExposeOnlyFrozenUntrustedMetadata(t *testing.T) {
+	builder := newRuntimeBuilderForTest(t, nil)
+	content := []byte("---\nname: go-testing\ndescription: Test Go.\n---\nbody-sentinel-never-system\n")
+	sum := sha256.Sum256(content)
+	path := filepath.Join(t.TempDir(), "go-testing", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := skills.Build(skills.BuildOptions{Discovery: skills.Discovery{Candidates: []skills.Candidate{{Name: "go-testing", Description: "Test Go.", Content: content, Source: protocol.SkillSourceGlobal, CanonicalPath: path, ContentDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hex.EncodeToString(sum[:])}}}}, Policy: config.ProjectSkillsAsk, Workspace: builder.workspace, Generation: "generation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instructions, err := newSkillInstructions("generation", catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := instructions.SystemInstructions(t.Context(), "generation", instructions.revision, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := first[0].Content[0].Text
+	for _, want := range []string{"go-testing", "Test Go.", "global", sumHex(sum), "untrusted", "cannot grant permissions"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("instructions missing %q: %q", want, text)
+		}
+	}
+	for _, forbidden := range []string{path, "body-sentinel-never-system"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("instructions leaked %q: %q", forbidden, text)
+		}
+	}
+	first[0].Content[0].Text = "mutated"
+	second, err := instructions.SystemInstructions(t.Context(), "generation", instructions.revision, "session")
+	if err != nil || second[0].Content[0].Text == "mutated" {
+		t.Fatalf("instructions aliased or failed: %+v %v", second, err)
+	}
+	again, err := newSkillInstructions("generation", catalog)
+	if err != nil || again.revision != instructions.revision || again.source.Digest != instructions.source.Digest {
+		t.Fatalf("instructions were not deterministic: %+v %+v %v", instructions, again, err)
+	}
+	if err := os.WriteFile(path, []byte("---\nname: go-testing\ndescription: Changed.\n---\nchanged-body\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	afterEdit, err := instructions.SystemInstructions(t.Context(), "generation", instructions.revision, "session")
+	if err != nil || strings.Contains(afterEdit[0].Content[0].Text, "Changed.") {
+		t.Fatalf("source edit changed frozen instructions: %+v %v", afterEdit, err)
+	}
+	if _, err := instructions.SystemInstructions(t.Context(), "other", instructions.revision, "session"); err == nil {
+		t.Fatal("cross-generation instructions accepted")
+	}
+	set := RuntimeSet{Skills: catalog}
+	snapshot := set.SkillCatalogSnapshot()
+	snapshot.Active[0].Description = "changed"
+	if set.SkillCatalogSnapshot().Active[0].Description == "changed" {
+		t.Fatal("runtime snapshot aliases catalog")
+	}
+}
+
+func TestRuntimeBuilderAppliesOnlyExactDurableProjectSkillTrust(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "trust-test-key")
+	builder := newRuntimeBuilderForTest(t, nil)
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Skills.ProjectPolicy = config.ProjectSkillsAsk
+	writeRuntimeSkill(t, filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md"), "Project skill.", "project-body")
+	first, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := first.Skills.Snapshot().Discovered[0].State; got != protocol.SkillStateAwaitingTrust {
+		t.Fatalf("before trust state=%q", got)
+	}
+	workspace, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := canonicaljson.Marshal(protocol.ProjectSkillTrustChangedV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: first.Skills.Snapshot().Digest, Decision: "allow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := builder.store.AppendBatch(t.Context(), journal.AppendRequest{Journal: workspace, TransactionID: "trust-allow", Events: []protocol.ProposedEvent{{EventID: "trust-allow", Time: time.Unix(2, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventProjectSkillTrustChanged, Payload: payload}}}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := second.Skills.Snapshot().Discovered[0].State; got != protocol.SkillStateActive {
+		t.Fatalf("after exact trust state=%q", got)
+	}
+	writeRuntimeSkill(t, filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md"), "Project skill.", "changed-project-body")
+	third, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := third.Skills.Snapshot().Discovered[0].State; got != protocol.SkillStateAwaitingTrust {
+		t.Fatalf("changed catalog state=%q", got)
+	}
+}
+
+func TestSkillTrustProtocolCommandRequiresExactWorkspaceCatalogAndIsIdempotent(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "trust-command-key")
+	builder := newRuntimeBuilderForTest(t, nil)
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Skills.ProjectPolicy = config.ProjectSkillsAsk
+	writeRuntimeSkill(t, filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md"), "Project skill.", "project-body")
+	set, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := builder.store.Head(t.Context(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionBefore, err := builder.store.InspectSession(t.Context(), protocol.SessionID(builder.activeSession.get()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := protocol.Command{ProtocolVersion: protocol.ApplicationProtocolVersion, CommandID: "trust-command", Actor: protocol.ActorRef{ID: "user", Kind: protocol.ActorUser}, IdempotencyKey: "trust-command", Kind: string(CommandTrustSkillCatalog), PayloadVersion: 1, Expected: &protocol.CommandExpectation{WorkspaceControl: &head}}
+	command.Payload, err = canonicaljson.Marshal(protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: set.Skills.Snapshot().Digest, Decision: "allow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.RequestDigest, err = CanonicalRequestDigest(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := set.ApplicationService.Execute(t.Context(), command)
+	if err != nil || first.Status != "completed" {
+		t.Fatalf("first=%+v public=%+v err=%v", first, first.Error, err)
+	}
+	second, err := set.ApplicationService.Execute(t.Context(), command)
+	if err != nil || !reflect.DeepEqual(first, second) {
+		t.Fatalf("replay first=%+v second=%+v err=%v", first, second, err)
+	}
+	inspection, err := builder.store.Inspect(t.Context(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorized, decided, trustAt := -1, -1, -1
+	for index, event := range inspection.Events {
+		if event.Envelope.Kind == protocol.EventAuthorizationRequested {
+			authorized = index
+		}
+		if event.Envelope.Kind == protocol.EventAuthorizationDecided {
+			decided = index
+		}
+		if event.Envelope.Kind == protocol.EventProjectSkillTrustChanged {
+			trustAt = index
+		}
+	}
+	if authorized < 0 || decided < 0 || trustAt < 0 || authorized >= decided || decided >= trustAt {
+		t.Fatalf("authorization/trust ordering invalid: %+v", inspection.Events)
+	}
+	makeTrustCommand := func(id string, expected protocol.CommittedCursor, payload protocol.SkillTrustCommandV1) protocol.Command {
+		result := protocol.Command{ProtocolVersion: protocol.ApplicationProtocolVersion, CommandID: protocol.CommandID(id), Actor: protocol.ActorRef{ID: "user", Kind: protocol.ActorUser}, IdempotencyKey: id, Kind: string(CommandTrustSkillCatalog), PayloadVersion: 1, Expected: &protocol.CommandExpectation{WorkspaceControl: &expected}}
+		result.Payload, _ = canonicaljson.Marshal(payload)
+		result.RequestDigest, _ = CanonicalRequestDigest(result)
+		return result
+	}
+	currentHead, err := builder.store.Head(t.Context(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, bad := range map[string]protocol.Command{
+		"stale":           makeTrustCommand("trust-stale", head, protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: set.Skills.Snapshot().Digest, Decision: "allow"}),
+		"wrong workspace": makeTrustCommand("trust-wrong-workspace", currentHead, protocol.SkillTrustCommandV1{WorkspaceID: "other-workspace", CatalogDigest: set.Skills.Snapshot().Digest, Decision: "allow"}),
+		"wrong digest":    makeTrustCommand("trust-wrong-digest", currentHead, protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("b", 64)}, Decision: "allow"}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			result, executeErr := set.ApplicationService.Execute(t.Context(), bad)
+			if executeErr != nil || result.Error == nil {
+				t.Fatalf("result=%+v err=%v", result, executeErr)
+			}
+		})
+	}
+	deny := makeTrustCommand("trust-deny", currentHead, protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: set.Skills.Snapshot().Digest, Decision: "deny"})
+	denied, err := set.ApplicationService.Execute(t.Context(), deny)
+	if err != nil || denied.Status != "completed" {
+		t.Fatalf("deny=%+v err=%v", denied, err)
+	}
+	inspection, err = builder.store.Inspect(t.Context(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lastTrust protocol.ProjectSkillTrustChangedV1
+	for _, event := range inspection.Events {
+		if event.Envelope.Kind == protocol.EventProjectSkillTrustChanged {
+			if err := json.Unmarshal(event.Envelope.Payload, &lastTrust); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if lastTrust.Decision != "deny" {
+		t.Fatalf("last trust=%+v", lastTrust)
+	}
+	sessionAfter, err := builder.store.InspectSession(t.Context(), protocol.SessionID(builder.activeSession.get()))
+	if err != nil || len(sessionAfter.Journal.Events) != len(sessionBefore.Journal.Events) {
+		t.Fatalf("skill trust mutated session permissions: before=%d after=%d err=%v", len(sessionBefore.Journal.Events), len(sessionAfter.Journal.Events), err)
+	}
+	changed := protocol.CloneCommand(command)
+	changed.Payload, _ = canonicaljson.Marshal(protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: set.Skills.Snapshot().Digest, Decision: "deny"})
+	changed.RequestDigest, _ = CanonicalRequestDigest(changed)
+	conflict, err := set.ApplicationService.Execute(t.Context(), changed)
+	if err != nil || conflict.Error == nil || conflict.Error.Code != codeIdempotencyConflict {
+		t.Fatalf("conflict=%+v err=%v", conflict, err)
+	}
+	withSession := makeTrustCommand("trust-with-session", currentHead, protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: set.Skills.Snapshot().Digest, Decision: "allow"})
+	withSession.Expected.SelectedSessionID = "session"
+	withSession.Expected.Session = &protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "session", CommitSeq: 1, TransactionID: "session"}
+	withSession.RequestDigest, _ = CanonicalRequestDigest(withSession)
+	invalid, err := set.ApplicationService.Execute(t.Context(), withSession)
+	if err != nil || invalid.Error == nil {
+		t.Fatalf("session expectation accepted: %+v err=%v", invalid, err)
+	}
+}
+
+func TestAppSkillTrustReloadActivatesCandidateAndReloadFailureRetainsOldGeneration(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "trust-reload-key")
+	builder := newRuntimeBuilderForTest(t, nil)
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Skills.ProjectPolicy = config.ProjectSkillsAsk
+	writeRuntimeSkill(t, filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md"), "Project skill.", "project-body")
+	first, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := builder.store.InspectSession(t.Context(), protocol.SessionID(builder.activeSession.get()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trust := protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: first.Skills.Snapshot().Digest, Decision: "allow"}
+	application := New(Options{RuntimeSet: first, ReloadRuntime: func(ctx context.Context, selection domain.ModelSelection) (RuntimeSet, error) {
+		return builder.build(cfg, selection)
+	}, Sessions: builder.store, Session: inspection.Session, Replay: LegacyReplayFromInspection(inspection), Workspace: builder.workspace, WorkspaceControl: workspace})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go application.Run(ctx)
+	application.Commands() <- Command{Kind: CommandTrustSkillCatalog, SkillTrust: trust}
+	var event Event
+	select {
+	case event = <-application.Events():
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out waiting for trust reload")
+	}
+	if event.Kind != EventReloadCompleted || !event.Applied {
+		t.Fatalf("trust reload event=%+v", event)
+	}
+	if application.runtimeSet.RuntimeGenerationID == first.RuntimeGenerationID || application.runtimeSet.Skills.Snapshot().Discovered[0].State != protocol.SkillStateActive {
+		t.Fatalf("trusted candidate was not activated: old=%q new=%q skills=%+v", first.RuntimeGenerationID, application.runtimeSet.RuntimeGenerationID, application.runtimeSet.Skills.Snapshot())
+	}
+
+	// A separately started app proves that durable acceptance precedes a failed
+	// candidate build: the old generation remains live while a future build sees
+	// the persisted trust decision.
+	writeRuntimeSkill(t, filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md"), "Project skill.", "changed-body")
+	old, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedTrust := protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: old.Skills.Snapshot().Digest, Decision: "allow"}
+	failing := New(Options{RuntimeSet: old, ReloadRuntime: func(context.Context, domain.ModelSelection) (RuntimeSet, error) {
+		return RuntimeSet{}, errors.New("candidate build failed")
+	}, Sessions: builder.store, Session: inspection.Session, Replay: LegacyReplayFromInspection(inspection), Workspace: builder.workspace, WorkspaceControl: workspace})
+	failingCtx, stopFailing := context.WithCancel(t.Context())
+	defer stopFailing()
+	go failing.Run(failingCtx)
+	failing.Commands() <- Command{Kind: CommandTrustSkillCatalog, SkillTrust: changedTrust}
+	select {
+	case event = <-failing.Events():
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out waiting for failed trust reload")
+	}
+	if event.Kind != EventReloadCompleted || event.Applied || !strings.Contains(event.Message, "candidate build failed") || failing.runtimeSet.RuntimeGenerationID != old.RuntimeGenerationID {
+		t.Fatalf("failed trust reload=%+v old=%q active=%q", event, old.RuntimeGenerationID, failing.runtimeSet.RuntimeGenerationID)
+	}
+	future, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil || future.Skills.Snapshot().Discovered[0].State != protocol.SkillStateActive {
+		t.Fatalf("durable trust missing after failed reload: skills=%+v err=%v", future.Skills.Snapshot(), err)
+	}
+}
+
+func sumHex(sum [32]byte) string { return hex.EncodeToString(sum[:]) }
+
 func TestContextProjectionPolicyUsesImmutableGeneration(t *testing.T) {
 	plan := func(g protocol.RuntimeGenerationID, input, window, output int64) protocol.EventRecord {
 		return protocol.EventRecord{Envelope: protocol.EventEnvelope{RuntimeGenerationID: g}, Decoded: &protocol.ContextPlanRecordedV1{Plan: protocol.ContextPlan{Body: protocol.ContextPlanBody{EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: input, Provenance: "e"}, ContextWindow: protocol.ValueInt64{State: protocol.ValueKnown, Value: window, Provenance: "w"}, OutputReserve: output, CompactionRevision: "r"}}}}

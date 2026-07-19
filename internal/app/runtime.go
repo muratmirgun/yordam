@@ -22,6 +22,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/evidence"
 	"github.com/muratmirgun/yordam/internal/orchestrator"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/projection"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/provider"
 	"github.com/muratmirgun/yordam/internal/provider/openaicompat"
@@ -180,6 +181,16 @@ func (s RuntimeSet) BindApprover(approver ports.PermissionApprover) {
 	}
 }
 
+// SkillCatalogSnapshot returns a deep-copied description of the catalog frozen
+// into this generation. Child handoffs must use this snapshot rather than
+// rescanning mutable filesystem input.
+func (s RuntimeSet) SkillCatalogSnapshot() protocol.SkillCatalogSnapshot {
+	if s.Skills == nil {
+		return protocol.SkillCatalogSnapshot{}
+	}
+	return protocol.DeepCopy(s.Skills.Snapshot())
+}
+
 type runtimeBuilder struct {
 	configPath       string
 	cli              cli.Options
@@ -286,6 +297,13 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		Redact:           admission,
 		Admission:        admission,
 	}
+	workspaceControl := b.workspaceControl
+	if workspaceControl == (protocol.JournalRef{}) {
+		workspaceControl, err = b.store.EnsureWorkspaceControl(context.Background(), b.workspace)
+		if err != nil {
+			return RuntimeSet{}, configurationError(b.configPath, "initialize workspace control", err)
+		}
+	}
 	discovery, err := skills.Discover(context.Background(), skills.DiscoveryOptions{
 		Workspace:    b.workspace,
 		GlobalRoot:   filepath.Join(filepath.Dir(b.configPath), "skills"),
@@ -295,7 +313,23 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 	if err != nil {
 		return RuntimeSet{}, configurationError(b.configPath, "discover skills", err)
 	}
-	skillCatalog, err := skills.Build(skills.BuildOptions{Discovery: discovery, Policy: cfg.Skills.ProjectPolicy, Workspace: b.workspace, Generation: generationID})
+	projectDigest, err := skills.ProjectCatalogDigest(discovery.Candidates)
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "digest discovered project skills", err)
+	}
+	workspaceHead, err := b.store.Head(context.Background(), workspaceControl)
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "read workspace trust", err)
+	}
+	var trust *skills.TrustState
+	if workspaceHead != (protocol.CommittedCursor{}) {
+		trustProjection, projectErr := projection.New[skills.TrustProjection](b.store, skills.TrustProjector{}, nil).At(context.Background(), workspaceControl, workspaceHead)
+		if projectErr != nil {
+			return RuntimeSet{}, configurationError(b.configPath, "project skill trust", projectErr)
+		}
+		trust, _ = trustProjection.State.Resolve(protocol.WorkspaceID(b.workspace.ID), projectDigest)
+	}
+	skillCatalog, err := skills.Build(skills.BuildOptions{Discovery: discovery, Policy: cfg.Skills.ProjectPolicy, Trust: trust, Workspace: b.workspace, Generation: generationID})
 	if err != nil {
 		return RuntimeSet{}, configurationError(b.configPath, "build skill catalog", err)
 	}
@@ -353,6 +387,10 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		}
 		toolDescriptors = append(toolDescriptors, descriptor)
 	}
+	instructions, err := newSkillInstructions(generationID, skillCatalog)
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "build skill instructions", err)
+	}
 	body := protocol.RuntimeGenerationBody{
 		ProviderCatalogRevision: providerCatalogRevision,
 		Models:                  protocol.DeepCopy(models),
@@ -360,7 +398,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		Tools:                   protocol.DeepCopy(toolDescriptors),
 		SkillCatalogRevision:    skillCatalog.Snapshot().Revision,
 		Skills:                  skillCatalog.Snapshot().Active,
-		InstructionRevision:     "system-v1",
+		InstructionRevision:     instructions.revision,
 		PolicyGeneration:        "compatibility-v1",
 		ExecutionProfiles:       []string{"network", "restricted", "unsandboxed"},
 		Limits: protocol.RuntimeLimits{
@@ -375,13 +413,6 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 	manifest := protocol.RuntimeGenerationManifest{ID: generationID, Body: protocol.DeepCopy(body), Digest: manifestDigest}
 	if b.lane == nil {
 		b.lane = orchestrator.NewOperationLane()
-	}
-	workspaceControl := b.workspaceControl
-	if workspaceControl == (protocol.JournalRef{}) {
-		workspaceControl, err = b.store.EnsureWorkspaceControl(context.Background(), b.workspace)
-		if err != nil {
-			return RuntimeSet{}, configurationError(b.configPath, "initialize application broker", err)
-		}
 	}
 	broker, err := NewBroker(BrokerOptions{
 		Source: runtimeBrokerSource{Repository: b.store, Workspace: workspaceControl, Generation: generationID, Manifest: manifest, Skills: skillCatalog},
@@ -414,7 +445,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		Tools: toolService, Authorization: authorizer, Approver: approverBridge,
 		Evidence: evidenceStore, Recovery: recoveryRecorder{Tools: toolService, Store: recoveryStore},
 		Verification: verification.NewService(time.Now), Projection: recoveryProjection{Repository: b.store},
-		Publisher: publisher, Admission: generationAdmission{Registry: secretRegistry}, Instructions: staticInstructions{},
+		Publisher: publisher, Admission: generationAdmission{Registry: secretRegistry}, Instructions: instructions,
 	})
 	if err != nil {
 		_ = evidenceStore.Close()
@@ -474,7 +505,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 			}
 		},
 	}
-	dispatcher := runtimeCommandDispatcher{Orchestrator: service, Store: b.store, Manifest: protocol.DeepCopy(manifest), Workspace: workspaceControl}
+	dispatcher := runtimeCommandDispatcher{Orchestrator: service, Store: b.store, Manifest: protocol.DeepCopy(manifest), Workspace: workspaceControl, WorkspaceID: protocol.WorkspaceID(b.workspace.ID), Skills: skillCatalog}
 	applicationService, err := NewProtocolService(ProtocolServiceOptions{
 		Orchestrator: service, Dispatcher: dispatcher, Broker: broker, WorkspaceControl: workspaceControl,
 	})

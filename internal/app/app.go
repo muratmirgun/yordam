@@ -472,6 +472,41 @@ func (a *App) Run(ctx context.Context) error {
 					candidate, err := a.reloadRuntime(reloadCtx, selection)
 					done <- operationResult{kind: operationReload, err: err, runtimeSet: candidate}
 				}()
+			case CommandTrustSkillCatalog:
+				if activeOperation != "" {
+					a.publish(ctx, Event{Kind: EventRejected, Message: "an operation is already active"})
+					continue
+				}
+				if a.runtimeSet.LegacyAdapter == nil || a.runtimeSet.ApplicationService == nil || a.reloadRuntime == nil {
+					a.publish(ctx, Event{Kind: EventRejected, Message: "skill trust reload is not available"})
+					continue
+				}
+				reloadCtx, cancel := context.WithCancel(ctx)
+				activeCancel = cancel
+				activeOperation = operationReload
+				selection := a.session.Selection
+				activeSet := a.runtimeSet
+				go func() {
+					protocolCommand, err := activeSet.LegacyAdapter.Command(command)
+					if err == nil {
+						result, executeErr := activeSet.ApplicationService.Execute(reloadCtx, protocolCommand)
+						if executeErr != nil {
+							err = executeErr
+						} else if result.Status != "completed" {
+							if result.Error != nil {
+								err = fmt.Errorf("skill trust command failed: %s", result.Error.Message)
+							} else {
+								err = fmt.Errorf("skill trust command status %q", result.Status)
+							}
+						}
+					}
+					if err != nil {
+						done <- operationResult{kind: operationReload, err: err}
+						return
+					}
+					candidate, err := a.reloadRuntime(reloadCtx, selection)
+					done <- operationResult{kind: operationReload, err: err, runtimeSet: candidate}
+				}()
 			case CommandChangeMode:
 				if err := command.Mode.Validate(); err != nil {
 					a.publish(ctx, Event{Kind: EventRejected, Message: err.Error()})

@@ -2551,6 +2551,11 @@ func validateControlRequest(request ControlRequest, recovery bool) error {
 		if err := validateProposedEvent(request.Event, request.Journal); err != nil {
 			return err
 		}
+		if request.Event.Kind == protocol.EventProjectSkillTrustChanged {
+			if err := validateProjectSkillTrustControl(request); err != nil {
+				return err
+			}
+		}
 	}
 	wantEvent := map[OperationKind]string{
 		OperationControl:          protocol.EventMigrationDiagnostic,
@@ -2558,8 +2563,24 @@ func validateControlRequest(request ControlRequest, recovery bool) error {
 		OperationRecovery:         protocol.EventRecoveryDiagnostic,
 		OperationReloadActivation: protocol.EventRuntimeGenerationActivated,
 	}[request.Kind]
-	if !settingControl && request.Event.Kind != wantEvent {
+	if !settingControl && request.Event.Kind != wantEvent && !(request.Kind == OperationControl && request.Event.Kind == protocol.EventProjectSkillTrustChanged) {
 		return fmt.Errorf("control kind %q requires event %q", request.Kind, wantEvent)
+	}
+	return nil
+}
+
+func validateProjectSkillTrustControl(request ControlRequest) error {
+	var trust protocol.ProjectSkillTrustChangedV1
+	if err := json.Unmarshal(request.Event.Payload, &trust); err != nil || trust.Validate() != nil || protocol.JournalID(trust.WorkspaceID) != request.Journal.ID {
+		return fmt.Errorf("project skill trust event binding is invalid")
+	}
+	body := request.Plan.Body
+	if body.Tool != (protocol.ToolIdentity{Source: "runtime", Authority: "yordam", Name: "skill-trust"}) || body.Action != "runtime.skill.trust" || body.Boundary != "workspace_control" || len(body.Resources) != 1 {
+		return fmt.Errorf("project skill trust action plan is invalid")
+	}
+	resource := body.Resources[0]
+	if resource.Kind != "skill_catalog" || resource.CanonicalID != string(trust.WorkspaceID) || resource.Digest != trust.CatalogDigest.Algorithm+":"+trust.CatalogDigest.Value || len(resource.Attributes) != 1 || resource.Attributes[0] != (protocol.ResourceAttribute{Name: "decision", Value: trust.Decision}) {
+		return fmt.Errorf("project skill trust target binding is invalid")
 	}
 	return nil
 }
