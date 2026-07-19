@@ -30,9 +30,9 @@ func TestMaterializeSelectedScenarioByteIdentical(t *testing.T) {
 		t.Fatalf("Materialize() error = %v", err)
 	}
 
-	want, err := os.ReadFile(filepath.Join("..", "..", "acceptance", "testdata", "foundation", "v1-valid", "events.jsonl"))
-	if err != nil {
-		t.Fatal(err)
+	want, ok := Read("v1-valid", "events.jsonl")
+	if !ok {
+		t.Fatal("Read(\"v1-valid\", \"events.jsonl\") returned ok = false")
 	}
 	got, err := os.ReadFile(filepath.Join(root, "v1-valid", "events.jsonl"))
 	if err != nil {
@@ -89,10 +89,13 @@ func TestReadReturnsDefensiveCopy(t *testing.T) {
 	}
 }
 
-func TestReadMatchesEverySourceFixtureFile(t *testing.T) {
-	fixtureRoot := filepath.Join("..", "..", "acceptance", "testdata", "foundation")
+func TestReadMatchesEveryMaterializedFixtureFile(t *testing.T) {
+	fixtureRoot := t.TempDir()
+	if err := Materialize(fixtureRoot); err != nil {
+		t.Fatalf("Materialize() error = %v", err)
+	}
 	err := filepath.WalkDir(fixtureRoot, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() || entry.Name() == "fixtures.sha256" {
+		if err != nil || entry.IsDir() {
 			return err
 		}
 		relative, err := filepath.Rel(fixtureRoot, path)

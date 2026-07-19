@@ -1,1 +1,0 @@
-{"sessions":[{"id":"session-parent","parent_id":"session-child","parent_cursor":{"commit_seq":2,"transaction_id":"txn-parent"}},{"id":"session-child","parent_id":"session-parent","parent_cursor":{"commit_seq":2,"transaction_id":"txn-child"}}]}

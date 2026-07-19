@@ -1,1 +1,0 @@
-{"evidence_id":"evidence-corrupt","declared_digest":{"algorithm":"sha256","value":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"actual_content":"digest mismatch fixture","producing_activity_id":"activity-evidence"}

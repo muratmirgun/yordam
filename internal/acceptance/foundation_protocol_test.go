@@ -5,7 +5,6 @@ package acceptance_test
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -15,7 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -27,6 +26,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
+	"github.com/muratmirgun/yordam/internal/testsupport/foundationfixture"
 )
 
 const (
@@ -37,23 +37,6 @@ const (
 	traceCatalog     = "PRD-FR-06/07; Capability 3.3/3.5; Foundation 14-15"
 	traceApplication = "PRD-FR-02/03/10; Capability 3.9/4.3; Foundation 16; Acceptance 6.2"
 )
-
-var foundationFixtureNames = []string{
-	"v1-valid",
-	"v1-truncated-final",
-	"v1-unmatched-tool-start",
-	"v1-stale-edit-recovery",
-	"mixed-v1-v2",
-	"unknown-future-kind",
-	"unsupported-envelope-version",
-	"unsupported-payload-version",
-	"invalid-known-payload",
-	"invalid-sequence",
-	"incomplete-batch",
-	"missing-evidence-blob",
-	"evidence-digest-mismatch",
-	"lineage-cycle",
-}
 
 func acceptFoundationMigration(t *testing.T) {
 	t.Logf("trace=%s", traceMigration)
@@ -182,77 +165,66 @@ func foundationRepositoryRoot(t *testing.T) string {
 
 func validateFoundationFixtures(t *testing.T) {
 	t.Helper()
-	root := filepath.Join("testdata", "foundation")
+	names := foundationfixture.Names()
+	if len(names) != 14 {
+		t.Fatalf("[%s] fixture count=%d want=14", traceMigration, len(names))
+	}
+	const wantDigest = "c20a9601d4a87b7105c2938d57abd9591bef932bd157d563f3cc5d5dd39ccaeb"
+	if got := foundationfixture.Digest(); got != wantDigest {
+		t.Fatalf("[%s] fixture digest=%s want=%s", traceMigration, got, wantDigest)
+	}
+
+	root := t.TempDir()
+	if err := foundationfixture.Materialize(root, names...); err != nil {
+		t.Fatalf("[%s] materialize fixtures: %v", traceMigration, err)
+	}
+	if got := foundationFixtureDirectories(t, root); !slices.Equal(got, names) {
+		t.Fatalf("[%s] materialized fixture inventory=%v want=%v", traceMigration, got, names)
+	}
+	before := snapshotFixtureTree(t, root)
+	validateMaterializedFoundationFixtures(t, root, before)
+	after := snapshotFixtureTree(t, root)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("[%s] materialized fixture bytes changed during validation", traceMigration)
+	}
+	t.Logf("trace=%s fixtures=%d digest=%s files=%d", traceMigration, len(names), wantDigest, len(before))
+}
+
+func foundationFixtureDirectories(t *testing.T, root string) []string {
+	t.Helper()
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		t.Fatalf("[%s] read fixture inventory: %v", traceMigration, err)
+		t.Fatalf("[%s] read materialized fixture inventory: %v", traceMigration, err)
 	}
-	var names []string
+	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() {
 			names = append(names, entry.Name())
 		}
 	}
-	wantNames := append([]string(nil), foundationFixtureNames...)
-	sort.Strings(wantNames)
-	if !reflect.DeepEqual(names, wantNames) {
-		t.Fatalf("[%s] fixture inventory=%v want=%v", traceMigration, names, foundationFixtureNames)
-	}
-	before := snapshotFixtureTree(t, root)
-	manifestRaw, err := os.ReadFile(filepath.Join(root, "fixtures.sha256"))
-	if err != nil {
-		t.Fatalf("[%s] read fixture manifest: %v", traceMigration, err)
-	}
-	seen := make(map[string]bool)
-	for number, line := range strings.Split(strings.TrimSpace(string(manifestRaw)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 || len(fields[0]) != sha256.Size*2 {
-			t.Fatalf("[%s] malformed manifest line %d: %q", traceMigration, number+1, line)
-		}
-		rel := filepath.Clean(fields[1])
-		if rel != fields[1] || filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") || seen[rel] {
-			t.Fatalf("[%s] unsafe or duplicate manifest path %q", traceMigration, rel)
-		}
-		raw, err := os.ReadFile(filepath.Join(root, rel))
+	slices.Sort(names)
+	return names
+}
+
+func validateMaterializedFoundationFixtures(t *testing.T, root string, tree map[string][]byte) {
+	t.Helper()
+	for path, got := range tree {
+		rel, err := filepath.Rel(root, path)
 		if err != nil {
-			t.Fatalf("[%s] read %s: %v", traceMigration, rel, err)
+			t.Fatalf("[%s] resolve materialized fixture path %q: %v", traceMigration, path, err)
 		}
-		got := fmt.Sprintf("%x", sha256.Sum256(raw))
-		if got != fields[0] {
-			t.Fatalf("[%s] checksum %s=%s want=%s", traceMigration, rel, got, fields[0])
+		parts := strings.SplitN(filepath.ToSlash(rel), "/", 2)
+		if len(parts) != 2 {
+			t.Fatalf("[%s] malformed materialized fixture path %q", traceMigration, rel)
 		}
-		seen[rel] = true
-	}
-	for path := range before {
-		rel, _ := filepath.Rel(root, path)
-		if rel != "fixtures.sha256" && !seen[rel] {
-			t.Fatalf("[%s] fixture file %s is absent from manifest", traceMigration, rel)
+		want, ok := foundationfixture.Read(parts[0], parts[1])
+		if !ok {
+			t.Fatalf("[%s] shared fixture bytes unavailable for %q", traceMigration, rel)
 		}
-	}
-	materialized := t.TempDir()
-	workspace := filepath.Join(materialized, "workspace")
-	workspaceID := fmt.Sprintf("%x", sha256.Sum256([]byte(workspace)))
-	for path, raw := range before {
-		rel, _ := filepath.Rel(root, path)
-		if rel == "fixtures.sha256" {
-			continue
-		}
-		replaced := bytes.ReplaceAll(raw, []byte("${WORKSPACE_ID}"), []byte(workspaceID))
-		replaced = bytes.ReplaceAll(replaced, []byte("${WORKSPACE}"), []byte(workspace))
-		destination := filepath.Join(materialized, rel)
-		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
-			t.Fatalf("[%s] materialize fixture directory: %v", traceMigration, err)
-		}
-		if err := os.WriteFile(destination, replaced, 0o600); err != nil {
-			t.Fatalf("[%s] materialize fixture: %v", traceMigration, err)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("[%s] materialized fixture bytes differ for %q", traceMigration, rel)
 		}
 	}
-	after := snapshotFixtureTree(t, root)
-	if !reflect.DeepEqual(after, before) {
-		t.Fatalf("[%s] source fixture bytes changed during materialization", traceMigration)
-	}
-	digest := sha256.Sum256(manifestRaw)
-	t.Logf("trace=%s fixtures=%d manifest_sha256=%x files=%d", traceMigration, len(names), digest, len(seen))
 }
 
 func snapshotFixtureTree(t *testing.T, root string) map[string][]byte {
@@ -287,9 +259,9 @@ func validateEvidenceLineageFixtureExpectations(t *testing.T) {
 		{"evidence-digest-mismatch", "availability", "corrupt"},
 		{"lineage-cycle", "accepted", "false"},
 	} {
-		raw, err := os.ReadFile(filepath.Join("testdata", "foundation", fixture.name, "want.json"))
-		if err != nil {
-			t.Fatalf("[%s] read %s expectation: %v", traceEvidence, fixture.name, err)
+		raw, ok := foundationfixture.Read(fixture.name, "want.json")
+		if !ok {
+			t.Fatalf("[%s] shared fixture expectation unavailable for %s", traceEvidence, fixture.name)
 		}
 		var decoded map[string]any
 		if err := json.Unmarshal(raw, &decoded); err != nil {
