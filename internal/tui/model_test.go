@@ -48,6 +48,27 @@ func TestContextResumeClearsCompactionProgress(t *testing.T) {
 	}
 }
 
+func TestContextDurableRangeRendersAtNarrowAndWideWidths(t *testing.T) {
+	for _, width := range []int{80, 120} {
+		t.Run(fmt.Sprint(width), func(t *testing.T) {
+			m := tui.NewModel(tui.OptionsForTest())
+			m = tui.UpdateForTest(m, tea.WindowSizeMsg{Width: width, Height: 40})
+			m = tui.OpenContextForTest(m)
+			r := protocol.CompactionRange{From: protocol.CommittedCursor{JournalID: "session-range", CommitSeq: 17}, Through: protocol.CommittedCursor{JournalID: "session-range", CommitSeq: 42}}
+			m = tui.ApplyAppEventForTest(m, app.Event{Kind: app.EventState, Context: &protocol.ContextProjectionV1{AutoReason: "below_threshold", EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 100}, ContextWindow: protocol.ValueInt64{State: protocol.ValueKnown, Value: 1000}, ReserveTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 50}, LatestRange: &r, Revision: "revision-7"}})
+			v := m.View().Content
+			for _, want := range []string{"session-range:17–42", "revision-7", "/compact"} {
+				if !strings.Contains(v, want) {
+					t.Fatalf("%d missing %q: %s", width, want, v)
+				}
+			}
+			if strings.Contains(v, "provider-body-sentinel") || strings.Contains(v, "summary-body-sentinel") {
+				t.Fatal(v)
+			}
+		})
+	}
+}
+
 func TestAdaptiveContextLayout(t *testing.T) {
 	model := tui.NewModel(tui.OptionsForTest())
 	model = tui.UpdateForTest(model, tea.WindowSizeMsg{Width: 120, Height: 40})

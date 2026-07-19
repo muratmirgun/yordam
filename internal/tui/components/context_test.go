@@ -106,11 +106,13 @@ func TestContextCompactionLabelsAndPolicyReasons(t *testing.T) {
 		}
 	}
 	for _, trigger := range []string{"manual", "automatic"} {
-		panel := components.NewContext()
-		panel.SetCompactionContext(protocol.ContextProjectionV1{})
-		panel.SetCompactionProgress(protocol.CompactionEventV1{Trigger: trigger, Stage: protocol.CompactionPreparing})
-		if !strings.Contains(panel.View(), "Compaction ("+trigger+"): preparing") {
-			t.Fatal(panel.View())
+		for _, stage := range []protocol.CompactionStage{protocol.CompactionPreparing, protocol.CompactionSummarizing, protocol.CompactionPersisting} {
+			panel := components.NewContext()
+			panel.SetCompactionContext(protocol.ContextProjectionV1{})
+			panel.SetCompactionProgress(protocol.CompactionEventV1{Trigger: trigger, Stage: stage})
+			if !strings.Contains(panel.View(), "Compaction ("+trigger+"): "+string(stage)) {
+				t.Fatal(panel.View())
+			}
 		}
 	}
 }
