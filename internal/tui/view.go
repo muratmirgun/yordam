@@ -117,7 +117,9 @@ func (model Model) renderScreen() string {
 		}
 		return strings.Join(append(lines, "Enter: select | Esc: cancel"), "\n")
 	case ScreenHelp:
-		return "HELP\n/new /sessions /mode /model /reload /compact /help /quit\nCtrl+P: commands | Ctrl+O: context | Ctrl+C: quit | Esc: back"
+		return "HELP\n/new /sessions /mode /model /skills /reload /compact /help /quit\nCtrl+P: commands | Ctrl+O: context | Ctrl+C: quit | Esc: back"
+	case ScreenSkills:
+		return model.skills.View(model.renderWidth())
 	default:
 		return ""
 	}

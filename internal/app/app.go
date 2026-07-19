@@ -744,12 +744,14 @@ func (a *App) completeReload(ctx context.Context, result operationResult) {
 		a.redactors.Replace(candidate.Redactor)
 	}
 	previous.retireSecrets()
+	skills := candidate.SkillSnapshot()
 	event := Event{
 		Kind:      EventReloadCompleted,
 		Applied:   true,
 		Message:   "configuration reloaded",
 		Models:    append([]domain.ModelSelection(nil), candidate.Models...),
 		Selection: selection,
+		Skills:    &skills,
 	}
 	if readyErr := candidate.Ready(selection); readyErr != nil {
 		event.Err = readyErr

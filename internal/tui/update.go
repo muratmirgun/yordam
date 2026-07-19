@@ -93,6 +93,10 @@ func (model Model) handleAppEvent(event app.Event) Model {
 		}
 	case app.EventReloadCompleted:
 		model = model.setTurnActive(false)
+		if event.Applied && event.Skills != nil {
+			model.skillSnapshot = event.Skills.Clone()
+			model = model.refreshSkillsStaleness()
+		}
 		if event.Applied {
 			model = model.replaceModels(event.Models, event.Selection)
 			if event.Message != "" {
@@ -125,7 +129,8 @@ func (model Model) handleAppEvent(event app.Event) Model {
 		model = model.setTurnActive(true)
 		model = model.setTurnProgress(progressWaiting)
 		if result := event.Runtime.Result; result != nil {
-			model.conversation.CompleteTool(result.CallID, "", toolStatus(result.Status), result.Content, result.Duration, result.Truncated)
+			name := skillCardName(event.Runtime.Skill)
+			model.conversation.CompleteTool(result.CallID, name, toolStatus(result.Status), result.Content, result.Duration, result.Truncated)
 			if result.FileChange != nil {
 				model.context.ShowDiff(result.FileChange.Path, result.FileChange.Diff)
 				model = model.openContext()
@@ -199,6 +204,17 @@ func (model Model) handleAppEvent(event app.Event) Model {
 		}
 	}
 	return model
+}
+
+func skillCardName(provenance *domain.SkillProvenance) string {
+	if provenance == nil || provenance.Validate() != nil {
+		return ""
+	}
+	digest := provenance.Digest.Value
+	if len(digest) > 7 {
+		digest = digest[:7]
+	}
+	return "skill " + provenance.Name + " [" + string(provenance.Source) + " " + provenance.Digest.Algorithm + ":" + digest + "]"
 }
 
 func (model Model) applyTerminalReplay(event app.Event) Model {
@@ -292,6 +308,8 @@ func (model Model) routeSubmission(submitted string) Model {
 	case "/help":
 		model.screen = ScreenHelp
 		model.focusedComponent = focusModal
+	case "/skills":
+		model = model.openSkills()
 	case "/quit":
 		if model.turnActive {
 			model.modal = ModalConfirmExit
@@ -303,6 +321,34 @@ func (model Model) routeSubmission(submitted string) Model {
 		model.conversation.Append(components.BlockNotice, "unknown command: "+command)
 	}
 	return model
+}
+
+func (model Model) openSkills() Model {
+	model.displayedSkills = model.skillSnapshot.Clone()
+	model.skills = components.NewSkills(skillScreenOptions(model.displayedSkills, false, model.turnActive))
+	model.screen = ScreenSkills
+	model.focusedComponent = focusModal
+	return model
+}
+
+func (model Model) refreshSkillsStaleness() Model {
+	if model.screen != ScreenSkills {
+		return model
+	}
+	stale := model.displayedSkills.WorkspaceID != model.skillSnapshot.WorkspaceID ||
+		model.displayedSkills.CatalogDigest != model.skillSnapshot.CatalogDigest ||
+		model.displayedSkills.ProjectPolicy != model.skillSnapshot.ProjectPolicy
+	if !stale {
+		// Trust decisions are catalog-digest-bound. A successful reload after a
+		// decision therefore keeps the same digest but changes visible states.
+		model.displayedSkills = model.skillSnapshot.Clone()
+	}
+	model.skills = components.NewSkills(skillScreenOptions(model.displayedSkills, stale, model.turnActive))
+	return model
+}
+
+func skillScreenOptions(snapshot app.SkillSnapshot, stale, active bool) components.SkillScreenOptions {
+	return components.SkillScreenOptions{Snapshot: snapshot.Clone(), Stale: stale, OperationActive: active}
 }
 
 func (model Model) matchesPendingDraft(event app.Event) bool {
@@ -465,6 +511,7 @@ func projectConversation(replay domain.SessionReplay) components.Conversation {
 func (model Model) setTurnActive(active bool) Model {
 	model.turnActive = active
 	model.composer.SetActiveTurn(active)
+	model.skills.SetOperationActive(active)
 	if !active {
 		model = model.setTurnProgress(progressIdle)
 	}

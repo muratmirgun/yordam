@@ -52,6 +52,7 @@ func prepareRun(ctx context.Context, options cli.Options) (*app.App, Model, erro
 		CanonicalWorkspace: snapshot.Workspace.CanonicalPath,
 		Sessions:           snapshot.Sessions,
 		Models:             snapshot.Models,
+		Skills:             snapshot.Skills,
 	})
 	model = model.handleAppEvent(app.Event{
 		Kind:      app.EventState,

@@ -3,6 +3,7 @@ package tui
 import (
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 )
 
@@ -156,6 +157,27 @@ func (model Model) handleScreenKey(key string) Model {
 		}
 	case ScreenHelp:
 		if key == "enter" {
+			model.screen = ScreenConversation
+			model.focusedComponent = focusComposer
+		}
+	case ScreenSkills:
+		switch key {
+		case "up":
+			model.skills.Move(-1)
+		case "down":
+			model.skills.Move(1)
+		case "a", "d":
+			model.skills.SetOperationActive(model.turnActive)
+			decision, ok := model.skills.TrustDecision(key)
+			if !ok {
+				return model
+			}
+			model = model.setTurnActive(true)
+			model.skills.SetOperationActive(true)
+			model.sendAppCommand(app.Command{Kind: app.CommandTrustSkillCatalog, SkillTrust: protocol.SkillTrustCommandV1{
+				WorkspaceID: model.displayedSkills.WorkspaceID, CatalogDigest: model.displayedSkills.CatalogDigest, Decision: string(decision),
+			}})
+		case "enter":
 			model.screen = ScreenConversation
 			model.focusedComponent = focusComposer
 		}

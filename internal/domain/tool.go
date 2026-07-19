@@ -136,6 +136,42 @@ type ToolResult struct {
 	Truncated        bool              `json:"truncated"`
 }
 
+// SkillProvenance is trusted, metadata-only activity-plan provenance for a
+// loaded skill. It is deliberately separate from tool output, which remains
+// untrusted text and may only be expanded as the bounded/redacted result.
+type SkillProvenance struct {
+	Name   string               `json:"name"`
+	Source protocol.SkillSource `json:"source"`
+	Digest protocol.Digest      `json:"digest"`
+}
+
+func (p SkillProvenance) Validate() error {
+	if !validSkillProvenanceName(p.Name) || (p.Source != protocol.SkillSourceGlobal && p.Source != protocol.SkillSourceProject) {
+		return fmt.Errorf("invalid skill provenance")
+	}
+	return p.Digest.Validate()
+}
+
+func validSkillProvenanceName(name string) bool {
+	if name == "" || name[0] == '-' || name[len(name)-1] == '-' {
+		return false
+	}
+	previousHyphen := false
+	for index := range name {
+		character := name[index]
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' {
+			previousHyphen = false
+			continue
+		}
+		if character == '-' && !previousHyphen {
+			previousHyphen = true
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 type ToolProgress struct {
 	CallID    string `json:"call_id"`
 	Text      string `json:"text"`

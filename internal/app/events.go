@@ -54,6 +54,7 @@ type Event struct {
 	Applied     bool
 	Context     *protocol.ContextProjectionV1
 	Compaction  *protocol.CompactionEventV1
+	Skills      *SkillSnapshot
 }
 
 func sanitizePublishedEvent(redactor secret.Redacting, event Event) (Event, error) {

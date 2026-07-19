@@ -57,6 +57,8 @@ type RuntimeSet struct {
 	ProviderService      *provider.Service
 	ToolService          *tooling.Service
 	Skills               skills.Catalog
+	WorkspaceID          protocol.WorkspaceID
+	ProjectSkillPolicy   config.ProjectSkillPolicy
 	AuthorizationService orchestrator.AuthorizationService
 	Broker               *Broker
 	ApplicationService   *ProtocolService
@@ -108,6 +110,9 @@ func (s RuntimeSet) Validate() error {
 	}
 	if s.Skills == nil {
 		return fmt.Errorf("runtime skill catalog is not configured")
+	}
+	if s.WorkspaceID == "" || (s.ProjectSkillPolicy != config.ProjectSkillsAsk && s.ProjectSkillPolicy != config.ProjectSkillsAllow && s.ProjectSkillPolicy != config.ProjectSkillsDeny) {
+		return fmt.Errorf("runtime skill snapshot binding is invalid")
 	}
 	snapshot := s.Skills.Snapshot()
 	if err := snapshot.Validate(); err != nil || snapshot.Revision != s.Manifest.Body.SkillCatalogRevision || !slices.EqualFunc(snapshot.Active, s.Manifest.Body.Skills, sameRuntimeSkillDescriptor) {
@@ -189,6 +194,25 @@ func (s RuntimeSet) SkillCatalogSnapshot() protocol.SkillCatalogSnapshot {
 		return protocol.SkillCatalogSnapshot{}
 	}
 	return protocol.DeepCopy(s.Skills.Snapshot())
+}
+
+// SkillSnapshot is the metadata-only, deep-copied catalog available to a
+// local client. It is a snapshot of this generation, never a filesystem scan.
+func (s RuntimeSet) SkillSnapshot() SkillSnapshot {
+	snapshot := NewSkillSnapshot(s.WorkspaceID, s.SkillCatalogSnapshot(), s.ProjectSkillPolicy)
+	if s.Redactor == nil {
+		return snapshot
+	}
+	for index := range snapshot.Active {
+		snapshot.Active[index].Description = s.Redactor.String(snapshot.Active[index].Description)
+	}
+	for index := range snapshot.Discovered {
+		snapshot.Discovered[index].Description = s.Redactor.String(snapshot.Discovered[index].Description)
+	}
+	for index := range snapshot.Diagnostics {
+		snapshot.Diagnostics[index].Message = s.Redactor.String(snapshot.Diagnostics[index].Message)
+	}
+	return snapshot
 }
 
 type runtimeBuilder struct {
@@ -535,6 +559,8 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		ProviderService:      providerService,
 		ToolService:          toolService,
 		Skills:               skillCatalog,
+		WorkspaceID:          protocol.WorkspaceID(b.workspace.ID),
+		ProjectSkillPolicy:   cfg.Skills.ProjectPolicy,
 		AuthorizationService: authorizer,
 		Broker:               broker,
 		ApplicationService:   applicationService,

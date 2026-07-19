@@ -24,6 +24,7 @@ func TestSlashCommandTable(t *testing.T) {
 		{input: "/sessions", wantScreen: "sessions"},
 		{input: "/mode", wantScreen: "mode"},
 		{input: "/model", wantScreen: "model"},
+		{input: "/skills", wantScreen: "skills"},
 		{input: "/reload", wantCommand: app.CommandReloadConfig, wantScreen: "conversation"},
 		{input: "/compact", wantCommand: app.CommandCompact, wantScreen: "conversation"},
 		{input: "/help", wantScreen: "help"},
@@ -346,7 +347,7 @@ func TestStateModelsDistinguishesNilFromEmpty(t *testing.T) {
 func TestHelpListsReloadCommand(t *testing.T) {
 	model, _ := tui.NavigationModelForTest()
 	model = tui.SubmitForTest(model, "/help")
-	if view := model.View().Content; !strings.Contains(view, "/new /sessions /mode /model /reload /compact /help /quit") {
+	if view := model.View().Content; !strings.Contains(view, "/new /sessions /mode /model /skills /reload /compact /help /quit") {
 		t.Fatalf("help missing reload command:\n%s", view)
 	}
 }

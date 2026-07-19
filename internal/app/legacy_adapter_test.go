@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/app"
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
@@ -147,6 +148,43 @@ func TestApplicationLegacyAdapterContextPlanDoesNotGuessPolicy(t *testing.T) {
 	}
 	if got.Context == nil || got.Context.AutoAvailable || got.Context.AutoReason != "" {
 		t.Fatalf("live plan guessed policy: %+v", got.Context)
+	}
+}
+
+func TestApplicationLegacyAdapterDerivesSkillProvenanceOnlyFromCanonicalPlan(t *testing.T) {
+	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{})
+	digest := protocol.Digest{Algorithm: "sha256", Value: strings.Repeat("a", 64)}
+	body := protocol.ActionPlanBody{
+		CallID: "skill-call", Tool: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "skill"}, SourceRevision: "builtin-v1", DescriptorDigest: digest,
+		Action: "skill", Purpose: "load frozen skill", ExecutionLocus: "local", Effect: "observation", Boundary: "workspace", Reversibility: "exact", VerificationCoverage: "exact", RequestedProfile: "restricted", EffectiveProfile: "restricted", RuntimeGenerationID: "runtime-1",
+		Resources: []protocol.ResourceTarget{{Kind: "skill", CanonicalID: "go-testing", Digest: "sha256:" + digest.Value, Attributes: []protocol.ResourceAttribute{{Name: "runtime_generation", Value: "runtime-1"}, {Name: "source", Value: "project"}, {Name: "workspace_id", Value: "workspace-1"}}}},
+	}
+	planDigest, err := canonicaljson.Digest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned := protocol.ActivityPlannedV1{Plan: &protocol.ActionPlan{Body: body, Digest: planDigest}}
+	raw, err := json.Marshal(planned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityPlanned, "skill-activity", string(raw))); err != nil {
+		t.Fatal(err)
+	}
+	startedPayload, err := json.Marshal(protocol.ActivityStartedV1{DecisionNonce: "nonce", DecisionEventID: "decision", ActivityID: "skill-activity", CallID: "skill-call", PlanDigest: planDigest, RequestDigest: digest, DispatchDigest: digest, RuntimeGenerationID: "runtime-1", DispatchState: "started"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityStarted, "skill-activity", string(startedPayload)))
+	if err != nil || started.Kind != app.EventToolStarted || started.Runtime.Skill == nil || started.Runtime.Skill.Name != "go-testing" || started.Runtime.Progress == nil || started.Runtime.Progress.CallID != "skill-call" {
+		t.Fatalf("started=%+v err=%v", started, err)
+	}
+	completed, err := adapter.Event(compactionApplicationEvent(protocol.EventActivitySucceeded, "skill-activity", `{}`))
+	if err != nil || completed.Kind != app.EventToolCompleted || completed.Runtime.Skill == nil || completed.Runtime.Skill.Source != protocol.SkillSourceProject || completed.Runtime.Result == nil || completed.Runtime.Result.CallID != "skill-call" || completed.Runtime.Result.Status != domain.ToolSucceeded {
+		t.Fatalf("completed=%+v err=%v", completed, err)
+	}
+	if _, ok := adapter.SkillProvenance("skill-activity"); ok {
+		t.Fatal("terminal skill activity retained provenance")
 	}
 }
 

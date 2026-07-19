@@ -43,6 +43,7 @@ type Snapshot struct {
 	Models             []domain.ModelSelection
 	ConfigurationError error
 	Context            *protocol.ContextProjectionV1
+	Skills             SkillSnapshot
 }
 
 func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapshot, err error) {
@@ -253,6 +254,7 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 		Models:             append([]domain.ModelSelection(nil), runtimeSet.Models...),
 		ConfigurationError: configErr,
 		Context:            contextState,
+		Skills:             runtimeSet.SkillSnapshot(),
 	}, nil
 }
 
