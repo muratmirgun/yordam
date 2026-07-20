@@ -7,6 +7,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/compaction"
 	contextplanner "github.com/muratmirgun/yordam/internal/context"
+	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/provider"
@@ -29,6 +30,8 @@ type StartTurnRequest struct {
 	ProviderID   protocol.ProviderID
 	ModelID      protocol.ModelID
 	Runtime      protocol.RuntimeGenerationManifest
+
+	child *childTurnConfig
 }
 
 type CompactRequest struct {
@@ -209,23 +212,54 @@ type EffectStartProbe interface {
 	ProvesNoEffect(context.Context, protocol.ActivityID) (bool, error)
 }
 
+// ChildSessionStore reserves the identity which is bound into the durable
+// parent request before any child session can be published.
+type ChildSessionStore interface {
+	ReserveSessionID() (protocol.SessionID, error)
+	CreateWithIdentity(context.Context, protocol.SessionID, domain.Workspace, domain.PermissionMode, domain.ModelSelection, *journal.SessionLineage) (domain.Session, error)
+	InspectSession(context.Context, protocol.SessionID) (journal.Inspection, error)
+}
+
+// ParentSessionInspector supplies the immutable session identity inherited by
+// a child. It is deliberately separate from ChildSessionStore because the
+// latter exposes only journal inspection to the parent handoff path.
+type ParentSessionInspector interface {
+	InspectSession(context.Context, protocol.SessionID) (journal.SessionInspection, error)
+}
+
+// ChildCoordinator owns the child-side session creation and turn execution.
+// It receives the exact frozen parent request and the pre-reserved identity;
+// implementations must never mint or substitute a child identity.
+type ChildCoordinator interface {
+	RunChild(context.Context, ChildRunRequest) (protocol.SubagentReceiptV1, error)
+}
+
+type ChildRunRequest struct {
+	Manifest protocol.SubagentManifestV1
+	Call     protocol.SubagentCallV1
+	Parent   StartTurnRequest
+}
+
 type Dependencies struct {
-	Lane          OperationLane
-	Repository    journal.Repository
-	TurnLeases    journal.TurnLeaseManager
-	Context       ContextPlanner
-	Providers     ProviderCatalog
-	Provider      ProviderService
-	Tools         ToolService
-	Authorization AuthorizationService
-	Approver      InteractiveApprover
-	Evidence      EvidenceRecorder
-	Recovery      RecoveryRecorder
-	Verification  VerificationService
-	Projection    ProjectionService
-	EffectProbe   EffectStartProbe
-	Publisher     ApplicationEventPublisher
-	BarrierProbe  BarrierProbe
-	Admission     AdmissionService
-	Instructions  InstructionService
+	Lane           OperationLane
+	Repository     journal.Repository
+	TurnLeases     journal.TurnLeaseManager
+	Context        ContextPlanner
+	Providers      ProviderCatalog
+	Provider       ProviderService
+	Tools          ToolService
+	Authorization  AuthorizationService
+	Approver       InteractiveApprover
+	Evidence       EvidenceRecorder
+	Recovery       RecoveryRecorder
+	Verification   VerificationService
+	Projection     ProjectionService
+	EffectProbe    EffectStartProbe
+	Publisher      ApplicationEventPublisher
+	BarrierProbe   BarrierProbe
+	Admission      AdmissionService
+	Instructions   InstructionService
+	ChildSessions  ChildSessionStore
+	ParentSessions ParentSessionInspector
+	Children       ChildCoordinator
 }

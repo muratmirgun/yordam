@@ -20,6 +20,7 @@ import (
 	contextplanner "github.com/muratmirgun/yordam/internal/context"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/evidence"
+	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/orchestrator"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/projection"
@@ -241,6 +242,24 @@ type runtimeBuilder struct {
 	publisher        orchestrator.ApplicationEventPublisher
 	dataDir          string
 	workspaceControl protocol.JournalRef
+}
+
+// childSessionStore deliberately exposes only journal inspection to the
+// parent handoff API while the coordinator receives the full parent-session
+// inspector separately to inherit workspace/mode/model identity.
+type childSessionStore struct{ store *jsonl.Store }
+
+func (s childSessionStore) ReserveSessionID() (protocol.SessionID, error) {
+	return s.store.ReserveSessionID()
+}
+
+func (s childSessionStore) CreateWithIdentity(ctx context.Context, id protocol.SessionID, workspace domain.Workspace, mode domain.PermissionMode, selection domain.ModelSelection, lineage *journal.SessionLineage) (domain.Session, error) {
+	return s.store.CreateWithIdentity(ctx, id, workspace, mode, selection, lineage)
+}
+
+func (s childSessionStore) InspectSession(ctx context.Context, id protocol.SessionID) (journal.Inspection, error) {
+	inspection, err := s.store.InspectSession(ctx, id)
+	return inspection.Journal, err
 }
 
 func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) (RuntimeSet, error) {
@@ -483,6 +502,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 	if publisher == nil {
 		publisher = broker
 	}
+	childSessions := childSessionStore{store: b.store}
 	service, err := orchestrator.NewService(orchestrator.Dependencies{
 		Lane: b.lane, Repository: b.store, TurnLeases: b.store,
 		Context: contextplanner.NewPlanner(toolCatalogRevision, contextplanner.NewEvidenceSummaryResolver(evidenceStore)), Providers: providerCatalog, Provider: providerService,
@@ -490,12 +510,20 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		Evidence: evidenceStore, Recovery: recoveryRecorder{Tools: toolService, Store: recoveryStore},
 		Verification: verification.NewService(time.Now), Projection: recoveryProjection{Repository: b.store},
 		Publisher: publisher, Admission: generationAdmission{Registry: secretRegistry}, Instructions: instructions,
+		ChildSessions: childSessions, ParentSessions: b.store,
 	})
 	if err != nil {
 		_ = evidenceStore.Close()
 		_ = recoveryStore.Close()
 		return RuntimeSet{}, configurationError(b.configPath, "build turn orchestrator", err)
 	}
+	childCoordinator, err := orchestrator.NewSequentialChildCoordinator(childSessions, b.store, service.RunTurn)
+	if err != nil {
+		_ = evidenceStore.Close()
+		_ = recoveryStore.Close()
+		return RuntimeSet{}, configurationError(b.configPath, "build child coordinator", err)
+	}
+	service.SetChildCoordinator(childCoordinator)
 	compactSession := func(ctx context.Context, session domain.Session, _ domain.SessionReplay) error {
 		if session.ID == "" {
 			return fmt.Errorf("compaction requires a selected session")

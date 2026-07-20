@@ -54,6 +54,13 @@ type Service struct {
 	probe      BarrierProbe
 }
 
+// SetChildCoordinator is used only while wiring an immutable runtime before it
+// is exposed to callers. Keeping the coordinator injected preserves small test
+// seams while production uses SequentialChildCoordinator.
+func (s *Service) SetChildCoordinator(coordinator ChildCoordinator) {
+	s.deps.Children = coordinator
+}
+
 func NewService(dependencies Dependencies) (*Service, error) {
 	if dependencies.Repository == nil {
 		return nil, fmt.Errorf("journal repository is required")
@@ -83,7 +90,7 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 		return RunResult{}, err
 	}
 	request.Prompt = admittedPrompt
-	lease, err := s.lane.Acquire(ctx, OperationClaim{Kind: OperationTurn, SessionID: request.SessionID})
+	lease, err := acquireManagedOperationLease(ctx, s.lane, OperationClaim{Kind: OperationTurn, SessionID: request.SessionID})
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -119,6 +126,18 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 		result = terminalResult
 	}()
 
+	if request.child != nil {
+		manifestEvents, manifestErr := s.turnEvents(state, request.Runtime.ID, "subagent-manifest", []struct {
+			kind    string
+			payload any
+		}{{protocol.EventSubagentManifest, request.child.manifest}})
+		if manifestErr != nil {
+			return RunResult{}, manifestErr
+		}
+		if manifestErr = s.append(ctx, &state, "subagent-manifest", manifestEvents); manifestErr != nil {
+			return RunResult{}, manifestErr
+		}
+	}
 	initial, err := s.initialTurnEvents(request, state)
 	if err != nil {
 		return RunResult{}, err
@@ -173,15 +192,19 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 		if len(assistant.ToolIntents) == 0 {
 			return s.completeTurn(ctx, request, &state, assistant, terminal)
 		}
-		if completedTools+len(assistant.ToolIntents) > request.Runtime.Body.Limits.MaxToolCalls {
-			return RunResult{}, fmt.Errorf("tool call limit %d reached", request.Runtime.Body.Limits.MaxToolCalls)
+		maxTools := request.Runtime.Body.Limits.MaxToolCalls
+		if request.child != nil {
+			maxTools = request.child.manifest.MaxToolCalls
+		}
+		if completedTools+len(assistant.ToolIntents) > maxTools {
+			return RunResult{}, fmt.Errorf("tool call limit %d reached", maxTools)
 		}
 		if s.deps.Tools == nil || s.deps.Evidence == nil || s.deps.Recovery == nil {
 			return RunResult{}, fmt.Errorf("tool orchestration dependencies are incomplete")
 		}
 		results := make([]protocol.ContentBlock, 0, len(assistant.ToolIntents))
 		for _, intent := range assistant.ToolIntents {
-			result, runErr := s.runToolIntent(ctx, request, &state, intent)
+			result, runErr := s.runToolIntent(ctx, lease, request, &state, intent)
 			if runErr != nil {
 				return RunResult{}, runErr
 			}
@@ -271,7 +294,7 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 	modelRequest := protocol.ModelRequest{
 		RequestID:  stableID("provider-request", string(request.Command.CommandID), fmt.Sprint(attempt)),
 		ProviderID: model.ProviderID, ModelID: model.ModelID, Messages: messages,
-		Tools: toolExposure(request.Runtime), Requirements: requirements, Plan: plan,
+		Tools: effectiveToolExposure(request), Requirements: requirements, Plan: plan,
 	}
 	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "provider", fmt.Sprint(attempt)))
 	callID := stableID("provider-call", string(request.Command.CommandID), fmt.Sprint(attempt))
@@ -385,13 +408,16 @@ func (s *Service) readFullHistory(ctx context.Context, ref protocol.JournalRef) 
 	}
 }
 
-func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock) (protocol.ToolResultBlock, error) {
+func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock) (protocol.ToolResultBlock, error) {
 	descriptor, ok := toolDescriptor(request.Runtime, intent.Alias)
 	if !ok {
 		if err := s.appendSyntheticToolFailure(ctx, request, state, intent, nil, "unknown tool"); err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
 		return protocol.ToolResultBlock{CallID: intent.CallID, Status: "failed", Text: "unknown tool"}, nil
+	}
+	if canonicalSubagentDescriptor(descriptor) {
+		return s.runSubagentIntent(ctx, lease, request, state, intent)
 	}
 	mutating := descriptor.Body.Effect != "observation"
 	if !mutating {
@@ -1077,7 +1103,7 @@ func (s *Service) authorizeActivity(ctx context.Context, request StartTurnReques
 	})
 }
 
-func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, state *turnState, assistant protocol.AssistantMessageV1, _ protocol.ProviderAttemptTerminalV1) (RunResult, error) {
+func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, state *turnState, assistant protocol.AssistantMessageV1, terminal protocol.ProviderAttemptTerminalV1) (RunResult, error) {
 	verificationActivityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "verification"))
 	assessment, err := s.deps.Verification.Assess(ctx, verification.Request{
 		TaskID: state.taskID, OutcomeContractID: state.contractID, ContractVersion: 2,
@@ -1112,7 +1138,11 @@ func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, st
 	}
 
 	finalTransactionID := protocol.TransactionID(stableID("transaction", string(state.command.CommandID), "turn-terminal"))
-	finalCursor := protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + 4, TransactionID: finalTransactionID}
+	terminalEventCount := uint64(3)
+	if request.child != nil {
+		terminalEventCount++
+	}
+	finalCursor := protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + terminalEventCount + 1, TransactionID: finalTransactionID}
 	commandPayload, err := canonicaljson.Marshal(struct {
 		TaskID protocol.TaskID `json:"task_id"`
 		TurnID protocol.TurnID `json:"turn_id"`
@@ -1136,6 +1166,13 @@ func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, st
 		{protocol.EventTurnCompleted, protocol.TurnTerminalV1{Status: "completed", Reason: "provider completed"}},
 		{protocol.EventTaskStatusChanged, protocol.TaskStatusChangedV1{From: string(protocol.TaskRunning), To: string(protocol.TaskCompleted), Reason: "legacy turn terminal"}},
 		{protocol.EventCommandCompleted, protocol.CommandCompletedV1{CommandID: request.Command.CommandID, RequestDigest: request.Command.RequestDigest, Status: "completed", Result: rawResult}},
+	}
+	if request.child != nil {
+		receipt := childReceipt(request.child.manifest, "succeeded", assistantSummary(assistant), protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + terminalEventCount, TransactionID: finalTransactionID}, terminal.Usage, nil, nil)
+		terminalEvents = append(terminalEvents, struct {
+			kind    string
+			payload any
+		}{protocol.EventSubagentReceipt, receipt})
 	}
 	events, err = s.turnEvents(*state, request.Runtime.ID, "turn-terminal", terminalEvents)
 	if err != nil {
@@ -1195,6 +1232,9 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 	if state.activeActivityID != "" {
 		eventCount++
 	}
+	if request.child != nil {
+		eventCount++
+	}
 	transactionID := protocol.TransactionID(stableID("transaction", string(request.Command.CommandID), "turn-failure-terminal"))
 	finalCursor := protocol.CommittedCursor{
 		JournalKind: state.ref.Kind, JournalID: state.ref.ID,
@@ -1237,7 +1277,7 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 	if state.taskRunning {
 		from = string(protocol.TaskRunning)
 	}
-	turnEvents, err := s.turnEvents(*state, request.Runtime.ID, "turn-failure-terminal", []struct {
+	terminalValues := []struct {
 		kind    string
 		payload any
 	}{
@@ -1247,7 +1287,24 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 			CommandID: request.Command.CommandID, RequestDigest: request.Command.RequestDigest,
 			Status: commandStatus, Result: rawResult, Error: publicError,
 		}},
-	})
+	}
+	if request.child != nil {
+		receiptStatus := "failed"
+		unknownEffects := []protocol.ActivityID{}
+		if activityStatus == "uncertain" {
+			receiptStatus = "uncertain"
+			if state.activeActivityID != "" {
+				unknownEffects = append(unknownEffects, state.activeActivityID)
+			}
+		} else if turnStatus == "interrupted" {
+			receiptStatus = "cancelled"
+		}
+		terminalValues = append(terminalValues, struct {
+			kind    string
+			payload any
+		}{protocol.EventSubagentReceipt, childReceipt(request.child.manifest, receiptStatus, reason, protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + uint64(eventCount), TransactionID: transactionID}, unknownUsage(), publicError, unknownEffects)})
+	}
+	turnEvents, err := s.turnEvents(*state, request.Runtime.ID, "turn-failure-terminal", terminalValues)
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -1284,6 +1341,13 @@ func toolExposure(manifest protocol.RuntimeGenerationManifest) protocol.ToolExpo
 		exposure.Aliases = append(exposure.Aliases, protocol.ToolAliasBinding{Alias: alias, Identity: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest})
 	}
 	return exposure
+}
+
+func effectiveToolExposure(request StartTurnRequest) protocol.ToolExposure {
+	if request.child != nil {
+		return protocol.DeepCopy(request.child.exposure)
+	}
+	return toolExposure(request.Runtime)
 }
 
 func providerAuthorizationRequest(request StartTurnRequest, state *turnState, activityID protocol.ActivityID, callID string, modelRequest protocol.ModelRequest, contextPlanDigest protocol.Digest) (protocol.AuthorizationRequest, error) {
@@ -1638,6 +1702,9 @@ type turnState struct {
 	activeStarted     bool
 	activeDispatched  bool
 	compactedSources  map[protocol.Digest]struct{}
+	subagentAttempts  int
+	subagentDepth     int
+	activeSubagent    bool
 }
 
 type authorizationDeniedError struct{ reason string }
@@ -1659,7 +1726,7 @@ func (e *providerFailureError) Error() string {
 }
 
 func newTurnState(request StartTurnRequest) turnState {
-	return turnState{
+	state := turnState{
 		ref:  protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(request.SessionID)},
 		head: request.ExpectedHead, command: request.Command,
 		taskID:           protocol.TaskID(stableID("task", string(request.Command.CommandID))),
@@ -1667,6 +1734,11 @@ func newTurnState(request StartTurnRequest) turnState {
 		contractID:       protocol.OutcomeContractID(stableID("contract", string(request.Command.CommandID))),
 		compactedSources: make(map[protocol.Digest]struct{}),
 	}
+	if request.child != nil {
+		state.taskID, state.turnID = request.child.manifest.ChildTaskID, request.child.manifest.ChildTurnID
+		state.subagentDepth = 1
+	}
+	return state
 }
 
 func (s *Service) initialTurnEvents(request StartTurnRequest, state turnState) ([]protocol.ProposedEvent, error) {
