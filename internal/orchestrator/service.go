@@ -1169,7 +1169,10 @@ func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, st
 		{protocol.EventCommandCompleted, protocol.CommandCompletedV1{CommandID: request.Command.CommandID, RequestDigest: request.Command.RequestDigest, Status: "completed", Result: rawResult}},
 	}
 	if request.child != nil {
-		receipt := childReceipt(request.child.manifest, "succeeded", assistantSummary(assistant), protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + terminalEventCount, TransactionID: finalTransactionID}, terminal.Usage, nil, nil)
+		receipt, receiptErr := s.projectChildReceipt(ctx, state, request.child.manifest, "succeeded", assistantSummary(assistant), protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + terminalEventCount, TransactionID: finalTransactionID}, terminal.Usage, nil)
+		if receiptErr != nil {
+			return RunResult{}, receiptErr
+		}
 		terminalEvents = append(terminalEvents, struct {
 			kind    string
 			payload any
@@ -1300,10 +1303,29 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 		} else if turnStatus == "interrupted" {
 			receiptStatus = "cancelled"
 		}
+		receipt, receiptErr := s.projectChildReceipt(ctx, state, request.child.manifest, receiptStatus, reason, protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + uint64(eventCount), TransactionID: transactionID}, unknownUsage(), publicError)
+		if receiptErr != nil {
+			return RunResult{}, receiptErr
+		}
+		if len(unknownEffects) != 0 {
+			receipt.Status = "uncertain"
+			seen := make(map[protocol.ActivityID]struct{}, len(receipt.UnknownEffects)+len(unknownEffects))
+			for _, activityID := range receipt.UnknownEffects {
+				seen[activityID] = struct{}{}
+			}
+			for _, activityID := range unknownEffects {
+				seen[activityID] = struct{}{}
+			}
+			receipt.UnknownEffects = receipt.UnknownEffects[:0]
+			for activityID := range seen {
+				receipt.UnknownEffects = append(receipt.UnknownEffects, activityID)
+			}
+			sort.Slice(receipt.UnknownEffects, func(i, j int) bool { return receipt.UnknownEffects[i] < receipt.UnknownEffects[j] })
+		}
 		terminalValues = append(terminalValues, struct {
 			kind    string
 			payload any
-		}{protocol.EventSubagentReceipt, childReceipt(request.child.manifest, receiptStatus, reason, protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + uint64(eventCount), TransactionID: transactionID}, unknownUsage(), publicError, unknownEffects)})
+		}{protocol.EventSubagentReceipt, receipt})
 	}
 	turnEvents, err := s.turnEvents(*state, request.Runtime.ID, "turn-failure-terminal", terminalValues)
 	if err != nil {

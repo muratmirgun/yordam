@@ -118,12 +118,18 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 	runtimeEvents := make(chan agent.RuntimeEvent, 64)
 	activeSession := &sessionBinding{id: session.ID}
 	policy := newPolicyBinding(permission.Restore(replay))
+	policies := permission.NewSessionPolicyRegistry()
+	if err := policies.RegisterParent(protocol.SessionID(session.ID), policy.current); err != nil {
+		return nil, Snapshot{}, err
+	}
+	policy.registry = policies
 	builder := runtimeBuilder{
 		configPath:       configPath,
 		cli:              options.CLI,
 		workspace:        workspace,
 		store:            store,
 		policy:           policy,
+		policies:         policies,
 		activeSession:    activeSession,
 		runtimeEvents:    runtimeEvents,
 		httpClient:       options.HTTPClient,
@@ -521,8 +527,9 @@ func zeroBytes(value []byte) {
 }
 
 type policyBinding struct {
-	mu      sync.RWMutex
-	current *permission.SessionPolicy
+	mu       sync.RWMutex
+	current  *permission.SessionPolicy
+	registry *permission.SessionPolicyRegistry
 }
 
 type sessionBinding struct {
@@ -585,6 +592,9 @@ func (p *policyBinding) GrantSession(tool, scope string) {
 func (p *policyBinding) restore(replay domain.SessionReplay) MutablePolicy {
 	p.mu.Lock()
 	p.current = permission.Restore(replay)
+	if p.registry != nil {
+		_ = p.registry.RegisterParent(protocol.SessionID(replay.Session.ID), p.current)
+	}
 	p.mu.Unlock()
 	return p
 }

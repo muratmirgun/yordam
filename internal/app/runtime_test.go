@@ -25,6 +25,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/permission"
+	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
@@ -37,6 +38,34 @@ func TestNewUsesEmptyRedactorBindingWhenNoneIsSupplied(t *testing.T) {
 	if got := application.redactors.String("candidate-secret"); got != "candidate-secret" {
 		t.Fatalf("implicit binding inherited candidate secrets: %q", got)
 	}
+}
+
+func TestInteractiveApproverProjectsChildPromptLineage(t *testing.T) {
+	registry := permission.NewSessionPolicyRegistry()
+	if err := registry.RegisterChild("child", domain.ModeAsk); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.RegisterChildLineage("child", "parent", "attempt"); err != nil {
+		t.Fatal(err)
+	}
+	approver := &promptCapturingApprover{}
+	binding := &interactiveApproverBinding{}
+	binding.set(approver)
+	binding.setChildPrompts(registry)
+	_, err := binding.Approve(t.Context(), protocol.AuthorizationDecision{Request: protocol.AuthorizationRequest{SessionID: "child", CallID: "shell-call", Source: protocol.ToolIdentity{Name: "shell"}, Effect: "mutation", ExecutionLocus: "process", Boundary: "workspace"}, Scope: protocol.CanonicalAuthorizationScope{Resources: []protocol.ResourceTarget{{Kind: "directory", CanonicalID: "/workspace"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approver.prompt.SessionID != "child" || approver.prompt.ParentSessionID != "parent" || approver.prompt.DelegationAttemptID != "attempt" || approver.prompt.Call.Request.CallID != "shell-call" {
+		t.Fatalf("child prompt=%+v", approver.prompt)
+	}
+}
+
+type promptCapturingApprover struct{ prompt ports.PermissionPrompt }
+
+func (a *promptCapturingApprover) Resolve(_ context.Context, prompt ports.PermissionPrompt) (domain.PermissionDecision, error) {
+	a.prompt = prompt
+	return domain.PermissionDecision{Action: domain.PermissionAllow, Lifetime: domain.PermissionOnce, Scope: prompt.Call.CanonicalScope}, nil
 }
 
 func TestRuntimeSetReadinessClassifiesModelsAndCredentials(t *testing.T) {

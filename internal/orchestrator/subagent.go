@@ -13,6 +13,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	receiptprojector "github.com/muratmirgun/yordam/internal/subagent"
 	"github.com/muratmirgun/yordam/internal/tooling"
 	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 )
@@ -267,6 +268,26 @@ func childReceipt(manifest protocol.SubagentManifestV1, status, summary string, 
 		unknown = []protocol.ActivityID{}
 	}
 	return protocol.SubagentReceiptV1{Status: status, Summary: summary, Manifest: manifest, TerminalCursor: cursor, ChangedFiles: []string{}, CommandsAndTests: []string{}, Usage: usage, EvidenceIDs: []protocol.EvidenceID{}, UnknownEffects: unknown, Error: protocol.DeepCopy(public)}
+}
+
+// projectChildReceipt reads the child's exact durable journal prefix while
+// constructing its terminal transaction, so assistant response prose can
+// never become effect evidence.
+func (s *Service) projectChildReceipt(ctx context.Context, state *turnState, manifest protocol.SubagentManifestV1, status, summary string, cursor protocol.CommittedCursor, usage protocol.ModelUsage, public *protocol.PublicError) (protocol.SubagentReceiptV1, error) {
+	after := protocol.CommittedCursor{}
+	events := make([]protocol.EventRecord, 0)
+	for {
+		page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: state.ref, After: after, Limit: 1000})
+		if err != nil {
+			return protocol.SubagentReceiptV1{}, err
+		}
+		events = append(events, page.Events...)
+		if !page.More {
+			break
+		}
+		after = page.Cursor
+	}
+	return receiptprojector.ProjectReceipt(manifest, cursor, status, summary, usage, public, events), nil
 }
 
 func assistantSummary(message protocol.AssistantMessageV1) string {

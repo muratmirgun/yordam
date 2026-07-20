@@ -29,13 +29,21 @@ type SequentialChildCoordinator struct {
 	sessions ChildSessionStore
 	parents  ParentSessionInspector
 	run      func(context.Context, StartTurnRequest) (RunResult, error)
+	policies ChildPolicyRegistry
 }
 
-func NewSequentialChildCoordinator(sessions ChildSessionStore, parents ParentSessionInspector, run func(context.Context, StartTurnRequest) (RunResult, error)) (*SequentialChildCoordinator, error) {
+func NewSequentialChildCoordinator(sessions ChildSessionStore, parents ParentSessionInspector, run func(context.Context, StartTurnRequest) (RunResult, error), policies ...ChildPolicyRegistry) (*SequentialChildCoordinator, error) {
 	if sessions == nil || parents == nil || run == nil {
 		return nil, fmt.Errorf("child coordinator dependencies are incomplete")
 	}
-	return &SequentialChildCoordinator{sessions: sessions, parents: parents, run: run}, nil
+	coordinator := &SequentialChildCoordinator{sessions: sessions, parents: parents, run: run}
+	if len(policies) > 1 {
+		return nil, fmt.Errorf("at most one child policy registry is allowed")
+	}
+	if len(policies) == 1 {
+		coordinator.policies = policies[0]
+	}
+	return coordinator, nil
 }
 
 func (c *SequentialChildCoordinator) RunChild(ctx context.Context, request ChildRunRequest) (protocol.SubagentReceiptV1, error) {
@@ -51,6 +59,16 @@ func (c *SequentialChildCoordinator) RunChild(ctx context.Context, request Child
 	parent, err := c.parents.InspectSession(ctx, request.Manifest.ParentSessionID)
 	if err != nil {
 		return protocol.SubagentReceiptV1{}, err
+	}
+	if c.policies != nil {
+		if err := c.policies.RegisterChild(request.Manifest.ChildSessionID, parent.Session.Mode); err != nil {
+			return protocol.SubagentReceiptV1{}, err
+		}
+		if prompts, ok := c.policies.(ChildPromptRegistry); ok {
+			if err := prompts.RegisterChildLineage(request.Manifest.ChildSessionID, request.Manifest.ParentSessionID, request.Manifest.AttemptID); err != nil {
+				return protocol.SubagentReceiptV1{}, err
+			}
+		}
 	}
 	manifestDigest, err := canonicaljson.Digest(request.Manifest)
 	if err != nil {

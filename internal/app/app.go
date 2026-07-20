@@ -106,7 +106,7 @@ type App struct {
 }
 
 type pendingPermission struct {
-	internalCallID  string
+	internalKey     string
 	displayedCallID string
 	decision        chan domain.PermissionDecision
 	internalScope   string
@@ -1080,6 +1080,7 @@ func (a *App) settingEvent() Event {
 
 func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domain.PermissionDecision, error) {
 	internalCallID := prompt.Call.Request.CallID
+	internalKey := permissionPendingKey(prompt.SessionID, internalCallID)
 	var redactor secret.Redacting = secret.New()
 	if a.redactors != nil {
 		redactor = a.redactors.Snapshot()
@@ -1093,7 +1094,7 @@ func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domai
 		return domain.PermissionDecision{}, sanitizeErr
 	}
 	a.pendingMu.Lock()
-	if _, exists := a.pendingInternal[internalCallID]; exists {
+	if _, exists := a.pendingInternal[internalKey]; exists {
 		a.pendingMu.Unlock()
 		return domain.PermissionDecision{}, errors.New("duplicate permission call is already pending")
 	}
@@ -1109,14 +1110,14 @@ func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domai
 	}
 	published = permissionEventWithCallID(published, displayedCallID)
 	pending := &pendingPermission{
-		internalCallID:  internalCallID,
+		internalKey:     internalKey,
 		displayedCallID: displayedCallID,
 		decision:        make(chan domain.PermissionDecision, 1),
 		internalScope:   permissionApprovalScope(prompt.Call),
 		displayedScope:  permissionApprovalScope(published.Permission.Call),
 	}
 	a.pending[displayedCallID] = pending
-	a.pendingInternal[internalCallID] = pending
+	a.pendingInternal[internalKey] = pending
 	a.pendingMu.Unlock()
 	defer a.removePending(pending)
 
@@ -1130,6 +1131,8 @@ func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domai
 		return domain.PermissionDecision{}, ctx.Err()
 	}
 }
+
+func permissionPendingKey(sessionID, callID string) string { return sessionID + "\x00" + callID }
 
 func (a *App) newDisplayedPermissionCallID(redactor secret.Redacting) (string, error) {
 	for range 32 {
@@ -1199,7 +1202,7 @@ func (a *App) resolvePermission(callID string, decision domain.PermissionDecisio
 	select {
 	case pending.decision <- decision:
 		delete(a.pending, callID)
-		delete(a.pendingInternal, pending.internalCallID)
+		delete(a.pendingInternal, pending.internalKey)
 		return permissionResolved
 	default:
 		return permissionStale
@@ -1212,8 +1215,8 @@ func (a *App) removePending(pending *pendingPermission) {
 	if a.pending[pending.displayedCallID] == pending {
 		delete(a.pending, pending.displayedCallID)
 	}
-	if a.pendingInternal[pending.internalCallID] == pending {
-		delete(a.pendingInternal, pending.internalCallID)
+	if a.pendingInternal[pending.internalKey] == pending {
+		delete(a.pendingInternal, pending.internalKey)
 	}
 }
 

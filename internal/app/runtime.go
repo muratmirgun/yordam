@@ -22,6 +22,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/evidence"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/orchestrator"
+	"github.com/muratmirgun/yordam/internal/permission"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/projection"
 	"github.com/muratmirgun/yordam/internal/protocol"
@@ -234,6 +235,7 @@ type runtimeBuilder struct {
 	workspace        domain.Workspace
 	store            *jsonl.Store
 	policy           *policyBinding
+	policies         *permission.SessionPolicyRegistry
 	activeSession    *sessionBinding
 	runtimeEvents    chan<- agent.RuntimeEvent
 	httpClient       *http.Client
@@ -433,8 +435,22 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 	providerCatalogRevision := "configured-v1"
 	providerCatalog := provider.NewCatalog(providerCatalogRevision, models)
 	durableAuthorization := authorization.NewService(b.store)
+	policies := b.policies
+	if policies == nil {
+		policies = permission.NewSessionPolicyRegistry()
+		b.policies = policies
+	}
+	if b.policy == nil {
+		return RuntimeSet{}, configurationError(b.configPath, "build authorization", fmt.Errorf("session policy is required"))
+	}
+	b.policy.mu.RLock()
+	currentPolicy := b.policy.current
+	b.policy.mu.RUnlock()
+	if err := policies.RegisterParent(protocol.SessionID(b.activeSession.get()), currentPolicy); err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "register active session policy", err)
+	}
 	authorizer := &runtimeAuthorization{
-		Service: durableAuthorization, Policy: b.policy, Tools: toolCatalog,
+		Service: durableAuthorization, Registry: policies, Tools: toolCatalog,
 		Workspace: b.workspace, ActiveSession: b.activeSession,
 	}
 	providerService, err := provider.NewService(providerCatalog, []provider.Adapter{&openAIAdapterRouter{byProvider: routedAdapters}}, authorizer)
@@ -498,6 +514,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		return RuntimeSet{}, configurationError(b.configPath, "build recovery store", err)
 	}
 	approverBridge := &interactiveApproverBinding{}
+	approverBridge.setChildPrompts(policies)
 	publisher := b.publisher
 	if publisher == nil {
 		publisher = broker
@@ -517,7 +534,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		_ = recoveryStore.Close()
 		return RuntimeSet{}, configurationError(b.configPath, "build turn orchestrator", err)
 	}
-	childCoordinator, err := orchestrator.NewSequentialChildCoordinator(childSessions, b.store, service.RunTurn)
+	childCoordinator, err := orchestrator.NewSequentialChildCoordinator(childSessions, b.store, service.RunTurn, policies)
 	if err != nil {
 		_ = evidenceStore.Close()
 		_ = recoveryStore.Close()

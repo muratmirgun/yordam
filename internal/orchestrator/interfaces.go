@@ -234,6 +234,16 @@ type ChildCoordinator interface {
 	RunChild(context.Context, ChildRunRequest) (protocol.SubagentReceiptV1, error)
 }
 
+// ChildPolicyRegistry creates an isolated policy entry before the child turn
+// can issue any authorization request. Implementations must not clone grants.
+type ChildPolicyRegistry interface {
+	RegisterChild(protocol.SessionID, domain.PermissionMode) error
+}
+
+type ChildPromptRegistry interface {
+	RegisterChildLineage(protocol.SessionID, protocol.SessionID, protocol.DelegationAttemptID) error
+}
+
 type ChildRunRequest struct {
 	Manifest protocol.SubagentManifestV1
 	Call     protocol.SubagentCallV1

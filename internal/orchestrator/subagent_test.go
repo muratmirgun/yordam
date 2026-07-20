@@ -210,11 +210,12 @@ func TestSequentialChildCoordinatorRunsOrdinaryChildTurnAndReadsReceipt(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	policies := &recordingChildPolicies{}
 	coordinator, err := NewSequentialChildCoordinator(store, productionCoordinatorParent{store}, func(ctx context.Context, request StartTurnRequest) (RunResult, error) {
 		result, runErr := childService.RunTurn(ctx, request)
 		store.capture(childRepo)
 		return result, runErr
-	})
+	}, policies)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,6 +225,9 @@ func TestSequentialChildCoordinatorRunsOrdinaryChildTurnAndReadsReceipt(t *testi
 	}
 	if store.created != manifest.ChildSessionID || !sameSubagentManifest(receipt.Manifest, manifest) || receipt.Status != "succeeded" {
 		t.Fatalf("created=%q receipt=%+v", store.created, receipt)
+	}
+	if policies.sessionID != manifest.ChildSessionID || policies.mode != domain.ModeAsk || policies.parentID != manifest.ParentSessionID || policies.attemptID != manifest.AttemptID {
+		t.Fatalf("child policy registration=%+v", policies)
 	}
 	if !containsBatchKind(childRepo.batchKinds(), protocol.EventSubagentManifest) || !containsBatchKind(childRepo.batchKinds(), protocol.EventSubagentReceipt) {
 		t.Fatalf("child did not own manifest/receipt: %v", childRepo.batchKinds())
@@ -781,6 +785,26 @@ type productionCoordinatorParent struct{ store *productionCoordinatorStore }
 
 func (s productionCoordinatorParent) InspectSession(context.Context, protocol.SessionID) (journal.SessionInspection, error) {
 	return journal.SessionInspection{Session: domain.Session{Workspace: s.store.workspace, Mode: domain.ModeAsk, Selection: domain.ModelSelection{Profile: "provider-a", Model: "model-a"}}}, nil
+}
+
+type recordingChildPolicies struct {
+	sessionID protocol.SessionID
+	mode      domain.PermissionMode
+	parentID  protocol.SessionID
+	attemptID protocol.DelegationAttemptID
+}
+
+func (r *recordingChildPolicies) RegisterChild(sessionID protocol.SessionID, mode domain.PermissionMode) error {
+	r.sessionID, r.mode = sessionID, mode
+	return nil
+}
+
+func (r *recordingChildPolicies) RegisterChildLineage(sessionID, parentID protocol.SessionID, attemptID protocol.DelegationAttemptID) error {
+	if r.sessionID != sessionID {
+		return fmt.Errorf("lineage before child policy")
+	}
+	r.parentID, r.attemptID = parentID, attemptID
+	return nil
 }
 
 type subagentTestChildren struct {

@@ -20,6 +20,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/orchestrator"
+	"github.com/muratmirgun/yordam/internal/permission"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/projection"
 	"github.com/muratmirgun/yordam/internal/protocol"
@@ -145,14 +146,14 @@ func (r *openAIAdapterRouter) StartPrepared(ctx context.Context, prepared provid
 
 type runtimeAuthorization struct {
 	Service       *authorization.Service
-	Policy        *policyBinding
+	Registry      *permission.SessionPolicyRegistry
 	Tools         *tooling.Catalog
 	Workspace     domain.Workspace
 	ActiveSession *sessionBinding
 }
 
 func (a *runtimeAuthorization) Decide(ctx context.Context, request protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error) {
-	if a == nil || a.Policy == nil || a.Tools == nil {
+	if a == nil || a.Registry == nil || a.Tools == nil {
 		return protocol.AuthorizationDecision{}, fmt.Errorf("runtime authorization is not configured")
 	}
 	if request.ControlOperationID != "" && request.Source.Source == "runtime" {
@@ -187,7 +188,7 @@ func (a *runtimeAuthorization) Decide(ctx context.Context, request protocol.Auth
 			}
 		}
 	}
-	return a.Policy.EvaluateAuthorization(ctx, ports.EvaluationInput{Permission: permissionContext, Request: request, Descriptor: descriptor})
+	return a.Registry.EvaluateAuthorization(ctx, ports.EvaluationInput{Permission: permissionContext, Request: request, Descriptor: descriptor})
 }
 
 func (a *runtimeAuthorization) ResolveInteractive(_ context.Context, request protocol.AuthorizationRequest, pending protocol.AuthorizationDecision, response protocol.ApprovalResponse) (protocol.AuthorizationDecision, error) {
@@ -198,8 +199,8 @@ func (a *runtimeAuthorization) ResolveInteractive(_ context.Context, request pro
 	if err != nil {
 		return protocol.AuthorizationDecision{}, err
 	}
-	if resolved.Action == "allow" && resolved.Lifetime == protocol.AuthorizationLifetimeSession && a.Policy != nil {
-		if err := a.Policy.GrantAuthorizationSession(request, resolved.Constraints); err != nil {
+	if resolved.Action == "allow" && resolved.Lifetime == protocol.AuthorizationLifetimeSession && a.Registry != nil {
+		if err := a.Registry.GrantAuthorizationSession(request, resolved.Constraints); err != nil {
 			return protocol.AuthorizationDecision{}, err
 		}
 	}
@@ -217,6 +218,9 @@ func (a *runtimeAuthorization) Dispatch(ctx context.Context, token authorization
 type interactiveApproverBinding struct {
 	mu       sync.RWMutex
 	approver ports.PermissionApprover
+	children interface {
+		ChildPrompt(protocol.SessionID, domain.PreparedToolRequest) (ports.ChildPrompt, bool)
+	}
 }
 
 func (b *interactiveApproverBinding) set(approver ports.PermissionApprover) {
@@ -225,9 +229,18 @@ func (b *interactiveApproverBinding) set(approver ports.PermissionApprover) {
 	b.mu.Unlock()
 }
 
+func (b *interactiveApproverBinding) setChildPrompts(children interface {
+	ChildPrompt(protocol.SessionID, domain.PreparedToolRequest) (ports.ChildPrompt, bool)
+}) {
+	b.mu.Lock()
+	b.children = children
+	b.mu.Unlock()
+}
+
 func (b *interactiveApproverBinding) Approve(ctx context.Context, pending protocol.AuthorizationDecision) (protocol.ApprovalResponse, error) {
 	b.mu.RLock()
 	approver := b.approver
+	children := b.children
 	b.mu.RUnlock()
 	if approver == nil {
 		return protocol.ApprovalResponse{}, fmt.Errorf("interactive approver is not bound")
@@ -242,13 +255,19 @@ func (b *interactiveApproverBinding) Approve(ctx context.Context, pending protoc
 	} else if pending.Request.ExecutionLocus == "process" {
 		mutation = domain.MutationProcess
 	}
-	decision, err := approver.Resolve(ctx, ports.PermissionPrompt{
+	prompt := ports.PermissionPrompt{
 		SessionID: string(pending.Request.SessionID),
 		Call: domain.PreparedToolRequest{
 			Request:  domain.ToolRequest{CallID: pending.Request.CallID, Name: pending.Request.Source.Name, Input: json.RawMessage(`{}`)},
 			Mutation: mutation, CanonicalScope: scope, InsideWorkspace: pending.Request.Boundary == "workspace", Summary: pending.Reason,
 		},
-	})
+	}
+	if children != nil {
+		if child, ok := children.ChildPrompt(pending.Request.SessionID, prompt.Call); ok {
+			prompt.SessionID, prompt.ParentSessionID, prompt.DelegationAttemptID, prompt.Call = child.SessionID, child.ParentSessionID, child.DelegationAttemptID, child.Call
+		}
+	}
+	decision, err := approver.Resolve(ctx, prompt)
 	if err != nil {
 		return protocol.ApprovalResponse{}, err
 	}
