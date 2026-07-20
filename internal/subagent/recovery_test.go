@@ -64,3 +64,42 @@ func TestSubagentRecoverAttachmentIsTheOnlyResumableState(t *testing.T) {
 		t.Fatalf("result=%+v", result)
 	}
 }
+
+func TestSubagentRecoverRestartAndCancellationMatrix(t *testing.T) {
+	manifest := projectorManifest()
+	request := ReconcileRequest{ParentSessionID: manifest.ParentSessionID, ParentCursor: manifest.ParentCursor, Runtime: protocol.RuntimeGenerationManifest{ID: manifest.RuntimeGenerationID}}
+	nonterminal := Attempt{AttemptID: manifest.AttemptID, Manifest: manifest, State: StateWaiting}
+	receipt := receiptEvent(manifest, "cancelled").Decoded.(*protocol.SubagentReceiptV1)
+	digest, err := receiptDigest(*receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attached := Attempt{AttemptID: manifest.AttemptID, Manifest: manifest, State: StateAttached, Receipt: receipt, ReceiptDigest: digest, TerminalCursor: receipt.TerminalCursor, Attachment: &protocol.SubagentResultAttachedV1{AttemptID: manifest.AttemptID, ChildSessionID: manifest.ChildSessionID, TerminalCursor: receipt.TerminalCursor, ReceiptDigest: digest, ReceiptEvidenceID: "evidence"}}
+	for _, test := range []struct {
+		name      string
+		attempt   Attempt
+		child     ChildRecoveryState
+		status    string
+		create    bool
+		resumable bool
+	}{
+		{name: "parent wait before child creation", attempt: nonterminal, child: ChildRecoveryState{CommitKnown: true}, status: "planned", create: true},
+		{name: "child created before provider stream", attempt: nonterminal, child: ChildRecoveryState{Exists: true, CommitKnown: true, NoUnmatchedEffect: true}, status: "cancelled"},
+		{name: "provider stream cancellation with unproven mutation", attempt: nonterminal, child: ChildRecoveryState{Exists: true, CommitKnown: true}, status: "uncertain"},
+		{name: "pending approval cancellation leaves no effect", attempt: nonterminal, child: ChildRecoveryState{Exists: true, CommitKnown: true, NoUnmatchedEffect: true}, status: "cancelled"},
+		{name: "shell process cancellation with unproven effect", attempt: nonterminal, child: ChildRecoveryState{Exists: true, CommitKnown: true}, status: "uncertain"},
+		{name: "child receipt before parent attachment", attempt: Attempt{AttemptID: manifest.AttemptID, Manifest: manifest, State: StateTerminal, Receipt: receipt, ReceiptDigest: digest, TerminalCursor: receipt.TerminalCursor}, child: ChildRecoveryState{Exists: true, CommitKnown: true}, status: "cancelled"},
+		{name: "parent reacquire after exact attachment", attempt: attached, child: ChildRecoveryState{Exists: true, CommitKnown: true}, status: "cancelled", resumable: true},
+		{name: "child receipt commit unknown", attempt: nonterminal, child: ChildRecoveryState{Exists: true}, status: "uncertain"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := Reconcile(request, test.attempt, test.child)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.ChildStatus != test.status || result.CreateOnce != test.create || result.ParentResumable != test.resumable || result.Attached != test.resumable {
+				t.Fatalf("result=%+v", result)
+			}
+		})
+	}
+}
