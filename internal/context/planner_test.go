@@ -55,7 +55,7 @@ func TestChildPlannerBindsDerivedExposureAndRejectsCanonicalSubagent(t *testing.
 	if _, err := contextplanner.NewChildPlanner(parentExposure, childExposure, nil); err == nil {
 		t.Fatal("child planner accepted forged child exposure revision")
 	}
-	derived, err := tooling.DerivedExposureRevision(parentExposure, childExposure.Aliases)
+	derived, err := tooling.DerivedExposureRevision(parentExposure, childExposure.Tools, childExposure.Aliases)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestChildPlannerBindsDerivedExposureAndRejectsCanonicalSubagent(t *testing.
 	parentExposure.Aliases = append(parentExposure.Aliases, protocol.ToolAliasBinding{Alias: "subagent", Identity: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest})
 	blocked.Tools = append(blocked.Tools, protocol.ExposedTool{Alias: "renamed", Identity: descriptor.Body.Identity, Description: descriptor.Body.Description, InputSchema: descriptor.Body.InputSchema})
 	blocked.Aliases = append(blocked.Aliases, protocol.ToolAliasBinding{Alias: "renamed", Identity: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest})
-	blocked.CatalogRevision, err = tooling.DerivedExposureRevision(parentExposure, blocked.Aliases)
+	blocked.CatalogRevision, err = tooling.DerivedExposureRevision(parentExposure, blocked.Tools, blocked.Aliases)
 	if err != nil {
 		t.Fatal(err)
 	}

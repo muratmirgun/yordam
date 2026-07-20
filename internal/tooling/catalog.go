@@ -224,8 +224,8 @@ func (c *Catalog) Filter(filter ToolExposureFilter) (protocol.ToolExposure, erro
 			entries = append(entries, entry)
 		}
 	}
-	bindings := c.expose("", entries).Aliases
-	revision, err := DerivedExposureRevision(c.Expose(), bindings)
+	retained := c.expose("", entries)
+	revision, err := DerivedExposureRevision(c.Expose(), retained.Tools, retained.Aliases)
 	if err != nil {
 		return protocol.ToolExposure{}, err
 	}
@@ -275,9 +275,11 @@ func (c *Catalog) expose(revision string, entries []catalogEntry) protocol.ToolE
 }
 
 // DerivedExposureRevision returns the only valid revision for a retained
-// ordered binding subset of parent. It is intentionally independent of a live
-// Catalog so child contexts can validate frozen parent and child exposures.
-func DerivedExposureRevision(parent protocol.ToolExposure, bindings []protocol.ToolAliasBinding) (string, error) {
+// ordered provider-visible subset of parent. It hashes both the exact exposed
+// tools (including schemas) and their canonical bindings so the provider's
+// order and content are cryptographically bound. It is intentionally
+// independent of a live Catalog so child contexts can validate frozen views.
+func DerivedExposureRevision(parent protocol.ToolExposure, tools []protocol.ExposedTool, bindings []protocol.ToolAliasBinding) (string, error) {
 	if err := parent.Validate(); err != nil {
 		return "", fmt.Errorf("parent tool exposure: %w", err)
 	}
@@ -291,10 +293,15 @@ func DerivedExposureRevision(parent protocol.ToolExposure, bindings []protocol.T
 	for _, entry := range bindings {
 		canonicalBindings = append(canonicalBindings, binding{Alias: entry.Alias, Identity: entry.Identity, SourceRevision: entry.SourceRevision, DescriptorDigest: entry.DescriptorDigest})
 	}
+	canonicalTools := make([]protocol.ExposedTool, len(tools))
+	for index, tool := range tools {
+		canonicalTools[index] = protocol.ExposedTool{Alias: tool.Alias, Identity: tool.Identity, Description: tool.Description, InputSchema: cloneRaw(tool.InputSchema)}
+	}
 	digest, err := canonicaljson.Digest(struct {
-		Parent   string    `json:"parent"`
-		Bindings []binding `json:"bindings"`
-	}{Parent: parent.CatalogRevision, Bindings: canonicalBindings})
+		Parent   string                 `json:"parent"`
+		Tools    []protocol.ExposedTool `json:"tools"`
+		Bindings []binding              `json:"bindings"`
+	}{Parent: parent.CatalogRevision, Tools: canonicalTools, Bindings: canonicalBindings})
 	if err != nil {
 		return "", fmt.Errorf("derive tool exposure revision: %w", err)
 	}
@@ -312,34 +319,45 @@ func ValidateDerivedExposure(parent, child protocol.ToolExposure) error {
 	if err := child.Validate(); err != nil {
 		return fmt.Errorf("child tool exposure: %w", err)
 	}
+	if err := validateExposureAlignment(parent, "parent"); err != nil {
+		return err
+	}
+	if err := validateExposureAlignment(child, "child"); err != nil {
+		return err
+	}
 	parentBindings := make(map[string]protocol.ToolAliasBinding, len(parent.Aliases))
-	parentTools := make(map[string]protocol.ExposedTool, len(parent.Tools))
 	parentOrder := make(map[string]int, len(parent.Aliases))
 	for index, binding := range parent.Aliases {
 		parentBindings[binding.Alias], parentOrder[binding.Alias] = binding, index
 	}
-	for _, tool := range parent.Tools {
-		parentTools[tool.Alias] = tool
-	}
 	last := -1
-	for _, binding := range child.Aliases {
+	for index, binding := range child.Aliases {
 		parentBinding, ok := parentBindings[binding.Alias]
-		if !ok || parentBinding != binding || parentOrder[binding.Alias] <= last {
+		parentIndex := parentOrder[binding.Alias]
+		if !ok || parentBinding != binding || parentIndex <= last || !reflect.DeepEqual(parent.Tools[parentIndex], child.Tools[index]) {
 			return fmt.Errorf("child tool binding %q is not an ordered parent binding", binding.Alias)
 		}
-		last = parentOrder[binding.Alias]
+		last = parentIndex
 	}
-	for _, tool := range child.Tools {
-		if parentTool, ok := parentTools[tool.Alias]; !ok || !reflect.DeepEqual(parentTool, tool) {
-			return fmt.Errorf("child exposed tool %q does not match parent", tool.Alias)
-		}
-	}
-	expected, err := DerivedExposureRevision(parent, child.Aliases)
+	expected, err := DerivedExposureRevision(parent, child.Tools, child.Aliases)
 	if err != nil {
 		return err
 	}
 	if child.CatalogRevision != expected {
 		return fmt.Errorf("child tool exposure revision does not match canonical derivation")
+	}
+	return nil
+}
+
+func validateExposureAlignment(exposure protocol.ToolExposure, label string) error {
+	if len(exposure.Tools) != len(exposure.Aliases) {
+		return fmt.Errorf("%s tool exposure is incomplete", label)
+	}
+	for index := range exposure.Tools {
+		tool, binding := exposure.Tools[index], exposure.Aliases[index]
+		if tool.Alias != binding.Alias || tool.Identity != binding.Identity {
+			return fmt.Errorf("%s tool exposure is not positionally aligned at %d", label, index)
+		}
 	}
 	return nil
 }

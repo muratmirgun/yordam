@@ -116,6 +116,14 @@ func TestCatalogWithoutSubagentDerivesChildExposureWithoutChangingOtherDescripto
 	if resolved, err := catalog.ResolveExposure(child, "read"); err != nil || resolved.Body.Identity.Name != "read" {
 		t.Fatalf("read resolution=%#v err=%v", resolved, err)
 	}
+	reordered := protocol.DeepCopy(child)
+	reordered.Tools[0], reordered.Tools[1] = reordered.Tools[1], reordered.Tools[0]
+	if err := ValidateDerivedExposure(parent, reordered); err == nil {
+		t.Fatal("reordered provider-visible child tools were accepted")
+	}
+	if _, err := catalog.ResolveExposure(reordered, "read"); err == nil {
+		t.Fatal("reordered provider-visible child tools reached exposure resolution")
+	}
 	descriptor, ok := catalog.Descriptor("subagent")
 	if !ok {
 		t.Fatal("subagent descriptor not found")
