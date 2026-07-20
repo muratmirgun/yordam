@@ -1,5 +1,10 @@
 package protocol
 
+import (
+	"fmt"
+	"time"
+)
+
 type RuntimeLimits struct {
 	MaxToolCalls             int            `json:"max_tool_calls"`
 	ShellTimeoutNanos        int64          `json:"shell_timeout_nanos"`
@@ -14,6 +19,26 @@ type SubagentLimits struct {
 	MaxPerTurn   int   `json:"max_per_turn"`
 	MaxToolCalls int   `json:"max_tool_calls"`
 	TimeoutNanos int64 `json:"timeout_nanos"`
+}
+
+func (limits SubagentLimits) Validate() error {
+	if limits.MaxPerTurn < 1 || limits.MaxPerTurn > 4 {
+		return fmt.Errorf("subagent max per turn must be 1..4")
+	}
+	if limits.MaxToolCalls < 1 || limits.MaxToolCalls > 64 {
+		return fmt.Errorf("subagent max tool calls must be 1..64")
+	}
+	if limits.TimeoutNanos < int64(time.Second) || limits.TimeoutNanos > int64(1800*time.Second) {
+		return fmt.Errorf("subagent timeout must be 1..1800 seconds")
+	}
+	return nil
+}
+
+func (limits RuntimeLimits) Validate() error {
+	if limits.MaxToolCalls < 1 || limits.MaxToolCalls > 128 || limits.ShellTimeoutNanos <= 0 || limits.ApplicationQueueCapacity <= 0 {
+		return fmt.Errorf("runtime limits are invalid")
+	}
+	return limits.Subagents.Validate()
 }
 
 type RuntimeGenerationBody struct {

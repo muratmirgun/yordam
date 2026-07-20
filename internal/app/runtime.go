@@ -89,7 +89,7 @@ func (s RuntimeSet) Validate() error {
 		return fmt.Errorf("runtime generation manifest: %w", err)
 	}
 	limits := s.Manifest.Body.Limits
-	if len(s.Manifest.Body.Models) == 0 || limits.MaxToolCalls < 1 || limits.MaxToolCalls > 128 || limits.ShellTimeoutNanos <= 0 || limits.ApplicationQueueCapacity <= 0 || limits.Subagents.MaxPerTurn < 1 || limits.Subagents.MaxPerTurn > 4 || limits.Subagents.MaxToolCalls < 1 || limits.Subagents.MaxToolCalls > 64 || limits.Subagents.TimeoutNanos <= 0 || limits.Subagents.TimeoutNanos > int64(1800*time.Second) {
+	if len(s.Manifest.Body.Models) == 0 || limits.Validate() != nil {
 		return fmt.Errorf("runtime generation manifest limits or models are invalid")
 	}
 	reserve := limits.CompactReserveTokens

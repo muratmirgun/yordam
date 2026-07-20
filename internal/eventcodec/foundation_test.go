@@ -101,7 +101,7 @@ func TestFoundationRegistryRejectsDuplicateRuntimeSkillNamesAcrossSources(t *tes
 	body := protocol.RuntimeGenerationBody{
 		ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{},
 		SkillCatalogRevision: "skills", Skills: []protocol.SkillDescriptor{global, project}, InstructionRevision: "instructions", PolicyGeneration: "policy",
-		ExecutionProfiles: []string{"restricted"}, Limits: protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1},
+		ExecutionProfiles: []string{"restricted"}, Limits: protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1, Subagents: validSubagentLimits()},
 	}
 	digest, err := canonicaljson.Digest(body)
 	if err != nil {
@@ -127,7 +127,7 @@ func TestFoundationRegistryRejectsRuntimeSkillShadowFromOtherGeneration(t *testi
 	body := protocol.RuntimeGenerationBody{
 		ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{},
 		SkillCatalogRevision: "skills", Skills: []protocol.SkillDescriptor{project}, InstructionRevision: "instructions", PolicyGeneration: "policy",
-		ExecutionProfiles: []string{"restricted"}, Limits: protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1},
+		ExecutionProfiles: []string{"restricted"}, Limits: protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1, Subagents: validSubagentLimits()},
 	}
 	digest, err := canonicaljson.Digest(body)
 	if err != nil {
@@ -140,6 +140,55 @@ func TestFoundationRegistryRejectsRuntimeSkillShadowFromOtherGeneration(t *testi
 	}
 	if err := registry.Validate(record); err == nil {
 		t.Fatal("runtime manifest accepted a shadow target from another generation")
+	}
+}
+
+func TestFoundationRegistryRejectsInvalidSubagentRuntimeLimits(t *testing.T) {
+	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := protocol.RuntimeGenerationManifest{
+		ID: "generation",
+		Body: protocol.RuntimeGenerationBody{
+			ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{}, InstructionRevision: "instructions", PolicyGeneration: "policy",
+			ExecutionProfiles: []string{"restricted"},
+			Limits:            protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1, Subagents: protocol.SubagentLimits{Enabled: true, MaxPerTurn: 1, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}},
+		},
+	}
+	manifest.Digest, err = canonicaljson.Digest(manifest.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid, err := registry.Decode(envelopeFor(t, protocol.EventEnvelope{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", RuntimeGenerationID: manifest.ID, Kind: protocol.EventRuntimeGenerationActivated}, protocol.RuntimeGenerationActivatedV1{Manifest: manifest}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Validate(valid); err != nil {
+		t.Fatalf("valid runtime manifest rejected: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*protocol.SubagentLimits){
+		"max per turn":   func(limits *protocol.SubagentLimits) { limits.MaxPerTurn = 0 },
+		"max tool calls": func(limits *protocol.SubagentLimits) { limits.MaxToolCalls = 65 },
+		"one nanosecond": func(limits *protocol.SubagentLimits) { limits.TimeoutNanos = 1 },
+		"above maximum":  func(limits *protocol.SubagentLimits) { limits.TimeoutNanos = int64(1800*time.Second) + 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := protocol.DeepCopy(manifest)
+			mutate(&candidate.Body.Limits.Subagents)
+			candidate.Digest, err = canonicaljson.Digest(candidate.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record, err := registry.Decode(envelopeFor(t, protocol.EventEnvelope{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", RuntimeGenerationID: candidate.ID, Kind: protocol.EventRuntimeGenerationActivated}, protocol.RuntimeGenerationActivatedV1{Manifest: candidate}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := registry.Validate(record); err == nil {
+				t.Fatal("canonically redigested invalid subagent limits accepted")
+			}
+		})
 	}
 }
 

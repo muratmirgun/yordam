@@ -569,8 +569,11 @@ func validateManifest(manifest protocol.RuntimeGenerationManifest) error {
 	if err := protocol.ValidateBounds(manifest.Body); err != nil {
 		return err
 	}
-	if manifest.ID == "" || manifest.Body.ProviderCatalogRevision == "" || manifest.Body.ToolCatalogRevision == "" || manifest.Body.InstructionRevision == "" || manifest.Body.PolicyGeneration == "" || manifest.Body.Limits.MaxToolCalls <= 0 || manifest.Body.Limits.ShellTimeoutNanos <= 0 || manifest.Body.Limits.ApplicationQueueCapacity <= 0 {
+	if manifest.ID == "" || manifest.Body.ProviderCatalogRevision == "" || manifest.Body.ToolCatalogRevision == "" || manifest.Body.InstructionRevision == "" || manifest.Body.PolicyGeneration == "" {
 		return fmt.Errorf("runtime generation manifest is incomplete")
+	}
+	if err := manifest.Body.Limits.Validate(); err != nil {
+		return fmt.Errorf("runtime generation manifest limits: %w", err)
 	}
 	if len(manifest.Body.Skills) > 0 && manifest.Body.SkillCatalogRevision == "" {
 		return fmt.Errorf("runtime skill catalog revision is required")

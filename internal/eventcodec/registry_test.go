@@ -111,6 +111,10 @@ func testDigest(fill byte) protocol.Digest {
 	return protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat(string(fill), 64)}
 }
 
+func validSubagentLimits() protocol.SubagentLimits {
+	return protocol.SubagentLimits{Enabled: true, MaxPerTurn: 1, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+}
+
 func registryModelDescriptor() protocol.ModelDescriptor {
 	return protocol.ModelDescriptor{
 		ProviderID: "provider", ModelID: "model", AdapterKind: "openai_compatible", DisplayName: "Model",
@@ -721,7 +725,7 @@ func TestFoundationRegistryRequiresExactEnvelopePayloadIdentity(t *testing.T) {
 		t.Fatalf("valid evidence.recorded identity rejected: %v", err)
 	}
 
-	manifestBody := protocol.RuntimeGenerationBody{ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{}, InstructionRevision: "instructions", PolicyGeneration: "policy", ExecutionProfiles: []string{"restricted"}, Limits: protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1}}
+	manifestBody := protocol.RuntimeGenerationBody{ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{}, InstructionRevision: "instructions", PolicyGeneration: "policy", ExecutionProfiles: []string{"restricted"}, Limits: protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1, Subagents: validSubagentLimits()}}
 	manifestDigest, err := canonicaljson.Digest(manifestBody)
 	if err != nil {
 		t.Fatal(err)
@@ -823,7 +827,7 @@ func TestFoundationRegistryValidatesNestedBodiesBeforeOuterDigests(t *testing.T)
 		if err != nil {
 			t.Fatal(err)
 		}
-		body := protocol.RuntimeGenerationBody{ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{registryModelDescriptor()}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{{Body: toolBody, DescriptorDigest: toolDigest}}, InstructionRevision: "instructions", PolicyGeneration: "policy", ExecutionProfiles: []string{"restricted"}, Limits: protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1}}
+		body := protocol.RuntimeGenerationBody{ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{registryModelDescriptor()}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{{Body: toolBody, DescriptorDigest: toolDigest}}, InstructionRevision: "instructions", PolicyGeneration: "policy", ExecutionProfiles: []string{"restricted"}, Limits: protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1, Subagents: validSubagentLimits()}}
 		manifest := protocol.RuntimeGenerationManifest{ID: "generation", Body: body, Digest: testDigest('f')}
 		record, err := registry.Decode(envelopeFor(t, protocol.EventEnvelope{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", Kind: protocol.EventRuntimeGenerationActivated, RuntimeGenerationID: "generation"}, protocol.RuntimeGenerationActivatedV1{Manifest: manifest}))
 		if err != nil {
@@ -972,7 +976,7 @@ func TestFoundationRegistryBindsEveryNestedRepeatedIdentity(t *testing.T) {
 		assertIdentity(t, protocol.EventEnvelope{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", Kind: protocol.EventControlOperationStarted, RuntimeGenerationID: "generation"}, controlStarted, "runtime")
 	})
 
-	manifestBody := protocol.RuntimeGenerationBody{ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{}, InstructionRevision: "instructions", PolicyGeneration: "policy", ExecutionProfiles: []string{"restricted"}, Limits: protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1}}
+	manifestBody := protocol.RuntimeGenerationBody{ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{}, InstructionRevision: "instructions", PolicyGeneration: "policy", ExecutionProfiles: []string{"restricted"}, Limits: protocol.RuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1, Subagents: validSubagentLimits()}}
 	manifestDigest, err := canonicaljson.Digest(manifestBody)
 	if err != nil {
 		t.Fatal(err)

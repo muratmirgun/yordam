@@ -959,31 +959,45 @@ func TestRuntimeBuilderBindsSubagentLimitsIntoManifestDigest(t *testing.T) {
 		t.Fatalf("manifest digest=%+v want=%+v", set.Manifest.Digest, canonical)
 	}
 
-	cfg.Subagents.Enabled = true
-	changedBuilder := newRuntimeBuilderForTest(t, nil)
-	changed, err := changedBuilder.build(cfg, domain.ModelSelection{})
+	unchangedBody := protocol.DeepCopy(set.Manifest.Body)
+	changedBody := protocol.DeepCopy(set.Manifest.Body)
+	changedBody.Limits.Subagents.Enabled = true
+	unchangedDigest, err := canonicaljson.Digest(unchangedBody)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changed.Manifest.Digest == set.Manifest.Digest {
+	changedDigest, err := canonicaljson.Digest(changedBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchangedDigest == changedDigest {
 		t.Fatal("subagent configuration did not affect manifest digest")
 	}
 }
 
 func TestRuntimeSetRejectsInvalidSubagentLimits(t *testing.T) {
 	t.Setenv("PRIMARY_KEY", "primary-secret")
-	builder := newRuntimeBuilderForTest(t, nil)
-	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	set.Manifest.Body.Limits.Subagents.MaxPerTurn = 0
-	set.Manifest.Digest, err = canonicaljson.Digest(set.Manifest.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := set.Validate(); err == nil {
-		t.Fatal("invalid subagent limits accepted")
+	for name, mutate := range map[string]func(*protocol.SubagentLimits){
+		"max per turn":   func(limits *protocol.SubagentLimits) { limits.MaxPerTurn = 0 },
+		"max tool calls": func(limits *protocol.SubagentLimits) { limits.MaxToolCalls = 65 },
+		"one nanosecond": func(limits *protocol.SubagentLimits) { limits.TimeoutNanos = 1 },
+		"above maximum":  func(limits *protocol.SubagentLimits) { limits.TimeoutNanos = int64(1800*time.Second) + 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			builder := newRuntimeBuilderForTest(t, nil)
+			set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(&set.Manifest.Body.Limits.Subagents)
+			set.Manifest.Digest, err = canonicaljson.Digest(set.Manifest.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := set.Validate(); err == nil {
+				t.Fatal("canonically redigested invalid subagent limits accepted")
+			}
+		})
 	}
 }
 
