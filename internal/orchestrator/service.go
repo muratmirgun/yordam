@@ -285,7 +285,8 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 		}
 	}
 	state.contextPlanDigest = contextPlan.Digest
-	plan, err := s.deps.Providers.Negotiate(model.ProviderID, model.ModelID, requirements, request.Runtime.Body.ToolCatalogRevision)
+	exposure := effectiveToolExposure(request)
+	plan, err := s.deps.Providers.Negotiate(model.ProviderID, model.ModelID, requirements, exposure.CatalogRevision)
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
@@ -294,7 +295,7 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 	modelRequest := protocol.ModelRequest{
 		RequestID:  stableID("provider-request", string(request.Command.CommandID), fmt.Sprint(attempt)),
 		ProviderID: model.ProviderID, ModelID: model.ModelID, Messages: messages,
-		Tools: effectiveToolExposure(request), Requirements: requirements, Plan: plan,
+		Tools: exposure, Requirements: requirements, Plan: plan,
 	}
 	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "provider", fmt.Sprint(attempt)))
 	callID := stableID("provider-call", string(request.Command.CommandID), fmt.Sprint(attempt))

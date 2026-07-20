@@ -128,7 +128,7 @@ func (s *Service) runSubagentIntent(ctx context.Context, lease managedOperationL
 	if err := s.verifyParentHead(ctx, state); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
-	return s.attachSubagentReceipt(ctx, request, state, intent, receipt)
+	return s.attachSubagentReceipt(ctx, request, state, intent, activityID, receipt)
 }
 
 func (s *Service) verifyParentHead(ctx context.Context, state *turnState) error {
@@ -192,7 +192,7 @@ func (s *Service) rejectSubagentIntent(ctx context.Context, request StartTurnReq
 	return protocol.ToolResultBlock{CallID: intent.CallID, Status: "failed", Text: reason}, nil
 }
 
-func (s *Service) attachSubagentReceipt(ctx context.Context, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock, receipt protocol.SubagentReceiptV1) (protocol.ToolResultBlock, error) {
+func (s *Service) attachSubagentReceipt(ctx context.Context, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock, activityID protocol.ActivityID, receipt protocol.SubagentReceiptV1) (protocol.ToolResultBlock, error) {
 	encoded, err := canonicaljson.Marshal(receipt)
 	if err != nil {
 		return protocol.ToolResultBlock{}, err
@@ -211,7 +211,7 @@ func (s *Service) attachSubagentReceipt(ctx context.Context, request StartTurnRe
 	candidate := protocol.EvidenceCandidate{
 		ID: protocol.EvidenceID(stableID("evidence", string(request.Command.CommandID), string(receipt.Manifest.AttemptID), digest.Value)), Kind: "subagent_receipt",
 		WorkspaceID: protocol.WorkspaceID(parent.Session.Workspace.ID), SessionID: request.SessionID, MediaType: "application/json",
-		ProducingActivityID: protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "subagent", string(receipt.Manifest.AttemptID))),
+		ProducingActivityID: activityID,
 		Actor:               protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}, Subject: protocol.SubjectRef{Kind: "subagent_attempt", ID: string(receipt.Manifest.AttemptID)}, Content: encoded, Limit: protocol.MaxSubagentReceiptSummaryBytes,
 	}
 	record, err := s.deps.Evidence.Put(ctx, candidate)

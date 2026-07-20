@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/muratmirgun/yordam/internal/activity"
 	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/eventcodec"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/provider"
@@ -113,6 +116,81 @@ func TestRunTurnSubagentHappyPathCommitsParentHandoffAndAttachment(t *testing.T)
 	if !containsBatchKind(batches, protocol.EventEvidenceRecorded) {
 		t.Fatalf("receipt evidence missing: %v", batches)
 	}
+	var planned, evidence, terminal protocol.ActivityID
+	for _, appendRequest := range repo.appendRequests() {
+		for _, event := range appendRequest.Events {
+			switch event.Kind {
+			case protocol.EventActivityPlanned:
+				if strings.Contains(string(event.Payload), "sequential child orchestration") {
+					planned = event.ActivityID
+				}
+			case protocol.EventEvidenceRecorded:
+				evidence = event.ActivityID
+			case protocol.EventActivitySucceeded:
+				if planned != "" && event.ActivityID == planned {
+					terminal = event.ActivityID
+				}
+			}
+		}
+	}
+	if planned == "" || planned != evidence || planned != terminal {
+		t.Fatalf("subagent activity planned=%q evidence=%q terminal=%q", planned, evidence, terminal)
+	}
+	projector := activity.Projector{}
+	projection := projector.Zero(protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(request.SessionID)})
+	for _, record := range subagentActivityRecords(t, repo.appendRequests(), request.SessionID, planned) {
+		var err error
+		projection, err = projector.Apply(projection, record)
+		if err != nil {
+			t.Fatalf("replay parent handoff %s: %v", record.Envelope.Kind, err)
+		}
+	}
+	replayed, ok := projection.Activities[planned]
+	if !ok || replayed.State != activity.StateSucceeded || len(replayed.OutputEvidenceIDs) != 1 {
+		t.Fatalf("replayed handoff activity=%+v", replayed)
+	}
+}
+
+// subagentActivityRecords turns the exact persisted parent candidates into the
+// stateful records consumed by the activity projector.  Filtering is deliberate:
+// the projector ignores all other foundation events, while this regression
+// verifies that the handoff's own lifecycle and evidence linkage replay.
+func subagentActivityRecords(t *testing.T, requests []journal.AppendRequest, sessionID protocol.SessionID, activityID protocol.ActivityID) []protocol.EventRecord {
+	t.Helper()
+	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var records []protocol.EventRecord
+	var sequence uint64 = 1
+	for _, request := range requests {
+		for _, event := range request.Events {
+			if event.ActivityID != activityID || (event.Kind != protocol.EventActivityPlanned && event.Kind != protocol.EventActivityAuthorized && event.Kind != protocol.EventActivityStarted && event.Kind != protocol.EventActivitySucceeded && event.Kind != protocol.EventEvidenceLinked) {
+				sequence++
+				continue
+			}
+			envelope := protocol.EventEnvelope{
+				SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: event.PayloadVersion,
+				JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, SessionID: sessionID,
+				EventID: event.EventID, Seq: sequence, Time: event.Time, Kind: event.Kind,
+				TaskID: event.TaskID, TurnID: event.TurnID, ActivityID: event.ActivityID,
+				ParentActivityID: event.ParentActivityID, CausationEventID: event.CausationEventID,
+				Actor: event.Actor, RuntimeGenerationID: event.RuntimeGenerationID, TransactionID: request.TransactionID,
+				Payload: event.Payload,
+			}
+			raw, marshalErr := canonicaljson.Marshal(envelope)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			record, decodeErr := registry.Decode(raw)
+			if decodeErr != nil {
+				t.Fatalf("decode persisted %s: %v", event.Kind, decodeErr)
+			}
+			records = append(records, record)
+			sequence++
+		}
+	}
+	return records
 }
 
 func TestSequentialChildCoordinatorRunsOrdinaryChildTurnAndReadsReceipt(t *testing.T) {
@@ -126,7 +204,9 @@ func TestSequentialChildCoordinatorRunsOrdinaryChildTurnAndReadsReceipt(t *testi
 	store := &productionCoordinatorStore{workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}}
 	childRepo := &recordingRepository{head: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 1, TransactionID: "create"}}
 	childLog := &recordLog{}
-	childService, err := NewService(Dependencies{Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: &loggingLane{delegate: NewOperationLane(), log: childLog}, Repository: childRepo, TurnLeases: &recordingTurnLeaseManager{log: childLog}, Context: fakeContextPlanner{log: childLog}, Providers: fakeProviderCatalog{log: childLog}, Provider: fakeProviderService{log: childLog}, Tools: noToolService{}, Authorization: &allowingAuthorization{log: childLog}, Evidence: noEvidenceRecorder{}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now)})
+	childCatalog := &capturingProviderCatalog{log: childLog}
+	childProvider := &capturingFinalProvider{log: childLog}
+	childService, err := NewService(Dependencies{Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: &loggingLane{delegate: NewOperationLane(), log: childLog}, Repository: childRepo, TurnLeases: &recordingTurnLeaseManager{log: childLog}, Context: fakeContextPlanner{log: childLog}, Providers: childCatalog, Provider: childProvider, Tools: noToolService{}, Authorization: &allowingAuthorization{log: childLog}, Evidence: noEvidenceRecorder{}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,6 +228,161 @@ func TestSequentialChildCoordinatorRunsOrdinaryChildTurnAndReadsReceipt(t *testi
 	if !containsBatchKind(childRepo.batchKinds(), protocol.EventSubagentManifest) || !containsBatchKind(childRepo.batchKinds(), protocol.EventSubagentReceipt) {
 		t.Fatalf("child did not own manifest/receipt: %v", childRepo.batchKinds())
 	}
+	if childCatalog.revision != childProvider.request.Tools.CatalogRevision || childCatalog.revision == parent.Runtime.Body.ToolCatalogRevision {
+		t.Fatalf("child catalog negotiation=%q exposure=%q parent=%q", childCatalog.revision, childProvider.request.Tools.CatalogRevision, parent.Runtime.Body.ToolCatalogRevision)
+	}
+}
+
+func TestRunTurnSubagentUsesRealSequentialCoordinatorAndContinuesParent(t *testing.T) {
+	parent := validStartTurnRequest()
+	parent.Runtime = validRuntimeManifest(t, "observation")
+	parent.Runtime.Body.SkillCatalogRevision = "skills-a"
+	parent.Runtime.Body.Limits.MaxToolCalls = 5
+	parent.Runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+	parent.Runtime.Body.Tools = append(parent.Runtime.Body.Tools, subagenttool.BuiltinDescriptor())
+	refreshRuntimeDigest(t, &parent.Runtime)
+
+	log := &recordLog{}
+	parentRepo := &recordingRepository{head: parent.ExpectedHead, log: log}
+	childRepo := &recordingRepository{head: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 1, TransactionID: "create"}, log: log}
+	store := &productionCoordinatorStore{workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}}
+	childCatalog := &capturingProviderCatalog{log: log}
+	childProvider := &capturingFinalProvider{log: log}
+	childService, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: &loggingLane{delegate: NewOperationLane(), log: log}, Repository: childRepo,
+		TurnLeases: &recordingTurnLeaseManager{log: log}, Context: fakeContextPlanner{log: log}, Providers: childCatalog, Provider: childProvider,
+		Tools: noToolService{}, Authorization: &allowingAuthorization{log: log}, Evidence: noEvidenceRecorder{}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentProvider := &subagentTestProvider{log: log}
+	parentService, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: &loggingLane{delegate: NewOperationLane(), log: log}, Repository: parentRepo,
+		TurnLeases: &recordingTurnLeaseManager{log: log}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: parentProvider,
+		Tools: subagentPlanService{}, Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+		ChildSessions: store, ParentSessions: productionCoordinatorParent{store},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var childStart StartTurnRequest
+	coordinator, err := NewSequentialChildCoordinator(store, productionCoordinatorParent{store}, func(ctx context.Context, request StartTurnRequest) (RunResult, error) {
+		log.add("child.run")
+		childStart = protocol.DeepCopy(request)
+		result, runErr := childService.RunTurn(ctx, request)
+		store.capture(childRepo)
+		return result, runErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentService.SetChildCoordinator(coordinator)
+
+	if _, err := parentService.RunTurn(context.Background(), parent); err != nil {
+		t.Fatalf("parent turn: %v", err)
+	}
+	if parentProvider.calls != 2 {
+		t.Fatalf("parent provider calls=%d want continuation after child", parentProvider.calls)
+	}
+	if !containsBatchKind(childRepo.batchKinds(), protocol.EventSubagentManifest) || !containsBatchKind(childRepo.batchKinds(), protocol.EventSubagentReceipt) {
+		t.Fatalf("child journal missing lifecycle events: %v", childRepo.batchKinds())
+	}
+	if containsBatchKind(parentRepo.batchKinds(), protocol.EventSubagentManifest) || containsBatchKind(parentRepo.batchKinds(), protocol.EventSubagentReceipt) {
+		t.Fatalf("child lifecycle leaked to parent journal: %v", parentRepo.batchKinds())
+	}
+	if !containsBatchKind(parentRepo.batchKinds(), protocol.EventSubagentRequested) || !containsBatchKind(parentRepo.batchKinds(), protocol.EventSubagentWaiting) || !containsBatchKind(parentRepo.batchKinds(), protocol.EventSubagentResultAttached) || !containsBatchKind(parentRepo.batchKinds(), protocol.EventEvidenceRecorded) {
+		t.Fatalf("parent handoff incomplete: %v", parentRepo.batchKinds())
+	}
+	if childCatalog.revision != childProvider.request.Tools.CatalogRevision || childCatalog.revision == parent.Runtime.Body.ToolCatalogRevision {
+		t.Fatalf("child provider exposure revision negotiated=%q request=%q parent=%q", childCatalog.revision, childProvider.request.Tools.CatalogRevision, parent.Runtime.Body.ToolCatalogRevision)
+	}
+	if childProvider.request.ProviderID != parent.ProviderID || childProvider.request.ModelID != parent.ModelID {
+		t.Fatalf("child provider/model=%q/%q want frozen %q/%q", childProvider.request.ProviderID, childProvider.request.ModelID, parent.ProviderID, parent.ModelID)
+	}
+	if childStart.Runtime.ID != parent.Runtime.ID || childStart.Runtime.Digest != parent.Runtime.Digest || childStart.Runtime.Body.SkillCatalogRevision != parent.Runtime.Body.SkillCatalogRevision || childStart.child == nil {
+		t.Fatalf("child runtime was not frozen from parent: %+v", childStart)
+	}
+	if childStart.child.exposure.CatalogRevision != childProvider.request.Tools.CatalogRevision || len(childStart.child.exposure.Tools) != len(parent.Runtime.Body.Tools)-1 {
+		t.Fatalf("child exposure=%+v request=%+v", childStart.child.exposure, childProvider.request.Tools)
+	}
+	childReceipt, ok := receiptFromRepo(childRepo)
+	if !ok {
+		t.Fatal("child receipt was not committed")
+	}
+	if childReceipt.Manifest.RuntimeGenerationID != parent.Runtime.ID || childReceipt.Manifest.SkillCatalogRevision != parent.Runtime.Body.SkillCatalogRevision || childReceipt.Manifest.ParentSessionID != parent.SessionID {
+		t.Fatalf("child manifest did not preserve frozen parent identity: %+v", childReceipt.Manifest)
+	}
+	attachment, ok := subagentAttachment(parentRepo)
+	if !ok {
+		t.Fatal("parent attachment was not committed")
+	}
+	receiptDigest, err := canonicaljson.Digest(childReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attachment.TerminalCursor != childReceipt.TerminalCursor || attachment.ReceiptDigest != receiptDigest || attachment.ReceiptEvidenceID == "" {
+		t.Fatalf("attachment=%+v receipt=%+v", attachment, childReceipt)
+	}
+	entries := log.snapshot()
+	if indexOf(entries, "child.run") < 0 || indexOf(entries, "evidence.put") < indexOf(entries, "child.run") {
+		t.Fatalf("parent attached evidence before child completed: %v", entries)
+	}
+}
+
+func subagentAttachment(repo *recordingRepository) (protocol.SubagentResultAttachedV1, bool) {
+	for _, request := range repo.appendRequests() {
+		for _, event := range request.Events {
+			if event.Kind != protocol.EventSubagentResultAttached {
+				continue
+			}
+			var attachment protocol.SubagentResultAttachedV1
+			if json.Unmarshal(event.Payload, &attachment) == nil {
+				return attachment, true
+			}
+		}
+	}
+	return protocol.SubagentResultAttachedV1{}, false
+}
+
+func indexOf(values []string, want string) int {
+	for index, value := range values {
+		if value == want {
+			return index
+		}
+	}
+	return -1
+}
+
+type capturingProviderCatalog struct {
+	log      *recordLog
+	revision string
+}
+
+func (c *capturingProviderCatalog) Resolve(protocol.ProviderID, protocol.ModelID) (protocol.ModelDescriptor, bool) {
+	return protocol.ModelDescriptor{}, false
+}
+func (c *capturingProviderCatalog) Negotiate(providerID protocol.ProviderID, modelID protocol.ModelID, requirements []protocol.CapabilityRequirement, revision string) (protocol.NegotiatedProviderPlan, error) {
+	c.revision = revision
+	return fakeProviderCatalog{log: c.log}.Negotiate(providerID, modelID, requirements, revision)
+}
+
+type capturingFinalProvider struct {
+	log     *recordLog
+	request protocol.ModelRequest
+}
+
+func (p *capturingFinalProvider) Prepare(_ context.Context, _ protocol.ActivityID, _ string, request protocol.ModelRequest, _ protocol.Digest) (provider.ProviderHandle, error) {
+	p.request = protocol.DeepCopy(request)
+	p.log.add("provider.prepare")
+	return provider.ProviderHandle{}, nil
+}
+func (p *capturingFinalProvider) Stream(context.Context, provider.ProviderHandle, authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	stream := make(chan protocol.ModelEvent, 2)
+	stream <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: "done"}}
+	stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "stop"}}
+	close(stream)
+	return stream, nil
 }
 
 func TestRunTurnSubagentDisabledRejectsBeforeChildDispatch(t *testing.T) {
