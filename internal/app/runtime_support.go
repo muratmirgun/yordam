@@ -473,10 +473,12 @@ func (p recoveryProjection) InspectRecovery(ctx context.Context, ref protocol.Jo
 
 type runtimeBrokerSource struct {
 	Repository journal.Repository
+	Sessions   *jsonl.Store
 	Workspace  protocol.JournalRef
 	Generation protocol.RuntimeGenerationID
 	Manifest   protocol.RuntimeGenerationManifest
 	Skills     skills.Catalog
+	Redactor   secret.Redacting
 }
 
 func (s runtimeBrokerSource) WorkspaceControl() protocol.JournalRef { return s.Workspace }
@@ -521,7 +523,7 @@ func (s runtimeBrokerSource) Project(ctx context.Context, vector SnapshotVector)
 			Input: protocol.UsageValue{State: protocol.UsageUnknown}, Output: protocol.UsageValue{State: protocol.UsageUnknown},
 			Cached: protocol.UsageValue{State: protocol.UsageUnknown}, CacheWrite: protocol.UsageValue{State: protocol.UsageUnknown}, Reasoning: protocol.UsageValue{State: protocol.UsageUnknown},
 		},
-		Cost: protocol.CostValue{State: protocol.ValueUnknown}, Checkpoints: []protocol.ProjectionView{}, Evidence: []protocol.ProjectionView{}, Receipts: []protocol.ProjectionView{}, RecoveryDiagnostics: []protocol.Diagnostic{},
+		Cost: protocol.CostValue{State: protocol.ValueUnknown}, Checkpoints: []protocol.ProjectionView{}, Evidence: []protocol.ProjectionView{}, Receipts: []protocol.ProjectionView{}, Subagents: []protocol.ProjectionView{}, RecoveryDiagnostics: []protocol.Diagnostic{},
 	}
 	if s.Skills != nil {
 		snapshot := s.Skills.Snapshot()
@@ -532,6 +534,41 @@ func (s runtimeBrokerSource) Project(ctx context.Context, vector SnapshotVector)
 	}
 	if vector.SelectedSession != nil {
 		ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: vector.SelectedSession.JournalID}
+		inspection, inspectErr := s.Repository.Inspect(ctx, ref)
+		if inspectErr != nil {
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("inspect selected session for subagents: %w", inspectErr)
+		}
+		cards, cardsErr := projectSubagentCards(inspection, func(childID protocol.SessionID) (journal.Inspection, error) {
+			return s.Repository.Inspect(ctx, protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(childID)})
+		}, time.Now().UTC(), s.Redactor)
+		if cardsErr != nil {
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("project subagent cards: %w", cardsErr)
+		}
+		children := make([]protocol.SessionID, 0, len(cards))
+		for _, card := range cards {
+			data, marshalErr := canonicaljson.Marshal(card)
+			if marshalErr != nil {
+				return protocol.DurableProjection{}, protocol.RuntimeProjection{}, marshalErr
+			}
+			durable.Subagents = append(durable.Subagents, known(string(card.AttemptID), "subagent", string(card.State), data))
+			children = append(children, card.ChildSessionID)
+		}
+		lineage := protocol.SubagentLineageV1{SessionID: protocol.SessionID(ref.ID), Children: children}
+		if s.Sessions != nil {
+			stored, lineageErr := s.Sessions.SessionLineage(ctx, protocol.SessionID(ref.ID))
+			if lineageErr != nil {
+				return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("read selected session lineage: %w", lineageErr)
+			}
+			if stored != nil && stored.Kind == journal.LineageSubagent {
+				lineage.ParentSessionID, lineage.DelegationAttemptID = stored.ParentSessionID, stored.DelegationAttemptID
+			}
+		}
+		lineageData, marshalErr := canonicaljson.Marshal(lineage)
+		if marshalErr != nil {
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, marshalErr
+		}
+		lineageView := known(string(ref.ID), "lineage", "ready", lineageData)
+		durable.Lineage = &lineageView
 		tasks, projectErr := projection.New[taskprojection.Projection](s.Repository, taskprojection.Projector{}, nil).At(ctx, ref, *vector.SelectedSession)
 		if projectErr != nil {
 			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("project tasks at cursor: %w", projectErr)
@@ -671,6 +708,7 @@ type runtimeCommandDispatcher struct {
 	Workspace    protocol.JournalRef
 	WorkspaceID  protocol.WorkspaceID
 	Skills       skills.Catalog
+	Acquire      func() (func(), error)
 }
 
 func (d runtimeCommandDispatcher) DispatchCommand(ctx context.Context, metadata orchestrator.CommandMetadata, command protocol.Command, decoded any) (protocol.CommandResult, error) {
@@ -679,6 +717,14 @@ func (d runtimeCommandDispatcher) DispatchCommand(ctx context.Context, metadata 
 	}
 	switch payload := decoded.(type) {
 	case *protocol.StartTurnCommandV1:
+		if d.Acquire == nil {
+			return failedCommand(command, "service_unavailable", "runtime generation lease is unavailable", true), nil
+		}
+		release, acquireErr := d.Acquire()
+		if acquireErr != nil {
+			return failedCommand(command, "runtime_retired", acquireErr.Error(), false), nil
+		}
+		defer release()
 		if command.Expected == nil || command.Expected.Session == nil || command.Expected.SelectedSessionID == "" {
 			return failedCommand(command, codeInvalidCommand, "turn command requires a selected session cursor", false), nil
 		}

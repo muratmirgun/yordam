@@ -255,6 +255,7 @@ func (a *App) Run(ctx context.Context) error {
 				}
 			}
 		case event := <-protocolEvents:
+			event = a.enrichSubagentStage(ctx, event)
 			if event.Kind != "" && !a.publish(ctx, event) {
 				if activeCancel != nil {
 					activeCancel()
@@ -308,8 +309,8 @@ func (a *App) Run(ctx context.Context) error {
 						a.publish(ctx, Event{Kind: EventError, Err: contextErr, Message: "invalid durable context", NonTerminal: true})
 						continue
 					}
-					if contextState != nil {
-						a.publish(ctx, Event{Kind: EventState, Context: contextState})
+					if contextState != nil || snapshot.Durable.SelectedSession != nil {
+						a.publish(ctx, Event{Kind: EventState, Context: contextState, Durable: protocol.DeepCopy(&snapshot.Durable)})
 					}
 					// The operation result owns successful turn completion so it can
 					// clear activeOperation before publishing the sole terminal event.
@@ -616,6 +617,18 @@ func (a *App) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (a *App) enrichSubagentStage(ctx context.Context, event Event) Event {
+	if event.Kind != EventSubagentStage || a.runtimeSet.ApplicationService == nil || a.session.ID == "" {
+		return event
+	}
+	snapshot, err := a.runtimeSet.ApplicationService.Snapshot(ctx, protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(a.session.ID), Consumer: "legacy_subagent_stage", QueueCapacity: 1})
+	if err != nil {
+		return Event{Kind: EventError, Err: err, Message: "refresh durable subagent state", NonTerminal: true}
+	}
+	event.Durable = protocol.DeepCopy(&snapshot.Durable)
+	return event
 }
 
 func serializableCompactionFailure(public protocol.PublicError) *Event {
@@ -1062,6 +1075,7 @@ func (a *App) openSession(ctx context.Context, sessionID string) bool {
 			return a.publish(ctx, Event{Kind: EventError, Err: contextErr, Message: "invalid durable context", NonTerminal: true})
 		}
 		event.Context = contextState
+		event.Durable = protocol.DeepCopy(&snapshot.Durable)
 	}
 	return a.publish(ctx, event)
 }

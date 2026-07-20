@@ -10,6 +10,7 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/tui"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 )
@@ -551,6 +552,69 @@ func TestDurableStateEventUpdatesStatusAndProjectsOpenedSession(t *testing.T) {
 	blocks := model.ConversationBlocksForTest()
 	if len(blocks) != 2 || blocks[0].Content != "persisted user" || blocks[1].Content != "persisted assistant" {
 		t.Fatalf("projected blocks=%v", blocks)
+	}
+}
+
+func TestDurableSubagentSnapshotRendersCardAndNavigatesChildAndParent(t *testing.T) {
+	model, commands := tui.NavigationModelForTest()
+	card := protocol.SubagentCardV1{AttemptID: "attempt", ParentSessionID: "parent", ChildSessionID: "child", Task: "inspect recovery", State: protocol.SubagentStageRunning, Attempt: 1, StartedAt: time.Unix(1, 0).UTC(), Deadline: time.Unix(11, 0).UTC(), ElapsedNanos: int64(time.Second), MaxToolCalls: 4}
+	rawCard, _ := json.Marshal(card)
+	lineage := protocol.SubagentLineageV1{SessionID: "parent", Children: []protocol.SessionID{"child"}}
+	rawLineage, _ := json.Marshal(lineage)
+	durable := protocol.DurableProjection{Subagents: []protocol.ProjectionView{{ID: "attempt", Kind: "subagent", Status: "running", State: protocol.ValueKnown, Data: rawCard}}, Lineage: &protocol.ProjectionView{ID: "parent", Kind: "lineage", Status: "ready", State: protocol.ValueKnown, Data: rawLineage}}
+	parent := domain.Session{ID: "parent", Title: "Parent", Mode: domain.ModeAsk, Selection: domain.ModelSelection{Profile: "primary", Model: "model-a"}}
+	parentEvent := app.Event{Kind: app.EventState, Session: parent, Replay: domain.SessionReplay{Session: parent}, Durable: &durable}
+	model = tui.ApplyAppEventForTest(model, parentEvent)
+	if view := model.View().Content; !strings.Contains(view, "inspect recovery") || !strings.Contains(view, "child") {
+		t.Fatalf("child card absent:\n%s", view)
+	}
+	model = tui.PressForTest(model, "alt+enter")
+	got := tui.CommandsForTest(commands)
+	if len(got) != 1 || got[0].Kind != app.CommandOpenSession || got[0].SessionID != "child" {
+		t.Fatalf("open child commands=%+v", got)
+	}
+
+	childLineage := protocol.SubagentLineageV1{SessionID: "child", ParentSessionID: "parent", DelegationAttemptID: "attempt", Children: []protocol.SessionID{}}
+	rawChildLineage, _ := json.Marshal(childLineage)
+	childDurable := protocol.DurableProjection{Lineage: &protocol.ProjectionView{ID: "child", Kind: "lineage", Status: "ready", State: protocol.ValueKnown, Data: rawChildLineage}}
+	child := domain.Session{ID: "child", Title: "Child", Mode: domain.ModeAsk, Selection: parent.Selection}
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventState, Session: child, Replay: domain.SessionReplay{Session: child}, Durable: &childDurable})
+	if view := model.View().Content; !strings.Contains(view, "Parent: parent") {
+		t.Fatalf("parent backlink absent:\n%s", view)
+	}
+	model = tui.PressForTest(model, "alt+left")
+	got = tui.CommandsForTest(commands)
+	if len(got) != 1 || got[0].SessionID != "parent" {
+		t.Fatalf("return parent commands=%+v", got)
+	}
+
+	restarted, restartedCommands := tui.NavigationModelForTest()
+	restarted = tui.ApplyAppEventForTest(restarted, parentEvent)
+	if view := restarted.View().Content; !strings.Contains(view, "inspect recovery") || !strings.Contains(view, "child") {
+		t.Fatalf("restart did not reconstruct child card:\n%s", view)
+	}
+	restarted = tui.PressForTest(restarted, "alt+enter")
+	if got := tui.CommandsForTest(restartedCommands); len(got) != 1 || got[0].SessionID != "child" {
+		t.Fatalf("restart child navigation=%+v", got)
+	}
+}
+
+func TestLiveSubagentStageUsesFreshDurableSnapshotAndEscCancelsParent(t *testing.T) {
+	model, commands := tui.NavigationModelForTest()
+	model = tui.SetTurnActiveForTest(model, true)
+	card := protocol.SubagentCardV1{AttemptID: "attempt", ParentSessionID: "parent", ChildSessionID: "child", Task: "child task", State: protocol.SubagentStageRunning, Attempt: 1, StartedAt: time.Unix(1, 0).UTC(), Deadline: time.Unix(11, 0).UTC(), ElapsedNanos: int64(time.Second), MaxToolCalls: 4}
+	raw, _ := json.Marshal(card)
+	durable := protocol.DurableProjection{Subagents: []protocol.ProjectionView{{ID: "attempt", Kind: "subagent", Status: "running", State: protocol.ValueKnown, Data: raw}}}
+	stage := protocol.SubagentStageV1{AttemptID: "attempt", ParentSessionID: "parent", ChildSessionID: "child", Stage: protocol.SubagentStageWaiting}
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventSubagentStage, Subagent: &stage, Durable: &durable})
+	view := model.View().Content
+	if !strings.Contains(view, "[running]") || strings.Contains(view, "[waiting]") {
+		t.Fatalf("transient stage overrode durable snapshot:\n%s", view)
+	}
+	model = tui.PressForTest(model, "esc")
+	got := tui.CommandsForTest(commands)
+	if len(got) != 1 || got[0].Kind != app.CommandCancelTurn || !model.CancelSentForTest() {
+		t.Fatalf("Esc did not cancel owning parent turn: commands=%+v", got)
 	}
 }
 

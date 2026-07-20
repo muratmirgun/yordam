@@ -6,6 +6,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
 const splitGap = 3
@@ -87,13 +88,23 @@ func (model Model) renderScreen() string {
 	switch model.screen {
 	case ScreenSessions:
 		lines := []string{"SESSIONS", "Filter: " + model.sessions.Filter()}
+		if model.lineage.ParentSessionID != "" {
+			lines = append(lines, "Current child of "+string(model.lineage.ParentSessionID)+" [Alt+Left: return]")
+		}
+		if len(model.lineage.Children) != 0 {
+			lines = append(lines, "Children: "+strings.Join(sessionIDs(model.lineage.Children), ", "))
+		}
 		selected := model.sessions.Select()
 		for _, session := range model.sessions.Visible() {
 			marker := "  "
 			if session.ID == selected {
 				marker = "> "
 			}
-			lines = append(lines, marker+session.Title+" ["+session.ID+"]")
+			label := marker + session.Title + " [" + session.ID + "]"
+			if relation := model.sessions.Relation(session.ID); relation != "" {
+				label += " — " + relation
+			}
+			lines = append(lines, label)
 		}
 		return strings.Join(append(lines, "Enter: open | Esc: cancel"), "\n")
 	case ScreenMode:
@@ -130,6 +141,16 @@ func (model Model) renderConversation(width int) string {
 	if len(model.conversation.Blocks()) == 0 {
 		stream = "Conversation"
 	}
+	if model.lineage.ParentSessionID != "" {
+		stream = "Parent: " + string(model.lineage.ParentSessionID) + " [Alt+Left: return]\n\n" + stream
+	}
+	streamWidth := width
+	if model.layout() == LayoutSplit {
+		streamWidth = (width - splitGap) * 2 / 3
+	}
+	if cards := model.childCards.View(streamWidth); cards != "" {
+		stream += "\n\n" + cards
+	}
 	var body string
 	switch model.layout() {
 	case LayoutContextOnly:
@@ -142,6 +163,14 @@ func (model Model) renderConversation(width int) string {
 		body = renderPanel(stream, width)
 	}
 	return body
+}
+
+func sessionIDs(ids []protocol.SessionID) []string {
+	result := make([]string, len(ids))
+	for index := range ids {
+		result[index] = string(ids[index])
+	}
+	return result
 }
 
 func renderedLineCount(value string) int { return strings.Count(value, "\n") + 1 }

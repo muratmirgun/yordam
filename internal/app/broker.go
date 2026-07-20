@@ -278,6 +278,20 @@ func (b *Broker) PublishCommitted(_ context.Context, ref protocol.JournalRef, cu
 			return fmt.Errorf("published committed event does not match transaction")
 		}
 	}
+	type parentStage struct {
+		envelope protocol.EventEnvelope
+		stage    protocol.SubagentStageV1
+	}
+	parentStages := make([]parentStage, 0, 1)
+	for _, event := range events {
+		stage, ok, err := publicSubagentStage(event)
+		if err != nil {
+			return err
+		}
+		if ok && event.SessionID == stage.ChildSessionID {
+			parentStages = append(parentStages, parentStage{envelope: event, stage: stage})
+		}
+	}
 	b.mu.Lock()
 	callbacks := make([]struct {
 		consumer string
@@ -298,11 +312,49 @@ func (b *Broker) PublishCommitted(_ context.Context, ref protocol.JournalRef, cu
 			delete(b.subscriptions, subscription.id)
 		}
 	}
+	for _, candidate := range parentStages {
+		b.streamSeq++
+		for _, subscription := range b.subscriptions {
+			if subscription.closed || subscription.terminal || subscription.selected != candidate.stage.ParentSessionID {
+				continue
+			}
+			event, eventErr := parentSubagentStageEvent(candidate.envelope, candidate.stage, subscription.cursor, b.epoch, b.streamSeq)
+			if eventErr != nil {
+				b.mu.Unlock()
+				return eventErr
+			}
+			if subscription.enqueueEventLocked(event) {
+				continue
+			}
+			if subscription.consumer == ConsumerFakeHeadless && !subscription.overflowFired && b.nonReconnectableOverflow != nil {
+				subscription.overflowFired = true
+				callbacks = append(callbacks, struct {
+					consumer string
+					terminal protocol.SubscriptionTerminal
+				}{subscription.consumer, *subscription.queue[len(subscription.queue)-1].Terminal})
+			}
+			delete(b.subscriptions, subscription.id)
+		}
+	}
 	b.mu.Unlock()
 	for _, callback := range callbacks {
 		b.nonReconnectableOverflow(callback.consumer, protocol.DeepCopy(callback.terminal))
 	}
 	return nil
+}
+
+func parentSubagentStageEvent(envelope protocol.EventEnvelope, stage protocol.SubagentStageV1, cursor protocol.ApplicationCursor, epoch string, streamSeq uint64) (protocol.ApplicationEvent, error) {
+	payload, err := json.Marshal(stage)
+	if err != nil {
+		return protocol.ApplicationEvent{}, err
+	}
+	cursor = protocol.DeepCopy(cursor)
+	cursor.Stream = protocol.StreamCursor{Epoch: epoch, Seq: streamSeq}
+	event := protocol.ApplicationEvent{ProtocolVersion: protocol.ApplicationProtocolVersion, StreamEventID: string(envelope.EventID) + ":parent:" + string(stage.ParentSessionID), Cursor: cursor, Correlation: protocol.EventCorrelation{JournalKind: envelope.JournalKind, JournalID: envelope.JournalID, SessionID: envelope.SessionID, TaskID: envelope.TaskID, TurnID: envelope.TurnID, ActivityID: envelope.ActivityID, ParentSessionID: stage.ParentSessionID, DelegationAttemptID: stage.AttemptID}, Time: envelope.Time, Kind: envelope.Kind, Classification: "transient", PayloadVersion: 1, Payload: payload}
+	if err := event.Validate(); err != nil {
+		return protocol.ApplicationEvent{}, err
+	}
+	return event, nil
 }
 
 func (b *Broker) PublishTransient(event protocol.ApplicationEvent) error {
@@ -568,6 +620,19 @@ func (s *brokerSubscription) Close() error {
 
 func applicationEvent(envelope protocol.EventEnvelope, journalCursor protocol.CommittedCursor, cursor protocol.ApplicationCursor) (protocol.ApplicationEvent, error) {
 	correlation := protocol.EventCorrelation{JournalKind: envelope.JournalKind, JournalID: envelope.JournalID, SessionID: envelope.SessionID, TaskID: envelope.TaskID, TurnID: envelope.TurnID, ActivityID: envelope.ActivityID}
+	payload := protocol.CloneRawMessage(envelope.Payload)
+	if stage, ok, err := publicSubagentStage(envelope); err != nil {
+		return protocol.ApplicationEvent{}, err
+	} else if ok {
+		payload, err = json.Marshal(stage)
+		if err != nil {
+			return protocol.ApplicationEvent{}, err
+		}
+		if envelope.SessionID == stage.ChildSessionID {
+			correlation.ParentSessionID = stage.ParentSessionID
+			correlation.DelegationAttemptID = stage.AttemptID
+		}
+	}
 	if isApplicationControlEvent(envelope.Kind) {
 		var identity struct {
 			ControlOperationID protocol.ControlOperationID `json:"control_operation_id"`
@@ -580,12 +645,54 @@ func applicationEvent(envelope protocol.EventEnvelope, journalCursor protocol.Co
 	event := protocol.ApplicationEvent{
 		ProtocolVersion: protocol.ApplicationProtocolVersion, StreamEventID: string(envelope.EventID), Cursor: protocol.DeepCopy(cursor),
 		Correlation: correlation, Time: envelope.Time, Kind: envelope.Kind, Classification: "durable",
-		JournalCursor: ptrCommittedCursor(journalCursor), PayloadVersion: envelope.PayloadVersion, Payload: protocol.CloneRawMessage(envelope.Payload),
+		JournalCursor: ptrCommittedCursor(journalCursor), PayloadVersion: envelope.PayloadVersion, Payload: payload,
 	}
 	if err := event.Validate(); err != nil {
 		return protocol.ApplicationEvent{}, err
 	}
 	return event, nil
+}
+
+func publicSubagentStage(envelope protocol.EventEnvelope) (protocol.SubagentStageV1, bool, error) {
+	stage := protocol.SubagentStageV1{}
+	switch envelope.Kind {
+	case protocol.EventSubagentRequested:
+		var value protocol.SubagentRequestedV1
+		if err := json.Unmarshal(envelope.Payload, &value); err != nil {
+			return stage, true, err
+		}
+		stage = protocol.SubagentStageV1{AttemptID: value.Manifest.AttemptID, ParentSessionID: value.Manifest.ParentSessionID, ChildSessionID: value.Manifest.ChildSessionID, Stage: protocol.SubagentStageRequested}
+	case protocol.EventSubagentWaiting:
+		var value protocol.SubagentWaitingV1
+		if err := json.Unmarshal(envelope.Payload, &value); err != nil {
+			return stage, true, err
+		}
+		stage = protocol.SubagentStageV1{AttemptID: value.AttemptID, ParentSessionID: envelope.SessionID, ChildSessionID: value.ChildSessionID, Stage: protocol.SubagentStageWaiting}
+	case protocol.EventSubagentManifest:
+		var value protocol.SubagentManifestV1
+		if err := json.Unmarshal(envelope.Payload, &value); err != nil {
+			return stage, true, err
+		}
+		stage = protocol.SubagentStageV1{AttemptID: value.AttemptID, ParentSessionID: value.ParentSessionID, ChildSessionID: value.ChildSessionID, Stage: protocol.SubagentStageRunning}
+	case protocol.EventSubagentReceipt:
+		var value protocol.SubagentReceiptV1
+		if err := json.Unmarshal(envelope.Payload, &value); err != nil {
+			return stage, true, err
+		}
+		stage = protocol.SubagentStageV1{AttemptID: value.Manifest.AttemptID, ParentSessionID: value.Manifest.ParentSessionID, ChildSessionID: value.Manifest.ChildSessionID, Stage: protocol.SubagentStage(value.Status)}
+	case protocol.EventSubagentResultAttached:
+		var value protocol.SubagentResultAttachedV1
+		if err := json.Unmarshal(envelope.Payload, &value); err != nil {
+			return stage, true, err
+		}
+		stage = protocol.SubagentStageV1{AttemptID: value.AttemptID, ParentSessionID: envelope.SessionID, ChildSessionID: value.ChildSessionID, Stage: protocol.SubagentStageAttached}
+	default:
+		return stage, false, nil
+	}
+	if err := stage.Validate(); err != nil {
+		return protocol.SubagentStageV1{}, true, err
+	}
+	return stage, true, nil
 }
 
 func isApplicationControlEvent(kind string) bool {

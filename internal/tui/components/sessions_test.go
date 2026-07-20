@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 )
 
@@ -34,6 +35,18 @@ func TestSessionPickerFiltersAndSelects(t *testing.T) {
 	picker.Move(1)
 	if selected := picker.Select(); selected != "1" {
 		t.Fatalf("moved selected=%q", selected)
+	}
+}
+
+func TestSessionPickerProjectsDurableParentChildLineageLabels(t *testing.T) {
+	picker := components.NewSessions([]domain.SessionSummary{{ID: "parent", Title: "Parent"}, {ID: "child", Title: "Child"}})
+	picker.SetLineage(protocol.SubagentLineageV1{SessionID: "parent", Children: []protocol.SessionID{"child"}})
+	if got := picker.Relation("child"); got != "child of parent" {
+		t.Fatalf("child relation=%q", got)
+	}
+	picker.SetLineage(protocol.SubagentLineageV1{SessionID: "child", ParentSessionID: "parent", DelegationAttemptID: "attempt", Children: []protocol.SessionID{}})
+	if got := picker.Relation("parent"); got != "parent of child" {
+		t.Fatalf("parent relation=%q", got)
 	}
 }
 

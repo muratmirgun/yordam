@@ -9,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 )
 
@@ -143,6 +144,17 @@ func (model Model) handleAppEvent(event app.Event) Model {
 				model.context.ShowWorkspaceChanges(result.WorkspaceChanges)
 				model = model.openContext()
 			}
+		}
+	case app.EventSubagentStage:
+		if event.Subagent != nil {
+			model.childCards.ApplyStage(*event.Subagent)
+			if event.Subagent.Stage == protocol.SubagentStageRequested || event.Subagent.Stage == protocol.SubagentStageWaiting || event.Subagent.Stage == protocol.SubagentStageRunning {
+				model = model.setTurnActive(true)
+				model = model.setTurnProgress(progressWaiting)
+			}
+		}
+		if event.Durable != nil {
+			model = model.applyDurableSubagents(*event.Durable)
 		}
 	case app.EventPermissionRequested:
 		if event.Permission != nil {
@@ -416,6 +428,9 @@ func (model Model) replaceModels(models []domain.ModelSelection, selection domai
 }
 
 func (model Model) applyDurableState(event app.Event) Model {
+	if event.Durable != nil {
+		model = model.applyDurableSubagents(*event.Durable)
+	}
 	if event.Mode != "" {
 		model.effectiveMode = event.Mode
 		switch event.Mode {
@@ -453,6 +468,29 @@ func (model Model) applyDurableState(event app.Event) Model {
 	model.modal = ModalNone
 	model.focusedComponent = focusComposer
 	model = model.replaceConversation(event.Replay)
+	return model
+}
+
+func (model Model) applyDurableSubagents(durable protocol.DurableProjection) Model {
+	cards := make([]protocol.SubagentCardV1, 0, len(durable.Subagents))
+	for _, view := range durable.Subagents {
+		if view.State != protocol.ValueKnown || view.Kind != "subagent" {
+			continue
+		}
+		var card protocol.SubagentCardV1
+		if json.Unmarshal(view.Data, &card) == nil && card.Validate() == nil {
+			cards = append(cards, card)
+		}
+	}
+	model.childCards.Set(cards)
+	model.lineage = protocol.SubagentLineageV1{}
+	if durable.Lineage != nil && durable.Lineage.State == protocol.ValueKnown {
+		var lineage protocol.SubagentLineageV1
+		if json.Unmarshal(durable.Lineage.Data, &lineage) == nil {
+			model.lineage = lineage
+			model.sessions.SetLineage(lineage)
+		}
+	}
 	return model
 }
 

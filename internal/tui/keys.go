@@ -44,6 +44,26 @@ func (model Model) handleKey(key string) Model {
 			return model
 		}
 	}
+	if model.screen == ScreenConversation {
+		switch key {
+		case "alt+enter":
+			if child := model.childCards.SelectedSession(); child != "" {
+				model.sendAppCommand(app.Command{Kind: app.CommandOpenSession, SessionID: string(child)})
+			}
+			return model
+		case "alt+left":
+			if model.lineage.ParentSessionID != "" {
+				model.sendAppCommand(app.Command{Kind: app.CommandOpenSession, SessionID: string(model.lineage.ParentSessionID)})
+			}
+			return model
+		case "alt+[":
+			model.childCards.Move(-1)
+			return model
+		case "alt+]":
+			model.childCards.Move(1)
+			return model
+		}
+	}
 	if model.screen != ScreenConversation {
 		return model.handleScreenKey(key)
 	}

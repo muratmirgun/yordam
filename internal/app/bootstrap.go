@@ -44,6 +44,7 @@ type Snapshot struct {
 	ConfigurationError error
 	Context            *protocol.ContextProjectionV1
 	Skills             SkillSnapshot
+	Durable            *protocol.DurableProjection
 }
 
 func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapshot, err error) {
@@ -242,6 +243,7 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 	}
 
 	var contextState *protocol.ContextProjectionV1
+	var durableState *protocol.DurableProjection
 	if runtimeSet.ApplicationService != nil {
 		durable, snapErr := runtimeSet.ApplicationService.Snapshot(ctx, protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(session.ID), Consumer: "bootstrap_context", QueueCapacity: 1})
 		if snapErr != nil {
@@ -251,6 +253,7 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 		if snapErr != nil {
 			return nil, Snapshot{}, fmt.Errorf("decode durable context: %w", snapErr)
 		}
+		durableState = protocol.DeepCopy(&durable.Durable)
 	}
 	return application, Snapshot{
 		Workspace:          workspace,
@@ -261,6 +264,7 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 		ConfigurationError: configErr,
 		Context:            contextState,
 		Skills:             runtimeSet.SkillSnapshot(),
+		Durable:            durableState,
 	}, nil
 }
 

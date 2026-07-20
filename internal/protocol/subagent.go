@@ -12,7 +12,90 @@ const (
 	MaxSubagentContextBytes        = 64 << 10
 	MaxSubagentReceiptSummaryBytes = 128 << 10
 	MaxSubagentAttemptsPerTurn     = 4
+	MaxSubagentPublicSummaryBytes  = 2048
 )
+
+// SubagentStage is the public, presentation-safe lifecycle of one durable
+// delegation attempt. Detailed calls and receipts remain journal-private.
+type SubagentStage string
+
+const (
+	SubagentStageRequested SubagentStage = "requested"
+	SubagentStageWaiting   SubagentStage = "waiting"
+	SubagentStageRunning   SubagentStage = "running"
+	SubagentStageSucceeded SubagentStage = "succeeded"
+	SubagentStageFailed    SubagentStage = "failed"
+	SubagentStageCancelled SubagentStage = "cancelled"
+	SubagentStageUncertain SubagentStage = "uncertain"
+	SubagentStageConflict  SubagentStage = "conflict"
+	SubagentStageAttached  SubagentStage = "attached"
+)
+
+func (s SubagentStage) Validate() error {
+	switch s {
+	case SubagentStageRequested, SubagentStageWaiting, SubagentStageRunning,
+		SubagentStageSucceeded, SubagentStageFailed, SubagentStageCancelled,
+		SubagentStageUncertain, SubagentStageConflict, SubagentStageAttached:
+		return nil
+	default:
+		return fmt.Errorf("invalid subagent stage")
+	}
+}
+
+// SubagentStageV1 is the only subagent payload published on the application
+// event stream. It deliberately excludes task text, receipts, paths and test
+// output; clients obtain those bounded fields from an authoritative snapshot.
+type SubagentStageV1 struct {
+	AttemptID       DelegationAttemptID `json:"attempt_id"`
+	ParentSessionID SessionID           `json:"parent_session_id"`
+	ChildSessionID  SessionID           `json:"child_session_id"`
+	Stage           SubagentStage       `json:"stage"`
+}
+
+func (v SubagentStageV1) Validate() error {
+	if v.AttemptID.Validate() != nil || v.ParentSessionID == "" || v.ChildSessionID == "" || v.ParentSessionID == v.ChildSessionID || v.Stage.Validate() != nil {
+		return fmt.Errorf("invalid subagent stage event")
+	}
+	return nil
+}
+
+// SubagentCardV1 is reconstructed from committed parent and child journals.
+// Every user-controlled string is redacted and bounded before this value
+// crosses the application snapshot boundary.
+type SubagentCardV1 struct {
+	AttemptID        DelegationAttemptID `json:"attempt_id"`
+	ParentSessionID  SessionID           `json:"parent_session_id"`
+	ChildSessionID   SessionID           `json:"child_session_id"`
+	Task             string              `json:"task"`
+	State            SubagentStage       `json:"state"`
+	Attempt          int                 `json:"attempt"`
+	StartedAt        time.Time           `json:"started_at"`
+	Deadline         time.Time           `json:"deadline"`
+	ElapsedNanos     int64               `json:"elapsed_nanos"`
+	ToolCalls        int                 `json:"tool_calls"`
+	MaxToolCalls     int                 `json:"max_tool_calls"`
+	ReceiptSummary   string              `json:"receipt_summary,omitempty"`
+	ChangedFiles     []string            `json:"changed_files"`
+	CommandsAndTests []string            `json:"commands_and_tests"`
+	Warning          string              `json:"warning,omitempty"`
+}
+
+func (v SubagentCardV1) Validate() error {
+	if v.AttemptID.Validate() != nil || v.ParentSessionID == "" || v.ChildSessionID == "" || v.ParentSessionID == v.ChildSessionID || strings.TrimSpace(v.Task) == "" || len(v.Task) > MaxSubagentTaskBytes || v.State.Validate() != nil || v.Attempt < 1 || v.Attempt > MaxSubagentAttemptsPerTurn || v.StartedAt.IsZero() || v.Deadline.IsZero() || v.ElapsedNanos < 0 || v.ToolCalls < 0 || v.MaxToolCalls < 1 || v.ToolCalls > v.MaxToolCalls || len(v.ReceiptSummary) > MaxSubagentPublicSummaryBytes || len(v.Warning) > MaxSubagentPublicSummaryBytes {
+		return fmt.Errorf("invalid subagent card")
+	}
+	if err := validateSortedStrings(v.ChangedFiles, "changed files"); err != nil {
+		return err
+	}
+	return validateSortedStrings(v.CommandsAndTests, "commands and tests")
+}
+
+type SubagentLineageV1 struct {
+	SessionID           SessionID           `json:"session_id"`
+	ParentSessionID     SessionID           `json:"parent_session_id,omitempty"`
+	DelegationAttemptID DelegationAttemptID `json:"delegation_attempt_id,omitempty"`
+	Children            []SessionID         `json:"children"`
+}
 
 func (id DelegationAttemptID) Validate() error {
 	if id == "" {

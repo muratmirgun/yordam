@@ -269,6 +269,7 @@ type DurableProjection struct {
 	Checkpoints         []ProjectionView     `json:"checkpoints"`
 	Evidence            []ProjectionView     `json:"evidence"`
 	Receipts            []ProjectionView     `json:"receipts"`
+	Subagents           []ProjectionView     `json:"subagents"`
 	RecoveryDiagnostics []Diagnostic         `json:"recovery_diagnostics"`
 }
 

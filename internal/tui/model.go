@@ -5,6 +5,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 )
 
@@ -102,6 +103,8 @@ type Model struct {
 	skillSnapshot   app.SkillSnapshot
 	displayedSkills app.SkillSnapshot
 	skills          components.Skills
+	childCards      components.ChildCards
+	lineage         protocol.SubagentLineageV1
 }
 
 type appEventMsg struct {
@@ -150,6 +153,7 @@ func NewModel(options Options) Model {
 		models:             append([]domain.ModelSelection(nil), options.Models...),
 		skillSnapshot:      options.Skills.Clone(),
 		nextDraftID:        1,
+		childCards:         components.NewChildCards(nil),
 	}
 	model.skills = components.NewSkills(skillScreenOptions(model.skillSnapshot, false, false))
 	for index, configured := range model.models {

@@ -394,6 +394,12 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 		legacy.Compaction = &protocol.CompactionEventV1{Trigger: trigger, Stage: protocol.CompactionCompleted, Range: &rangeValue, Usage: usage, SummaryBytes: facts.outputBytes, Revision: compacted.Revision, SummaryEvidenceID: compacted.SummaryEvidenceID}
 		legacy.Context = &protocol.ContextProjectionV1{Revision: compacted.Revision, SummaryEvidenceID: compacted.SummaryEvidenceID, LatestRange: &rangeValue}
 		a.finishCompaction(event.Correlation.ActivityID)
+	case protocol.EventSubagentRequested, protocol.EventSubagentWaiting, protocol.EventSubagentManifest, protocol.EventSubagentReceipt, protocol.EventSubagentResultAttached:
+		var stage protocol.SubagentStageV1
+		if err := strictUnmarshal(event.Payload, &stage); err != nil || stage.Validate() != nil {
+			return Event{}, requestError(codeInvalidPayload, "invalid subagent stage event", err)
+		}
+		legacy.Kind, legacy.Subagent = EventSubagentStage, &stage
 	default:
 		legacy.Kind = ""
 	}

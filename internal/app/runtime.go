@@ -66,11 +66,38 @@ type RuntimeSet struct {
 	Broker               *Broker
 	ApplicationService   *ProtocolService
 	LegacyAdapter        *LegacyAdapter
+	ChildRuntime         *ChildRuntimeView
 	ConfigurationError   error
 	configPath           string
 	bindApprover         func(ports.PermissionApprover)
 	unchecked            bool
 	retire               func()
+}
+
+// ChildRuntimeView is the single immutable handoff surface for sequential
+// children. It is present only when the built-in subagent tool is enabled.
+type ChildRuntimeView struct {
+	Sessions            orchestrator.ChildSessionStore
+	Policies            *permission.SessionPolicyRegistry
+	Skills              skills.Catalog
+	Exposure            protocol.ToolExposure
+	Reconciler          *orchestrator.Service
+	RuntimeGenerationID protocol.RuntimeGenerationID
+	acquire             func() (func(), error)
+}
+
+func (v *ChildRuntimeView) Acquire() (func(), error) {
+	if v == nil || v.acquire == nil {
+		return nil, fmt.Errorf("child runtime is not configured")
+	}
+	return v.acquire()
+}
+
+func (v *ChildRuntimeView) SkillCatalogSnapshot() protocol.SkillCatalogSnapshot {
+	if v == nil || v.Skills == nil {
+		return protocol.SkillCatalogSnapshot{}
+	}
+	return protocol.DeepCopy(v.Skills.Snapshot())
 }
 
 var runtimeSecretGeneration atomic.Uint64
@@ -121,6 +148,22 @@ func (s RuntimeSet) Validate() error {
 	}
 	if subagentPresent != limits.Subagents.Enabled {
 		return fmt.Errorf("runtime subagent descriptor does not match configured limits")
+	}
+	if limits.Subagents.Enabled {
+		if s.ChildRuntime == nil || s.ChildRuntime.Sessions == nil || s.ChildRuntime.Policies == nil || s.ChildRuntime.Skills == nil || s.ChildRuntime.Reconciler == nil || s.ChildRuntime.RuntimeGenerationID != s.Manifest.ID || s.ChildRuntime.acquire == nil || s.ChildRuntime.Exposure.Validate() != nil {
+			return fmt.Errorf("runtime child composition is incomplete")
+		}
+		for _, tool := range s.ChildRuntime.Exposure.Tools {
+			if tool.Identity == (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: subagenttool.Kind}) {
+				return fmt.Errorf("runtime child exposure retains subagent")
+			}
+		}
+		childSnapshot := s.ChildRuntime.SkillCatalogSnapshot()
+		if childSnapshot.Revision != s.Manifest.Body.SkillCatalogRevision || !slices.EqualFunc(childSnapshot.Active, s.Manifest.Body.Skills, sameRuntimeSkillDescriptor) {
+			return fmt.Errorf("runtime child skill catalog is not frozen to parent")
+		}
+	} else if s.ChildRuntime != nil {
+		return fmt.Errorf("disabled runtime exposes child composition")
 	}
 	if s.Skills == nil {
 		return fmt.Errorf("runtime skill catalog is not configured")
@@ -494,7 +537,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		b.lane = orchestrator.NewOperationLane()
 	}
 	broker, err := NewBroker(BrokerOptions{
-		Source: runtimeBrokerSource{Repository: b.store, Workspace: workspaceControl, Generation: generationID, Manifest: manifest, Skills: skillCatalog},
+		Source: runtimeBrokerSource{Repository: b.store, Sessions: b.store, Workspace: workspaceControl, Generation: generationID, Manifest: manifest, Skills: skillCatalog, Redactor: admission},
 		Epoch:  string(generationID), DefaultQueueCapacity: 64, MaxQueueCapacity: 1024,
 	})
 	if err != nil {
@@ -513,6 +556,16 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		_ = evidenceStore.Close()
 		return RuntimeSet{}, configurationError(b.configPath, "build recovery store", err)
 	}
+	lifecycle := newRuntimeLifecycle(func() {
+		_ = evidenceStore.Close()
+		_ = recoveryStore.Close()
+		_ = secretRegistry.Retire(generationID)
+		_ = admission.Close()
+		for _, producer := range producerLeases {
+			_ = producer.Close()
+		}
+	})
+	retire = lifecycle.retire
 	approverBridge := &interactiveApproverBinding{}
 	approverBridge.setChildPrompts(policies)
 	publisher := b.publisher
@@ -530,14 +583,20 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		ChildSessions: childSessions, ParentSessions: b.store,
 	})
 	if err != nil {
-		_ = evidenceStore.Close()
-		_ = recoveryStore.Close()
+		lifecycle.retire()
 		return RuntimeSet{}, configurationError(b.configPath, "build turn orchestrator", err)
 	}
-	childCoordinator, err := orchestrator.NewSequentialChildCoordinator(childSessions, b.store, service.RunTurn, policies)
+	childRun := func(ctx context.Context, request orchestrator.StartTurnRequest) (orchestrator.RunResult, error) {
+		release, acquireErr := lifecycle.acquire()
+		if acquireErr != nil {
+			return orchestrator.RunResult{}, acquireErr
+		}
+		defer release()
+		return service.RunTurn(ctx, request)
+	}
+	childCoordinator, err := orchestrator.NewSequentialChildCoordinator(childSessions, b.store, childRun, policies)
 	if err != nil {
-		_ = evidenceStore.Close()
-		_ = recoveryStore.Close()
+		lifecycle.retire()
 		return RuntimeSet{}, configurationError(b.configPath, "build child coordinator", err)
 	}
 	service.SetChildCoordinator(childCoordinator)
@@ -561,16 +620,6 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		})
 		return err
 	}
-	lifecycle := newRuntimeLifecycle(func() {
-		_ = evidenceStore.Close()
-		_ = recoveryStore.Close()
-		_ = secretRegistry.Retire(generationID)
-		_ = admission.Close()
-		for _, producer := range producerLeases {
-			_ = producer.Close()
-		}
-	})
-	retire = lifecycle.retire
 	runner := &agent.OrchestratedRunner{
 		Orchestrator: service,
 		Prepare: func(_ context.Context, input agent.RunInput) (orchestrator.StartTurnRequest, error) {
@@ -594,7 +643,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 			}
 		},
 	}
-	dispatcher := runtimeCommandDispatcher{Orchestrator: service, Store: b.store, Manifest: protocol.DeepCopy(manifest), Workspace: workspaceControl, WorkspaceID: protocol.WorkspaceID(b.workspace.ID), Skills: skillCatalog}
+	dispatcher := runtimeCommandDispatcher{Orchestrator: service, Store: b.store, Manifest: protocol.DeepCopy(manifest), Workspace: workspaceControl, WorkspaceID: protocol.WorkspaceID(b.workspace.ID), Skills: skillCatalog, Acquire: lifecycle.acquire}
 	applicationService, err := NewProtocolService(ProtocolServiceOptions{
 		Orchestrator: service, Dispatcher: dispatcher, Broker: broker, WorkspaceControl: workspaceControl,
 	})
@@ -606,6 +655,15 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		Actor: protocol.ActorRef{ID: "legacy-user", Kind: protocol.ActorUser}, SelectedSessionID: protocol.SessionID(b.activeSession.get()),
 		Cursor: runtimeCommandExpectation(b.store, workspaceControl, b.activeSession), RuntimeGenerationID: generationID,
 	})
+	var childRuntime *ChildRuntimeView
+	if cfg.Subagents.Enabled {
+		childExposure, exposureErr := toolCatalog.Without(subagenttool.Kind)
+		if exposureErr != nil {
+			lifecycle.retire()
+			return RuntimeSet{}, configurationError(b.configPath, "derive child tool exposure", exposureErr)
+		}
+		childRuntime = &ChildRuntimeView{Sessions: childSessions, Policies: policies, Skills: skillCatalog, Exposure: childExposure, Reconciler: service, RuntimeGenerationID: generationID, acquire: lifecycle.acquire}
+	}
 	succeeded = true
 	result := RuntimeSet{
 		Runtime:              runner,
@@ -630,6 +688,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		Broker:               broker,
 		ApplicationService:   applicationService,
 		LegacyAdapter:        legacyAdapter,
+		ChildRuntime:         childRuntime,
 		configPath:           b.configPath,
 		bindApprover: func(approver ports.PermissionApprover) {
 			approverBridge.set(approver)

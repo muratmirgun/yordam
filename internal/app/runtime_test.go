@@ -1015,6 +1015,58 @@ func TestRuntimeBuilderBindsSubagentLimitsIntoManifestDigest(t *testing.T) {
 	}
 }
 
+func TestRuntimeBuilderComposesCompleteImmutableChildRuntimeOnlyWhenEnabled(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "child-runtime-secret")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	builder := newRuntimeBuilderForTest(t, nil)
+	enabled, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enabled.ChildRuntime == nil || enabled.ChildRuntime.Sessions == nil || enabled.ChildRuntime.Policies == nil || enabled.ChildRuntime.Skills == nil || enabled.ChildRuntime.Reconciler == nil || enabled.ChildRuntime.RuntimeGenerationID != enabled.RuntimeGenerationID || enabled.ChildRuntime.SkillCatalogSnapshot().Revision != enabled.Manifest.Body.SkillCatalogRevision {
+		t.Fatalf("enabled child composition=%+v", enabled.ChildRuntime)
+	}
+	dispatcher, ok := enabled.ApplicationService.dispatcher.(runtimeCommandDispatcher)
+	if !ok || dispatcher.Acquire == nil {
+		t.Fatalf("production parent dispatcher has no runtime lease: %T", enabled.ApplicationService.dispatcher)
+	}
+	for _, tool := range enabled.ChildRuntime.Exposure.Tools {
+		if tool.Identity.Name == "subagent" {
+			t.Fatalf("child exposure retained subagent: %+v", tool)
+		}
+	}
+
+	parentRelease, err := enabled.Runtime.(*agent.OrchestratedRunner).Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	childRelease, err := enabled.ChildRuntime.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabled.retireSecrets()
+	parentRelease()
+	if _, err := enabled.Admission.Derive(); err != nil {
+		t.Fatalf("retirement ignored active child lease: %v", err)
+	}
+	childRelease()
+	if _, err := enabled.ChildRuntime.Acquire(); err == nil {
+		t.Fatal("retired child runtime accepted a future lease")
+	}
+
+	disabledConfig := cfg
+	disabledConfig.Subagents.Enabled = false
+	disabledBuilder := newRuntimeBuilderForTest(t, nil)
+	disabled, err := disabledBuilder.build(disabledConfig, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disabled.retireSecrets()
+	if disabled.ChildRuntime != nil {
+		t.Fatalf("disabled runtime composed child dependencies: %+v", disabled.ChildRuntime)
+	}
+}
+
 func TestRuntimeSetRejectsInvalidSubagentLimits(t *testing.T) {
 	t.Setenv("PRIMARY_KEY", "primary-secret")
 	for name, mutate := range map[string]func(*protocol.SubagentLimits){
