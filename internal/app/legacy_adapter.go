@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/protocol"
@@ -211,6 +212,12 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 	if err := event.Validate(); err != nil {
 		return Event{}, requestError(codeInvalidPayload, "invalid application event", err)
 	}
+	// Tool presentations are broker-only, transient UI material. Decode them
+	// before the legacy transient envelope so their typed payload never has to
+	// impersonate the private legacy shape.
+	if event.Kind == protocol.EventToolResultAvailable {
+		return a.transientSkillResultEvent(event)
+	}
 	var payload legacyApplicationPayload
 	if err := strictUnmarshal(event.Payload, &payload); err != nil {
 		// Durable Foundation payloads are decoded below by kind; they do not use
@@ -221,14 +228,6 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 	}
 	legacy := Event{DraftID: payload.DraftID, Draft: payload.Draft, Message: payload.Message, Mode: payload.Mode, Selection: payload.Selection, Applied: payload.Applied}
 	switch event.Kind {
-	case protocol.EventToolResultAvailable:
-		var available protocol.ToolResultAvailableV1
-		if err := strictUnmarshal(event.Payload, &available); err != nil {
-			return Event{}, err
-		}
-		if provenance, progress, ok := a.skillResult(event.Correlation.ActivityID, available); ok {
-			legacy.Kind, legacy.Runtime.Skill, legacy.Runtime.Progress = EventToolOutput, &provenance, &progress
-		}
 	case ApplicationEventState:
 		legacy.Kind = EventState
 		legacy.Runtime.State = payload.State
@@ -411,6 +410,29 @@ func (a *LegacyAdapter) Event(event protocol.ApplicationEvent) (Event, error) {
 		legacy.Err = nil
 	}
 	return legacy, nil
+}
+
+func (a *LegacyAdapter) transientSkillResultEvent(event protocol.ApplicationEvent) (Event, error) {
+	if event.Classification != "transient" || event.JournalCursor != nil || event.PayloadVersion != 1 ||
+		event.Correlation.JournalKind != protocol.JournalSession || event.Correlation.SessionID == "" ||
+		event.Correlation.JournalID != protocol.JournalID(event.Correlation.SessionID) || event.Correlation.ActivityID == "" || event.Error != nil ||
+		event.Cursor.SelectedSession == nil || event.Cursor.SelectedSession.JournalKind != protocol.JournalSession || event.Cursor.SelectedSession.JournalID != event.Correlation.JournalID {
+		return Event{}, requestError(codeInvalidPayload, "invalid transient tool result event", nil)
+	}
+	if a.selectedSessionID != "" && event.Correlation.SessionID != a.selectedSessionID {
+		return Event{}, requestError(codeInvalidPayload, "transient tool result is for another session", nil)
+	}
+	var available protocol.ToolResultAvailableV1
+	if err := strictUnmarshal(event.Payload, &available); err != nil {
+		return Event{}, requestError(codeInvalidPayload, "invalid transient tool result payload", err)
+	}
+	if err := available.Validate(); err != nil || available.ActivityID != event.Correlation.ActivityID {
+		return Event{}, requestError(codeInvalidPayload, "invalid transient tool result payload", err)
+	}
+	if provenance, progress, ok := a.skillResult(event.Correlation.ActivityID, available); ok {
+		return Event{Kind: EventToolOutput, Runtime: agent.RuntimeEvent{Skill: &provenance, Progress: &progress}}, nil
+	}
+	return Event{}, nil
 }
 
 // SkillProvenance returns metadata only when it was derived from an exact

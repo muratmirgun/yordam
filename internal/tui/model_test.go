@@ -2,6 +2,7 @@ package tui_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -11,9 +12,12 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/app"
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
+	skilltool "github.com/muratmirgun/yordam/internal/tools/skill"
 	"github.com/muratmirgun/yordam/internal/tui"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 	"github.com/muratmirgun/yordam/internal/workspace"
@@ -454,6 +458,113 @@ func TestSkillOutputThenDurableTerminalCompletesOneCard(t *testing.T) {
 	if block.Kind != components.BlockTool || block.CallID != "skill-call" || block.Name != "skill go-testing [project sha256:aaaaaaa]" || block.Status != components.ToolFailed || block.Content != "durable terminal content" || block.Duration != time.Second || !block.Truncated {
 		t.Fatalf("tool block=%+v", block)
 	}
+}
+
+func TestBrokerSkillPresentationFlowsThroughAdapterToOneDurableToolCard(t *testing.T) {
+	broker, err := app.NewBroker(app.BrokerOptions{Source: tuiTransientBrokerSource{}, Epoch: "test-epoch", DefaultQueueCapacity: 4, MaxQueueCapacity: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, subscription, err := broker.SnapshotAndSubscribe(t.Context(), protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: "session-1", Consumer: "interactive", QueueCapacity: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Close()
+	adapter, activityID, available := tuiSkillAdapterForTest(t)
+	if err := broker.PublishTransient(protocol.ApplicationEvent{
+		// The broker must normalize this sender-controlled presentation to a
+		// broker-only transient with no journal cursor.
+		Correlation: protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: "session-1", SessionID: "session-1", ActivityID: activityID},
+		Kind:        protocol.EventToolResultAvailable, Classification: "durable", PayloadVersion: 1, Payload: available,
+		JournalCursor: &protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "session-1", CommitSeq: 9, TransactionID: "forged"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, err := subscription.Next(t.Context())
+	if err != nil || item.Event == nil || item.Event.Classification != "transient" || item.Event.JournalCursor != nil {
+		t.Fatalf("transient item=%+v err=%v", item, err)
+	}
+	output, err := adapter.Event(*item.Event)
+	if err != nil || output.Kind != app.EventToolOutput {
+		t.Fatalf("output=%+v err=%v", output, err)
+	}
+	model := tui.NewModel(tui.OptionsForTest())
+	model = tui.ApplyAppEventForTest(model, output)
+	terminal, err := adapter.Event(tuiSkillDurableEvent(protocol.EventActivitySucceeded, activityID, json.RawMessage(`{}`)))
+	if err != nil || terminal.Kind != app.EventToolCompleted {
+		t.Fatalf("terminal=%+v err=%v", terminal, err)
+	}
+	model = tui.ApplyAppEventForTest(model, terminal)
+	blocks := model.ConversationBlocksForTest()
+	if len(blocks) != 1 || blocks[0].Content != "bounded skill body" || blocks[0].Status != components.ToolSucceeded {
+		t.Fatalf("durable card=%+v", blocks)
+	}
+	if err := broker.PublishTransient(protocol.ApplicationEvent{Correlation: protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: "session-1", SessionID: "session-1"}, Kind: app.ApplicationEventState, PayloadVersion: 1, Payload: json.RawMessage(`{"state":"ready"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	item, err = subscription.Next(t.Context())
+	if err != nil || item.Event == nil {
+		t.Fatalf("stream did not continue: item=%+v err=%v", item, err)
+	}
+	state, err := adapter.Event(*item.Event)
+	if err != nil || state.Kind != app.EventState || state.Runtime.State != "ready" {
+		t.Fatalf("state=%+v err=%v", state, err)
+	}
+}
+
+func tuiSkillAdapterForTest(t *testing.T) (*app.LegacyAdapter, protocol.ActivityID, json.RawMessage) {
+	t.Helper()
+	activityID := protocol.ActivityID("skill-activity")
+	digest := protocol.Digest{Algorithm: "sha256", Value: strings.Repeat("a", 64)}
+	descriptor := skilltool.BuiltinDescriptor()
+	body := protocol.ActionPlanBody{CallID: "skill-call", Tool: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest, Action: "skill", Purpose: "inspect", ExecutionLocus: "builtin", Effect: "observation", Boundary: "workspace", Reversibility: "not_applicable", VerificationCoverage: "full", RequestedProfile: "restricted", EffectiveProfile: "restricted", RuntimeGenerationID: "runtime-1", Resources: []protocol.ResourceTarget{{Kind: "skill", CanonicalID: "go-testing", Digest: "sha256:" + digest.Value, Attributes: []protocol.ResourceAttribute{{Name: "runtime_generation", Value: "runtime-1"}, {Name: "source", Value: "project"}, {Name: "workspace_id", Value: "workspace-1"}}}}}
+	planDigest, err := canonicaljson.Digest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned, err := json.Marshal(protocol.ActivityPlannedV1{Kind: "tool", Purpose: "tool observation", PurposeActor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorAgent}, Source: "builtin", RequestedProfile: "restricted", EffectiveProfile: "restricted", Plan: &protocol.ActionPlan{Body: body, Digest: planDigest}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{SelectedSessionID: "session-1"})
+	if _, err := adapter.Event(tuiSkillDurableEvent(protocol.EventActivityPlanned, activityID, planned)); err != nil {
+		t.Fatal(err)
+	}
+	started, err := json.Marshal(protocol.ActivityStartedV1{DecisionNonce: "nonce", DecisionEventID: "decision", ActivityID: activityID, CallID: body.CallID, PlanDigest: planDigest, RequestDigest: digest, DispatchDigest: digest, RuntimeGenerationID: body.RuntimeGenerationID, DispatchState: "registered"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := adapter.Event(tuiSkillDurableEvent(protocol.EventActivityStarted, activityID, started)); err != nil || got.Kind != app.EventToolStarted {
+		t.Fatalf("started=%+v err=%v", got, err)
+	}
+	available, err := json.Marshal(protocol.ToolResultAvailableV1{ActivityID: activityID, CallID: body.CallID, Status: "succeeded", Content: "bounded skill body", DurationNanos: int64(time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return adapter, activityID, available
+}
+
+func tuiSkillDurableEvent(kind string, activityID protocol.ActivityID, payload json.RawMessage) protocol.ApplicationEvent {
+	return protocol.ApplicationEvent{ProtocolVersion: protocol.ApplicationProtocolVersion, StreamEventID: kind + ":" + string(activityID), Correlation: protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: "session-1", SessionID: "session-1", ActivityID: activityID}, Time: time.Unix(1, 0).UTC(), Kind: kind, Classification: "durable", PayloadVersion: 1, Payload: payload}
+}
+
+type tuiTransientBrokerSource struct{}
+
+func (tuiTransientBrokerSource) WorkspaceControl() protocol.JournalRef {
+	return protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "workspace-1"}
+}
+func (tuiTransientBrokerSource) Session(id protocol.SessionID) protocol.JournalRef {
+	return protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(id)}
+}
+func (tuiTransientBrokerSource) Head(_ context.Context, ref protocol.JournalRef) (protocol.CommittedCursor, error) {
+	return protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 1, TransactionID: "head"}, nil
+}
+func (tuiTransientBrokerSource) ReadRange(_ context.Context, request journal.ReadRangeRequest) (journal.EventPage, error) {
+	head, _ := tuiTransientBrokerSource{}.Head(context.Background(), request.Journal)
+	return journal.EventPage{Cursor: head, Head: head}, nil
+}
+func (tuiTransientBrokerSource) Project(context.Context, app.SnapshotVector) (protocol.DurableProjection, protocol.RuntimeProjection, error) {
+	return protocol.DurableProjection{}, protocol.RuntimeProjection{}, nil
 }
 
 func TestTurnProgressOnlyShowsTheCurrentActivePhase(t *testing.T) {

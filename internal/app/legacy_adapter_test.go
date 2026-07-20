@@ -155,7 +155,7 @@ func TestApplicationLegacyAdapterContextPlanDoesNotGuessPolicy(t *testing.T) {
 func TestApplicationLegacyAdapterDerivesSkillProvenanceOnlyFromCanonicalPlan(t *testing.T) {
 	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{})
 	activityID, available := startSkillActivityForTest(t, adapter)
-	output, err := adapter.Event(compactionApplicationEvent(protocol.EventToolResultAvailable, activityID, string(available)))
+	output, err := adapter.Event(transientSkillApplicationEvent(activityID, string(available)))
 	if err != nil || output.Kind != app.EventToolOutput || output.Runtime.Skill == nil || output.Runtime.Progress == nil || output.Runtime.Progress.Text != "bounded skill body" || !output.Runtime.Progress.Truncated {
 		t.Fatalf("output=%+v err=%v", output, err)
 	}
@@ -180,21 +180,95 @@ func TestApplicationLegacyAdapterSkillTransientLifecycleRejectsMismatchesAndDupl
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventToolResultAvailable, activityID, string(mismatchRaw))); err != nil || got.Kind != "" {
+	if got, err := adapter.Event(transientSkillApplicationEvent(activityID, string(mismatchRaw))); err != nil || got.Kind != "" {
 		t.Fatalf("mismatched output=%+v err=%v", got, err)
 	}
-	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventToolResultAvailable, activityID, string(available))); err != nil || got.Kind != app.EventToolOutput {
+	if got, err := adapter.Event(transientSkillApplicationEvent(activityID, string(available))); err != nil || got.Kind != app.EventToolOutput {
 		t.Fatalf("first output=%+v err=%v", got, err)
 	}
-	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventToolResultAvailable, activityID, string(available))); err != nil || got.Kind != "" {
+	if got, err := adapter.Event(transientSkillApplicationEvent(activityID, string(available))); err != nil || got.Kind != "" {
 		t.Fatalf("duplicate output=%+v err=%v", got, err)
 	}
 	terminal, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityFailed, activityID, `{}`))
 	if err != nil || terminal.Kind != app.EventToolCompleted || terminal.Runtime.Result == nil || terminal.Runtime.Result.Status != domain.ToolFailed || terminal.Runtime.Result.Content != "bounded skill body" {
 		t.Fatalf("terminal=%+v err=%v", terminal, err)
 	}
-	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventToolResultAvailable, activityID, string(available))); err != nil || got.Kind != "" {
+	if got, err := adapter.Event(transientSkillApplicationEvent(activityID, string(available))); err != nil || got.Kind != "" {
 		t.Fatalf("late output=%+v err=%v", got, err)
+	}
+}
+
+func TestApplicationLegacyAdapterRejectsSpoofedTransientSkillResultEnvelopes(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*protocol.ApplicationEvent)
+	}{
+		{"durable", func(event *protocol.ApplicationEvent) { event.Classification = "durable" }},
+		{"journal_cursor", func(event *protocol.ApplicationEvent) {
+			cursor := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "session-1", CommitSeq: 2, TransactionID: "tx"}
+			event.JournalCursor = &cursor
+		}},
+		{"payload_version", func(event *protocol.ApplicationEvent) { event.PayloadVersion = 2 }},
+		{"activity_binding", func(event *protocol.ApplicationEvent) { event.Correlation.ActivityID = "another-activity" }},
+		{"session_binding", func(event *protocol.ApplicationEvent) {
+			event.Correlation.SessionID, event.Correlation.JournalID = "session-2", "session-2"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{SelectedSessionID: "session-1"})
+			activityID, available := startSkillActivityForTest(t, adapter)
+			event := transientSkillApplicationEvent(activityID, string(available))
+			test.mutate(&event)
+			if _, err := adapter.Event(event); err == nil {
+				t.Fatal("spoofed transient event was accepted")
+			}
+		})
+	}
+}
+
+func TestBrokerForcedTransientSkillResultReachesAdapterAndStreamContinues(t *testing.T) {
+	source := newBrokerSource()
+	broker := mustBroker(t, source, nil)
+	_, subscription, err := broker.SnapshotAndSubscribe(t.Context(), snapshotRequest(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Close()
+	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{SelectedSessionID: "session-1"})
+	activityID, available := startSkillActivityForTest(t, adapter)
+	// PublishTransient must overwrite these sender-controlled fields before the
+	// subscribed client receives the tool presentation.
+	spoofed := transientSkillApplicationEvent(activityID, string(available))
+	spoofed.Classification = "durable"
+	spoofed.JournalCursor = &protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "session-1", CommitSeq: 99, TransactionID: "forged"}
+	if err := broker.PublishTransient(spoofed); err != nil {
+		t.Fatal(err)
+	}
+	item, err := subscription.Next(t.Context())
+	if err != nil || item.Event == nil || item.Event.Classification != "transient" || item.Event.JournalCursor != nil {
+		t.Fatalf("broker event=%+v err=%v", item, err)
+	}
+	output, err := adapter.Event(*item.Event)
+	if err != nil || output.Kind != app.EventToolOutput || output.Runtime.Progress == nil || output.Runtime.Progress.Text != "bounded skill body" {
+		t.Fatalf("output=%+v err=%v", output, err)
+	}
+	terminal, err := adapter.Event(compactionApplicationEvent(protocol.EventActivitySucceeded, activityID, `{}`))
+	if err != nil || terminal.Kind != app.EventToolCompleted || terminal.Runtime.Result == nil || terminal.Runtime.Result.Content != "bounded skill body" {
+		t.Fatalf("terminal=%+v err=%v", terminal, err)
+	}
+	if err := broker.PublishTransient(protocol.ApplicationEvent{
+		Correlation: protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: "session-1", SessionID: "session-1"},
+		Kind:        app.ApplicationEventState, PayloadVersion: 1, Payload: json.RawMessage(`{"state":"ready"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item, err = subscription.Next(t.Context())
+	if err != nil || item.Event == nil {
+		t.Fatalf("stream did not continue: item=%+v err=%v", item, err)
+	}
+	state, err := adapter.Event(*item.Event)
+	if err != nil || state.Kind != app.EventState || state.Runtime.State != "ready" {
+		t.Fatalf("state=%+v err=%v", state, err)
 	}
 }
 
@@ -216,7 +290,7 @@ func TestApplicationLegacyAdapterInvalidReplacementPlanClearsSkillState(t *testi
 	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityPlanned, activityID, `{"kind":"tool"}`)); err != nil || got.Kind != "" {
 		t.Fatalf("replacement plan=%+v err=%v", got, err)
 	}
-	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventToolResultAvailable, activityID, string(available))); err != nil || got.Kind != "" {
+	if got, err := adapter.Event(transientSkillApplicationEvent(activityID, string(available))); err != nil || got.Kind != "" {
 		t.Fatalf("stale output=%+v err=%v", got, err)
 	}
 	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventActivitySucceeded, activityID, `{}`)); err != nil || got.Kind != "" {
@@ -325,6 +399,17 @@ func compactionApplicationEvent(kind string, activityID protocol.ActivityID, bod
 		StreamEventID:   string(kind) + ":" + string(activityID),
 		Correlation:     protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: "session-1", SessionID: "session-1", ActivityID: activityID},
 		Time:            time.Unix(1, 0).UTC(), Kind: string(kind), Classification: "durable", PayloadVersion: 1, Payload: json.RawMessage(body),
+	}
+}
+
+func transientSkillApplicationEvent(activityID protocol.ActivityID, body string) protocol.ApplicationEvent {
+	selected := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "session-1", CommitSeq: 1, TransactionID: "head"}
+	return protocol.ApplicationEvent{
+		ProtocolVersion: protocol.ApplicationProtocolVersion,
+		StreamEventID:   protocol.EventToolResultAvailable + ":" + string(activityID),
+		Cursor:          protocol.ApplicationCursor{WorkspaceControl: protocol.CommittedCursor{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace-1", CommitSeq: 1, TransactionID: "head"}, SelectedSession: &selected},
+		Correlation:     protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: "session-1", SessionID: "session-1", ActivityID: activityID},
+		Time:            time.Unix(1, 0).UTC(), Kind: protocol.EventToolResultAvailable, Classification: "transient", PayloadVersion: 1, Payload: json.RawMessage(body),
 	}
 }
 
