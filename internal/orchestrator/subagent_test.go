@@ -281,6 +281,73 @@ func TestRunTurnSubagentHardDenyPreventsChildReservation(t *testing.T) {
 	}
 }
 
+func TestRunTurnSubagentParentHeadMismatchWritesNoEvidence(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	request.Runtime.Body.SkillCatalogRevision = "skills-a"
+	request.Runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+	request.Runtime.Body.Tools = append(request.Runtime.Body.Tools, subagenttool.BuiltinDescriptor())
+	refreshRuntimeDigest(t, &request.Runtime)
+	log := &recordLog{}
+	repo := &recordingRepository{head: request.ExpectedHead, log: log}
+	seed := protocol.SubagentManifestV1{AttemptID: "seed", ParentSessionID: request.SessionID, ParentCursor: request.ExpectedHead, ChildSessionID: "child", ChildTaskID: "task", ChildTurnID: "turn", RuntimeGenerationID: request.Runtime.ID, SkillCatalogRevision: "skills-a", MaxToolCalls: 1, Deadline: testSubagentDeadline()}
+	children := &subagentTestChildren{receipt: childReceipt(seed, "succeeded", "done", protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 2, TransactionID: "t"}, unknownUsage(), nil, nil), workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}}
+	coordinator := headChangingCoordinator{children: children, repo: repo, log: log}
+	service, err := NewService(Dependencies{Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repo, TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &subagentTestProvider{log: log}, Tools: subagentPlanService{}, Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now), ChildSessions: children, ParentSessions: subagentParentInspector{children}, Children: coordinator})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); err == nil {
+		t.Fatal("head mismatch unexpectedly succeeded")
+	}
+	if countPrefix(log.snapshot(), "evidence.put") != 0 {
+		t.Fatalf("evidence persisted after head mismatch: %v", log.snapshot())
+	}
+}
+
+func TestSequentialChildCoordinatorCancellationReadsCancelledReceipt(t *testing.T) {
+	parent := validStartTurnRequest()
+	parent.Runtime = validRuntimeManifest(t, "observation")
+	parent.Runtime.Body.SkillCatalogRevision = "skills-a"
+	parent.Runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+	parent.Runtime.Body.Tools = append(parent.Runtime.Body.Tools, subagenttool.BuiltinDescriptor())
+	refreshRuntimeDigest(t, &parent.Runtime)
+	manifest := protocol.SubagentManifestV1{AttemptID: "cancel", ParentSessionID: parent.SessionID, ParentCursor: parent.ExpectedHead, ChildSessionID: "child", ChildTaskID: protocol.TaskID(stableID("task", "cancel")), ChildTurnID: protocol.TurnID(stableID("turn", "cancel")), RuntimeGenerationID: parent.Runtime.ID, SkillCatalogRevision: "skills-a", MaxToolCalls: 1, Deadline: time.Now().Add(time.Second)}
+	store := &productionCoordinatorStore{workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}}
+	coordinator, err := NewSequentialChildCoordinator(store, productionCoordinatorParent{store}, func(_ context.Context, request StartTurnRequest) (RunResult, error) {
+		receipt := childReceipt(request.child.manifest, "cancelled", "cancelled", protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), CommitSeq: 2, TransactionID: "cancel"}, unknownUsage(), &protocol.PublicError{Code: "cancelled", Message: "cancelled"}, nil)
+		raw, _ := canonicaljson.Marshal(receipt)
+		store.inspection = journal.Inspection{Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(request.SessionID)}, Head: receipt.TerminalCursor, Events: []protocol.EventRecord{{Envelope: protocol.EventEnvelope{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), SessionID: request.SessionID, Kind: protocol.EventSubagentReceipt, Seq: 2, TransactionID: "cancel", Payload: raw}}}}
+		return RunResult{}, context.Canceled
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	receipt, err := coordinator.RunChild(ctx, ChildRunRequest{Manifest: manifest, Call: protocol.SubagentCallV1{Task: "child"}, Parent: parent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Status != "cancelled" {
+		t.Fatalf("receipt=%+v", receipt)
+	}
+}
+
+type headChangingCoordinator struct {
+	children *subagentTestChildren
+	repo     *recordingRepository
+	log      *recordLog
+}
+
+func (s headChangingCoordinator) RunChild(ctx context.Context, request ChildRunRequest) (protocol.SubagentReceiptV1, error) {
+	receipt, err := subagentTestCoordinator{children: s.children, log: s.log}.RunChild(ctx, request)
+	s.repo.mu.Lock()
+	s.repo.head.CommitSeq++
+	s.repo.mu.Unlock()
+	return receipt, err
+}
+
 type denyingSubagentAuthorization struct{}
 
 func (denyingSubagentAuthorization) Decide(_ context.Context, request protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error) {
