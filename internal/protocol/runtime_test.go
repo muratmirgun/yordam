@@ -90,3 +90,17 @@ func TestRuntimeLimitsValidateDelegatesSubagentBounds(t *testing.T) {
 		t.Fatal("runtime limits accepted invalid subagent timeout")
 	}
 }
+
+func TestRuntimeLimitsRejectUnknownJSONFields(t *testing.T) {
+	for name, raw := range map[string]string{
+		"limits":    `{"max_tool_calls":1,"shell_timeout_nanos":1,"application_queue_capacity":1,"auto_compact":false,"compact_reserve_tokens":{"state":"unknown"},"subagents":{"enabled":true,"max_per_turn":1,"max_tool_calls":1,"timeout_nanos":1000000000},"extra":true}`,
+		"subagents": `{"max_tool_calls":1,"shell_timeout_nanos":1,"application_queue_capacity":1,"auto_compact":false,"compact_reserve_tokens":{"state":"unknown"},"subagents":{"enabled":true,"max_per_turn":1,"max_tool_calls":1,"timeout_nanos":1000000000,"extra":true}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var limits protocol.RuntimeLimits
+			if err := json.Unmarshal([]byte(raw), &limits); err == nil {
+				t.Fatal("unknown JSON field accepted")
+			}
+		})
+	}
+}

@@ -1,8 +1,10 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -89,7 +91,7 @@ func (limits *RuntimeLimits) UnmarshalJSON(data []byte) error {
 		Subagents                json.RawMessage `json:"subagents"`
 	}
 	var decoded wire
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := strictUnmarshalRuntimeLimits(data, &decoded); err != nil {
 		return err
 	}
 	*limits = RuntimeLimits{
@@ -100,7 +102,23 @@ func (limits *RuntimeLimits) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 	limits.subagentsPresent = true
-	return json.Unmarshal(decoded.Subagents, &limits.Subagents)
+	return strictUnmarshalRuntimeLimits(decoded.Subagents, &limits.Subagents)
+}
+
+func strictUnmarshalRuntimeLimits(data []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("runtime limits contain multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }
 
 type RuntimeGenerationBody struct {

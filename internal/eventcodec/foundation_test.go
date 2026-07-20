@@ -221,6 +221,42 @@ func TestFoundationRegistryRejectsInvalidSubagentRuntimeLimits(t *testing.T) {
 	if err := registry.Validate(record); err == nil {
 		t.Fatal("explicit zero subagent limits accepted")
 	}
+
+	for name, mutate := range map[string]func(map[string]any){
+		"limits": func(limits map[string]any) { limits["extra"] = true },
+		"subagents": func(limits map[string]any) {
+			limits["subagents"].(map[string]any)["extra"] = true
+		},
+	} {
+		t.Run("unknown "+name, func(t *testing.T) {
+			raw, err := json.Marshal(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(raw, &payload); err != nil {
+				t.Fatal(err)
+			}
+			body := payload["body"].(map[string]any)
+			mutate(body["limits"].(map[string]any))
+			digest, err := canonicaljson.Digest(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload["digest"] = map[string]any{"algorithm": digest.Algorithm, "value": digest.Value}
+			rawPayload, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			envelope, err := json.Marshal(protocol.EventEnvelope{SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1, JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", EventID: "event", Seq: 1, Time: time.Unix(1, 0).UTC(), Kind: protocol.EventRuntimeGenerationActivated, RuntimeGenerationID: manifest.ID, TransactionID: "transaction", Payload: rawPayload})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := registry.Decode(envelope); err == nil || !strings.Contains(err.Error(), "unknown field") {
+				t.Fatalf("canonically redigested unknown runtime limit field error=%v", err)
+			}
+		})
+	}
 }
 
 func TestFoundationRegistryPreservesLegacyRuntimeManifestWithoutSubagents(t *testing.T) {
