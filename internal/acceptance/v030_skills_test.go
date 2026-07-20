@@ -142,8 +142,8 @@ func assertV030SkillsAcceptance(t *testing.T) {
 	if prompt.Call.Request.Name != "shell" || prompt.Call.Mutation != domain.MutationProcess {
 		t.Fatalf("hostile skill bypassed normal approval: %+v", prompt)
 	}
-	restarted.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: prompt.Call.Request.CallID, Decision: domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: prompt.Call.CanonicalScope}}
-	v030SkillsWaitDenied(t, restarted)
+	restarted.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: prompt.Call.Request.CallID, Decision: domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: prompt.Call.CanonicalScope, Reason: "denied by user"}}
+	denial := v030SkillsWaitDenied(t, restarted)
 	shutdownV030App(t, restarted, done)
 	mu.Lock()
 	got := append([]string(nil), captured...)
@@ -159,7 +159,7 @@ func assertV030SkillsAcceptance(t *testing.T) {
 			t.Fatalf("provider leaked configured key: %q", value)
 		}
 	}
-	v030AssertAbsent(t, key, readV030File(t, debug), v030JSON(before.Skills), v030JSON(after.Skills), components.NewSkills(components.SkillScreenOptions{Snapshot: after.Skills}).View(120))
+	v030AssertAbsent(t, key, denial, readV030File(t, debug), v030JSON(before.Skills), v030JSON(after.Skills), components.NewSkills(components.SkillScreenOptions{Snapshot: after.Skills}).View(120))
 	assertV030TreeOmits(t, data, key)
 	// A stale digest cannot activate altered project bytes after restart.
 	v030WriteSkill(t, project, "Project testing metadata.", hostile+" changed")
@@ -261,24 +261,27 @@ func v030SkillsWaitPermission(t *testing.T, a *app.App) *ports.PermissionPrompt 
 		}
 	}
 }
-func v030SkillsWaitDenied(t *testing.T, a *app.App) {
+func v030SkillsWaitDenied(t *testing.T, a *app.App) string {
 	t.Helper()
 	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
 	for {
 		select {
 		case event := <-a.Events():
-			if event.Kind == app.EventTurnCompleted {
-				return
-			}
-			if event.Kind == app.EventError && strings.Contains(event.Message, "authorization decision is stale") {
-				return
-			}
 			if event.Kind == app.EventRejected {
 				t.Fatalf("denial rejected: %+v", event)
 			}
+			if event.Kind == app.EventError {
+				if !strings.Contains(event.Message, "authorization denied: denied by user") {
+					t.Fatalf("unexpected denial terminal: %+v", event)
+				}
+				return v030JSON(event) + event.Message
+			}
+			if event.Kind == app.EventTurnCompleted {
+				t.Fatal("denial unexpectedly continued turn")
+			}
 		case <-deadline.C:
-			t.Fatal("timed out waiting for denied hostile tool terminal")
+			t.Fatal("timed out waiting for authorization-denied terminal")
 		}
 	}
 }

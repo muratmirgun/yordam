@@ -146,7 +146,7 @@ func acceptFoundationApplicationProtocol(t *testing.T) {
 func acceptFoundationSkills(t *testing.T) {
 	t.Logf("trace=%s", traceSkills)
 	runFoundationGoTest(t, traceSkills, "./internal/skills", `^Test(Discover|Build|ProjectCatalogDigest|TrustProjector)`)
-	runFoundationGoTest(t, traceSkills, "./internal/tools/skill", `^Test(Prepare|Execute|Tool)`)
+	runFoundationGoTest(t, traceSkills, "./internal/tools/skill", `^TestSkill`)
 }
 
 func runFoundationGoTest(t *testing.T, trace, pkg, pattern string) {
