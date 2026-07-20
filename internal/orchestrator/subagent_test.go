@@ -149,6 +149,27 @@ func TestSequentialChildCoordinatorRunsOrdinaryChildTurnAndReadsReceipt(t *testi
 	}
 }
 
+func TestRunTurnSubagentDisabledRejectsBeforeChildDispatch(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	request.Runtime.Body.SkillCatalogRevision = "skills-a"
+	request.Runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: false, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+	request.Runtime.Body.Tools = append(request.Runtime.Body.Tools, subagenttool.BuiltinDescriptor())
+	refreshRuntimeDigest(t, &request.Runtime)
+	log := &recordLog{}
+	repo := &recordingRepository{head: request.ExpectedHead, log: log}
+	service, err := NewService(Dependencies{Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: &loggingLane{delegate: NewOperationLane(), log: log}, Repository: repo, TurnLeases: &recordingTurnLeaseManager{log: log}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &subagentTestProvider{log: log}, Tools: noToolService{}, Authorization: &allowingAuthorization{log: log}, Evidence: noEvidenceRecorder{}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if containsBatchKind(repo.batchKinds(), protocol.EventSubagentRequested) {
+		t.Fatalf("disabled subagent was requested: %v", repo.batchKinds())
+	}
+}
+
 type productionCoordinatorStore struct {
 	workspace  domain.Workspace
 	created    protocol.SessionID
