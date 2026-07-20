@@ -1826,7 +1826,7 @@ func eventID(commandID protocol.CommandID, label string, index int, kind string)
 func (s *Service) append(ctx context.Context, state *turnState, label string, events []protocol.ProposedEvent) error {
 	validate := validateProposedEvents
 	for _, event := range events {
-		if event.Kind == protocol.EventContextCompacted {
+		if event.Kind == protocol.EventContextCompacted || event.Kind == protocol.EventSubagentRequested || event.Kind == protocol.EventSubagentReceipt {
 			validate = func(events []protocol.ProposedEvent, ref protocol.JournalRef) error {
 				return validateCompactionProposedEvents(events, ref, state.head.CommitSeq+1)
 			}
