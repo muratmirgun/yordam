@@ -851,6 +851,7 @@ type recordingRepository struct {
 	head     protocol.CommittedCursor
 	batches  [][]string
 	log      *recordLog
+	trace    func(journal.AppendRequest)
 	events   []protocol.ProposedEvent
 	requests []journal.AppendRequest
 }
@@ -894,6 +895,9 @@ func (r *recordingRepository) AppendBatch(_ context.Context, request journal.App
 	r.head = protocol.CommittedCursor{
 		JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
 		CommitSeq: r.head.CommitSeq + uint64(len(request.Events)) + 1, TransactionID: request.TransactionID,
+	}
+	if r.trace != nil {
+		r.trace(protocol.DeepCopy(request))
 	}
 	return journal.AppendResult{Status: journal.AppendCommitted, Cursor: r.head}, nil
 }
@@ -976,25 +980,31 @@ func (l *recordLog) snapshot() []string {
 type loggingLane struct {
 	delegate OperationLane
 	log      *recordLog
+	name     string
 }
 
 func (l *loggingLane) Acquire(ctx context.Context, claim OperationClaim) (OperationLease, error) {
-	l.log.add("lane.acquire(" + string(claim.Kind) + ")")
+	prefix := ""
+	if l.name != "" {
+		prefix = l.name + "."
+	}
+	l.log.add(prefix + "lane.acquire(" + string(claim.Kind) + ")")
 	lease, err := l.delegate.Acquire(ctx, claim)
 	if err != nil {
 		return nil, err
 	}
-	return loggingOperationLease{OperationLease: lease, log: l.log}, nil
+	return loggingOperationLease{OperationLease: lease, log: l.log, prefix: prefix}, nil
 }
 
 type loggingOperationLease struct {
 	OperationLease
-	log *recordLog
+	log    *recordLog
+	prefix string
 }
 
 func (l loggingOperationLease) Release() {
 	l.OperationLease.Release()
-	l.log.add("lane.release")
+	l.log.add(l.prefix + "lane.release")
 }
 
 type fakeContextPlanner struct{ log *recordLog }
