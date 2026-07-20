@@ -12,7 +12,9 @@ func TestProjectReceiptUsesOnlyDurableEffectsAndMarksUnmatchedActivityUncertain(
 	events := []protocol.EventRecord{
 		durableReceiptEvent(protocol.EventFileChanged, protocol.FileChangedV1{Subject: protocol.SubjectRef{Kind: "file", ID: "/workspace/z.go"}}),
 		durableReceiptEvent(protocol.EventFileChanged, protocol.FileChangedV1{Subject: protocol.SubjectRef{Kind: "file", ID: "/workspace/a.go"}}),
-		durableReceiptEvent(protocol.EventExecutionPlanDeclared, protocol.ExecutionPlanDeclaredV1{Plan: protocol.ActionPlan{Body: protocol.ActionPlanBody{Tool: protocol.ToolIdentity{Name: "shell"}, Resources: []protocol.ResourceTarget{{Kind: "directory", CanonicalID: "/workspace", Attributes: []protocol.ResourceAttribute{{Name: "command", Value: "go test ./..."}}}}}}}),
+		activityReceiptEvent(protocol.EventExecutionPlanDeclared, "shell", protocol.ExecutionPlanDeclaredV1{Plan: protocol.ActionPlan{Body: protocol.ActionPlanBody{Tool: protocol.ToolIdentity{Name: "shell"}, Resources: []protocol.ResourceTarget{{Kind: "directory", CanonicalID: "/workspace", Attributes: []protocol.ResourceAttribute{{Name: "command", Value: "go test ./..."}}}}}}}),
+		activityReceiptEvent(protocol.EventActivityStarted, "shell", protocol.ActivityStartedV1{}),
+		activityReceiptEvent(protocol.EventActivitySucceeded, "shell", protocol.ActivityOutcomeV1{Status: "succeeded"}),
 		durableReceiptEvent(protocol.EventEvidenceRecorded, protocol.EvidenceRecordedV1{Record: protocol.EvidenceRecord{Body: protocol.EvidenceRecordBody{ID: "evidence-1"}}}),
 		{Envelope: protocol.EventEnvelope{Kind: protocol.EventActivityStarted, ActivityID: "ambiguous"}},
 	}
@@ -38,9 +40,24 @@ func TestProjectReceiptDoesNotTreatAssistantProseAsEvidence(t *testing.T) {
 	}
 }
 
+func TestProjectReceiptExcludesShellPlansThatNeverStarted(t *testing.T) {
+	plan := activityReceiptEvent(protocol.EventExecutionPlanDeclared, "denied", protocol.ExecutionPlanDeclaredV1{Plan: protocol.ActionPlan{Body: protocol.ActionPlanBody{Tool: protocol.ToolIdentity{Name: "shell"}, Resources: []protocol.ResourceTarget{{Kind: "directory", CanonicalID: "/workspace", Attributes: []protocol.ResourceAttribute{{Name: "command", Value: "rm -rf nope"}}}}}}})
+	denied := activityReceiptEvent(protocol.EventActivityDenied, "denied", protocol.ActivityOutcomeV1{Status: "denied"})
+	receipt := ProjectReceipt(protocol.SubagentManifestV1{}, protocol.CommittedCursor{}, "failed", "", protocol.ModelUsage{}, nil, []protocol.EventRecord{plan, denied})
+	if len(receipt.CommandsAndTests) != 0 {
+		t.Fatalf("unstarted command was reported: %v", receipt.CommandsAndTests)
+	}
+}
+
 func durableReceiptEvent(kind string, payload any) protocol.EventRecord {
 	raw, _ := json.Marshal(payload)
 	return protocol.EventRecord{Envelope: protocol.EventEnvelope{Kind: kind, Payload: raw}}
+}
+
+func activityReceiptEvent(kind string, activityID protocol.ActivityID, payload any) protocol.EventRecord {
+	event := durableReceiptEvent(kind, payload)
+	event.Envelope.ActivityID = activityID
+	return event
 }
 
 func equalStrings(left, right []string) bool {

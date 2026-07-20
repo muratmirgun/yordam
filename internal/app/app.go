@@ -107,6 +107,7 @@ type App struct {
 
 type pendingPermission struct {
 	internalKey     string
+	child           bool
 	displayedCallID string
 	decision        chan domain.PermissionDecision
 	internalScope   string
@@ -849,6 +850,15 @@ func (a *App) applyModel(ctx context.Context, selection domain.ModelSelection) b
 }
 
 func (a *App) acknowledgeAutoShell(ctx context.Context, callID string, decision domain.PermissionDecision) bool {
+	if callID != "" && a.pendingChild(callID) {
+		switch a.resolvePermission(callID, decision) {
+		case permissionStale:
+			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q is stale", callID)})
+		case permissionInvalidScope:
+			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q response is invalid", callID)})
+		}
+		return true
+	}
 	if a.session.Mode != domain.ModeAuto {
 		return a.publish(ctx, Event{Kind: EventRejected, Message: "trusted shell acknowledgement requires auto mode"})
 	}
@@ -878,6 +888,13 @@ func (a *App) acknowledgeAutoShell(ctx context.Context, callID string, decision 
 		}
 	}
 	return a.publish(ctx, a.settingEvent())
+}
+
+func (a *App) pendingChild(callID string) bool {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	pending := a.pending[callID]
+	return pending != nil && pending.child
 }
 
 func (a *App) commitSessionChange(ctx context.Context, kind string, payload any) error {
@@ -1111,6 +1128,7 @@ func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domai
 	published = permissionEventWithCallID(published, displayedCallID)
 	pending := &pendingPermission{
 		internalKey:     internalKey,
+		child:           prompt.ParentSessionID != "" || prompt.DelegationAttemptID != "",
 		displayedCallID: displayedCallID,
 		decision:        make(chan domain.PermissionDecision, 1),
 		internalScope:   permissionApprovalScope(prompt.Call),

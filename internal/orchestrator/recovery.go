@@ -11,6 +11,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	receiptprojector "github.com/muratmirgun/yordam/internal/subagent"
 )
 
 func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlRequest) (result RecoveryControlResult, runErr error) {
@@ -208,6 +209,9 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 	if projection.OriginalCommandID != "" {
 		eventCount++
 	}
+	if projection.ChildManifest != nil {
+		eventCount++
+	}
 	transactionID := protocol.TransactionID(stableID("transaction", string(request.Control.Command.CommandID), "recovery-session-terminal"))
 	finalCursor := protocol.CommittedCursor{
 		JournalKind: request.Storage.Journal.Kind, JournalID: request.Storage.Journal.ID,
@@ -265,6 +269,19 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 			Actor: &actor, RuntimeGenerationID: request.Control.Runtime.ID,
 			Payload: mustCanonical(protocol.CommandCompletedV1{CommandID: projection.OriginalCommandID, RequestDigest: projection.OriginalRequestDigest, Status: "interrupted", Result: rawResult, Error: publicError}),
 		})
+	}
+	if projection.ChildManifest != nil {
+		page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: request.Storage.Journal, Limit: 10000})
+		if err != nil {
+			return protocol.CommittedCursor{}, err
+		}
+		status := "cancelled"
+		if len(projection.StartedActivities) != 0 {
+			status = "uncertain"
+		}
+		receiptCursor := protocol.CommittedCursor{JournalKind: request.Storage.Journal.Kind, JournalID: request.Storage.Journal.ID, CommitSeq: expected.CommitSeq + uint64(eventCount), TransactionID: transactionID}
+		receipt := receiptprojector.ProjectReceipt(*projection.ChildManifest, receiptCursor, status, "turn interrupted during journal recovery", protocol.ModelUsage{}, &protocol.PublicError{Code: "recovery_interrupted", Message: "turn interrupted during journal recovery"}, page.Events)
+		events = append(events, protocol.ProposedEvent{EventID: eventID(request.Control.Command.CommandID, "recovery-session-terminal", len(events), protocol.EventSubagentReceipt), Time: now, PayloadVersion: 1, Kind: protocol.EventSubagentReceipt, SessionID: protocol.SessionID(request.Storage.Journal.ID), TaskID: projection.ChildManifest.ChildTaskID, TurnID: projection.ChildManifest.ChildTurnID, Actor: &actor, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(receipt)})
 	}
 	if err := validateProposedEvents(events, request.Storage.Journal); err != nil {
 		return protocol.CommittedCursor{}, err

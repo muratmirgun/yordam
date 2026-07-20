@@ -146,10 +146,11 @@ func (model Model) handleAppEvent(event app.Event) Model {
 		}
 	case app.EventPermissionRequested:
 		if event.Permission != nil {
-			warning := model.effectiveMode == domain.ModeAuto && event.Permission.Call.Request.Name == "shell"
+			childPrompt := event.Permission.ParentSessionID != "" || event.Permission.DelegationAttemptID != ""
+			warning := !childPrompt && model.effectiveMode == domain.ModeAuto && event.Permission.Call.Request.Name == "shell"
 			commands := model.commands
 			callID := event.Permission.Call.Request.CallID
-			model.permission = components.NewPermission(event.Permission.Call, func(decision domain.PermissionDecision) {
+			model.permission = components.NewPermissionPrompt(*event.Permission, func(decision domain.PermissionDecision) {
 				if commands == nil {
 					return
 				}

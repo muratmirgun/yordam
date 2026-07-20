@@ -22,6 +22,9 @@ type AuthorizationResolveFunc func(protocol.ApprovalResponse)
 
 type Permission struct {
 	request              domain.PreparedToolRequest
+	sessionID            string
+	parentSessionID      string
+	delegationAttemptID  string
 	resolve              PermissionResolveFunc
 	open                 bool
 	resolved             bool
@@ -33,6 +36,10 @@ type Permission struct {
 
 func NewPermission(request domain.PreparedToolRequest, resolve PermissionResolveFunc) Permission {
 	return Permission{request: request, resolve: resolve, open: true}
+}
+
+func NewPermissionPrompt(prompt ports.PermissionPrompt, resolve PermissionResolveFunc) Permission {
+	return Permission{request: prompt.Call, sessionID: prompt.SessionID, parentSessionID: prompt.ParentSessionID, delegationAttemptID: prompt.DelegationAttemptID, resolve: resolve, open: true}
 }
 
 func NewAuthorizationPermission(prompt ports.AuthorizationPrompt, actor protocol.ActorRef, resolve AuthorizationResolveFunc) Permission {
@@ -138,6 +145,9 @@ func (p Permission) View() string {
 		marker,
 		p.request.Summary,
 	))
+	if p.parentSessionID != "" || p.delegationAttemptID != "" {
+		sections = append(sections, fmt.Sprintf("Child session: %s\nParent session: %s\nDelegation attempt: %s", p.sessionID, p.parentSessionID, p.delegationAttemptID))
+	}
 	if p.request.ProposedDiff != "" {
 		sections = append(sections, "Proposed diff\n"+p.request.ProposedDiff)
 	}

@@ -202,6 +202,7 @@ type RecoveryProjection struct {
 	OriginalRequestDigest protocol.Digest
 	StartedActivities     []protocol.ActivityID
 	UnmatchedNoEffect     map[protocol.ActivityID]bool
+	ChildManifest         *protocol.SubagentManifestV1
 }
 
 type ProjectionService interface {

@@ -3,6 +3,8 @@ package subagent
 import (
 	"encoding/json"
 	"sort"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
@@ -12,6 +14,7 @@ import (
 // admitted as proof of changed files, commands, tests, or verification.
 func ProjectReceipt(manifest protocol.SubagentManifestV1, terminal protocol.CommittedCursor, status, summary string, fallbackUsage protocol.ModelUsage, public *protocol.PublicError, events []protocol.EventRecord) protocol.SubagentReceiptV1 {
 	files := map[string]struct{}{}
+	plannedCommands := map[protocol.ActivityID][]string{}
 	commands := map[string]struct{}{}
 	evidence := map[protocol.EvidenceID]struct{}{}
 	started := map[protocol.ActivityID]struct{}{}
@@ -20,7 +23,13 @@ func ProjectReceipt(manifest protocol.SubagentManifestV1, terminal protocol.Comm
 	usage, haveUsage := protocol.ModelUsage{}, false
 
 	for _, event := range events {
+		if event.Envelope.JournalKind != "" && event.Envelope.JournalKind != protocol.JournalSession || event.Envelope.JournalID != "" && event.Envelope.JournalID != terminal.JournalID || event.Envelope.SessionID != "" && event.Envelope.SessionID != manifest.ChildSessionID {
+			continue
+		}
 		if terminal.CommitSeq != 0 && event.Envelope.Seq > terminal.CommitSeq {
+			continue
+		}
+		if terminal.CommitSeq != 0 && event.Envelope.Seq == terminal.CommitSeq && terminal.TransactionID != "" && event.Envelope.TransactionID != terminal.TransactionID {
 			continue
 		}
 		activityID := event.Envelope.ActivityID
@@ -37,7 +46,7 @@ func ProjectReceipt(manifest protocol.SubagentManifestV1, terminal protocol.Comm
 				for _, resource := range payload.Plan.Body.Resources {
 					for _, attribute := range resource.Attributes {
 						if attribute.Name == "command" && attribute.Value != "" {
-							commands[attribute.Value] = struct{}{}
+							plannedCommands[activityID] = append(plannedCommands[activityID], attribute.Value)
 						}
 					}
 				}
@@ -81,7 +90,14 @@ func ProjectReceipt(manifest protocol.SubagentManifestV1, terminal protocol.Comm
 			unknown[activityID] = struct{}{}
 		}
 	}
-	if len(unknown) != 0 && status == "succeeded" {
+	for activityID := range terminalActivities {
+		if _, didStart := started[activityID]; didStart {
+			for _, command := range plannedCommands[activityID] {
+				commands[command] = struct{}{}
+			}
+		}
+	}
+	if len(unknown) != 0 {
 		status = "uncertain"
 	}
 	if !haveUsage {
@@ -90,10 +106,19 @@ func ProjectReceipt(manifest protocol.SubagentManifestV1, terminal protocol.Comm
 	if usage == (protocol.ModelUsage{}) {
 		usage = unknownUsage()
 	}
-	if len(summary) > protocol.MaxSubagentReceiptSummaryBytes {
-		summary = summary[:protocol.MaxSubagentReceiptSummaryBytes]
-	}
+	summary = boundedUTF8(summary, protocol.MaxSubagentReceiptSummaryBytes)
 	return protocol.SubagentReceiptV1{Status: status, Summary: summary, Manifest: manifest, TerminalCursor: terminal, ChangedFiles: sortedStrings(files), CommandsAndTests: sortedStrings(commands), Usage: usage, EvidenceIDs: sortedEvidence(evidence), UnknownEffects: sortedActivities(unknown), Error: protocol.DeepCopy(public)}
+}
+
+func boundedUTF8(value string, limit int) string {
+	value = strings.ToValidUTF8(value, "�")
+	if len(value) <= limit {
+		return value
+	}
+	for limit > 0 && !utf8.ValidString(value[:limit]) {
+		limit--
+	}
+	return value[:limit]
 }
 
 func addEvidence(target map[protocol.EvidenceID]struct{}, values []protocol.EvidenceID) {

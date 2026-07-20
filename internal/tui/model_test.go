@@ -894,6 +894,28 @@ func TestAutoShellAcceptAcknowledgesBeforeResolution(t *testing.T) {
 	}
 }
 
+func TestChildShellNeverUsesParentAutoAcknowledgement(t *testing.T) {
+	model, commands := tui.ModelAndCommandsForTest()
+	model = tui.SetModeForTest(model, domain.ModeAuto)
+	prompt := tui.PermissionPromptForTest("shell", "/workspace\x00go test ./...", true)
+	prompt.SessionID, prompt.ParentSessionID, prompt.DelegationAttemptID = "child", "parent", "attempt"
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventPermissionRequested, Permission: &prompt})
+	view := model.View().Content
+	for _, want := range []string{"Child session: child", "Parent session: parent", "Delegation attempt: attempt"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing child lineage %q: %s", want, view)
+		}
+	}
+	if strings.Contains(view, components.AutoShellWarningTitle) {
+		t.Fatal("child shell used parent auto-shell warning")
+	}
+	model = tui.PressForTest(model, "s")
+	got := tui.CommandsForTest(commands)
+	if len(got) != 1 || got[0].Kind != app.CommandResolvePermission || got[0].CallID != "call-1" {
+		t.Fatalf("commands=%+v", got)
+	}
+}
+
 func TestToolWorkspaceChangesOpenContext(t *testing.T) {
 	model := tui.NewModel(tui.OptionsForTest())
 	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventToolCompleted, Runtime: agent.RuntimeEvent{Result: &domain.ToolResult{

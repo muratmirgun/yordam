@@ -450,6 +450,11 @@ func (p recoveryProjection) InspectRecovery(ctx context.Context, ref protocol.Jo
 			if event.TurnID == result.ActiveTurnID {
 				result.ActiveTurnID = ""
 			}
+		case protocol.EventSubagentManifest:
+			var manifest protocol.SubagentManifestV1
+			if json.Unmarshal(event.Payload, &manifest) == nil && manifest.ChildSessionID == protocol.SessionID(ref.ID) {
+				result.ChildManifest = &manifest
+			}
 		case protocol.EventActivityStarted:
 			started[event.ActivityID] = true
 		case protocol.EventActivitySucceeded, protocol.EventActivityFailed, protocol.EventActivityDenied, protocol.EventActivityCancelled, protocol.EventActivityUncertain:

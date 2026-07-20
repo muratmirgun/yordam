@@ -23,3 +23,10 @@ go test -race ./internal/permission ./internal/app ./internal/orchestrator -run 
 go vet ./internal/permission ./internal/subagent ./internal/app ./internal/orchestrator
 git diff --check
 ```
+
+Review follow-up: child shell prompts now always resolve through the exact child
+correlation (including a malformed acknowledgement command), never mutate parent
+trusted-shell state, and render child/parent/attempt lineage. Receipt projection
+now ignores foreign/out-of-cursor records, admits shell commands only after their
+activity started and terminalized, forces unmatched effects to `uncertain`, and
+recovery emits a projected child receipt when it finds a durable child manifest.
