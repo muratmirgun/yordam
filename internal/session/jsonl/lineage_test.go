@@ -3,6 +3,7 @@ package jsonl_test
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -139,6 +140,7 @@ func TestLegacyCheckpointLineageWithoutKindStillComposesParentPrefix(t *testing.
 	if strings.Contains(string(raw), `"kind"`) {
 		t.Fatalf("legacy lineage unexpectedly wrote a kind: %s", raw)
 	}
+	assertLineageWireFamily(t, raw, false)
 	stored, err := store.SessionLineage(t.Context(), protocol.SessionID(child.ID))
 	if err != nil {
 		t.Fatal(err)
@@ -189,6 +191,11 @@ func TestSubagentLineageIsIdentityOnlyAndRequiresExactParentAnchor(t *testing.T)
 	if child.ID != string(reservedID) {
 		t.Fatalf("child ID=%q want reserved %q", child.ID, reservedID)
 	}
+	raw, err := os.ReadFile(filepath.Join(root, "workspaces", workspace.ID, "sessions", child.ID, "lineage.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertLineageWireFamily(t, raw, true)
 	page, err := store.ReadComposedRange(t.Context(), journal.ComposedReadRequest{SessionID: reservedID, Limit: 100})
 	if err != nil {
 		t.Fatal(err)
@@ -205,6 +212,27 @@ func TestSubagentLineageIsIdentityOnlyAndRequiresExactParentAnchor(t *testing.T)
 	badCursor.ParentCursor.CommitSeq++
 	if _, err := store.CreateWithLineage(t.Context(), workspace, domain.ModeAsk, domain.ModelSelection{Profile: "p", Model: "m"}, &badCursor); err == nil || !strings.Contains(err.Error(), "anchored committed prefix") {
 		t.Fatalf("bad parent cursor err=%v", err)
+	}
+}
+
+func assertLineageWireFamily(t *testing.T, raw []byte, subagent bool) {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	_, hasKind := fields["kind"]
+	_, hasCheckpoint := fields["checkpoint_digest"]
+	_, hasAttempt := fields["delegation_attempt_id"]
+	_, hasManifest := fields["manifest_digest"]
+	if subagent {
+		if !hasKind || hasCheckpoint || !hasAttempt || !hasManifest {
+			t.Fatalf("subagent lineage wire fields=%s", raw)
+		}
+		return
+	}
+	if hasKind || !hasCheckpoint || hasAttempt || hasManifest {
+		t.Fatalf("legacy checkpoint lineage wire fields=%s", raw)
 	}
 }
 
