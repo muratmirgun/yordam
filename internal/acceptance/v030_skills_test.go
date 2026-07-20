@@ -44,6 +44,11 @@ func TestV030Skills(t *testing.T) {
 	})
 }
 
+// Race instrumentation makes provider/journal scheduling substantially slower
+// than the normal deterministic fixture. One shared deadline keeps every
+// event/barrier wait bounded without turning a valid slow run into a flake.
+const v030SkillsEventDeadline = 60 * time.Second
+
 func assertV030SkillsAcceptance(t *testing.T) {
 	t.Helper()
 	const key = "V030_SKILLS_PROVIDER_SECRET_9a3f"
@@ -130,12 +135,12 @@ func assertV030SkillsAcceptance(t *testing.T) {
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "metadata only"}
 	select {
 	case <-firstCaptured:
-	case <-time.After(30 * time.Second):
+	case <-time.After(v030SkillsEventDeadline):
 		t.Fatal("first provider request did not arrive")
 	}
 	v030WriteSkill(t, global, "Reloaded global metadata.", "reloaded global body")
 	application.Commands() <- app.Command{Kind: app.CommandReloadConfig}
-	deadline := time.NewTimer(30 * time.Second)
+	deadline := time.NewTimer(v030SkillsEventDeadline)
 	for {
 		select {
 		case event := <-application.Events():
@@ -316,7 +321,7 @@ func v030SkillsSendUntil(t *testing.T, a *app.App, command app.Command, terminal
 }
 func v030SkillsWait(t *testing.T, a *app.App, terminal app.EventKind) {
 	t.Helper()
-	deadline := time.NewTimer(30 * time.Second)
+	deadline := time.NewTimer(v030SkillsEventDeadline)
 	defer deadline.Stop()
 	for {
 		select {
@@ -334,7 +339,7 @@ func v030SkillsWait(t *testing.T, a *app.App, terminal app.EventKind) {
 }
 func v030SkillsWaitPermission(t *testing.T, a *app.App, observed *[]app.Event) *ports.PermissionPrompt {
 	t.Helper()
-	deadline := time.NewTimer(30 * time.Second)
+	deadline := time.NewTimer(v030SkillsEventDeadline)
 	defer deadline.Stop()
 	for {
 		select {
@@ -353,7 +358,7 @@ func v030SkillsWaitPermission(t *testing.T, a *app.App, observed *[]app.Event) *
 }
 func v030SkillsWaitDenied(t *testing.T, a *app.App, observed *[]app.Event) string {
 	t.Helper()
-	deadline := time.NewTimer(30 * time.Second)
+	deadline := time.NewTimer(v030SkillsEventDeadline)
 	defer deadline.Stop()
 	for {
 		select {
