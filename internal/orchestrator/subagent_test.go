@@ -86,6 +86,7 @@ func TestRunTurnSubagentHappyPathCommitsParentHandoffAndAttachment(t *testing.T)
 	request.Runtime = validRuntimeManifest(t, "observation")
 	request.Runtime.Body.SkillCatalogRevision = "skills-a"
 	request.Runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+	request.Runtime.Body.Limits.MaxToolCalls = 5
 	request.Runtime.Body.Tools = append(request.Runtime.Body.Tools, subagenttool.BuiltinDescriptor())
 	refreshRuntimeDigest(t, &request.Runtime)
 	log := &recordLog{}
@@ -170,6 +171,33 @@ func TestRunTurnSubagentDisabledRejectsBeforeChildDispatch(t *testing.T) {
 	}
 }
 
+func TestRunTurnSubagentAttemptsOneThroughFourThenRejectsFifth(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	request.Runtime.Body.Limits.MaxToolCalls = 5
+	request.Runtime.Body.SkillCatalogRevision = "skills-a"
+	request.Runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+	request.Runtime.Body.Tools = append(request.Runtime.Body.Tools, subagenttool.BuiltinDescriptor())
+	refreshRuntimeDigest(t, &request.Runtime)
+	log := &recordLog{}
+	repo := &recordingRepository{head: request.ExpectedHead, log: log}
+	child := protocol.SubagentManifestV1{AttemptID: "seed", ParentSessionID: request.SessionID, ParentCursor: request.ExpectedHead, ChildSessionID: "child", ChildTaskID: "child-task", ChildTurnID: "child-turn", RuntimeGenerationID: request.Runtime.ID, SkillCatalogRevision: "skills-a", MaxToolCalls: 1, Deadline: testSubagentDeadline()}
+	children := &subagentTestChildren{receipt: childReceipt(child, "succeeded", "done", protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 2, TransactionID: "child-terminal"}, unknownUsage(), nil, nil), workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}}
+	service, err := NewService(Dependencies{Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repo, TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &manySubagentProvider{}, Tools: subagentPlanService{}, Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now), ChildSessions: children, ParentSessions: subagentParentInspector{children}, Children: subagentTestCoordinator{children: children, log: log}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if got := countBatchKind(repo.batchKinds(), protocol.EventSubagentRequested); got != 4 {
+		t.Fatalf("requests=%d batches=%v", got, repo.batchKinds())
+	}
+	if children.reservations != 4 {
+		t.Fatalf("reserved child IDs=%d", children.reservations)
+	}
+}
+
 type productionCoordinatorStore struct {
 	workspace  domain.Workspace
 	created    protocol.SessionID
@@ -210,12 +238,14 @@ func (s productionCoordinatorParent) InspectSession(context.Context, protocol.Se
 }
 
 type subagentTestChildren struct {
-	receipt   protocol.SubagentReceiptV1
-	workspace domain.Workspace
+	receipt      protocol.SubagentReceiptV1
+	workspace    domain.Workspace
+	reservations int
 }
 
 func (s *subagentTestChildren) ReserveSessionID() (protocol.SessionID, error) {
-	return s.receipt.Manifest.ChildSessionID, nil
+	s.reservations++
+	return protocol.SessionID(fmt.Sprintf("child-%d", s.reservations)), nil
 }
 func (s *subagentTestChildren) CreateWithIdentity(context.Context, protocol.SessionID, domain.Workspace, domain.PermissionMode, domain.ModelSelection, *journal.SessionLineage) (domain.Session, error) {
 	return domain.Session{}, nil
@@ -246,6 +276,38 @@ func (s subagentTestCoordinator) RunChild(_ context.Context, request ChildRunReq
 	s.children.receipt.Manifest = request.Manifest
 	s.children.receipt.TerminalCursor.JournalID = protocol.JournalID(request.Manifest.ChildSessionID)
 	return s.children.receipt, nil
+}
+
+type manySubagentProvider struct{ calls int }
+
+func (p *manySubagentProvider) Prepare(context.Context, protocol.ActivityID, string, protocol.ModelRequest, protocol.Digest) (provider.ProviderHandle, error) {
+	return provider.ProviderHandle{}, nil
+}
+func (p *manySubagentProvider) Stream(context.Context, provider.ProviderHandle, authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	p.calls++
+	out := make(chan protocol.ModelEvent, 6)
+	if p.calls == 1 {
+		for i := 1; i <= 5; i++ {
+			out <- protocol.ModelEvent{Kind: protocol.ModelEventToolIntent, Sequence: uint64(i), ToolIntent: &protocol.ToolUseBlock{CallID: fmt.Sprintf("delegate-%d", i), Alias: "subagent", Arguments: json.RawMessage(`{"task":"child"}`)}}
+		}
+		out <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 6, Terminal: &protocol.ModelTerminal{Reason: "tool"}}
+	} else {
+		out <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: "done"}}
+		out <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "stop"}}
+	}
+	close(out)
+	return out, nil
+}
+func countBatchKind(batches [][]string, kind string) int {
+	count := 0
+	for _, batch := range batches {
+		for _, got := range batch {
+			if got == kind {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 type subagentPlanService struct{ noToolService }
