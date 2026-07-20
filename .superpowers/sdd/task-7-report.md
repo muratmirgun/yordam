@@ -105,3 +105,46 @@ Verification: `go test ./internal/session/jsonl ./internal/subagent
   activity binding and counts the already-terminal provider activity before
   starting the authorized continuation (so the continuation cannot collide
   with the prior provider activity ID).
+
+## Acceptance closure
+
+- `TestSubagentRecoveryCreatesReservedChildOnceAndContinuesParent` now drives
+  the production recovery path from a durable parent wait and typed child
+  absence. It proves the exact reserved identity is created and run once, the
+  durable receipt cursor/digest is attached, and the reconstructed frozen
+  provider/model continuation runs only after that attachment. Repeating the
+  same recovery command does not re-run repository recovery, child creation,
+  child execution, or parent provider continuation.
+- A parent whose attached continuation is already terminal returns without
+  reconciliation work, preventing a restart from dispatching a second provider
+  activity.
+- Uncertain/conflicting child reconciliation now persists a structured
+  `subagent.recovery_uncertain` diagnostic containing attempt ID, child session
+  ID, child status, terminal cursor, receipt digest, and reason. The parent
+  command completes with a non-retryable `subagent_recovery_uncertain` public
+  error instead of silently degrading to a generic recovery interruption.
+- Cancellation after a mutation process starts now stops the provider loop
+  after its detached durable uncertain/no-effect terminal write. This closes a
+  race where the cancelled child could otherwise enter another provider round
+  and report a tool-limit error. The repository test double now preserves
+  durable activity identity, so the terminal child receipt is derived as
+  `uncertain` from the committed activity event rather than test-local state.
+
+Final verification:
+
+```text
+go test ./internal/subagent ./internal/orchestrator ./internal/app -run 'Test.*Subagent.*Recover|Test.*Subagent.*Cancel|TestRecovery' -count=1  PASS
+go test ./internal/subagent ./internal/orchestrator ./internal/app -count=1  PASS
+go test -race ./internal/subagent ./internal/orchestrator ./internal/app -run 'Test.*Subagent.*Recover|Test.*Subagent.*Cancel|TestRecovery' -count=1  PASS
+go test ./internal/orchestrator -run '^TestSubagentCancelDuringChildShellProcessStopsProcessAndWritesOneReceipt$' -count=5  PASS
+go test -race ./internal/orchestrator -run '^TestSubagentCancelDuringChildShellProcessStopsProcessAndWritesOneReceipt$' -count=5  PASS
+go vet ./internal/subagent ./internal/orchestrator ./internal/app  PASS
+git diff --check  PASS
+```
+
+Residual risk: bootstrap still enters recovery through the single production
+`RecoverTurn` boundary, and the orchestrator tests prove reconciliation occurs
+before generic terminalization. There is not yet a real-JSONL application
+bootstrap fixture that corrupts a parent tail and observes the structured child
+diagnostic through an application subscription; that integration assertion is
+left explicit for review rather than represented by a mock-only startup test.

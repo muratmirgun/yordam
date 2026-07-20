@@ -208,6 +208,12 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 			if runErr != nil {
 				return RunResult{}, runErr
 			}
+			// A cancelled tool may still return a durable uncertain/no-effect
+			// result after its detached terminal write. Do not mistake that receipt
+			// for authority to start another provider activity.
+			if err := ctx.Err(); err != nil {
+				return RunResult{}, err
+			}
 			resultCopy := result
 			results = append(results, protocol.ContentBlock{Kind: protocol.ContentToolResult, ToolResult: &resultCopy})
 			completedTools++

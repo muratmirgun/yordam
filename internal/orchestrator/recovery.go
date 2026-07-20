@@ -147,7 +147,7 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 	// protocol, not an ordinary in-process activity. Reconcile that protocol
 	// before the generic active-turn terminalization below can erase its exact
 	// child receipt/attachment boundary.
-	if reconciledHead, reconciled, resumed, reconcileErr := s.reconcileWaitingSubagents(ctx, laneLease, request, projected, sessionHead); reconcileErr != nil {
+	if reconciledHead, reconciled, resumed, reconcileErr := s.reconcileWaitingSubagents(ctx, laneLease, request, &projected, sessionHead); reconcileErr != nil {
 		return RecoveryControlResult{}, reconcileErr
 	} else if reconciled {
 		sessionHead, releaseHead = reconciledHead, reconciledHead
@@ -229,6 +229,9 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 	if projection.ChildManifest != nil {
 		eventCount++
 	}
+	if projection.SubagentRecoveryDiagnostic != nil {
+		eventCount++
+	}
 	transactionID := protocol.TransactionID(stableID("transaction", string(request.Control.Command.CommandID), "recovery-session-terminal"))
 	finalCursor := protocol.CommittedCursor{
 		JournalKind: request.Storage.Journal.Kind, JournalID: request.Storage.Journal.ID,
@@ -267,6 +270,9 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 	)
 	if projection.OriginalCommandID != "" {
 		publicError := &protocol.PublicError{Code: "recovery_interrupted", Message: "turn interrupted during journal recovery", Retryable: false}
+		if diagnostic := projection.SubagentRecoveryDiagnostic; diagnostic != nil {
+			publicError = &protocol.PublicError{Code: "subagent_recovery_uncertain", Message: "sequential child recovery state is uncertain: " + diagnostic.Reason, Retryable: false}
+		}
 		payload := mustCanonical(struct {
 			TurnID protocol.TurnID `json:"turn_id"`
 			Status string          `json:"status"`
@@ -303,6 +309,18 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 		receipt := receiptprojector.ProjectReceipt(*projection.ChildManifest, receiptCursor, status, "turn interrupted during journal recovery", protocol.ModelUsage{}, &protocol.PublicError{Code: "recovery_interrupted", Message: "turn interrupted during journal recovery"}, prefix)
 		events = append(events, protocol.ProposedEvent{EventID: eventID(request.Control.Command.CommandID, "recovery-session-terminal", len(events), protocol.EventSubagentReceipt), Time: now, PayloadVersion: 1, Kind: protocol.EventSubagentReceipt, SessionID: protocol.SessionID(request.Storage.Journal.ID), TaskID: projection.ChildManifest.ChildTaskID, TurnID: projection.ChildManifest.ChildTurnID, Actor: &actor, RuntimeGenerationID: projection.ChildManifest.RuntimeGenerationID, Payload: mustCanonical(receipt)})
 	}
+	if diagnostic := projection.SubagentRecoveryDiagnostic; diagnostic != nil {
+		details, err := canonicaljson.Marshal(diagnostic)
+		if err != nil {
+			return protocol.CommittedCursor{}, err
+		}
+		events = append(events, protocol.ProposedEvent{
+			EventID: eventID(request.Control.Command.CommandID, "recovery-session-terminal", len(events), protocol.EventRecoveryDiagnostic), Time: now, PayloadVersion: 1,
+			Kind: protocol.EventRecoveryDiagnostic, SessionID: protocol.SessionID(request.Storage.Journal.ID), TaskID: projection.TaskID, TurnID: projection.ActiveTurnID,
+			Actor: &actor, RuntimeGenerationID: request.Control.Runtime.ID,
+			Payload: mustCanonical(protocol.DiagnosticV1{Diagnostic: protocol.Diagnostic{Code: "subagent.recovery_uncertain", Message: "sequential child recovery state is uncertain", Journal: request.Storage.Journal, AtSeq: expected.CommitSeq, Details: details}}),
+		})
+	}
 	if err := validateProposedEventsAt(events, request.Storage.Journal, expected.CommitSeq+1, transactionID); err != nil {
 		return protocol.CommittedCursor{}, err
 	}
@@ -321,11 +339,16 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 	return finalCursor, nil
 }
 
-// reconcileWaitingSubagents repairs only proven sequential handoff edges. It
-// never invokes a child coordinator or provider: a restarted process has no
-// authority to replay a child activity whose effect cannot be proven absent.
-// The child receipt is always committed before the parent attachment.
-func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOperationLease, request RecoveryControlRequest, projection RecoveryProjection, parentHead protocol.CommittedCursor) (protocol.CommittedCursor, bool, bool, error) {
+// reconcileWaitingSubagents repairs only proven sequential handoff edges. A
+// typed, proven-absent reserved child may be created once; ambiguous child
+// activity is never replayed. The child receipt is always committed before the
+// parent attachment and provider continuation.
+func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOperationLease, request RecoveryControlRequest, projection *RecoveryProjection, parentHead protocol.CommittedCursor) (protocol.CommittedCursor, bool, bool, error) {
+	// An attachment followed by a terminal continuation is already complete.
+	// Replaying it would make a restart dispatch a second provider activity.
+	if projection.ActiveTurnID == "" {
+		return parentHead, false, false, nil
+	}
 	if s.deps.ChildSessions == nil || s.deps.ParentSessions == nil || s.deps.Evidence == nil || s.deps.Children == nil {
 		return parentHead, false, false, nil
 	}
@@ -455,10 +478,17 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 		if reconcileErr != nil || result.ChildStatus == "uncertain" {
 			// The generic recovery terminal below makes this non-retryable and
 			// visible; do not create or replay a child from ambiguous state.
+			if projection.SubagentRecoveryDiagnostic == nil {
+				reason := result.Diagnostic
+				if reconcileErr != nil {
+					reason = reconcileErr.Error()
+				}
+				projection.SubagentRecoveryDiagnostic = &SubagentRecoveryDiagnostic{AttemptID: initial.AttemptID, ChildSessionID: initial.Manifest.ChildSessionID, ChildStatus: result.ChildStatus, TerminalCursor: attempt.TerminalCursor, ReceiptDigest: attempt.ReceiptDigest, Reason: reason}
+			}
 			continue
 		}
 		if result.CreateOnce {
-			parentRequest, rebuildErr := s.recoverParentStartRequest(ctx, request, projection, initial, parentHead, parentEvents)
+			parentRequest, rebuildErr := s.recoverParentStartRequest(ctx, request, *projection, initial, parentHead, parentEvents)
 			if rebuildErr != nil {
 				return parentHead, changed, false, rebuildErr
 			}
@@ -482,7 +512,7 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 			}
 		}
 		if result.Attached {
-			parentRequest, rebuildErr := s.recoverParentStartRequest(ctx, request, projection, initial, parentHead, parentEvents)
+			parentRequest, rebuildErr := s.recoverParentStartRequest(ctx, request, *projection, initial, parentHead, parentEvents)
 			if rebuildErr != nil {
 				return parentHead, changed, false, rebuildErr
 			}
@@ -508,7 +538,7 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 		}
 		parentHead, changed = recoveryTurn.head, true
 		if result.ParentResumable || attempt.Receipt != nil {
-			parentRequest, rebuildErr := s.recoverParentStartRequest(ctx, request, projection, initial, parentHead, parentEvents)
+			parentRequest, rebuildErr := s.recoverParentStartRequest(ctx, request, *projection, initial, parentHead, parentEvents)
 			if rebuildErr != nil {
 				return parentHead, changed, false, rebuildErr
 			}

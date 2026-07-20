@@ -872,6 +872,7 @@ func (r *recordingRepository) ReadRange(context.Context, journal.ReadRangeReques
 		records[index] = protocol.EventRecord{Envelope: protocol.EventEnvelope{
 			JournalKind: r.head.JournalKind, JournalID: r.head.JournalID, SessionID: event.SessionID,
 			EventID: event.EventID, Time: event.Time, Kind: event.Kind, PayloadVersion: event.PayloadVersion, Payload: protocol.DeepCopy(event.Payload),
+			TaskID: event.TaskID, TurnID: event.TurnID, ActivityID: event.ActivityID, RuntimeGenerationID: event.RuntimeGenerationID,
 		}}
 	}
 	return journal.EventPage{Events: records, Head: r.head, Cursor: r.head}, nil

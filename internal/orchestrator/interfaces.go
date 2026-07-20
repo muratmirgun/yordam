@@ -203,6 +203,23 @@ type RecoveryProjection struct {
 	StartedActivities     []protocol.ActivityID
 	UnmatchedNoEffect     map[protocol.ActivityID]bool
 	ChildManifest         *protocol.SubagentManifestV1
+	// SubagentRecoveryDiagnostic is populated only when reconciliation cannot
+	// prove a waiting parent/child boundary.  It is recorded with the parent
+	// terminal transaction rather than silently degrading to a generic recovery
+	// interruption.
+	SubagentRecoveryDiagnostic *SubagentRecoveryDiagnostic
+}
+
+// SubagentRecoveryDiagnostic is the public, durable shape for a failed-closed
+// sequential-child reconciliation.  The receipt digest/cursor are optional:
+// an ambiguous child may not have reached a terminal receipt.
+type SubagentRecoveryDiagnostic struct {
+	AttemptID      protocol.DelegationAttemptID `json:"attempt_id"`
+	ChildSessionID protocol.SessionID           `json:"child_session_id"`
+	ChildStatus    string                       `json:"child_status"`
+	TerminalCursor protocol.CommittedCursor     `json:"terminal_cursor,omitempty"`
+	ReceiptDigest  protocol.Digest              `json:"receipt_digest,omitempty"`
+	Reason         string                       `json:"reason"`
 }
 
 type ProjectionService interface {
