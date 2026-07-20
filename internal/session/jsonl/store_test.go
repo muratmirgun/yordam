@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/journal"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
 	"github.com/oklog/ulid/v2"
 )
@@ -44,6 +47,14 @@ func TestWorkspaceFromPathUsesFullSHA256OfCanonicalPath(t *testing.T) {
 	}
 	if workspace.ID != wantID {
 		t.Fatalf("workspace ID=%q want full SHA-256 %q", workspace.ID, wantID)
+	}
+}
+
+func TestInspectMissingSessionReturnsTypedNotFound(t *testing.T) {
+	store := jsonl.New(t.TempDir(), jsonl.Options{})
+	_, err := store.InspectSession(context.Background(), protocol.SessionID(ulid.Make().String()))
+	if !errors.Is(err, journal.ErrSessionNotFound) {
+		t.Fatalf("InspectSession error=%v, want typed session-not-found", err)
 	}
 }
 

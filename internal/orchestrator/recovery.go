@@ -30,7 +30,7 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 		return RecoveryControlResult{}, fmt.Errorf("admitted recovery control event: %w", err)
 	}
 	sessionID := protocol.SessionID(request.Storage.Journal.ID)
-	laneLease, err := s.lane.Acquire(ctx, OperationClaim{Kind: OperationRecovery, SessionID: sessionID, ControlOperationID: request.Control.OperationID})
+	laneLease, err := acquireManagedOperationLease(ctx, s.lane, OperationClaim{Kind: OperationRecovery, SessionID: sessionID, ControlOperationID: request.Control.OperationID})
 	if err != nil {
 		return RecoveryControlResult{}, err
 	}
@@ -146,13 +146,16 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 	// protocol, not an ordinary in-process activity. Reconcile that protocol
 	// before the generic active-turn terminalization below can erase its exact
 	// child receipt/attachment boundary.
-	if reconciledHead, reconciled, reconcileErr := s.reconcileWaitingSubagents(ctx, request, projected, sessionHead); reconcileErr != nil {
+	if reconciledHead, reconciled, resumed, reconcileErr := s.reconcileWaitingSubagents(ctx, laneLease, request, projected, sessionHead); reconcileErr != nil {
 		return RecoveryControlResult{}, reconcileErr
 	} else if reconciled {
 		sessionHead, releaseHead = reconciledHead, reconciledHead
 		projected, err = s.deps.Projection.InspectRecovery(ctx, request.Storage.Journal, sessionHead)
 		if err != nil {
 			return RecoveryControlResult{}, err
+		}
+		if resumed && projected.ActiveTurnID != "" {
+			return RecoveryControlResult{}, fmt.Errorf("resumed parent remains active")
 		}
 	}
 	if turnLease == nil && projected.ActiveTurnID != "" {
@@ -321,13 +324,13 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 // never invokes a child coordinator or provider: a restarted process has no
 // authority to replay a child activity whose effect cannot be proven absent.
 // The child receipt is always committed before the parent attachment.
-func (s *Service) reconcileWaitingSubagents(ctx context.Context, request RecoveryControlRequest, projection RecoveryProjection, parentHead protocol.CommittedCursor) (protocol.CommittedCursor, bool, error) {
-	if s.deps.ChildSessions == nil || s.deps.ParentSessions == nil || s.deps.Evidence == nil {
-		return parentHead, false, nil
+func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOperationLease, request RecoveryControlRequest, projection RecoveryProjection, parentHead protocol.CommittedCursor) (protocol.CommittedCursor, bool, bool, error) {
+	if s.deps.ChildSessions == nil || s.deps.ParentSessions == nil || s.deps.Evidence == nil || s.deps.Children == nil {
+		return parentHead, false, false, nil
 	}
 	parentEvents, err := s.durablePrefix(ctx, request.Storage.Journal, parentHead)
 	if err != nil {
-		return parentHead, false, err
+		return parentHead, false, false, err
 	}
 	projector := receiptprojector.Projector{}
 	state := projector.Zero(request.Storage.Journal)
@@ -337,7 +340,7 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, request Recover
 			continue
 		}
 		if err := decodeSubagentRecoveryEvent(&event); err != nil {
-			return parentHead, false, err
+			return parentHead, false, false, err
 		}
 		// The child receipt lives in the child journal, so parent attachments
 		// must be projected after that exact receipt has been loaded.
@@ -347,7 +350,7 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, request Recover
 		}
 		state, err = projector.Apply(state, event)
 		if err != nil {
-			return parentHead, false, fmt.Errorf("project parent subagent recovery: %w", err)
+			return parentHead, false, false, fmt.Errorf("project parent subagent recovery: %w", err)
 		}
 	}
 	changed := false
@@ -357,6 +360,12 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, request Recover
 		}
 		child, inspectErr := s.deps.ChildSessions.InspectSession(ctx, initial.Manifest.ChildSessionID)
 		childState := receiptprojector.ChildRecoveryState{Exists: inspectErr == nil, CommitKnown: inspectErr == nil}
+		if errors.Is(inspectErr, journal.ErrSessionNotFound) {
+			// Only a typed not-found result is proof that the identity reserved in
+			// the parent wait transaction has never been created. Timeouts, I/O
+			// errors, and malformed views remain unknown and are never retried.
+			childState.CommitKnown = true
+		}
 		attempt := initial
 		if inspectErr == nil {
 			for _, event := range child.Events {
@@ -364,11 +373,11 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, request Recover
 					continue
 				}
 				if err := decodeSubagentRecoveryEvent(&event); err != nil {
-					return parentHead, changed, err
+					return parentHead, changed, false, err
 				}
 				state, err = projector.Apply(state, event)
 				if err != nil {
-					return parentHead, changed, fmt.Errorf("project child subagent recovery: %w", err)
+					return parentHead, changed, false, fmt.Errorf("project child subagent recovery: %w", err)
 				}
 			}
 			attempt = state.Attempts[initial.AttemptID]
@@ -379,7 +388,7 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, request Recover
 				}
 				state, err = projector.Apply(state, attachment)
 				if err != nil {
-					return parentHead, changed, fmt.Errorf("project parent receipt attachment: %w", err)
+					return parentHead, changed, false, fmt.Errorf("project parent receipt attachment: %w", err)
 				}
 				attempt = state.Attempts[initial.AttemptID]
 			}
@@ -416,23 +425,23 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, request Recover
 						if childRequest.Control.Runtime.ID != initial.Manifest.RuntimeGenerationID {
 							childState.CommitKnown = false
 						} else if _, appendErr := s.appendRecoverySessionTerminal(ctx, childRequest, childProjection, child.Head); appendErr != nil {
-							return parentHead, changed, appendErr
+							return parentHead, changed, false, appendErr
 						} else {
 							changed = true
 							child, inspectErr = s.deps.ChildSessions.InspectSession(ctx, initial.Manifest.ChildSessionID)
 							if inspectErr != nil {
-								return parentHead, changed, inspectErr
+								return parentHead, changed, false, inspectErr
 							}
 							for _, event := range child.Events {
 								if event.Envelope.Kind != protocol.EventSubagentReceipt {
 									continue
 								}
 								if err := decodeSubagentRecoveryEvent(&event); err != nil {
-									return parentHead, changed, err
+									return parentHead, changed, false, err
 								}
 								state, err = projector.Apply(state, event)
 								if err != nil {
-									return parentHead, changed, err
+									return parentHead, changed, false, err
 								}
 							}
 							attempt = state.Attempts[initial.AttemptID]
@@ -442,16 +451,51 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, request Recover
 			}
 		}
 		result, reconcileErr := receiptprojector.Reconcile(receiptprojector.ReconcileRequest{ParentSessionID: protocol.SessionID(request.Storage.Journal.ID), ParentCursor: parentHead, Runtime: request.Control.Runtime}, attempt, childState)
-		if reconcileErr != nil || result.ChildStatus == "uncertain" || result.CreateOnce {
+		if reconcileErr != nil || result.ChildStatus == "uncertain" {
 			// The generic recovery terminal below makes this non-retryable and
 			// visible; do not create or replay a child from ambiguous state.
 			continue
 		}
-		if result.Attached || attempt.Receipt == nil {
+		if result.CreateOnce {
+			parentRequest, rebuildErr := s.recoverParentStartRequest(ctx, request, projection, initial, parentHead, parentEvents)
+			if rebuildErr != nil {
+				return parentHead, changed, false, rebuildErr
+			}
+			var receipt protocol.SubagentReceiptV1
+			if yieldErr := lease.Yield(ctx, func(childContext context.Context) error {
+				var runErr error
+				receipt, runErr = s.deps.Children.RunChild(childContext, ChildRunRequest{Manifest: initial.Manifest, Call: initial.Call, Parent: parentRequest})
+				return runErr
+			}); yieldErr != nil {
+				return parentHead, changed, false, yieldErr
+			}
+			if !sameSubagentManifest(receipt.Manifest, initial.Manifest) || receipt.Validate() != nil || s.verifyChildReceipt(ctx, initial.Manifest, receipt) != nil {
+				return parentHead, changed, false, fmt.Errorf("recovery-created child receipt is not durably bound")
+			}
+			attempt.Receipt = protocol.DeepCopy(&receipt)
+			attempt.TerminalCursor = receipt.TerminalCursor
+			attempt.ReceiptDigest, _ = canonicaljson.Digest(receipt)
+			result, reconcileErr = receiptprojector.Reconcile(receiptprojector.ReconcileRequest{ParentSessionID: protocol.SessionID(request.Storage.Journal.ID), ParentCursor: parentHead, Runtime: request.Control.Runtime}, attempt, receiptprojector.ChildRecoveryState{Exists: true, CommitKnown: true})
+			if reconcileErr != nil || result.ChildStatus == "uncertain" || attempt.Receipt == nil {
+				return parentHead, changed, false, fmt.Errorf("recovery-created child receipt cannot be reconciled")
+			}
+		}
+		if result.Attached {
+			parentRequest, rebuildErr := s.recoverParentStartRequest(ctx, request, projection, initial, parentHead, parentEvents)
+			if rebuildErr != nil {
+				return parentHead, changed, false, rebuildErr
+			}
+			resumed, resumeErr := s.resumeRecoveredParent(ctx, lease, parentRequest, initial, *attempt.Receipt)
+			if resumeErr != nil {
+				return parentHead, changed, false, resumeErr
+			}
+			return resumed.Cursor, true, true, nil
+		}
+		if attempt.Receipt == nil {
 			continue
 		}
 		if err := s.verifyParentHead(ctx, &turnState{ref: request.Storage.Journal, head: parentHead}); err != nil {
-			return parentHead, changed, err
+			return parentHead, changed, false, err
 		}
 		recoveryTurn := turnState{ref: request.Storage.Journal, head: parentHead, command: CommandMetadata{CommandID: projection.OriginalCommandID, RequestDigest: projection.OriginalRequestDigest}, taskID: attempt.ParentTaskID, turnID: attempt.ParentTurnID, activeActivityID: attempt.ActivityID}
 		if recoveryTurn.command.CommandID == "" || recoveryTurn.activeActivityID == "" {
@@ -459,11 +503,22 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, request Recover
 		}
 		_, attachErr := s.attachSubagentReceipt(ctx, StartTurnRequest{Command: recoveryTurn.command, SessionID: protocol.SessionID(request.Storage.Journal.ID), Runtime: protocol.DeepCopy(request.Control.Runtime)}, &recoveryTurn, protocol.ToolUseBlock{CallID: string(attempt.AttemptID)}, attempt.ActivityID, *attempt.Receipt)
 		if attachErr != nil {
-			return parentHead, changed, attachErr
+			return parentHead, changed, false, attachErr
 		}
 		parentHead, changed = recoveryTurn.head, true
+		if result.ParentResumable || attempt.Receipt != nil {
+			parentRequest, rebuildErr := s.recoverParentStartRequest(ctx, request, projection, initial, parentHead, parentEvents)
+			if rebuildErr != nil {
+				return parentHead, changed, false, rebuildErr
+			}
+			resumed, resumeErr := s.resumeRecoveredParent(ctx, lease, parentRequest, initial, *attempt.Receipt)
+			if resumeErr != nil {
+				return parentHead, changed, false, resumeErr
+			}
+			return resumed.Cursor, true, true, nil
+		}
 	}
-	return parentHead, changed, nil
+	return parentHead, changed, false, nil
 }
 
 func decodeSubagentRecoveryEvent(event *protocol.EventRecord) error {
@@ -503,6 +558,140 @@ func decodeSubagentRecoveryEvent(event *protocol.EventRecord) error {
 		event.Decoded = &payload
 	}
 	return nil
+}
+
+// recoverParentStartRequest rebuilds only immutable request facts from the
+// committed parent journal.  Recovery never borrows mutable current-session
+// configuration: a missing or mismatched frozen generation fails closed.
+func (s *Service) recoverParentStartRequest(ctx context.Context, control RecoveryControlRequest, projection RecoveryProjection, attempt receiptprojector.Attempt, head protocol.CommittedCursor, events []protocol.EventRecord) (StartTurnRequest, error) {
+	if attempt.Manifest.RuntimeGenerationID != control.Control.Runtime.ID {
+		return StartTurnRequest{}, fmt.Errorf("subagent recovery runtime mismatch for child %q", attempt.Manifest.ChildSessionID)
+	}
+	var accepted protocol.TurnAcceptedV1
+	var command protocol.CommandAcceptedV1
+	var actor protocol.ActorRef
+	foundTurn, foundCommand := false, false
+	for _, event := range events {
+		if event.Envelope.TurnID != attempt.ParentTurnID || event.Envelope.RuntimeGenerationID != control.Control.Runtime.ID {
+			continue
+		}
+		switch event.Envelope.Kind {
+		case protocol.EventTurnAccepted:
+			if err := json.Unmarshal(event.Envelope.Payload, &accepted); err != nil {
+				return StartTurnRequest{}, err
+			}
+			foundTurn = true
+		case protocol.EventCommandAccepted:
+			if err := json.Unmarshal(event.Envelope.Payload, &command); err != nil {
+				return StartTurnRequest{}, err
+			}
+			if event.Envelope.Actor == nil {
+				return StartTurnRequest{}, fmt.Errorf("subagent recovery parent command actor is absent")
+			}
+			actor = protocol.DeepCopy(*event.Envelope.Actor)
+			foundCommand = true
+		}
+	}
+	if !foundTurn || !foundCommand || accepted.CommandID != command.CommandID || accepted.Goal == "" || command.CommandID != projection.OriginalCommandID || command.RequestDigest != projection.OriginalRequestDigest {
+		return StartTurnRequest{}, fmt.Errorf("subagent recovery parent identity is not reconstructible")
+	}
+	parent, err := s.deps.ParentSessions.InspectSession(ctx, protocol.SessionID(control.Storage.Journal.ID))
+	if err != nil {
+		return StartTurnRequest{}, fmt.Errorf("inspect recovery parent session: %w", err)
+	}
+	var model protocol.ModelDescriptor
+	foundModel := false
+	for _, candidate := range control.Control.Runtime.Body.Models {
+		if candidate.ModelID == protocol.ModelID(parent.Session.Selection.Model) {
+			if foundModel {
+				return StartTurnRequest{}, fmt.Errorf("subagent recovery parent model is ambiguous")
+			}
+			model, foundModel = candidate, true
+		}
+	}
+	if !foundModel {
+		return StartTurnRequest{}, fmt.Errorf("subagent recovery frozen model is unavailable")
+	}
+	return StartTurnRequest{Command: CommandMetadata{CommandID: command.CommandID, IdempotencyKey: command.IdempotencyKey, RequestDigest: command.RequestDigest, Actor: actor}, SessionID: protocol.SessionID(control.Storage.Journal.ID), ExpectedHead: head, Prompt: accepted.Goal, ProviderID: model.ProviderID, ModelID: model.ModelID, Runtime: protocol.DeepCopy(control.Control.Runtime)}, nil
+}
+
+// resumeRecoveredParent continues the ordinary provider/tool loop after the
+// exact canonical child receipt has been attached. The recovery lease remains
+// owned throughout; nested children use its Yield path and all new provider or
+// tool dispatches therefore receive fresh authorization.
+func (s *Service) resumeRecoveredParent(ctx context.Context, lease managedOperationLease, request StartTurnRequest, attempt receiptprojector.Attempt, receipt protocol.SubagentReceiptV1) (RunResult, error) {
+	if err := validateStartTurnRequest(request); err != nil {
+		return RunResult{}, err
+	}
+	intent, providerAttempts, err := s.recoverSubagentIntent(ctx, request, attempt)
+	if err != nil {
+		return RunResult{}, err
+	}
+	state := newTurnState(request)
+	state.taskID, state.turnID, state.contractID = attempt.ParentTaskID, attempt.ParentTurnID, protocol.OutcomeContractID(stableID("contract", string(request.Command.CommandID)))
+	state.accepted, state.taskRunning, state.subagentAttempts = true, true, 1
+	encoded, err := canonicaljson.Marshal(receipt)
+	if err != nil {
+		return RunResult{}, err
+	}
+	resultBlock := protocol.ToolResultBlock{CallID: intent.CallID, Status: receipt.Status, JSON: encoded}
+	extra := []protocol.ModelMessage{{Role: "tool", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolResult, ToolResult: &resultBlock}}}}
+	completedTools := 1
+	for providerAttempt := providerAttempts; ; providerAttempt++ {
+		assistant, terminal, runErr := s.runProviderActivity(ctx, request, &state, providerAttempt, extra)
+		if runErr != nil {
+			return RunResult{}, runErr
+		}
+		if len(assistant.ToolIntents) == 0 {
+			return s.completeTurn(ctx, request, &state, assistant, terminal)
+		}
+		if completedTools+len(assistant.ToolIntents) > request.Runtime.Body.Limits.MaxToolCalls {
+			return RunResult{}, fmt.Errorf("tool call limit %d reached", request.Runtime.Body.Limits.MaxToolCalls)
+		}
+		results := make([]protocol.ContentBlock, 0, len(assistant.ToolIntents))
+		for _, next := range assistant.ToolIntents {
+			toolResult, toolErr := s.runToolIntent(ctx, lease, request, &state, next)
+			if toolErr != nil {
+				return RunResult{}, toolErr
+			}
+			copyResult := toolResult
+			results = append(results, protocol.ContentBlock{Kind: protocol.ContentToolResult, ToolResult: &copyResult})
+			completedTools++
+		}
+		extra = make([]protocol.ModelMessage, 0, len(results))
+		for _, result := range results {
+			extra = append(extra, protocol.ModelMessage{Role: "tool", Blocks: []protocol.ContentBlock{result}})
+		}
+	}
+}
+
+func (s *Service) recoverSubagentIntent(ctx context.Context, request StartTurnRequest, attempt receiptprojector.Attempt) (protocol.ToolUseBlock, int, error) {
+	events, err := s.durablePrefix(ctx, protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(request.SessionID)}, request.ExpectedHead)
+	if err != nil {
+		return protocol.ToolUseBlock{}, 0, err
+	}
+	providerAttempts := 0
+	for _, event := range events {
+		if event.Envelope.TurnID != attempt.ParentTurnID {
+			continue
+		}
+		if event.Envelope.Kind == protocol.EventProviderAttemptTerminal {
+			providerAttempts++
+		}
+		if event.Envelope.Kind != protocol.EventAssistantMessage {
+			continue
+		}
+		var assistant protocol.AssistantMessageV1
+		if err := json.Unmarshal(event.Envelope.Payload, &assistant); err != nil {
+			return protocol.ToolUseBlock{}, 0, err
+		}
+		for _, intent := range assistant.ToolIntents {
+			if protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "subagent", intent.CallID)) == attempt.ActivityID {
+				return intent, providerAttempts, nil
+			}
+		}
+	}
+	return protocol.ToolUseBlock{}, 0, fmt.Errorf("subagent recovery assistant tool use is not reconstructible")
 }
 
 func validateRecoveryControlRequest(request RecoveryControlRequest) error {

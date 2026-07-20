@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/journal"
 )
 
 const (
@@ -504,7 +505,7 @@ func (s *Store) openSessionTransaction(
 	if err != nil {
 		storeRoot.Close()
 		if os.IsNotExist(err) {
-			return nil, domain.Session{}, fmt.Errorf("session %q not found", sessionID)
+			return nil, domain.Session{}, fmt.Errorf("session %q: %w", sessionID, journal.ErrSessionNotFound)
 		}
 		return nil, domain.Session{}, err
 	}
@@ -552,7 +553,7 @@ func (s *Store) openSessionTransaction(
 		session = candidateSession
 	}
 	if transaction == nil {
-		return nil, domain.Session{}, fmt.Errorf("session %q not found", sessionID)
+		return nil, domain.Session{}, fmt.Errorf("session %q: %w", sessionID, journal.ErrSessionNotFound)
 	}
 	return transaction, session, nil
 }

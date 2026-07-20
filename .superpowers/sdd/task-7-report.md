@@ -78,3 +78,24 @@ Follow-up fixture coverage:
 The full `go test ./... -count=1` invocation was started; this foreground
 runner returned only its first successful package line and did not provide a
 complete package stream, so it is not claimed as a full-suite completion.
+
+## Review follow-up
+
+- Recovery now uses a managed recovery-lane lease. A proven pre-reserved,
+  typed-not-found child identity is created exactly once by the production
+  coordinator under `Yield`; inspection errors remain uncertain and are never
+  treated as absence.
+- A terminal child receipt is attached first, then the parent request, actor,
+  turn/task/contract identity, frozen runtime and selected model are rebuilt
+  from durable records. Recovery resumes the normal authorized
+  provider/tool loop with the exact canonical receipt `ToolResultBlock` rather
+  than terminalizing a resumable parent.
+- Runtime/model ambiguity and malformed historical bindings fail closed before
+  any new provider or tool activity. New provider/tool work remains inside the
+  existing managed lane and receives ordinary fresh authorization.
+- Added a JSONL regression test proving session inspection returns the typed
+  `journal.ErrSessionNotFound` signal required for create-once recovery.
+
+Verification: `go test ./internal/session/jsonl ./internal/subagent
+./internal/orchestrator ./internal/app -run 'Test(InspectMissingSessionReturnsTypedNotFound|.*Subagent.*Recover|.*Subagent.*Cancel|Recovery)' -count=1` — PASS;
+`git diff --check` — PASS.

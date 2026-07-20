@@ -17,6 +17,9 @@ var (
 	ErrTurnRecoveryRequired = errors.New("turn recovery required")
 	ErrTurnHeadConflict     = errors.New("turn lease expected-head conflict")
 	ErrTurnNotTerminal      = errors.New("turn is not terminal at supplied cursor")
+	// ErrSessionNotFound is deliberately typed so recovery can distinguish a
+	// proven absent pre-reserved child from an unavailable inspection.
+	ErrSessionNotFound = errors.New("session not found")
 )
 
 type SessionLineage struct {
