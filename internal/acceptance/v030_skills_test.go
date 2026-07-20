@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/cli"
 	"github.com/muratmirgun/yordam/internal/config"
@@ -23,6 +24,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/skills"
+	tui "github.com/muratmirgun/yordam/internal/tui"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 )
 
@@ -182,13 +184,14 @@ release:
 		t.Fatalf("child catalog snapshot is not exact metadata-only handoff: %+v", child)
 	}
 	done = runV030App(t, restarted)
+	var observed []app.Event
 	restarted.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "load it"}
-	prompt := v030SkillsWaitPermission(t, restarted)
+	prompt := v030SkillsWaitPermission(t, restarted, &observed)
 	if prompt.Call.Request.Name != "shell" || prompt.Call.Mutation != domain.MutationProcess {
 		t.Fatalf("hostile skill bypassed normal approval: %+v", prompt)
 	}
 	restarted.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: prompt.Call.Request.CallID, Decision: domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: prompt.Call.CanonicalScope, Reason: "denied by user"}}
-	denial := v030SkillsWaitDenied(t, restarted)
+	denial := v030SkillsWaitDenied(t, restarted, &observed)
 	shutdownV030App(t, restarted, done)
 	mu.Lock()
 	got := append([]string(nil), captured...)
@@ -204,7 +207,26 @@ release:
 			t.Fatalf("provider leaked configured key: %q", value)
 		}
 	}
-	surfaces := []string{denial, readV030File(t, debug), v030JSON(before.Skills), v030JSON(after.Skills), components.NewSkills(components.SkillScreenOptions{Snapshot: after.Skills}).View(120)}
+	eventQueue := make(chan app.Event, len(observed))
+	for _, event := range observed {
+		eventQueue <- event
+	}
+	model := tui.NewModel(tui.Options{Events: eventQueue, Mode: domain.ModeAsk, Skills: after.Skills})
+	resized, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = resized.(tui.Model)
+	sawSkillCard := false
+	for range observed {
+		command := model.Init()
+		message := command()
+		updated, _ := model.Update(message)
+		model = updated.(tui.Model)
+		sawSkillCard = sawSkillCard || strings.Contains(model.View().Content, "skill go-testing [project sha256:")
+	}
+	conversation := model.View().Content
+	if !sawSkillCard {
+		t.Fatalf("production TUI never rendered loaded skill provenance: %q", conversation)
+	}
+	surfaces := []string{denial, v030JSON(observed), conversation, readV030File(t, debug), v030JSON(before.Skills), v030JSON(after.Skills), components.NewSkills(components.SkillScreenOptions{Snapshot: after.Skills}).View(120)}
 	surfaces = append(surfaces, got...)
 	for _, variant := range secretVariants {
 		v030AssertAbsent(t, variant, surfaces...)
@@ -310,13 +332,14 @@ func v030SkillsWait(t *testing.T, a *app.App, terminal app.EventKind) {
 		}
 	}
 }
-func v030SkillsWaitPermission(t *testing.T, a *app.App) *ports.PermissionPrompt {
+func v030SkillsWaitPermission(t *testing.T, a *app.App, observed *[]app.Event) *ports.PermissionPrompt {
 	t.Helper()
 	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
 	for {
 		select {
 		case event := <-a.Events():
+			*observed = append(*observed, event)
 			if event.Kind == app.EventError || event.Kind == app.EventRejected {
 				t.Fatalf("event=%+v", event)
 			}
@@ -328,13 +351,14 @@ func v030SkillsWaitPermission(t *testing.T, a *app.App) *ports.PermissionPrompt 
 		}
 	}
 }
-func v030SkillsWaitDenied(t *testing.T, a *app.App) string {
+func v030SkillsWaitDenied(t *testing.T, a *app.App, observed *[]app.Event) string {
 	t.Helper()
 	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
 	for {
 		select {
 		case event := <-a.Events():
+			*observed = append(*observed, event)
 			if event.Kind == app.EventRejected {
 				t.Fatalf("denial rejected: %+v", event)
 			}
