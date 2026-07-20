@@ -223,6 +223,33 @@ func TestRecoveryChildReceiptBindsManifestRuntimeAndTerminalCursor(t *testing.T)
 	}
 }
 
+func TestSubagentRecoverNoEffectChildWritesCancelledReceipt(t *testing.T) {
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "child"}
+	head := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 1, TransactionID: "child-head"}
+	repository := newRecoveryRepository(&recordLog{}, protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "control"}, protocol.CommittedCursor{}, ref, head, head)
+	manifest := protocol.SubagentManifestV1{AttemptID: "attempt", ParentSessionID: "parent", ParentCursor: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "parent", CommitSeq: 1, TransactionID: "parent-tx"}, ChildSessionID: "child", ChildTaskID: "child-task", ChildTurnID: "child-turn", RuntimeGenerationID: "runtime", SkillCatalogRevision: "skills", MaxToolCalls: 1, Deadline: time.Now().Add(time.Minute)}
+	repository.events[ref] = []protocol.ProposedEvent{{Kind: protocol.EventSubagentManifest, SessionID: "child", TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID, RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: mustCanonical(manifest)}}
+	service, err := NewService(Dependencies{Repository: repository, Lane: NewOperationLane()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := RecoveryControlRequest{Control: ControlRequest{Command: CommandMetadata{CommandID: "recover-command"}, Runtime: protocol.RuntimeGenerationManifest{ID: manifest.RuntimeGenerationID}}, Storage: journal.RecoveryRequest{Journal: ref}}
+	if _, err := service.appendRecoverySessionTerminal(context.Background(), request, RecoveryProjection{ActiveTurnID: manifest.ChildTurnID, TaskID: manifest.ChildTaskID, ChildManifest: &manifest, UnmatchedNoEffect: map[protocol.ActivityID]bool{}}, head); err != nil {
+		t.Fatal(err)
+	}
+	var receipt protocol.SubagentReceiptV1
+	for _, event := range repository.appendRequests()[0].Events {
+		if event.Kind == protocol.EventSubagentReceipt {
+			if err := json.Unmarshal(event.Payload, &receipt); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if receipt.Status != "cancelled" || receipt.Error == nil || receipt.Error.Code != "recovery_interrupted" {
+		t.Fatalf("receipt=%+v", receipt)
+	}
+}
+
 type recoveryChildStore struct{ inspection journal.Inspection }
 
 func (s recoveryChildStore) ReserveSessionID() (protocol.SessionID, error) { return "", nil }

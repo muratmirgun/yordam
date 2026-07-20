@@ -289,6 +289,11 @@ func recoverBootstrapSession(ctx context.Context, store *jsonl.Store, runtime Ru
 	if observedTail.IsZero() {
 		return nil
 	}
+	// RecoverTurn owns the one recovery lane for this session. Its first session
+	// phase reconciles a waiting sequential-child handoff (child receipt before
+	// parent attachment) before it falls back to generic turn terminalization.
+	// Keeping bootstrap at this single entry point prevents a second startup
+	// worker from racing provider, process, or approval cancellation cleanup.
 	controlHead, err := store.Head(ctx, workspaceControl)
 	if err != nil {
 		return err

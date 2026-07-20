@@ -142,6 +142,19 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 	}
 	sessionHead := recoveryResult.Cursor
 	releaseHead = sessionHead
+	// A parent waiting on a sequential child has a durable cross-session
+	// protocol, not an ordinary in-process activity. Reconcile that protocol
+	// before the generic active-turn terminalization below can erase its exact
+	// child receipt/attachment boundary.
+	if reconciledHead, reconciled, reconcileErr := s.reconcileWaitingSubagents(ctx, request, projected, sessionHead); reconcileErr != nil {
+		return RecoveryControlResult{}, reconcileErr
+	} else if reconciled {
+		sessionHead, releaseHead = reconciledHead, reconciledHead
+		projected, err = s.deps.Projection.InspectRecovery(ctx, request.Storage.Journal, sessionHead)
+		if err != nil {
+			return RecoveryControlResult{}, err
+		}
+	}
 	if turnLease == nil && projected.ActiveTurnID != "" {
 		turnLease, err = s.turnLeases.AcquireTurnRecoveryLease(ctx, sessionID, projected.ActiveTurnID, recoveryResult.Cursor)
 		if err != nil {
@@ -276,8 +289,11 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 			return protocol.CommittedCursor{}, err
 		}
 		status := "cancelled"
-		if len(projection.StartedActivities) != 0 {
-			status = "uncertain"
+		for _, activityID := range projection.StartedActivities {
+			if !projection.UnmatchedNoEffect[activityID] {
+				status = "uncertain"
+				break
+			}
 		}
 		receiptCursor := protocol.CommittedCursor{JournalKind: request.Storage.Journal.Kind, JournalID: request.Storage.Journal.ID, CommitSeq: expected.CommitSeq + uint64(eventCount), TransactionID: transactionID}
 		receipt := receiptprojector.ProjectReceipt(*projection.ChildManifest, receiptCursor, status, "turn interrupted during journal recovery", protocol.ModelUsage{}, &protocol.PublicError{Code: "recovery_interrupted", Message: "turn interrupted during journal recovery"}, prefix)
@@ -299,6 +315,194 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 		}
 	}
 	return finalCursor, nil
+}
+
+// reconcileWaitingSubagents repairs only proven sequential handoff edges. It
+// never invokes a child coordinator or provider: a restarted process has no
+// authority to replay a child activity whose effect cannot be proven absent.
+// The child receipt is always committed before the parent attachment.
+func (s *Service) reconcileWaitingSubagents(ctx context.Context, request RecoveryControlRequest, projection RecoveryProjection, parentHead protocol.CommittedCursor) (protocol.CommittedCursor, bool, error) {
+	if s.deps.ChildSessions == nil || s.deps.ParentSessions == nil || s.deps.Evidence == nil {
+		return parentHead, false, nil
+	}
+	parentEvents, err := s.durablePrefix(ctx, request.Storage.Journal, parentHead)
+	if err != nil {
+		return parentHead, false, err
+	}
+	projector := receiptprojector.Projector{}
+	state := projector.Zero(request.Storage.Journal)
+	attachments := make([]protocol.EventRecord, 0)
+	for _, event := range parentEvents {
+		if event.Envelope.Kind != protocol.EventSubagentRequested && event.Envelope.Kind != protocol.EventSubagentWaiting && event.Envelope.Kind != protocol.EventSubagentResultAttached {
+			continue
+		}
+		if err := decodeSubagentRecoveryEvent(&event); err != nil {
+			return parentHead, false, err
+		}
+		// The child receipt lives in the child journal, so parent attachments
+		// must be projected after that exact receipt has been loaded.
+		if event.Envelope.Kind == protocol.EventSubagentResultAttached {
+			attachments = append(attachments, event)
+			continue
+		}
+		state, err = projector.Apply(state, event)
+		if err != nil {
+			return parentHead, false, fmt.Errorf("project parent subagent recovery: %w", err)
+		}
+	}
+	changed := false
+	for _, initial := range state.Attempts {
+		if initial.State != receiptprojector.StateWaiting && initial.State != receiptprojector.StateTerminal {
+			continue
+		}
+		child, inspectErr := s.deps.ChildSessions.InspectSession(ctx, initial.Manifest.ChildSessionID)
+		childState := receiptprojector.ChildRecoveryState{Exists: inspectErr == nil, CommitKnown: inspectErr == nil}
+		attempt := initial
+		if inspectErr == nil {
+			for _, event := range child.Events {
+				if event.Envelope.Kind != protocol.EventSubagentManifest && event.Envelope.Kind != protocol.EventSubagentReceipt {
+					continue
+				}
+				if err := decodeSubagentRecoveryEvent(&event); err != nil {
+					return parentHead, changed, err
+				}
+				state, err = projector.Apply(state, event)
+				if err != nil {
+					return parentHead, changed, fmt.Errorf("project child subagent recovery: %w", err)
+				}
+			}
+			attempt = state.Attempts[initial.AttemptID]
+			for _, attachment := range attachments {
+				payload, ok := attachment.Decoded.(*protocol.SubagentResultAttachedV1)
+				if !ok || payload.AttemptID != initial.AttemptID {
+					continue
+				}
+				state, err = projector.Apply(state, attachment)
+				if err != nil {
+					return parentHead, changed, fmt.Errorf("project parent receipt attachment: %w", err)
+				}
+				attempt = state.Attempts[initial.AttemptID]
+			}
+			if attempt.Receipt == nil {
+				childProjection, projectionErr := s.deps.Projection.InspectRecovery(ctx, child.Journal, child.Head)
+				if projectionErr != nil {
+					childState.CommitKnown = false
+				} else {
+					for _, activityID := range childProjection.StartedActivities {
+						if s.deps.EffectProbe == nil {
+							continue
+						}
+						noEffect, probeErr := s.deps.EffectProbe.ProvesNoEffect(ctx, activityID)
+						if probeErr == nil && noEffect {
+							childProjection.UnmatchedNoEffect[activityID] = true
+						}
+					}
+					childState.NoUnmatchedEffect = len(childProjection.StartedActivities) == 0
+					if len(childProjection.StartedActivities) != 0 {
+						childState.NoUnmatchedEffect = true
+						for _, activityID := range childProjection.StartedActivities {
+							if !childProjection.UnmatchedNoEffect[activityID] {
+								childState.NoUnmatchedEffect = false
+								break
+							}
+						}
+					}
+					if childState.NoUnmatchedEffect || childState.CommitKnown {
+						// Persist the bounded receipt first. Any non-proven activity is
+						// represented as uncertain by appendRecoverySessionTerminal.
+						childRequest := request
+						childRequest.Storage.Journal, childRequest.Storage.ExpectedHead = child.Journal, child.Head
+						childRequest.Control.Runtime = protocol.DeepCopy(request.Control.Runtime)
+						if childRequest.Control.Runtime.ID != initial.Manifest.RuntimeGenerationID {
+							childState.CommitKnown = false
+						} else if _, appendErr := s.appendRecoverySessionTerminal(ctx, childRequest, childProjection, child.Head); appendErr != nil {
+							return parentHead, changed, appendErr
+						} else {
+							changed = true
+							child, inspectErr = s.deps.ChildSessions.InspectSession(ctx, initial.Manifest.ChildSessionID)
+							if inspectErr != nil {
+								return parentHead, changed, inspectErr
+							}
+							for _, event := range child.Events {
+								if event.Envelope.Kind != protocol.EventSubagentReceipt {
+									continue
+								}
+								if err := decodeSubagentRecoveryEvent(&event); err != nil {
+									return parentHead, changed, err
+								}
+								state, err = projector.Apply(state, event)
+								if err != nil {
+									return parentHead, changed, err
+								}
+							}
+							attempt = state.Attempts[initial.AttemptID]
+						}
+					}
+				}
+			}
+		}
+		result, reconcileErr := receiptprojector.Reconcile(receiptprojector.ReconcileRequest{ParentSessionID: protocol.SessionID(request.Storage.Journal.ID), ParentCursor: parentHead, Runtime: request.Control.Runtime}, attempt, childState)
+		if reconcileErr != nil || result.ChildStatus == "uncertain" || result.CreateOnce {
+			// The generic recovery terminal below makes this non-retryable and
+			// visible; do not create or replay a child from ambiguous state.
+			continue
+		}
+		if result.Attached || attempt.Receipt == nil {
+			continue
+		}
+		if err := s.verifyParentHead(ctx, &turnState{ref: request.Storage.Journal, head: parentHead}); err != nil {
+			return parentHead, changed, err
+		}
+		recoveryTurn := turnState{ref: request.Storage.Journal, head: parentHead, command: CommandMetadata{CommandID: projection.OriginalCommandID, RequestDigest: projection.OriginalRequestDigest}, taskID: attempt.ParentTaskID, turnID: attempt.ParentTurnID, activeActivityID: attempt.ActivityID}
+		if recoveryTurn.command.CommandID == "" || recoveryTurn.activeActivityID == "" {
+			continue
+		}
+		_, attachErr := s.attachSubagentReceipt(ctx, StartTurnRequest{Command: recoveryTurn.command, SessionID: protocol.SessionID(request.Storage.Journal.ID), Runtime: protocol.DeepCopy(request.Control.Runtime)}, &recoveryTurn, protocol.ToolUseBlock{CallID: string(attempt.AttemptID)}, attempt.ActivityID, *attempt.Receipt)
+		if attachErr != nil {
+			return parentHead, changed, attachErr
+		}
+		parentHead, changed = recoveryTurn.head, true
+	}
+	return parentHead, changed, nil
+}
+
+func decodeSubagentRecoveryEvent(event *protocol.EventRecord) error {
+	if event.Decoded != nil {
+		return nil
+	}
+	switch event.Envelope.Kind {
+	case protocol.EventSubagentRequested:
+		var payload protocol.SubagentRequestedV1
+		if err := json.Unmarshal(event.Envelope.Payload, &payload); err != nil {
+			return err
+		}
+		event.Decoded = &payload
+	case protocol.EventSubagentWaiting:
+		var payload protocol.SubagentWaitingV1
+		if err := json.Unmarshal(event.Envelope.Payload, &payload); err != nil {
+			return err
+		}
+		event.Decoded = &payload
+	case protocol.EventSubagentManifest:
+		var payload protocol.SubagentManifestV1
+		if err := json.Unmarshal(event.Envelope.Payload, &payload); err != nil {
+			return err
+		}
+		event.Decoded = &payload
+	case protocol.EventSubagentReceipt:
+		var payload protocol.SubagentReceiptV1
+		if err := json.Unmarshal(event.Envelope.Payload, &payload); err != nil {
+			return err
+		}
+		event.Decoded = &payload
+	case protocol.EventSubagentResultAttached:
+		var payload protocol.SubagentResultAttachedV1
+		if err := json.Unmarshal(event.Envelope.Payload, &payload); err != nil {
+			return err
+		}
+		event.Decoded = &payload
+	}
+	return nil
 }
 
 func validateRecoveryControlRequest(request RecoveryControlRequest) error {

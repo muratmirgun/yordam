@@ -25,6 +25,7 @@ type Attempt struct {
 	AttemptID       protocol.DelegationAttemptID       `json:"attempt_id"`
 	ParentTaskID    protocol.TaskID                    `json:"parent_task_id"`
 	ParentTurnID    protocol.TurnID                    `json:"parent_turn_id"`
+	ActivityID      protocol.ActivityID                `json:"activity_id"`
 	Call            protocol.SubagentCallV1            `json:"call"`
 	Manifest        protocol.SubagentManifestV1        `json:"manifest"`
 	State           State                              `json:"state"`
@@ -98,7 +99,7 @@ func applyRequest(current, next Projection, event protocol.EventRecord) (Project
 	if attemptsForTurn(next, event.Envelope.TurnID) >= protocol.MaxSubagentAttemptsPerTurn {
 		return current, fmt.Errorf("subagent attempt limit exceeded")
 	}
-	next.Attempts[payload.Manifest.AttemptID] = Attempt{AttemptID: payload.Manifest.AttemptID, ParentTaskID: event.Envelope.TaskID, ParentTurnID: event.Envelope.TurnID, Call: protocol.DeepCopy(payload.Call), Manifest: protocol.DeepCopy(payload.Manifest), State: StateIncomplete, RequestCursor: eventCursor(event)}
+	next.Attempts[payload.Manifest.AttemptID] = Attempt{AttemptID: payload.Manifest.AttemptID, ParentTaskID: event.Envelope.TaskID, ParentTurnID: event.Envelope.TurnID, ActivityID: event.Envelope.ActivityID, Call: protocol.DeepCopy(payload.Call), Manifest: protocol.DeepCopy(payload.Manifest), State: StateIncomplete, RequestCursor: eventCursor(event)}
 	return next, nil
 }
 
