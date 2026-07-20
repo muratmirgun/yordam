@@ -33,6 +33,13 @@ import (
 func TestV030Skills(t *testing.T) {
 	t.Run("bootstrap_trust_reload_restart_and_explicit_load", assertV030SkillsAcceptance)
 	t.Run("discovery_rejects_hostile_filesystem_entries", assertV030SkillDiscoveryBoundaries)
+	t.Run("catalog_bound_tool_and_discovery_inventory", func(t *testing.T) {
+		runV030GoTest(t, "./internal/tools/skill", "TestSkillCapturesCatalogEntryAndReturnsCanonicalContent")
+		runV030GoTest(t, "./internal/tools/skill", "TestSkillRejectsStrictAndUnavailableInputs")
+		runV030GoTest(t, "./internal/tools/skill", "TestSkillGenerationAdmissionRedactsJSONEscapedSecretsBeforeEncoding")
+		runV030GoTest(t, "./internal/skills", "TestDiscoverRejectsDuplicateIdentityAndReplacementRaces")
+		runV030GoTest(t, "./internal/skills", "TestDiscoverRejectsFileInspectOpenFIFOAndSymlinkReplacement")
+	})
 }
 
 func assertV030SkillsAcceptance(t *testing.T) {
