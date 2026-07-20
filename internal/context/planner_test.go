@@ -8,6 +8,7 @@ import (
 
 	contextplanner "github.com/muratmirgun/yordam/internal/context"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 )
 
 func TestContextPlanRecordsProvenanceBudgetAndDigest(t *testing.T) {
@@ -39,6 +40,40 @@ func TestContextPlanRecordsProvenanceBudgetAndDigest(t *testing.T) {
 	if again.Body.Sources[0].Content[0].Text != strings.Repeat("s", 16) {
 		t.Fatal("planner retained a mutable result alias")
 	}
+}
+
+func TestChildPlannerBindsDerivedExposureAndRejectsCanonicalSubagent(t *testing.T) {
+	childExposure := protocol.ToolExposure{
+		CatalogRevision: "derived:child-tools", Tools: []protocol.ExposedTool{{Alias: "read", Identity: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "read"}, Description: "Read", InputSchema: []byte(`{"type":"object"}`)}},
+		Aliases: []protocol.ToolAliasBinding{{Alias: "read", Identity: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "read"}, SourceRevision: "builtin-v1", DescriptorDigest: contextDigest("a")}},
+	}
+	planner, err := contextplanner.NewChildPlanner(childExposure, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planner.Plan(stdcontext.Background(), contextplanner.Request{Session: "child", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1, Model: contextModel(1024), OutputReserve: 64})
+	if err != nil || plan.Body.ToolExposureRevision != childExposure.CatalogRevision {
+		t.Fatalf("plan=%#v err=%v", plan, err)
+	}
+	blocked := protocol.DeepCopy(childExposure)
+	descriptor := subagenttool.BuiltinDescriptor()
+	blocked.Tools = append(blocked.Tools, protocol.ExposedTool{Alias: "renamed", Identity: descriptor.Body.Identity, Description: descriptor.Body.Description, InputSchema: descriptor.Body.InputSchema})
+	blocked.Aliases = append(blocked.Aliases, protocol.ToolAliasBinding{Alias: "renamed", Identity: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest})
+	if _, err := contextplanner.NewChildPlanner(blocked, nil); err == nil {
+		t.Fatal("child planner accepted canonical subagent exposure")
+	}
+	parent, err := contextplanner.NewPlannerForExposure(blocked, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentPlan, err := parent.Plan(stdcontext.Background(), contextplanner.Request{Session: "parent", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1, Model: contextModel(1024), OutputReserve: 64})
+	if err != nil || parentPlan.Body.ToolExposureRevision != blocked.CatalogRevision {
+		t.Fatalf("parent plan=%#v err=%v", parentPlan, err)
+	}
+}
+
+func contextDigest(fill string) protocol.Digest {
+	return protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat(fill, 64)}
 }
 
 func TestContextPlanAdaptsEventTranscriptAndLegacyCompaction(t *testing.T) {

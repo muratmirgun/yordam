@@ -7,6 +7,7 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 )
 
 const (
@@ -39,6 +40,31 @@ type boundedPlanner struct {
 
 func NewPlanner(toolExposureRevision string, summaries SummaryResolver) Planner {
 	return &boundedPlanner{toolExposureRevision: toolExposureRevision, summaries: summaries}
+}
+
+// NewPlannerForExposure binds a context plan to a validated immutable tool
+// exposure rather than a caller-provided revision string.
+func NewPlannerForExposure(exposure protocol.ToolExposure, summaries SummaryResolver) (Planner, error) {
+	if err := exposure.Validate(); err != nil {
+		return nil, fmt.Errorf("tool exposure: %w", err)
+	}
+	return NewPlanner(exposure.CatalogRevision, summaries), nil
+}
+
+// NewChildPlanner refuses the exact canonical orchestration descriptor. This
+// uses the trusted identity/digest binding, not an alias string, so a child can
+// never be handed the real subagent schema through a renamed alias.
+func NewChildPlanner(exposure protocol.ToolExposure, summaries SummaryResolver) (Planner, error) {
+	if err := exposure.Validate(); err != nil {
+		return nil, fmt.Errorf("child tool exposure: %w", err)
+	}
+	expected := subagenttool.BuiltinDescriptor()
+	for _, binding := range exposure.Aliases {
+		if binding.Identity == expected.Body.Identity && binding.SourceRevision == expected.Body.SourceRevision && binding.DescriptorDigest == expected.DescriptorDigest {
+			return nil, fmt.Errorf("child tool exposure includes orchestrated subagent")
+		}
+	}
+	return NewPlanner(exposure.CatalogRevision, summaries), nil
 }
 
 func (p *boundedPlanner) Plan(ctx stdcontext.Context, request Request) (protocol.ContextPlan, error) {

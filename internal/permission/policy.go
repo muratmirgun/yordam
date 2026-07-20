@@ -16,6 +16,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	skilltool "github.com/muratmirgun/yordam/internal/tools/skill"
+	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 )
 
 type PolicyRule struct {
@@ -206,6 +207,9 @@ func (p *SessionPolicy) EvaluateAuthorization(_ context.Context, evaluation port
 }
 
 func modeAuthorizationAction(mode domain.PermissionMode, evaluation ports.EvaluationInput, autoShell bool) (domain.PermissionAction, string) {
+	if trustedSubagentOrchestration(evaluation) {
+		return domain.PermissionAllow, "trusted runtime orchestration"
+	}
 	facts := deriveAuthorizationFacts(evaluation)
 	if facts.trustedMutationPreview {
 		return domain.PermissionAllow, "trusted mutation preview inside workspace"
@@ -247,6 +251,15 @@ func modeAuthorizationAction(mode domain.PermissionMode, evaluation ports.Evalua
 	default:
 		return domain.PermissionDeny, "invalid permission mode"
 	}
+}
+
+// trustedSubagentOrchestration admits only the frozen built-in marker. It is
+// not a child-effect grant: the child provider and each child tool request are
+// authorized separately under the inherited policy ceiling.
+func trustedSubagentOrchestration(evaluation ports.EvaluationInput) bool {
+	request, descriptor := evaluation.Request, evaluation.Descriptor
+	expected := subagenttool.BuiltinDescriptor()
+	return subagenttool.IsCanonicalDescriptor(descriptor) && request.Source == expected.Body.Identity && request.SourceRevision == expected.Body.SourceRevision && request.DescriptorDigest == expected.DescriptorDigest && request.Action == subagenttool.Kind && request.ExecutionLocus == "orchestrator" && request.RequestedProfile == "configured" && request.EffectiveProfile == "configured" && request.Effect == "orchestration" && request.Boundary == "runtime" && request.Reversibility == "not_applicable" && request.VerificationCoverage == "full" && len(request.Resources) == 0
 }
 
 type authorizationFacts struct {

@@ -15,6 +15,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	skilltool "github.com/muratmirgun/yordam/internal/tools/skill"
+	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 )
 
 func TestAuthorizationPolicyPrecedenceCrossProduct(t *testing.T) {
@@ -54,6 +55,41 @@ func TestAuthorizationPolicyPrecedenceCrossProduct(t *testing.T) {
 			}
 			if got.Action != test.want {
 				t.Fatalf("action=%s want=%s result=%#v", got.Action, test.want, got)
+			}
+		})
+	}
+}
+
+func TestPermissionAllowsOnlyCanonicalTrustedSubagentOrchestration(t *testing.T) {
+	descriptor := subagenttool.BuiltinDescriptor()
+	request := structuredRequest("subagent", descriptor.Body.Identity)
+	request.SourceRevision = descriptor.Body.SourceRevision
+	request.DescriptorDigest = descriptor.DescriptorDigest
+	request.Effect = descriptor.Body.Effect
+	request.ExecutionLocus = descriptor.Body.ExecutionLoci[0]
+	request.RequestedProfile = "configured"
+	request.EffectiveProfile = "configured"
+	request.Boundary = "runtime"
+	request.Reversibility = "not_applicable"
+	request.VerificationCoverage = "full"
+	request.Resources = nil
+	input := ports.EvaluationInput{Permission: ports.PermissionContext{SessionID: string(request.SessionID), Mode: domain.ModeSafe, Workspace: "/workspace"}, Request: request, Descriptor: descriptor}
+	decision, err := permission.NewSession(domain.ModeSafe).EvaluateAuthorization(context.Background(), input)
+	if err != nil || decision.Action != string(domain.PermissionAllow) {
+		t.Fatalf("decision=%#v err=%v", decision, err)
+	}
+	for name, mutate := range map[string]func(*ports.EvaluationInput){
+		"alias action": func(in *ports.EvaluationInput) { in.Request.Action = "other" },
+		"source":       func(in *ports.EvaluationInput) { in.Request.Source.Name = "other" },
+		"digest":       func(in *ports.EvaluationInput) { in.Request.DescriptorDigest = permissionDigest("0") },
+		"descriptor":   func(in *ports.EvaluationInput) { in.Descriptor.Body.Description = "forged" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			forged := protocol.DeepCopy(input)
+			mutate(&forged)
+			got, evaluateErr := permission.NewSession(domain.ModeSafe).EvaluateAuthorization(context.Background(), forged)
+			if evaluateErr != nil || got.Action != string(domain.PermissionDeny) {
+				t.Fatalf("decision=%#v err=%v", got, evaluateErr)
 			}
 		})
 	}

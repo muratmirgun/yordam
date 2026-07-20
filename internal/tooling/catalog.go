@@ -27,7 +27,15 @@ type Catalog struct {
 	byAlias  map[string]catalogEntry
 }
 
-var builtinOrder = map[string]int{"read": 0, "search": 1, "skill": 2, "edit": 3, "shell": 4}
+// ToolExposureFilter selects the exact aliases a derived model exposure may
+// contain. A supplied revision must already be a stable caller-owned revision;
+// otherwise Filter derives one from the parent catalog and selected bindings.
+type ToolExposureFilter struct {
+	AllowedAliases []string
+	Revision       string
+}
+
+var builtinOrder = map[string]int{"read": 0, "search": 1, "skill": 2, "subagent": 3, "edit": 4, "shell": 5}
 
 func NewCatalog(revision string, tools ...ports.Tool) (*Catalog, error) {
 	if revision == "" {
@@ -191,13 +199,100 @@ func classificationFor(tool ports.Tool) (domain.ToolClassification, bool) {
 }
 
 func (c *Catalog) Expose() protocol.ToolExposure {
-	exposure := protocol.ToolExposure{CatalogRevision: c.revision, Tools: make([]protocol.ExposedTool, 0, len(c.ordered)), Aliases: make([]protocol.ToolAliasBinding, 0, len(c.ordered))}
+	return c.expose(c.revision, c.ordered)
+}
+
+// Filter builds an immutable ordered subset. It rejects unknown or duplicate
+// aliases so a child cannot silently receive a broader or ambiguous exposure.
+func (c *Catalog) Filter(filter ToolExposureFilter) (protocol.ToolExposure, error) {
+	if c == nil {
+		return protocol.ToolExposure{}, fmt.Errorf("tool catalog is nil")
+	}
+	allowed := make(map[string]struct{}, len(filter.AllowedAliases))
+	for _, alias := range filter.AllowedAliases {
+		if _, exists := c.byAlias[alias]; !exists {
+			return protocol.ToolExposure{}, fmt.Errorf("unknown tool alias %q", alias)
+		}
+		if _, duplicate := allowed[alias]; duplicate {
+			return protocol.ToolExposure{}, fmt.Errorf("duplicate tool alias %q", alias)
+		}
+		allowed[alias] = struct{}{}
+	}
+	entries := make([]catalogEntry, 0, len(allowed))
 	for _, entry := range c.ordered {
+		if _, include := allowed[entry.alias]; include {
+			entries = append(entries, entry)
+		}
+	}
+	revision := filter.Revision
+	if revision == "" {
+		var err error
+		revision, err = derivedExposureRevision(c.revision, entries)
+		if err != nil {
+			return protocol.ToolExposure{}, err
+		}
+	}
+	exposure := c.expose(revision, entries)
+	if err := exposure.Validate(); err != nil {
+		return protocol.ToolExposure{}, fmt.Errorf("validate filtered tool exposure: %w", err)
+	}
+	return exposure, nil
+}
+
+// Without derives a child-safe exposure by removing exact registered aliases.
+// The derived revision cryptographically binds the retained canonical bindings.
+func (c *Catalog) Without(aliases ...string) (protocol.ToolExposure, error) {
+	if c == nil {
+		return protocol.ToolExposure{}, fmt.Errorf("tool catalog is nil")
+	}
+	excluded := make(map[string]struct{}, len(aliases))
+	for _, alias := range aliases {
+		if _, exists := c.byAlias[alias]; !exists {
+			return protocol.ToolExposure{}, fmt.Errorf("unknown tool alias %q", alias)
+		}
+		if _, duplicate := excluded[alias]; duplicate {
+			return protocol.ToolExposure{}, fmt.Errorf("duplicate tool alias %q", alias)
+		}
+		excluded[alias] = struct{}{}
+	}
+	allowed := make([]string, 0, len(c.ordered)-len(excluded))
+	for _, entry := range c.ordered {
+		if _, omit := excluded[entry.alias]; !omit {
+			allowed = append(allowed, entry.alias)
+		}
+	}
+	return c.Filter(ToolExposureFilter{AllowedAliases: allowed})
+}
+
+func (c *Catalog) expose(revision string, entries []catalogEntry) protocol.ToolExposure {
+	exposure := protocol.ToolExposure{CatalogRevision: revision, Tools: make([]protocol.ExposedTool, 0, len(entries)), Aliases: make([]protocol.ToolAliasBinding, 0, len(entries))}
+	for _, entry := range entries {
 		body := entry.descriptor.Body
 		exposure.Tools = append(exposure.Tools, protocol.ExposedTool{Alias: entry.alias, Identity: body.Identity, Description: body.Description, InputSchema: cloneRaw(body.InputSchema)})
 		exposure.Aliases = append(exposure.Aliases, protocol.ToolAliasBinding{Alias: entry.alias, Identity: body.Identity, SourceRevision: body.SourceRevision, DescriptorDigest: entry.descriptor.DescriptorDigest})
 	}
 	return exposure
+}
+
+func derivedExposureRevision(parent string, entries []catalogEntry) (string, error) {
+	type binding struct {
+		Alias            string                `json:"alias"`
+		Identity         protocol.ToolIdentity `json:"identity"`
+		SourceRevision   string                `json:"source_revision"`
+		DescriptorDigest protocol.Digest       `json:"descriptor_digest"`
+	}
+	bindings := make([]binding, 0, len(entries))
+	for _, entry := range entries {
+		bindings = append(bindings, binding{Alias: entry.alias, Identity: entry.descriptor.Body.Identity, SourceRevision: entry.descriptor.Body.SourceRevision, DescriptorDigest: entry.descriptor.DescriptorDigest})
+	}
+	digest, err := canonicaljson.Digest(struct {
+		Parent   string    `json:"parent"`
+		Bindings []binding `json:"bindings"`
+	}{Parent: parent, Bindings: bindings})
+	if err != nil {
+		return "", fmt.Errorf("derive tool exposure revision: %w", err)
+	}
+	return "derived:" + digest.Value, nil
 }
 
 func (c *Catalog) Descriptor(alias string) (protocol.ToolDescriptor, bool) {
@@ -206,6 +301,22 @@ func (c *Catalog) Descriptor(alias string) (protocol.ToolDescriptor, bool) {
 		return protocol.ToolDescriptor{}, false
 	}
 	return cloneDescriptor(entry.descriptor), true
+}
+
+// OrchestratedKind returns an orchestration marker only when the caller's
+// descriptor is the exact catalog-bound canonical descriptor. In particular,
+// a provider-controlled alias string cannot turn a different tool into an
+// orchestrated operation.
+func (c *Catalog) OrchestratedKind(alias string, descriptor protocol.ToolDescriptor) (string, bool) {
+	entry, ok := c.byAlias[alias]
+	if !ok || !reflect.DeepEqual(entry.descriptor, descriptor) {
+		return "", false
+	}
+	marker, ok := entry.tool.(ports.OrchestratedTool)
+	if !ok || marker.OrchestratedKind() == "" {
+		return "", false
+	}
+	return marker.OrchestratedKind(), true
 }
 
 // SourceAnnotation returns the provider-authored descriptor as an untrusted

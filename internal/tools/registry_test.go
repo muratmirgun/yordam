@@ -46,6 +46,17 @@ func TestRegistryDescriptorsAreStable(t *testing.T) {
 	}
 }
 
+func TestRegistryOrdersSubagentAfterSkillBeforeEdit(t *testing.T) {
+	registry := tools.NewRegistry(registryTool("shell"), registryTool("edit"), registryTool("subagent"), registryTool("skill"), registryTool("read"), registryTool("search"))
+	names := make([]string, 0, len(registry.Descriptors()))
+	for _, descriptor := range registry.Descriptors() {
+		names = append(names, descriptor.Name)
+	}
+	if !slices.Equal(names, []string{"read", "search", "skill", "subagent", "edit", "shell"}) {
+		t.Fatalf("names=%v", names)
+	}
+}
+
 func TestRegistryAcceptsArbitraryToolsAndRejectsDuplicateAliases(t *testing.T) {
 	readTool := registryTool("read")
 	searchTool := registryTool("search")
