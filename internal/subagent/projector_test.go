@@ -311,4 +311,10 @@ func TestSubagentProjectorRequestConflictIsAbsorbing(t *testing.T) {
 	if err != nil || state.Attempts[manifest.AttemptID].State != StateConflict {
 		t.Fatalf("conflicting request was silently resolved: %#v, %v", state, err)
 	}
+	other := manifest
+	other.AttemptID, other.ChildSessionID = "other-attempt", "other-child"
+	other.ChildTaskID, other.ChildTurnID = "other-task", "other-turn"
+	if _, err := projector.Apply(state, requestEvent(other)); err == nil {
+		t.Fatal("new delegation started after an unresolved request conflict")
+	}
 }

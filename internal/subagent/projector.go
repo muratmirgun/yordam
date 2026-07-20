@@ -226,7 +226,10 @@ func eventCursor(event protocol.EventRecord) protocol.CommittedCursor {
 
 func activeAttempt(state Projection) bool {
 	for _, attempt := range state.Attempts {
-		if attempt.State == StateIncomplete || attempt.State == StateWaiting {
+		// A conflict has no durable resolution in this protocol version. Treat it
+		// as active so a second child cannot begin while the first child's effect
+		// or attachment identity remains uncertain.
+		if attempt.State == StateIncomplete || attempt.State == StateWaiting || attempt.State == StateConflict {
 			return true
 		}
 	}
