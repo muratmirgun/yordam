@@ -1,6 +1,7 @@
 package eventcodec_test
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -189,6 +190,92 @@ func TestFoundationRegistryRejectsInvalidSubagentRuntimeLimits(t *testing.T) {
 				t.Fatal("canonically redigested invalid subagent limits accepted")
 			}
 		})
+	}
+
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var explicitZero map[string]any
+	if err := json.Unmarshal(raw, &explicitZero); err != nil {
+		t.Fatal(err)
+	}
+	limits := explicitZero["body"].(map[string]any)["limits"].(map[string]any)
+	limits["subagents"] = map[string]any{"enabled": false, "max_per_turn": float64(0), "max_tool_calls": float64(0), "timeout_nanos": float64(0)}
+	raw, err = json.Marshal(explicitZero)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var candidate protocol.RuntimeGenerationManifest
+	if err := json.Unmarshal(raw, &candidate); err != nil {
+		t.Fatal(err)
+	}
+	candidate.Digest, err = canonicaljson.Digest(candidate.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := registry.Decode(envelopeFor(t, protocol.EventEnvelope{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", RuntimeGenerationID: candidate.ID, Kind: protocol.EventRuntimeGenerationActivated}, protocol.RuntimeGenerationActivatedV1{Manifest: candidate}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Validate(record); err == nil {
+		t.Fatal("explicit zero subagent limits accepted")
+	}
+}
+
+func TestFoundationRegistryPreservesLegacyRuntimeManifestWithoutSubagents(t *testing.T) {
+	type legacyRuntimeLimits struct {
+		MaxToolCalls             int                 `json:"max_tool_calls"`
+		ShellTimeoutNanos        int64               `json:"shell_timeout_nanos"`
+		ApplicationQueueCapacity int                 `json:"application_queue_capacity"`
+		AutoCompact              bool                `json:"auto_compact"`
+		CompactReserveTokens     protocol.ValueInt64 `json:"compact_reserve_tokens"`
+	}
+	type legacyRuntimeBody struct {
+		ProviderCatalogRevision string                     `json:"provider_catalog_revision"`
+		Models                  []protocol.ModelDescriptor `json:"models"`
+		ToolCatalogRevision     string                     `json:"tool_catalog_revision"`
+		Tools                   []protocol.ToolDescriptor  `json:"tools"`
+		InstructionRevision     string                     `json:"instruction_revision"`
+		PolicyGeneration        string                     `json:"policy_generation"`
+		ExecutionProfiles       []string                   `json:"execution_profiles"`
+		Limits                  legacyRuntimeLimits        `json:"limits"`
+	}
+	legacy := legacyRuntimeBody{
+		ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{},
+		InstructionRevision: "instructions", PolicyGeneration: "policy", ExecutionProfiles: []string{"restricted"},
+		Limits: legacyRuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1, CompactReserveTokens: protocol.ValueInt64{State: protocol.ValueUnknown}},
+	}
+	legacyJSON, err := canonicaljson.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDigest, err := canonicaljson.Digest(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded protocol.RuntimeGenerationBody
+	if err := json.Unmarshal(legacyJSON, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	replayedJSON, err := canonicaljson.Marshal(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(replayedJSON) != string(legacyJSON) {
+		t.Fatalf("legacy replay changed body:\n got %s\nwant %s", replayedJSON, legacyJSON)
+	}
+	manifest := protocol.RuntimeGenerationManifest{ID: "generation", Body: decoded, Digest: legacyDigest}
+	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := registry.Decode(envelopeFor(t, protocol.EventEnvelope{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", RuntimeGenerationID: manifest.ID, Kind: protocol.EventRuntimeGenerationActivated}, protocol.RuntimeGenerationActivatedV1{Manifest: manifest}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Validate(record); err != nil {
+		t.Fatalf("legacy runtime manifest rejected: %v", err)
 	}
 }
 

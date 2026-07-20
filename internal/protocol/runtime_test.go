@@ -52,7 +52,7 @@ func TestRuntimeLimitsPreserveSubagentConfiguration(t *testing.T) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded != limits {
+	if decoded.MaxToolCalls != limits.MaxToolCalls || decoded.ShellTimeoutNanos != limits.ShellTimeoutNanos || decoded.ApplicationQueueCapacity != limits.ApplicationQueueCapacity || decoded.AutoCompact != limits.AutoCompact || decoded.CompactReserveTokens != limits.CompactReserveTokens || decoded.Subagents != limits.Subagents {
 		t.Fatalf("json round trip=%+v want=%+v", decoded, limits)
 	}
 }

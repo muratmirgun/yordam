@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -11,7 +12,8 @@ type RuntimeLimits struct {
 	ApplicationQueueCapacity int            `json:"application_queue_capacity"`
 	AutoCompact              bool           `json:"auto_compact"`
 	CompactReserveTokens     ValueInt64     `json:"compact_reserve_tokens"`
-	Subagents                SubagentLimits `json:"subagents"`
+	Subagents                SubagentLimits `json:"subagents,omitempty"`
+	subagentsPresent         bool
 }
 
 type SubagentLimits struct {
@@ -35,10 +37,70 @@ func (limits SubagentLimits) Validate() error {
 }
 
 func (limits RuntimeLimits) Validate() error {
+	if err := limits.validateBase(); err != nil {
+		return err
+	}
+	return limits.Subagents.Validate()
+}
+
+func (limits RuntimeLimits) ValidatePersisted() error {
+	if err := limits.validateBase(); err != nil {
+		return err
+	}
+	if !limits.subagentsPresent {
+		return nil
+	}
+	return limits.Subagents.Validate()
+}
+
+func (limits RuntimeLimits) validateBase() error {
 	if limits.MaxToolCalls < 1 || limits.MaxToolCalls > 128 || limits.ShellTimeoutNanos <= 0 || limits.ApplicationQueueCapacity <= 0 {
 		return fmt.Errorf("runtime limits are invalid")
 	}
-	return limits.Subagents.Validate()
+	return nil
+}
+
+func (limits RuntimeLimits) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		MaxToolCalls             int             `json:"max_tool_calls"`
+		ShellTimeoutNanos        int64           `json:"shell_timeout_nanos"`
+		ApplicationQueueCapacity int             `json:"application_queue_capacity"`
+		AutoCompact              bool            `json:"auto_compact"`
+		CompactReserveTokens     ValueInt64      `json:"compact_reserve_tokens"`
+		Subagents                *SubagentLimits `json:"subagents,omitempty"`
+	}
+	encoded := wire{
+		MaxToolCalls: limits.MaxToolCalls, ShellTimeoutNanos: limits.ShellTimeoutNanos, ApplicationQueueCapacity: limits.ApplicationQueueCapacity,
+		AutoCompact: limits.AutoCompact, CompactReserveTokens: limits.CompactReserveTokens,
+	}
+	if limits.subagentsPresent || limits.Subagents != (SubagentLimits{}) {
+		encoded.Subagents = &limits.Subagents
+	}
+	return json.Marshal(encoded)
+}
+
+func (limits *RuntimeLimits) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		MaxToolCalls             int             `json:"max_tool_calls"`
+		ShellTimeoutNanos        int64           `json:"shell_timeout_nanos"`
+		ApplicationQueueCapacity int             `json:"application_queue_capacity"`
+		AutoCompact              bool            `json:"auto_compact"`
+		CompactReserveTokens     ValueInt64      `json:"compact_reserve_tokens"`
+		Subagents                json.RawMessage `json:"subagents"`
+	}
+	var decoded wire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*limits = RuntimeLimits{
+		MaxToolCalls: decoded.MaxToolCalls, ShellTimeoutNanos: decoded.ShellTimeoutNanos, ApplicationQueueCapacity: decoded.ApplicationQueueCapacity,
+		AutoCompact: decoded.AutoCompact, CompactReserveTokens: decoded.CompactReserveTokens,
+	}
+	if len(decoded.Subagents) == 0 {
+		return nil
+	}
+	limits.subagentsPresent = true
+	return json.Unmarshal(decoded.Subagents, &limits.Subagents)
 }
 
 type RuntimeGenerationBody struct {

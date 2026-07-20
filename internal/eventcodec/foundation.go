@@ -572,7 +572,7 @@ func validateManifest(manifest protocol.RuntimeGenerationManifest) error {
 	if manifest.ID == "" || manifest.Body.ProviderCatalogRevision == "" || manifest.Body.ToolCatalogRevision == "" || manifest.Body.InstructionRevision == "" || manifest.Body.PolicyGeneration == "" {
 		return fmt.Errorf("runtime generation manifest is incomplete")
 	}
-	if err := manifest.Body.Limits.Validate(); err != nil {
+	if err := manifest.Body.Limits.ValidatePersisted(); err != nil {
 		return fmt.Errorf("runtime generation manifest limits: %w", err)
 	}
 	if len(manifest.Body.Skills) > 0 && manifest.Body.SkillCatalogRevision == "" {

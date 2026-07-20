@@ -1001,6 +1001,17 @@ func TestRuntimeSetRejectsInvalidSubagentLimits(t *testing.T) {
 	}
 }
 
+func TestRuntimeBuilderRejectsOverflowingSubagentTimeout(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Subagents.TimeoutSeconds = int(1 + 1<<55)
+	builder := newRuntimeBuilderForTest(t, nil)
+	_, err := builder.build(cfg, domain.ModelSelection{})
+	if err == nil {
+		t.Fatal("builder accepted overflowing subagent timeout")
+	}
+}
+
 func TestProductionCompactProtocolCommandUsesRuntimeCompactionService(t *testing.T) {
 	t.Setenv("PRIMARY_KEY", "primary-secret")
 	builder := newRuntimeBuilderForTest(t, nil)

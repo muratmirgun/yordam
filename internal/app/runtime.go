@@ -233,6 +233,9 @@ type runtimeBuilder struct {
 }
 
 func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) (RuntimeSet, error) {
+	if err := cfg.Validate(); err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "configuration is invalid; edit the file and run /reload", err)
+	}
 	defaultProfile, defaultModel := "", ""
 	if slices.Contains(cfg.Models(), current) {
 		defaultProfile, defaultModel = current.Profile, current.Model
