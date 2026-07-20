@@ -64,6 +64,15 @@ func assertV030SkillsAcceptance(t *testing.T) {
 
 	var mu sync.Mutex
 	var captured []string
+	firstCaptured := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseFirst:
+		default:
+			close(releaseFirst)
+		}
+	}()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -74,6 +83,10 @@ func assertV030SkillsAcceptance(t *testing.T) {
 		captured = append(captured, string(body))
 		n := len(captured)
 		mu.Unlock()
+		if n == 1 {
+			close(firstCaptured)
+			<-releaseFirst
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		if n == 3 { // The restarted turn explicitly loads the catalog-bound skill.
 			fmt.Fprint(w, "data: {\"id\":\"skills\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"load-hostile\",\"function\":{\"name\":\"skill\",\"arguments\":\"{\\\"name\\\":\\\"go-testing\\\"}\"}}]}}]}\n\n")
@@ -112,8 +125,29 @@ func assertV030SkillsAcceptance(t *testing.T) {
 	done := runV030App(t, application)
 	// An active generation keeps the captured global catalog bytes despite a
 	// filesystem edit; a successful reload alone activates the replacement.
+	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "metadata only"}
+	select {
+	case <-firstCaptured:
+	case <-time.After(30 * time.Second):
+		t.Fatal("first provider request did not arrive")
+	}
 	v030WriteSkill(t, global, "Reloaded global metadata.", "reloaded global body")
-	v030SkillsSendUntil(t, application, app.Command{Kind: app.CommandStartTurn, Prompt: "metadata only"}, app.EventTurnCompleted)
+	application.Commands() <- app.Command{Kind: app.CommandReloadConfig}
+	deadline := time.NewTimer(30 * time.Second)
+	for {
+		select {
+		case event := <-application.Events():
+			if event.Kind == app.EventRejected && strings.Contains(event.Message, "operation is already active") {
+				goto release
+			}
+		case <-deadline.C:
+			t.Fatal("active reload was not rejected")
+		}
+	}
+release:
+	deadline.Stop()
+	close(releaseFirst)
+	v030SkillsWait(t, application, app.EventTurnCompleted)
 	mu.Lock()
 	first := captured[0]
 	mu.Unlock()
