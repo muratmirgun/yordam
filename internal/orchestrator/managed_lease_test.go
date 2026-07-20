@@ -91,6 +91,41 @@ func TestManagedOperationLeaseReacquiresBeforePanicEscapes(t *testing.T) {
 	next.Release()
 }
 
+func TestManagedOperationLeasePreservesFIFOAndReacquiresAfterChildTerminal(t *testing.T) {
+	lane := NewOperationLane()
+	parent, err := acquireManagedOperationLease(context.Background(), lane, OperationClaim{Kind: OperationTurn, SessionID: "parent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiterAcquired := make(chan OperationLease, 1)
+	go func() {
+		lease, acquireErr := lane.Acquire(context.Background(), OperationClaim{Kind: OperationTurn, SessionID: "waiter"})
+		if acquireErr == nil {
+			waiterAcquired <- lease
+		}
+	}()
+	// Ensure the waiter is queued before the parent yields.
+	time.Sleep(time.Millisecond)
+	childTerminal := false
+	err = parent.Yield(context.Background(), func(context.Context) error {
+		select {
+		case waiter := <-waiterAcquired:
+			if childTerminal {
+				t.Fatal("waiter acquired after child terminal marker")
+			}
+			childTerminal = true
+			waiter.Release()
+			return nil
+		case <-time.After(time.Second):
+			return errors.New("FIFO waiter did not acquire yielded lane")
+		}
+	})
+	if err != nil || !childTerminal {
+		t.Fatalf("yield err=%v terminal=%v", err, childTerminal)
+	}
+	parent.Release()
+}
+
 func TestManagedOperationLeaseReacquiresAfterCancelledChild(t *testing.T) {
 	lane := NewOperationLane()
 	claim := OperationClaim{Kind: OperationTurn, SessionID: "parent"}
