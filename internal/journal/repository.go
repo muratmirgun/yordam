@@ -20,10 +20,22 @@ var (
 )
 
 type SessionLineage struct {
-	ParentSessionID  protocol.SessionID       `json:"parent_session_id"`
-	ParentCursor     protocol.CommittedCursor `json:"parent_cursor"`
-	CheckpointDigest protocol.Digest          `json:"checkpoint_digest"`
+	Kind LineageKind `json:"kind,omitempty"`
+
+	ParentSessionID protocol.SessionID       `json:"parent_session_id"`
+	ParentCursor    protocol.CommittedCursor `json:"parent_cursor"`
+
+	CheckpointDigest    protocol.Digest              `json:"checkpoint_digest,omitempty"`
+	DelegationAttemptID protocol.DelegationAttemptID `json:"delegation_attempt_id,omitempty"`
+	ManifestDigest      protocol.Digest              `json:"manifest_digest,omitempty"`
 }
+
+type LineageKind string
+
+const (
+	LineageCheckpoint LineageKind = "checkpoint"
+	LineageSubagent   LineageKind = "subagent"
+)
 
 type LineageCursor struct {
 	ViewSessionID   protocol.SessionID       `json:"view_session_id"`

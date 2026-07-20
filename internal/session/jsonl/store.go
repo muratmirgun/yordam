@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -170,35 +171,61 @@ func incrementULID(id *ulid.ULID) bool {
 }
 
 func (s *Store) Create(ctx context.Context, workspace domain.Workspace, mode domain.PermissionMode, selection domain.ModelSelection) (domain.Session, error) {
-	return s.create(ctx, workspace, mode, selection, nil)
+	return s.create(ctx, "", workspace, mode, selection, nil)
 }
 
 func (s *Store) CreateWithLineage(ctx context.Context, workspace domain.Workspace, mode domain.PermissionMode, selection domain.ModelSelection, lineage *journal.SessionLineage) (domain.Session, error) {
 	if lineage == nil {
-		return s.create(ctx, workspace, mode, selection, nil)
+		return s.create(ctx, "", workspace, mode, selection, nil)
 	}
 	copy := *lineage
-	return s.create(ctx, workspace, mode, selection, &copy)
+	return s.create(ctx, "", workspace, mode, selection, &copy)
 }
 
-func (s *Store) create(ctx context.Context, workspace domain.Workspace, mode domain.PermissionMode, selection domain.ModelSelection, lineage *journal.SessionLineage) (domain.Session, error) {
+// ReserveSessionID obtains a monotonic session identity without creating any
+// workspace or session storage. Callers can bind the identity into a durable
+// subagent manifest before CreateWithIdentity publishes the session.
+func (s *Store) ReserveSessionID() (protocol.SessionID, error) {
+	id, err := s.nextID()
+	if err != nil {
+		return "", err
+	}
+	return protocol.SessionID(id), nil
+}
+
+func (s *Store) CreateWithIdentity(ctx context.Context, sessionID protocol.SessionID, workspace domain.Workspace, mode domain.PermissionMode, selection domain.ModelSelection, lineage *journal.SessionLineage) (domain.Session, error) {
+	if err := validateSessionID(string(sessionID)); err != nil {
+		return domain.Session{}, err
+	}
+	if lineage == nil {
+		return s.create(ctx, string(sessionID), workspace, mode, selection, nil)
+	}
+	copy := *lineage
+	return s.create(ctx, string(sessionID), workspace, mode, selection, &copy)
+}
+
+func (s *Store) create(ctx context.Context, requestedID string, workspace domain.Workspace, mode domain.PermissionMode, selection domain.ModelSelection, lineage *journal.SessionLineage) (domain.Session, error) {
 	if err := validateWorkspace(workspace); err != nil {
 		return domain.Session{}, err
 	}
 	if err := mode.Validate(); err != nil {
 		return domain.Session{}, err
 	}
-	active := s.activeCreateCounter(workspace.ID)
-	active.Add(1)
-	defer active.Add(-1)
-	var inheritedTurns []protocol.TurnID
 	if lineage != nil {
-		var err error
-		inheritedTurns, err = s.validateLineageAnchor(ctx, workspace, *lineage)
-		if err != nil {
+		if err := validateLineage(*lineage); err != nil {
 			return domain.Session{}, err
 		}
 	}
+	if requestedID != "" {
+		identityLock := s.journalLock(protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(requestedID)})
+		if err := identityLock.lock(ctx); err != nil {
+			return domain.Session{}, err
+		}
+		defer identityLock.unlock()
+	}
+	active := s.activeCreateCounter(workspace.ID)
+	active.Add(1)
+	defer active.Add(-1)
 	layout, err := s.openWorkspaceLayout(ctx, workspace, true)
 	if err != nil {
 		return domain.Session{}, err
@@ -212,9 +239,31 @@ func (s *Store) create(ctx context.Context, workspace domain.Workspace, mode dom
 	if err := reconcileSessionStaging(ctx, layout.sessionsRoot); err != nil {
 		return domain.Session{}, err
 	}
-	id, err := s.nextID()
-	if err != nil {
-		return domain.Session{}, err
+	if requestedID != "" {
+		existing, existingLineage, found, err := s.findSessionByIdentity(ctx, requestedID)
+		if err != nil {
+			return domain.Session{}, err
+		}
+		if found {
+			if !sameSessionIdentity(existing, existingLineage, workspace, mode, selection, lineage) {
+				return domain.Session{}, fmt.Errorf("session identity collision for %q", requestedID)
+			}
+			return existing, nil
+		}
+	}
+	var inheritedTurns []protocol.TurnID
+	if lineage != nil {
+		inheritedTurns, err = s.validateLineageAnchor(ctx, workspace, *lineage)
+		if err != nil {
+			return domain.Session{}, err
+		}
+	}
+	id := requestedID
+	if id == "" {
+		id, err = s.nextID()
+		if err != nil {
+			return domain.Session{}, err
+		}
 	}
 	now := s.clock().UTC()
 	session := domain.Session{
@@ -227,6 +276,37 @@ func (s *Store) create(ctx context.Context, workspace domain.Workspace, mode dom
 		UpdatedAt: now,
 	}
 	return s.createStagedSession(ctx, layout, session, lineage, inheritedTurns)
+}
+
+func (s *Store) findSessionByIdentity(ctx context.Context, sessionID string) (domain.Session, *journal.SessionLineage, bool, error) {
+	transaction, session, err := s.openSessionTransaction(ctx, sessionID, os.O_RDONLY, 0)
+	if err != nil {
+		if strings.Contains(err.Error(), " not found") {
+			return domain.Session{}, nil, false, nil
+		}
+		return domain.Session{}, nil, false, err
+	}
+	lineage, lineageErr := readLineageFile(ctx, transaction)
+	closeErr := transaction.close()
+	if lineageErr != nil || closeErr != nil {
+		return domain.Session{}, nil, false, errors.Join(lineageErr, closeErr)
+	}
+	return session, lineage, true, nil
+}
+
+func sameSessionIdentity(existing domain.Session, existingLineage *journal.SessionLineage, workspace domain.Workspace, mode domain.PermissionMode, selection domain.ModelSelection, lineage *journal.SessionLineage) bool {
+	return existing.Workspace == workspace && existing.Mode == mode && existing.Selection == selection && sameLineage(existingLineage, lineage)
+}
+
+func sameLineage(left, right *journal.SessionLineage) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	leftKind, leftErr := lineageKind(*left)
+	rightKind, rightErr := lineageKind(*right)
+	return leftErr == nil && rightErr == nil && leftKind == rightKind &&
+		left.ParentSessionID == right.ParentSessionID && left.ParentCursor == right.ParentCursor &&
+		left.CheckpointDigest == right.CheckpointDigest && left.DelegationAttemptID == right.DelegationAttemptID && left.ManifestDigest == right.ManifestDigest
 }
 
 func (s *Store) activeCreateCounter(workspaceID string) *atomic.Int64 {
@@ -317,27 +397,14 @@ func (s *Store) createStagedSession(ctx context.Context, layout *workspaceLayout
 func (s *Store) buildInitialJournal(session domain.Session, lineage *journal.SessionLineage, inheritedTurns []protocol.TurnID) ([]byte, domain.Session, error) {
 	eventTime := s.clock().UTC()
 	if lineage == nil {
-		createdPayload, err := json.Marshal(session)
-		if err != nil {
-			return nil, domain.Session{}, err
-		}
-		eventID, err := s.nextID()
-		if err != nil {
-			return nil, domain.Session{}, err
-		}
-		session.LastSeq, session.UpdatedAt = 1, eventTime
-		event := domain.DurableEvent{SchemaVersion: 1, EventID: eventID, SessionID: session.ID, Seq: 1, Time: eventTime, Kind: domain.EventSessionCreated, Payload: createdPayload}
-		if err := event.Validate(); err != nil {
-			return nil, domain.Session{}, err
-		}
-		encoded, err := json.Marshal(event)
-		if err != nil {
-			return nil, domain.Session{}, err
-		}
-		if len(encoded) > maxEventSize {
-			return nil, domain.Session{}, fmt.Errorf("session event exceeds 2 MiB")
-		}
-		return append(encoded, '\n'), session, nil
+		return s.buildInitialSessionCreatedJournal(session, eventTime)
+	}
+	kind, err := lineageKind(*lineage)
+	if err != nil {
+		return nil, domain.Session{}, err
+	}
+	if kind == journal.LineageSubagent {
+		return s.buildInitialSessionCreatedJournal(session, eventTime)
 	}
 	transactionID, err := s.nextID()
 	if err != nil {
@@ -425,6 +492,30 @@ func (s *Store) buildInitialJournal(session domain.Session, lineage *journal.Ses
 	journalBytes = append(journalBytes, line...)
 	session.LastSeq, session.UpdatedAt = marker.Seq, eventTime
 	return journalBytes, session, nil
+}
+
+func (s *Store) buildInitialSessionCreatedJournal(session domain.Session, eventTime time.Time) ([]byte, domain.Session, error) {
+	createdPayload, err := json.Marshal(session)
+	if err != nil {
+		return nil, domain.Session{}, err
+	}
+	eventID, err := s.nextID()
+	if err != nil {
+		return nil, domain.Session{}, err
+	}
+	session.LastSeq, session.UpdatedAt = 1, eventTime
+	event := domain.DurableEvent{SchemaVersion: 1, EventID: eventID, SessionID: session.ID, Seq: 1, Time: eventTime, Kind: domain.EventSessionCreated, Payload: createdPayload}
+	if err := event.Validate(); err != nil {
+		return nil, domain.Session{}, err
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return nil, domain.Session{}, err
+	}
+	if len(encoded) > maxEventSize {
+		return nil, domain.Session{}, fmt.Errorf("session event exceeds 2 MiB")
+	}
+	return append(encoded, '\n'), session, nil
 }
 
 func writeStagedFile(ctx context.Context, root *os.Root, name string, contents []byte) error {

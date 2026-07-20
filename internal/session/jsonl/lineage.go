@@ -29,10 +29,42 @@ func validateLineage(lineage journal.SessionLineage) error {
 	if lineage.ParentCursor.JournalKind != protocol.JournalSession || lineage.ParentCursor.JournalID != protocol.JournalID(lineage.ParentSessionID) {
 		return fmt.Errorf("parent cursor identity mismatch")
 	}
-	if err := lineage.CheckpointDigest.Validate(); err != nil {
-		return fmt.Errorf("invalid checkpoint digest: %w", err)
+	kind, err := lineageKind(lineage)
+	if err != nil {
+		return err
+	}
+	switch kind {
+	case journal.LineageCheckpoint:
+		if err := lineage.CheckpointDigest.Validate(); err != nil {
+			return fmt.Errorf("invalid checkpoint digest: %w", err)
+		}
+	case journal.LineageSubagent:
+		if err := lineage.DelegationAttemptID.Validate(); err != nil {
+			return fmt.Errorf("invalid delegation attempt ID: %w", err)
+		}
+		if err := lineage.ManifestDigest.Validate(); err != nil {
+			return fmt.Errorf("invalid manifest digest: %w", err)
+		}
 	}
 	return nil
+}
+
+// lineageKind preserves an omitted kind as the legacy checkpoint encoding.
+// It is intentionally not written back when reading existing lineage files.
+func lineageKind(lineage journal.SessionLineage) (journal.LineageKind, error) {
+	checkpoint := !lineage.CheckpointDigest.IsZero()
+	subagent := lineage.DelegationAttemptID != "" || !lineage.ManifestDigest.IsZero()
+	switch lineage.Kind {
+	case "", journal.LineageCheckpoint:
+		if checkpoint && !subagent {
+			return journal.LineageCheckpoint, nil
+		}
+	case journal.LineageSubagent:
+		if !checkpoint && lineage.DelegationAttemptID != "" && !lineage.ManifestDigest.IsZero() {
+			return journal.LineageSubagent, nil
+		}
+	}
+	return "", fmt.Errorf("lineage must contain exactly one payload family")
 }
 
 func (s *Store) validateLineageAnchor(ctx context.Context, workspace domain.Workspace, lineage journal.SessionLineage) ([]protocol.TurnID, error) {
@@ -60,6 +92,13 @@ func (s *Store) validateLineageAnchor(ctx context.Context, workspace domain.Work
 	}
 	if len(chain) >= maxLineageDepth+1 {
 		return nil, journal.ErrLineageDepthExceeded
+	}
+	kind, err := lineageKind(lineage)
+	if err != nil {
+		return nil, err
+	}
+	if kind == journal.LineageSubagent {
+		return nil, nil
 	}
 	return nonterminalTurnsAtCursor(scan, lineage.ParentSessionID, lineage.ParentCursor), nil
 }
@@ -159,7 +198,7 @@ func (s *Store) readLineageChain(ctx context.Context, sessionID protocol.Session
 	seen := make(map[protocol.SessionID]struct{})
 	chain := make([]lineageNode, 0, 4)
 	current := sessionID
-	var workspaceID string
+	var workspaceID, workspacePath string
 	for {
 		if _, duplicate := seen[current]; duplicate {
 			return nil, journal.ErrLineageCycle
@@ -173,8 +212,8 @@ func (s *Store) readLineageChain(ctx context.Context, sessionID protocol.Session
 			return nil, err
 		}
 		if workspaceID == "" {
-			workspaceID = session.Workspace.ID
-		} else if session.Workspace.ID != workspaceID {
+			workspaceID, workspacePath = session.Workspace.ID, session.Workspace.CanonicalPath
+		} else if session.Workspace.ID != workspaceID || session.Workspace.CanonicalPath != workspacePath {
 			return nil, errors.Join(fmt.Errorf("lineage crosses workspace identity"), transaction.close())
 		}
 		ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(current)}
@@ -214,8 +253,26 @@ func (s *Store) ReadComposedRange(ctx context.Context, request journal.ComposedR
 	if err != nil {
 		return journal.ComposedEventPage{}, err
 	}
+	for childIndex := 0; childIndex+1 < len(chain); childIndex++ {
+		lineage := chain[childIndex].lineage
+		parent := chain[childIndex+1]
+		if lineage.ParentCursor.JournalID != protocol.JournalID(parent.sessionID) || !scanHasCursor(parent.scan, lineage.ParentCursor) {
+			return journal.ComposedEventPage{}, fmt.Errorf("lineage parent cursor is not an anchored committed prefix")
+		}
+	}
+	lastIncluded := len(chain) - 1
+	for index := 0; index+1 < len(chain); index++ {
+		kind, err := lineageKind(*chain[index].lineage)
+		if err != nil {
+			return journal.ComposedEventPage{}, err
+		}
+		if kind == journal.LineageSubagent {
+			lastIncluded = index
+			break
+		}
+	}
 	commits := make([]composedCommit, 0)
-	for index := len(chain) - 1; index >= 0; index-- {
+	for index := lastIncluded; index >= 0; index-- {
 		node := chain[index]
 		var cutoff protocol.CommittedCursor
 		if index > 0 {

@@ -152,6 +152,39 @@ func TestCreateAppendAndList(t *testing.T) {
 	}
 }
 
+func TestReservedSessionIDCreationIsIdempotentAndRejectsCollision(t *testing.T) {
+	root := t.TempDir()
+	store := jsonl.New(root, jsonl.Options{
+		Clock:   func() time.Time { return time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC) },
+		Entropy: strings.NewReader(strings.Repeat("a", 1024)),
+	})
+	workspace, err := jsonl.WorkspaceFromPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := store.ReserveSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "workspaces")); !os.IsNotExist(err) {
+		t.Fatalf("reservation wrote storage: %v", err)
+	}
+	first, err := store.CreateWithIdentity(t.Context(), id, workspace, domain.ModeAsk, domain.ModelSelection{Profile: "p", Model: "m"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.CreateWithIdentity(t.Context(), id, workspace, domain.ModeAsk, domain.ModelSelection{Profile: "p", Model: "m"}, nil)
+	if err != nil {
+		t.Fatalf("idempotent creation failed: %v", err)
+	}
+	if first != second {
+		t.Fatalf("idempotent sessions differ: first=%+v second=%+v", first, second)
+	}
+	if _, err := store.CreateWithIdentity(t.Context(), id, workspace, domain.ModeAuto, domain.ModelSelection{Profile: "p", Model: "m"}, nil); err == nil || !strings.Contains(err.Error(), "identity collision") {
+		t.Fatalf("different content collision err=%v", err)
+	}
+}
+
 func TestWorkspaceIdentityMismatchRejected(t *testing.T) {
 	root := t.TempDir()
 	workspace, err := jsonl.WorkspaceFromPath(t.TempDir())
