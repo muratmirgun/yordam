@@ -274,20 +274,37 @@ func childReceipt(manifest protocol.SubagentManifestV1, status, summary string, 
 // constructing its terminal transaction, so assistant response prose can
 // never become effect evidence.
 func (s *Service) projectChildReceipt(ctx context.Context, state *turnState, manifest protocol.SubagentManifestV1, status, summary string, cursor protocol.CommittedCursor, usage protocol.ModelUsage, public *protocol.PublicError) (protocol.SubagentReceiptV1, error) {
+	events, err := s.durablePrefix(ctx, state.ref, cursor)
+	if err != nil {
+		return protocol.SubagentReceiptV1{}, err
+	}
+	return receiptprojector.ProjectReceipt(manifest, cursor, status, summary, usage, public, events), nil
+}
+
+func (s *Service) durablePrefix(ctx context.Context, ref protocol.JournalRef, through protocol.CommittedCursor) ([]protocol.EventRecord, error) {
 	after := protocol.CommittedCursor{}
 	events := make([]protocol.EventRecord, 0)
 	for {
-		page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: state.ref, After: after, Limit: 1000})
-		if err != nil {
-			return protocol.SubagentReceiptV1{}, err
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		events = append(events, page.Events...)
+		page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: ref, After: after, Limit: 1000})
+		if err != nil {
+			return nil, err
+		}
+		for _, event := range page.Events {
+			if through.CommitSeq == 0 || event.Envelope.Seq <= through.CommitSeq {
+				events = append(events, event)
+			}
+		}
 		if !page.More {
-			break
+			return events, nil
+		}
+		if page.Cursor == after {
+			return nil, fmt.Errorf("journal range cursor did not advance")
 		}
 		after = page.Cursor
 	}
-	return receiptprojector.ProjectReceipt(manifest, cursor, status, summary, usage, public, events), nil
 }
 
 func assistantSummary(message protocol.AssistantMessageV1) string {

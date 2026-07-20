@@ -130,6 +130,22 @@ func TestRecoveryConflictTerminalizesControlWithoutSessionTerminal(t *testing.T)
 	validateAppendRequests(t, repository.appendRequests())
 }
 
+func TestDurablePrefixPagesAtThousandRecords(t *testing.T) {
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "child"}
+	r := newRecoveryRepository(&recordLog{}, protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "control"}, protocol.CommittedCursor{JournalKind: protocol.JournalWorkspaceControl, JournalID: "control"}, ref, protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child"}, protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 1001, TransactionID: "tail"})
+	for i := 0; i < 1001; i++ {
+		r.events[ref] = append(r.events[ref], protocol.ProposedEvent{Kind: protocol.EventActivityProgress, SessionID: "child"})
+	}
+	service, err := NewService(Dependencies{Repository: r, Lane: NewOperationLane()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := service.durablePrefix(context.Background(), ref, protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 1001, TransactionID: "tail"})
+	if err != nil || len(events) != 1001 {
+		t.Fatalf("events=%d err=%v", len(events), err)
+	}
+}
+
 func TestEveryRecoveryDispatchAndTerminalBarrierLeavesDurableControlTerminal(t *testing.T) {
 	for _, test := range []struct {
 		barrier          Barrier
@@ -261,11 +277,25 @@ func (r *recoveryRepository) Head(_ context.Context, ref protocol.JournalRef) (p
 func (r *recoveryRepository) ReadRange(_ context.Context, request journal.ReadRangeRequest) (journal.EventPage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	records := make([]protocol.EventRecord, len(r.events[request.Journal]))
-	for index, event := range r.events[request.Journal] {
-		records[index] = protocol.EventRecord{Envelope: protocol.EventEnvelope{JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, SessionID: event.SessionID, Kind: event.Kind, Payload: event.Payload}}
+	all := r.events[request.Journal]
+	start := int(request.After.CommitSeq)
+	limit := request.Limit
+	if limit <= 0 {
+		limit = len(all)
 	}
-	return journal.EventPage{Events: records, Head: r.heads[request.Journal], Cursor: r.heads[request.Journal]}, nil
+	end := start + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	records := make([]protocol.EventRecord, end-start)
+	for index, event := range all[start:end] {
+		records[index] = protocol.EventRecord{Envelope: protocol.EventEnvelope{JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, SessionID: event.SessionID, Kind: event.Kind, Seq: uint64(start + index + 1), Payload: event.Payload}}
+	}
+	cursor := request.After
+	if end > start {
+		cursor = protocol.CommittedCursor{JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, CommitSeq: uint64(end), TransactionID: "page"}
+	}
+	return journal.EventPage{Events: records, Head: r.heads[request.Journal], Cursor: cursor, More: end < len(all)}, nil
 }
 func (r *recoveryRepository) AppendBatch(_ context.Context, request journal.AppendRequest) (journal.AppendResult, error) {
 	r.mu.Lock()

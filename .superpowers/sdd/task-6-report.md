@@ -30,3 +30,7 @@ trusted-shell state, and render child/parent/attempt lineage. Receipt projection
 now ignores foreign/out-of-cursor records, admits shell commands only after their
 activity started and terminalized, forces unmatched effects to `uncertain`, and
 recovery emits a projected child receipt when it finds a durable child manifest.
+
+Second recovery follow-up: durable prefix reads page at 1,000 records with
+context and cursor-progress guards; recovery receipt envelopes use the child
+manifest runtime generation. A 1,001-record pagination regression is covered.
