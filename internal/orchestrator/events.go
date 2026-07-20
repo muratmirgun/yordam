@@ -13,6 +13,10 @@ import (
 // the event that activates it, so the generic sequence-one preflight cannot be
 // used for this transaction.
 func validateCompactionProposedEvents(events []protocol.ProposedEvent, ref protocol.JournalRef, firstSequence uint64) error {
+	return validateProposedEventsAt(events, ref, firstSequence, "validation")
+}
+
+func validateProposedEventsAt(events []protocol.ProposedEvent, ref protocol.JournalRef, firstSequence uint64, transactionID protocol.TransactionID) error {
 	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
 	if err != nil {
 		return err
@@ -24,7 +28,7 @@ func validateCompactionProposedEvents(events []protocol.ProposedEvent, ref proto
 		if event.SessionID == "" || protocol.JournalID(event.SessionID) != ref.ID || protocol.ValidateRawJSON(event.Payload) != nil {
 			return fmt.Errorf("proposed event %d session identity is invalid", index)
 		}
-		envelope := protocol.EventEnvelope{SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: event.PayloadVersion, JournalKind: ref.Kind, JournalID: ref.ID, EventID: event.EventID, SessionID: event.SessionID, Seq: firstSequence + uint64(index), Time: event.Time, Kind: event.Kind, TaskID: event.TaskID, TurnID: event.TurnID, ActivityID: event.ActivityID, ParentActivityID: event.ParentActivityID, CausationEventID: event.CausationEventID, Actor: protocol.DeepCopy(event.Actor), RuntimeGenerationID: event.RuntimeGenerationID, TransactionID: "validation", Payload: protocol.DeepCopy(event.Payload)}
+		envelope := protocol.EventEnvelope{SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: event.PayloadVersion, JournalKind: ref.Kind, JournalID: ref.ID, EventID: event.EventID, SessionID: event.SessionID, Seq: firstSequence + uint64(index), Time: event.Time, Kind: event.Kind, TaskID: event.TaskID, TurnID: event.TurnID, ActivityID: event.ActivityID, ParentActivityID: event.ParentActivityID, CausationEventID: event.CausationEventID, Actor: protocol.DeepCopy(event.Actor), RuntimeGenerationID: event.RuntimeGenerationID, TransactionID: transactionID, Payload: protocol.DeepCopy(event.Payload)}
 		raw, marshalErr := canonicaljson.Marshal(envelope)
 		if marshalErr != nil {
 			return marshalErr

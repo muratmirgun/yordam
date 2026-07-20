@@ -135,7 +135,7 @@ func committedChildReceipt(ctx context.Context, sessions ChildSessionStore, mani
 			continue
 		}
 		var receipt protocol.SubagentReceiptV1
-		if err := json.Unmarshal(event.Envelope.Payload, &receipt); err != nil || receipt.Manifest != manifest || receipt.Validate() != nil {
+		if err := json.Unmarshal(event.Envelope.Payload, &receipt); err != nil || !sameSubagentManifest(receipt.Manifest, manifest) || receipt.Validate() != nil {
 			continue
 		}
 		cursor := protocol.CommittedCursor{JournalKind: event.Envelope.JournalKind, JournalID: event.Envelope.JournalID, CommitSeq: event.Envelope.Seq, TransactionID: event.Envelope.TransactionID}

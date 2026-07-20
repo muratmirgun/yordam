@@ -119,7 +119,7 @@ func (s *Service) runSubagentIntent(ctx context.Context, lease managedOperationL
 	if err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
-	if receipt.Manifest != manifest || receipt.TerminalCursor.JournalID != protocol.JournalID(childID) || receipt.Validate() != nil {
+	if !sameSubagentManifest(receipt.Manifest, manifest) || receipt.TerminalCursor.JournalID != protocol.JournalID(childID) || receipt.Validate() != nil {
 		return protocol.ToolResultBlock{}, fmt.Errorf("subagent receipt does not bind the requested child")
 	}
 	if err := s.verifyChildReceipt(ctx, manifest, receipt); err != nil {
@@ -250,12 +250,21 @@ func canonicalSubagentDescriptor(descriptor protocol.ToolDescriptor) bool {
 	return subagenttool.IsCanonicalDescriptor(descriptor)
 }
 
+func sameSubagentManifest(left, right protocol.SubagentManifestV1) bool {
+	leftDigest, leftErr := canonicaljson.Digest(left)
+	rightDigest, rightErr := canonicaljson.Digest(right)
+	return leftErr == nil && rightErr == nil && leftDigest == rightDigest
+}
+
 func childReceipt(manifest protocol.SubagentManifestV1, status, summary string, cursor protocol.CommittedCursor, usage protocol.ModelUsage, public *protocol.PublicError, unknown []protocol.ActivityID) protocol.SubagentReceiptV1 {
 	if usage == (protocol.ModelUsage{}) {
 		usage = unknownUsage()
 	}
 	if len(summary) > protocol.MaxSubagentReceiptSummaryBytes {
 		summary = summary[:protocol.MaxSubagentReceiptSummaryBytes]
+	}
+	if unknown == nil {
+		unknown = []protocol.ActivityID{}
 	}
 	return protocol.SubagentReceiptV1{Status: status, Summary: summary, Manifest: manifest, TerminalCursor: cursor, ChangedFiles: []string{}, CommandsAndTests: []string{}, Usage: usage, EvidenceIDs: []protocol.EvidenceID{}, UnknownEffects: unknown, Error: protocol.DeepCopy(public)}
 }

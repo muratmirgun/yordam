@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -111,6 +112,80 @@ func TestRunTurnSubagentHappyPathCommitsParentHandoffAndAttachment(t *testing.T)
 	if !containsBatchKind(batches, protocol.EventEvidenceRecorded) {
 		t.Fatalf("receipt evidence missing: %v", batches)
 	}
+}
+
+func TestSequentialChildCoordinatorRunsOrdinaryChildTurnAndReadsReceipt(t *testing.T) {
+	parent := validStartTurnRequest()
+	parent.Runtime = validRuntimeManifest(t, "observation")
+	parent.Runtime.Body.SkillCatalogRevision = "skills-a"
+	parent.Runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+	parent.Runtime.Body.Tools = append(parent.Runtime.Body.Tools, subagenttool.BuiltinDescriptor())
+	refreshRuntimeDigest(t, &parent.Runtime)
+	manifest := protocol.SubagentManifestV1{AttemptID: "production-attempt", ParentSessionID: parent.SessionID, ParentCursor: parent.ExpectedHead, ChildSessionID: "child", ChildTaskID: protocol.TaskID(stableID("task", "child-command")), ChildTurnID: protocol.TurnID(stableID("turn", "child-command")), RuntimeGenerationID: parent.Runtime.ID, SkillCatalogRevision: "skills-a", MaxToolCalls: 1, Deadline: time.Now().Add(time.Second)}
+	store := &productionCoordinatorStore{workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}}
+	childRepo := &recordingRepository{head: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 1, TransactionID: "create"}}
+	childLog := &recordLog{}
+	childService, err := NewService(Dependencies{Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: &loggingLane{delegate: NewOperationLane(), log: childLog}, Repository: childRepo, TurnLeases: &recordingTurnLeaseManager{log: childLog}, Context: fakeContextPlanner{log: childLog}, Providers: fakeProviderCatalog{log: childLog}, Provider: fakeProviderService{log: childLog}, Tools: noToolService{}, Authorization: &allowingAuthorization{log: childLog}, Evidence: noEvidenceRecorder{}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := NewSequentialChildCoordinator(store, productionCoordinatorParent{store}, func(ctx context.Context, request StartTurnRequest) (RunResult, error) {
+		result, runErr := childService.RunTurn(ctx, request)
+		store.capture(childRepo)
+		return result, runErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := coordinator.RunChild(context.Background(), ChildRunRequest{Manifest: manifest, Call: protocol.SubagentCallV1{Task: "inspect", ExpectedOutput: "report", Context: "scope"}, Parent: parent})
+	if err != nil {
+		t.Fatalf("coordinator error=%v child inspection=%+v child batches=%v", err, store.inspection, childRepo.batchKinds())
+	}
+	if store.created != manifest.ChildSessionID || !sameSubagentManifest(receipt.Manifest, manifest) || receipt.Status != "succeeded" {
+		t.Fatalf("created=%q receipt=%+v", store.created, receipt)
+	}
+	if !containsBatchKind(childRepo.batchKinds(), protocol.EventSubagentManifest) || !containsBatchKind(childRepo.batchKinds(), protocol.EventSubagentReceipt) {
+		t.Fatalf("child did not own manifest/receipt: %v", childRepo.batchKinds())
+	}
+}
+
+type productionCoordinatorStore struct {
+	workspace  domain.Workspace
+	created    protocol.SessionID
+	inspection journal.Inspection
+}
+
+func (s *productionCoordinatorStore) ReserveSessionID() (protocol.SessionID, error) {
+	return "child", nil
+}
+func (s *productionCoordinatorStore) CreateWithIdentity(_ context.Context, id protocol.SessionID, workspace domain.Workspace, _ domain.PermissionMode, _ domain.ModelSelection, lineage *journal.SessionLineage) (domain.Session, error) {
+	if lineage == nil || lineage.Kind != journal.LineageSubagent {
+		return domain.Session{}, fmt.Errorf("missing subagent lineage")
+	}
+	s.created = id
+	s.workspace = workspace
+	s.inspection.Head = protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(id), CommitSeq: 1, TransactionID: "create"}
+	return domain.Session{ID: string(id), Workspace: workspace}, nil
+}
+func (s *productionCoordinatorStore) InspectSession(context.Context, protocol.SessionID) (journal.Inspection, error) {
+	return s.inspection, nil
+}
+func (s *productionCoordinatorStore) capture(repo *recordingRepository) {
+	for _, request := range repo.appendRequests() {
+		for _, event := range request.Events {
+			if event.Kind == protocol.EventSubagentReceipt {
+				var receipt protocol.SubagentReceiptV1
+				_ = json.Unmarshal(event.Payload, &receipt)
+				s.inspection = journal.Inspection{Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(receipt.Manifest.ChildSessionID)}, Head: receipt.TerminalCursor, Writable: true, Events: []protocol.EventRecord{{Envelope: protocol.EventEnvelope{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(receipt.Manifest.ChildSessionID), SessionID: receipt.Manifest.ChildSessionID, Kind: protocol.EventSubagentReceipt, Seq: receipt.TerminalCursor.CommitSeq, TransactionID: receipt.TerminalCursor.TransactionID, Payload: event.Payload}}}}
+			}
+		}
+	}
+}
+
+type productionCoordinatorParent struct{ store *productionCoordinatorStore }
+
+func (s productionCoordinatorParent) InspectSession(context.Context, protocol.SessionID) (journal.SessionInspection, error) {
+	return journal.SessionInspection{Session: domain.Session{Workspace: s.store.workspace, Mode: domain.ModeAsk, Selection: domain.ModelSelection{Profile: "provider-a", Model: "model-a"}}}, nil
 }
 
 type subagentTestChildren struct {
