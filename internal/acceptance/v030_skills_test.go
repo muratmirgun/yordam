@@ -18,8 +18,10 @@ import (
 	"github.com/muratmirgun/yordam/internal/cli"
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/skills"
+	"github.com/muratmirgun/yordam/internal/tui/components"
 )
 
 // TestV030Skills deliberately runs without acceptance build tags. It drives
@@ -62,8 +64,11 @@ func assertV030SkillsAcceptance(t *testing.T) {
 		n := len(captured)
 		mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
-		if n == 2 { // The restarted turn explicitly loads the catalog-bound skill.
+		if n == 3 { // The restarted turn explicitly loads the catalog-bound skill.
 			fmt.Fprint(w, "data: {\"id\":\"skills\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"load-hostile\",\"function\":{\"name\":\"skill\",\"arguments\":\"{\\\"name\\\":\\\"go-testing\\\"}\"}}]}}]}\n\n")
+			fmt.Fprint(w, "data: {\"id\":\"skills\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
+		} else if n == 4 {
+			fmt.Fprint(w, "data: {\"id\":\"skills\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"hostile-shell\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"touch pwned\\\",\\\"cwd\\\":\\\".\\\"}\"}}]}}]}\n\n")
 			fmt.Fprint(w, "data: {\"id\":\"skills\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
 		} else {
 			fmt.Fprint(w, "data: {\"id\":\"skills\",\"choices\":[{\"delta\":{\"content\":\"ordinary provider reply\"}}]}\n\n")
@@ -94,12 +99,24 @@ func assertV030SkillsAcceptance(t *testing.T) {
 		t.Fatalf("metadata snapshot leaked body or key: %s", got)
 	}
 	done := runV030App(t, application)
+	// An active generation keeps the captured global catalog bytes despite a
+	// filesystem edit; a successful reload alone activates the replacement.
+	v030WriteSkill(t, global, "Reloaded global metadata.", "reloaded global body")
 	v030SkillsSendUntil(t, application, app.Command{Kind: app.CommandStartTurn, Prompt: "metadata only"}, app.EventTurnCompleted)
 	mu.Lock()
 	first := captured[0]
 	mu.Unlock()
 	if !strings.Contains(first, "Global testing metadata.") || strings.Contains(first, hostile) || strings.Contains(first, key) {
 		t.Fatalf("pre-trust provider context=%s", first)
+	}
+	application.Commands() <- app.Command{Kind: app.CommandReloadConfig}
+	v030SkillsWait(t, application, app.EventReloadCompleted)
+	v030SkillsSendUntil(t, application, app.Command{Kind: app.CommandStartTurn, Prompt: "after successful reload"}, app.EventTurnCompleted)
+	mu.Lock()
+	reloadedContext := captured[1]
+	mu.Unlock()
+	if !strings.Contains(reloadedContext, "Reloaded global metadata.") || strings.Contains(reloadedContext, "global body") {
+		t.Fatalf("reload did not activate only next generation: %q", reloadedContext)
 	}
 
 	application.Commands() <- app.Command{Kind: app.CommandTrustSkillCatalog, SkillTrust: protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(before.Workspace.ID), CatalogDigest: before.Skills.CatalogDigest, Decision: "allow"}}
@@ -120,25 +137,56 @@ func assertV030SkillsAcceptance(t *testing.T) {
 		t.Fatalf("child catalog snapshot is not exact metadata-only handoff: %+v", child)
 	}
 	done = runV030App(t, restarted)
-	v030SkillsSendUntil(t, restarted, app.Command{Kind: app.CommandStartTurn, Prompt: "load it"}, app.EventTurnCompleted)
+	restarted.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: "load it"}
+	prompt := v030SkillsWaitPermission(t, restarted)
+	if prompt.Call.Request.Name != "shell" || prompt.Call.Mutation != domain.MutationProcess {
+		t.Fatalf("hostile skill bypassed normal approval: %+v", prompt)
+	}
+	restarted.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: prompt.Call.Request.CallID, Decision: domain.PermissionDecision{Action: domain.PermissionDeny, Lifetime: domain.PermissionOnce, Scope: prompt.Call.CanonicalScope}}
+	v030SkillsWaitDenied(t, restarted)
 	shutdownV030App(t, restarted, done)
 	mu.Lock()
 	got := append([]string(nil), captured...)
 	mu.Unlock()
-	if len(got) != 3 || strings.Contains(got[1], hostile) || !strings.Contains(got[2], hostile) {
-		t.Fatalf("provider metadata/load boundary requests=%d second=%q third=%q", len(got), got[1], got[2])
+	if _, err := os.Stat(filepath.Join(workspace, "pwned")); !os.IsNotExist(err) {
+		t.Fatalf("denied hostile mutation happened: %v", err)
+	}
+	if len(got) != 4 || strings.Contains(got[2], hostile) || !strings.Contains(got[3], hostile) {
+		t.Fatalf("provider metadata/load boundary requests=%d third=%q fourth=%q", len(got), got[2], got[3])
 	}
 	for _, value := range got {
 		if strings.Contains(value, key) {
 			t.Fatalf("provider leaked configured key: %q", value)
 		}
 	}
-	v030AssertAbsent(t, key, readV030File(t, debug), v030JSON(before.Skills), v030JSON(after.Skills))
+	v030AssertAbsent(t, key, readV030File(t, debug), v030JSON(before.Skills), v030JSON(after.Skills), components.NewSkills(components.SkillScreenOptions{Snapshot: after.Skills}).View(120))
+	assertV030TreeOmits(t, data, key)
 	// A stale digest cannot activate altered project bytes after restart.
 	v030WriteSkill(t, project, "Project testing metadata.", hostile+" changed")
-	_, stale := boot(true)
+	staleApp, stale := boot(true)
 	if len(stale.Skills.Active) != 1 || stale.Skills.Active[0].Source != protocol.SkillSourceGlobal {
 		t.Fatalf("stale trust activated changed project bytes: %+v", stale.Skills)
+	}
+	staleDone := runV030App(t, staleApp)
+	shutdownV030App(t, staleApp, staleDone)
+	// Fixed policies bypass the ask decision but still expose only metadata.
+	for _, policy := range []config.ProjectSkillPolicy{config.ProjectSkillsAllow, config.ProjectSkillsDeny} {
+		cfg.Skills.ProjectPolicy = policy
+		if err := config.SaveGlobal(configPath, cfg); err != nil {
+			t.Fatal(err)
+		}
+		fixedApp, fixed := boot(true)
+		if strings.Contains(v030JSON(fixed.Skills), hostile) {
+			t.Fatalf("%s policy leaked body", policy)
+		}
+		if policy == config.ProjectSkillsAllow && fixed.Skills.Active[0].Source != protocol.SkillSourceProject {
+			t.Fatalf("allow catalog=%+v", fixed.Skills)
+		}
+		if policy == config.ProjectSkillsDeny && fixed.Skills.Active[0].Source != protocol.SkillSourceGlobal {
+			t.Fatalf("deny catalog=%+v", fixed.Skills)
+		}
+		fixedDone := runV030App(t, fixedApp)
+		shutdownV030App(t, fixedApp, fixedDone)
 	}
 }
 
@@ -192,6 +240,45 @@ func v030SkillsWait(t *testing.T, a *app.App, terminal app.EventKind) {
 			}
 		case <-deadline.C:
 			t.Fatalf("timed out waiting for %s", terminal)
+		}
+	}
+}
+func v030SkillsWaitPermission(t *testing.T, a *app.App) *ports.PermissionPrompt {
+	t.Helper()
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case event := <-a.Events():
+			if event.Kind == app.EventError || event.Kind == app.EventRejected {
+				t.Fatalf("event=%+v", event)
+			}
+			if event.Kind == app.EventPermissionRequested {
+				return event.Permission
+			}
+		case <-deadline.C:
+			t.Fatal("timed out waiting for permission")
+		}
+	}
+}
+func v030SkillsWaitDenied(t *testing.T, a *app.App) {
+	t.Helper()
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case event := <-a.Events():
+			if event.Kind == app.EventTurnCompleted {
+				return
+			}
+			if event.Kind == app.EventError && strings.Contains(event.Message, "authorization decision is stale") {
+				return
+			}
+			if event.Kind == app.EventRejected {
+				t.Fatalf("denial rejected: %+v", event)
+			}
+		case <-deadline.C:
+			t.Fatal("timed out waiting for denied hostile tool terminal")
 		}
 	}
 }

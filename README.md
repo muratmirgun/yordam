@@ -171,7 +171,8 @@ shadows a same-name global skill, while `/skills` displays both.
 Provider context initially receives metadata only. Full content is available
 only when the model explicitly calls the read-only `skill` tool with an active
 canonical name; it accepts no path and is not a file reader. Reload validates a
-new generation, so changed files affect future turns only. Parent-to-child
+new generation, so changed files activate only after a successful reload or
+startup. Parent-to-child
 handoff uses that frozen catalog snapshot, never child filesystem discovery.
 Skill text is untrusted context: it cannot install hooks or URLs, execute code,
 change policy, reveal credentials, or bypass normal permission approval.
