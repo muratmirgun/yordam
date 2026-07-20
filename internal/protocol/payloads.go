@@ -68,6 +68,11 @@ const (
 	EventMigrationDiagnostic            = "migration.diagnostic"
 	EventRecoveryDiagnostic             = "recovery.diagnostic"
 	EventTransactionCommitted           = "transaction.committed"
+	EventSubagentRequested              = "subagent_requested_v1"
+	EventSubagentWaiting                = "subagent_waiting_v1"
+	EventSubagentResultAttached         = "subagent_result_attached_v1"
+	EventSubagentManifest               = "subagent_manifest_v1"
+	EventSubagentReceipt                = "subagent_receipt_v1"
 )
 
 type SessionCreatedV1 struct {

@@ -57,6 +57,7 @@ type (
 	MCPServerID         string
 	MCPItemID           string
 	RecoveryMaterialID  string
+	DelegationAttemptID string
 )
 
 type Digest struct {

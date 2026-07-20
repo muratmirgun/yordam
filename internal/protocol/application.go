@@ -109,13 +109,15 @@ type CommandResult struct {
 }
 
 type EventCorrelation struct {
-	JournalKind        JournalKind        `json:"journal_kind"`
-	JournalID          JournalID          `json:"journal_id"`
-	SessionID          SessionID          `json:"session_id,omitempty"`
-	ControlOperationID ControlOperationID `json:"control_operation_id,omitempty"`
-	TaskID             TaskID             `json:"task_id,omitempty"`
-	TurnID             TurnID             `json:"turn_id,omitempty"`
-	ActivityID         ActivityID         `json:"activity_id,omitempty"`
+	JournalKind         JournalKind         `json:"journal_kind"`
+	JournalID           JournalID           `json:"journal_id"`
+	SessionID           SessionID           `json:"session_id,omitempty"`
+	ControlOperationID  ControlOperationID  `json:"control_operation_id,omitempty"`
+	TaskID              TaskID              `json:"task_id,omitempty"`
+	TurnID              TurnID              `json:"turn_id,omitempty"`
+	ActivityID          ActivityID          `json:"activity_id,omitempty"`
+	ParentSessionID     SessionID           `json:"parent_session_id,omitempty"`
+	DelegationAttemptID DelegationAttemptID `json:"delegation_attempt_id,omitempty"`
 }
 
 func (c EventCorrelation) Validate() error {
@@ -131,6 +133,9 @@ func (c EventCorrelation) Validate() error {
 		if c.SessionID != "" {
 			return fmt.Errorf("invalid workspace-control correlation")
 		}
+	}
+	if (c.ParentSessionID == "") != (c.DelegationAttemptID == "") || (c.ParentSessionID != "" && (c.JournalKind != JournalSession || c.ParentSessionID == c.SessionID)) {
+		return fmt.Errorf("invalid subagent application correlation")
 	}
 	return nil
 }

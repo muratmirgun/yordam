@@ -80,6 +80,11 @@ func FoundationDescriptors() []Descriptor {
 		{protocol.EventMigrationDiagnostic, func() any { return new(protocol.DiagnosticV1) }, false, "diagnostic", []string{"diagnostics"}},
 		{protocol.EventRecoveryDiagnostic, func() any { return new(protocol.DiagnosticV1) }, false, "diagnostic", []string{"diagnostics", "recovery"}},
 		{protocol.EventTransactionCommitted, func() any { return new(protocol.TransactionCommittedV1) }, false, "public", []string{"journal"}},
+		{protocol.EventSubagentRequested, func() any { return new(protocol.SubagentRequestedV1) }, true, "sensitive", []string{"subagent", "turn"}},
+		{protocol.EventSubagentWaiting, func() any { return new(protocol.SubagentWaitingV1) }, false, "public", []string{"subagent", "turn"}},
+		{protocol.EventSubagentResultAttached, func() any { return new(protocol.SubagentResultAttachedV1) }, true, "sensitive", []string{"subagent", "turn", "evidence"}},
+		{protocol.EventSubagentManifest, func() any { return new(protocol.SubagentManifestV1) }, false, "public", []string{"subagent", "session"}},
+		{protocol.EventSubagentReceipt, func() any { return new(protocol.SubagentReceiptV1) }, false, "sensitive", []string{"subagent", "usage", "evidence"}},
 	}
 
 	descriptors := make([]Descriptor, 0, len(entries))
@@ -101,6 +106,40 @@ func FoundationDescriptors() []Descriptor {
 					trust, ok := payload.(*protocol.ProjectSkillTrustChangedV1)
 					if !ok || envelope.JournalKind != protocol.JournalWorkspaceControl || envelope.JournalID != protocol.JournalID(trust.WorkspaceID) {
 						return fmt.Errorf("project skill trust requires workspace-control journal")
+					}
+				case protocol.EventSubagentRequested:
+					return validateSubagentRequestedEnvelope(envelope, payload)
+				case protocol.EventSubagentWaiting:
+					waiting, ok := payload.(*protocol.SubagentWaitingV1)
+					if !ok {
+						return fmt.Errorf("invalid subagent waiting payload")
+					}
+					return waiting.Validate()
+				case protocol.EventSubagentResultAttached:
+					attachment, ok := payload.(*protocol.SubagentResultAttachedV1)
+					if !ok {
+						return fmt.Errorf("invalid subagent attachment payload")
+					}
+					return attachment.Validate()
+				case protocol.EventSubagentManifest:
+					manifest, ok := payload.(*protocol.SubagentManifestV1)
+					if !ok {
+						return fmt.Errorf("invalid subagent manifest payload")
+					}
+					return validateSubagentChildEnvelope(envelope, *manifest)
+				case protocol.EventSubagentReceipt:
+					receipt, ok := payload.(*protocol.SubagentReceiptV1)
+					if !ok {
+						return fmt.Errorf("invalid subagent receipt payload")
+					}
+					if err := receipt.Validate(); err != nil {
+						return err
+					}
+					if err := validateSubagentChildEnvelope(envelope, receipt.Manifest); err != nil {
+						return err
+					}
+					if receipt.TerminalCursor.CommitSeq != envelope.Seq || receipt.TerminalCursor.TransactionID != envelope.TransactionID {
+						return fmt.Errorf("subagent receipt terminal cursor does not match envelope")
 					}
 				}
 				return nil
@@ -393,6 +432,16 @@ func validateFoundationSemantic(kind string, payload any) error {
 		if value.TransactionID == "" || value.FirstSeq == 0 || value.LastSeq < value.FirstSeq || uint64(value.EventCount) != value.LastSeq-value.FirstSeq+1 || value.Digest.Validate() != nil {
 			return fmt.Errorf("transaction marker is invalid")
 		}
+	case *protocol.SubagentRequestedV1:
+		return value.Validate()
+	case *protocol.SubagentWaitingV1:
+		return value.Validate()
+	case *protocol.SubagentManifestV1:
+		return value.Validate()
+	case *protocol.SubagentReceiptV1:
+		return value.Validate()
+	case *protocol.SubagentResultAttachedV1:
+		return value.Validate()
 	}
 	return nil
 }
@@ -408,6 +457,21 @@ func validateContextCompactionEnvelope(envelope protocol.EventEnvelope, payload 
 	reference := protocol.ContextCompactionReference{SessionID: envelope.SessionID, From: value.From, Through: value.Through, SummaryEvidenceID: value.SummaryEvidenceID, Revision: value.Revision}
 	if reference.Validate() != nil || envelope.JournalKind != protocol.JournalSession || envelope.JournalID != protocol.JournalID(envelope.SessionID) || value.Through.CommitSeq >= envelope.Seq {
 		return fmt.Errorf("context compaction is not anchored before its event")
+	}
+	return nil
+}
+
+func validateSubagentRequestedEnvelope(envelope protocol.EventEnvelope, payload any) error {
+	request, ok := payload.(*protocol.SubagentRequestedV1)
+	if !ok || request == nil || request.Validate() != nil || envelope.JournalKind != protocol.JournalSession || envelope.SessionID != request.Manifest.ParentSessionID || envelope.JournalID != protocol.JournalID(request.Manifest.ParentSessionID) || envelope.RuntimeGenerationID != request.Manifest.RuntimeGenerationID || envelope.TaskID == "" || envelope.TurnID == "" || request.Manifest.ParentCursor.CommitSeq >= envelope.Seq {
+		return fmt.Errorf("subagent request does not match parent session")
+	}
+	return nil
+}
+
+func validateSubagentChildEnvelope(envelope protocol.EventEnvelope, manifest protocol.SubagentManifestV1) error {
+	if manifest.Validate() != nil || envelope.JournalKind != protocol.JournalSession || envelope.SessionID != manifest.ChildSessionID || envelope.JournalID != protocol.JournalID(manifest.ChildSessionID) || envelope.RuntimeGenerationID != manifest.RuntimeGenerationID || envelope.TaskID != manifest.ChildTaskID || envelope.TurnID != manifest.ChildTurnID {
+		return fmt.Errorf("subagent child event does not match manifest")
 	}
 	return nil
 }
@@ -840,6 +904,9 @@ func sessionOnlyKind(kind string) bool {
 		protocol.EventEvidenceRecorded, protocol.EventEvidenceLinked,
 		protocol.EventCheckpointPlanned, protocol.EventCheckpointReady, protocol.EventCheckpointFailed,
 		protocol.EventVerificationReceiptRecorded, protocol.EventContextPlanRecorded, protocol.EventContextUsageRecorded:
+		return true
+	case protocol.EventSubagentRequested, protocol.EventSubagentWaiting, protocol.EventSubagentResultAttached,
+		protocol.EventSubagentManifest, protocol.EventSubagentReceipt:
 		return true
 	default:
 		return false
