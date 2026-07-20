@@ -319,19 +319,39 @@ func TestSubagentRecoveryCreatesReservedChildOnceAndContinuesParent(t *testing.T
 	}
 	intent := protocol.ToolUseBlock{CallID: "delegate", Alias: "subagent", Arguments: json.RawMessage(`{"task":"durable child task"}`)}
 	activityID := protocol.ActivityID(stableID("activity", "command-original", "subagent", intent.CallID))
-	recoveredHead := protocol.CommittedCursor{JournalKind: parentRef.Kind, JournalID: parentRef.ID, CommitSeq: 7, TransactionID: "recovered-parent-wait"}
+	previousManifest := protocol.DeepCopy(manifest)
+	previousManifest.AttemptID = "completed-attempt"
+	previousManifest.ChildSessionID = "child-completed"
+	previousManifest.ChildTaskID = "completed-child-task"
+	previousManifest.ChildTurnID = "completed-child-turn"
+	previousManifest.ParentCursor = protocol.CommittedCursor{JournalKind: parentRef.Kind, JournalID: parentRef.ID, CommitSeq: 4, TransactionID: "previous-parent-provider"}
+	previousActivityID := protocol.ActivityID("previous-subagent-activity")
+	previousReceipt := childReceipt(previousManifest, "succeeded", "earlier child completed", protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(previousManifest.ChildSessionID), CommitSeq: 2, TransactionID: "previous-child-terminal"}, unknownUsage(), nil, nil)
+	previousReceiptDigest, err := canonicaljson.Digest(previousReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveredHead := protocol.CommittedCursor{JournalKind: parentRef.Kind, JournalID: parentRef.ID, CommitSeq: 10, TransactionID: "recovered-parent-wait"}
 	repository.recovered, repository.result.Cursor, repository.heads[parentRef] = recoveredHead, recoveredHead, recoveredHead
 	repository.events[parentRef] = []protocol.ProposedEvent{
 		{EventID: "command-original", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventCommandAccepted, SessionID: "session-a", TurnID: "turn-original", Actor: &protocol.ActorRef{ID: "user", Kind: protocol.ActorUser}, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.CommandAcceptedV1{CommandID: "command-original", RequestDigest: repeatedDigest("5"), IdempotencyKey: "parent-key"})},
 		{EventID: "turn-accepted", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventTurnAccepted, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.TurnAcceptedV1{CommandID: "command-original", Goal: "durable parent goal"})},
 		{EventID: "assistant-tool-use", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventAssistantMessage, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.AssistantMessageV1{ToolIntents: []protocol.ToolUseBlock{intent}})},
 		{EventID: "provider-terminal", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventProviderAttemptTerminal, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.ProviderAttemptTerminalV1{Status: "completed"})},
+		{EventID: "previous-subagent-request", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentRequested, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: previousActivityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.SubagentRequestedV1{Call: protocol.SubagentCallV1{Task: "earlier durable child task"}, Manifest: previousManifest})},
+		{EventID: "previous-subagent-wait", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentWaiting, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: previousActivityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.SubagentWaitingV1{AttemptID: previousManifest.AttemptID, ChildSessionID: previousManifest.ChildSessionID})},
+		{EventID: "previous-subagent-attachment", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentResultAttached, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: previousActivityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.SubagentResultAttachedV1{AttemptID: previousManifest.AttemptID, ChildSessionID: previousManifest.ChildSessionID, TerminalCursor: previousReceipt.TerminalCursor, ReceiptDigest: previousReceiptDigest, ReceiptEvidenceID: "previous-receipt-evidence"})},
 		{EventID: "parent-activity", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventActivityStarted, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: activityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.ActivityOutcomeV1{Status: "started"})},
 		{EventID: "subagent-request", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentRequested, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: activityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.SubagentRequestedV1{Call: protocol.SubagentCallV1{Task: "durable child task"}, Manifest: manifest})},
 		{EventID: "subagent-wait", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentWaiting, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: activityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.SubagentWaitingV1{AttemptID: manifest.AttemptID, ChildSessionID: manifest.ChildSessionID})},
 	}
 
-	children := &restartRecoveryChildStore{workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}, selection: domain.ModelSelection{Profile: "provider-a", Model: "model-a"}, log: recoveryLog}
+	children := &restartRecoveryChildStore{
+		workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}, selection: domain.ModelSelection{Profile: "provider-a", Model: "model-a"}, log: recoveryLog,
+		inspections: map[protocol.SessionID]journal.Inspection{
+			previousManifest.ChildSessionID: childRecoveryInspection(previousManifest, previousReceipt),
+		},
+	}
 	var childStart StartTurnRequest
 	coordinator, err := NewSequentialChildCoordinator(children, restartRecoveryParent{children}, func(_ context.Context, got StartTurnRequest) (RunResult, error) {
 		children.runs++
@@ -380,9 +400,11 @@ func TestSubagentRecoveryCreatesReservedChildOnceAndContinuesParent(t *testing.T
 		t.Fatalf("recovery did not attach and terminalize parent: %v", flattenBatches(repository.appendRequests()))
 	}
 	var attachment protocol.SubagentResultAttachedV1
+	attachmentCount := 0
 	for _, request := range repository.appendRequests() {
 		for _, event := range request.Events {
 			if event.Kind == protocol.EventSubagentResultAttached {
+				attachmentCount++
 				if err := json.Unmarshal(event.Payload, &attachment); err != nil {
 					t.Fatal(err)
 				}
@@ -399,6 +421,9 @@ func TestSubagentRecoveryCreatesReservedChildOnceAndContinuesParent(t *testing.T
 	}
 	if attachment.AttemptID != manifest.AttemptID || attachment.ChildSessionID != manifest.ChildSessionID || attachment.TerminalCursor != committedReceipt.TerminalCursor || attachment.ReceiptDigest != receiptDigest || attachment.ReceiptEvidenceID == "" {
 		t.Fatalf("attachment=%+v receipt=%+v", attachment, committedReceipt)
+	}
+	if attachmentCount != 1 || children.inspectionCalls[previousManifest.ChildSessionID] != 1 {
+		t.Fatalf("earlier attempt replayed or was not proven: attachments=%d inspection_calls=%v", attachmentCount, children.inspectionCalls)
 	}
 	assertStrictTrace(t, recoveryLog.snapshot(),
 		"child.session.create",
@@ -427,13 +452,15 @@ func flattenBatches(requests []journal.AppendRequest) [][]string {
 }
 
 type restartRecoveryChildStore struct {
-	workspace  domain.Workspace
-	selection  domain.ModelSelection
-	created    protocol.SessionID
-	creates    int
-	runs       int
-	inspection journal.Inspection
-	log        *recordLog
+	workspace       domain.Workspace
+	selection       domain.ModelSelection
+	created         protocol.SessionID
+	creates         int
+	runs            int
+	inspection      journal.Inspection
+	inspections     map[protocol.SessionID]journal.Inspection
+	inspectionCalls map[protocol.SessionID]int
+	log             *recordLog
 }
 
 func (s *restartRecoveryChildStore) ReserveSessionID() (protocol.SessionID, error) {
@@ -455,10 +482,27 @@ func (s *restartRecoveryChildStore) CreateWithIdentity(_ context.Context, id pro
 	return domain.Session{ID: string(id), Workspace: workspace, Selection: selection}, nil
 }
 func (s *restartRecoveryChildStore) InspectSession(_ context.Context, id protocol.SessionID) (journal.Inspection, error) {
+	if s.inspectionCalls == nil {
+		s.inspectionCalls = make(map[protocol.SessionID]int)
+	}
+	s.inspectionCalls[id]++
+	if inspection, ok := s.inspections[id]; ok {
+		return protocol.DeepCopy(inspection), nil
+	}
 	if s.created == "" || id != s.created || s.inspection.Journal.ID == "" {
 		return journal.Inspection{}, journal.ErrSessionNotFound
 	}
 	return protocol.DeepCopy(s.inspection), nil
+}
+
+func childRecoveryInspection(manifest protocol.SubagentManifestV1, receipt protocol.SubagentReceiptV1) journal.Inspection {
+	return journal.Inspection{
+		Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(manifest.ChildSessionID)}, Head: receipt.TerminalCursor, Writable: true,
+		Events: []protocol.EventRecord{
+			{Envelope: protocol.EventEnvelope{SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1, JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(manifest.ChildSessionID), SessionID: manifest.ChildSessionID, EventID: protocol.EventID("manifest-" + manifest.AttemptID), Seq: 1, Time: time.Now().UTC(), Kind: protocol.EventSubagentManifest, TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID, TransactionID: "child-manifest", RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: mustCanonical(manifest)}},
+			{Envelope: protocol.EventEnvelope{SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1, JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(manifest.ChildSessionID), SessionID: manifest.ChildSessionID, EventID: protocol.EventID("receipt-" + manifest.AttemptID), Seq: receipt.TerminalCursor.CommitSeq, Time: time.Now().UTC(), Kind: protocol.EventSubagentReceipt, TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID, TransactionID: receipt.TerminalCursor.TransactionID, RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: mustCanonical(receipt)}},
+		},
+	}
 }
 
 type restartRecoveryParent struct{ store *restartRecoveryChildStore }
@@ -880,9 +924,36 @@ func TestRecoveryParentInspectionInfrastructureFailureRemainsRetryable(t *testin
 
 func TestRecoveryChildInspectionInfrastructureFailureRemainsRetryable(t *testing.T) {
 	continuation := &capturingFinalProvider{log: &recordLog{}, name: "must-not-run"}
-	service, request, repository, children, _ := recoveredParentFailureFixture(t, domain.ModelSelection{Profile: "provider-a", Model: "model-a"}, continuation)
+	service, request, repository, children, currentManifest := recoveredParentFailureFixture(t, domain.ModelSelection{Profile: "provider-a", Model: "model-a"}, continuation)
+	previousManifest := protocol.DeepCopy(currentManifest)
+	previousManifest.AttemptID = "previous-attempt"
+	previousManifest.ChildSessionID = "previous-child"
+	previousManifest.ChildTaskID = "previous-child-task"
+	previousManifest.ChildTurnID = "previous-child-turn"
+	previousManifest.ParentCursor = protocol.CommittedCursor{JournalKind: request.Storage.Journal.Kind, JournalID: request.Storage.Journal.ID, CommitSeq: 4, TransactionID: "previous-parent-provider"}
+	previousReceipt := childReceipt(previousManifest, "succeeded", "previous child completed", protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(previousManifest.ChildSessionID), CommitSeq: 2, TransactionID: "previous-child-terminal"}, unknownUsage(), nil, nil)
+	previousDigest, err := canonicaljson.Digest(previousReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentEvents := repository.events[request.Storage.Journal]
+	previousActivityID := protocol.ActivityID("previous-subagent-activity")
+	repository.events[request.Storage.Journal] = append(append(append([]protocol.ProposedEvent{}, currentEvents[:5]...),
+		protocol.ProposedEvent{EventID: "previous-request", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentRequested, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: previousActivityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.SubagentRequestedV1{Call: protocol.SubagentCallV1{Task: "previous child task"}, Manifest: previousManifest})},
+		protocol.ProposedEvent{EventID: "previous-wait", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentWaiting, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: previousActivityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.SubagentWaitingV1{AttemptID: previousManifest.AttemptID, ChildSessionID: previousManifest.ChildSessionID})},
+		protocol.ProposedEvent{EventID: "previous-attachment", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentResultAttached, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: previousActivityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.SubagentResultAttachedV1{AttemptID: previousManifest.AttemptID, ChildSessionID: previousManifest.ChildSessionID, TerminalCursor: previousReceipt.TerminalCursor, ReceiptDigest: previousDigest, ReceiptEvidenceID: "previous-evidence"})},
+	), currentEvents[5:]...)
+	recoveredHead := protocol.CommittedCursor{JournalKind: request.Storage.Journal.Kind, JournalID: request.Storage.Journal.ID, CommitSeq: 10, TransactionID: "recovered-multi-attempt-parent"}
+	repository.recovered, repository.result.Cursor, repository.heads[request.Storage.Journal] = recoveredHead, recoveredHead, recoveredHead
 	inspectionFault := errors.New("child inspection transient fault")
-	service.deps.ChildSessions = transientRecoveryChildStore{restartRecoveryChildStore: children, err: inspectionFault}
+	inspector := &scriptedRecoveryChildInspector{
+		restartRecoveryChildStore: children,
+		inspections: map[protocol.SessionID]journal.Inspection{
+			previousManifest.ChildSessionID: childRecoveryInspection(previousManifest, previousReceipt),
+		},
+		errors: map[protocol.SessionID]error{currentManifest.ChildSessionID: inspectionFault},
+	}
+	service.deps.ChildSessions = inspector
 
 	if _, err := service.RecoverTurn(context.Background(), request); !errors.Is(err, inspectionFault) {
 		t.Fatalf("infrastructure failure=%v want wrapped %v", err, inspectionFault)
@@ -902,6 +973,27 @@ func TestRecoveryChildInspectionInfrastructureFailureRemainsRetryable(t *testing
 	if projection.ActiveTurnID != "turn-original" || continuation.request.ModelID != "" {
 		t.Fatalf("parent active turn=%q continuation=%+v", projection.ActiveTurnID, continuation.request)
 	}
+	if !slices.Equal(inspector.calls, []protocol.SessionID{previousManifest.ChildSessionID, currentManifest.ChildSessionID}) {
+		t.Fatalf("multi-attempt inspection preflight order=%v", inspector.calls)
+	}
+}
+
+type scriptedRecoveryChildInspector struct {
+	*restartRecoveryChildStore
+	inspections map[protocol.SessionID]journal.Inspection
+	errors      map[protocol.SessionID]error
+	calls       []protocol.SessionID
+}
+
+func (s *scriptedRecoveryChildInspector) InspectSession(ctx context.Context, id protocol.SessionID) (journal.Inspection, error) {
+	s.calls = append(s.calls, id)
+	if err := s.errors[id]; err != nil {
+		return journal.Inspection{}, err
+	}
+	if inspection, ok := s.inspections[id]; ok {
+		return protocol.DeepCopy(inspection), nil
+	}
+	return s.restartRecoveryChildStore.InspectSession(ctx, id)
 }
 
 type transientRecoveryChildStore struct {

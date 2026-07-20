@@ -382,7 +382,17 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 	}
 	projector := receiptprojector.Projector{}
 	state := projector.Zero(request.Storage.Journal)
-	attachments := make([]protocol.EventRecord, 0)
+	type inspectedChild struct {
+		inspection journal.Inspection
+		absent     bool
+	}
+	inspectedChildren := make(map[protocol.DelegationAttemptID]inspectedChild)
+	attemptOrder := make([]protocol.DelegationAttemptID, 0)
+	manifests := make(map[protocol.DelegationAttemptID]protocol.SubagentManifestV1)
+
+	// Decode and inspect every reserved child before replay can perform any
+	// durable repair. An infrastructure failure on a later attempt therefore
+	// cannot leave an earlier attempt partially repaired.
 	for _, event := range parentEvents {
 		if event.Envelope.Kind != protocol.EventSubagentRequested && event.Envelope.Kind != protocol.EventSubagentWaiting && event.Envelope.Kind != protocol.EventSubagentResultAttached {
 			continue
@@ -390,38 +400,98 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 		if err := decodeSubagentRecoveryEvent(&event); err != nil {
 			return parentHead, false, false, err
 		}
-		// The child receipt lives in the child journal, so parent attachments
-		// must be projected after that exact receipt has been loaded.
-		if event.Envelope.Kind == protocol.EventSubagentResultAttached {
-			attachments = append(attachments, event)
+		if event.Envelope.Kind != protocol.EventSubagentRequested {
 			continue
+		}
+		payload, ok := event.Decoded.(*protocol.SubagentRequestedV1)
+		if !ok || payload.Validate() != nil || payload.Manifest.ParentSessionID != protocol.SessionID(request.Storage.Journal.ID) || payload.Manifest.ParentCursor.CommitSeq >= event.Envelope.Seq || event.Envelope.JournalKind != request.Storage.Journal.Kind || event.Envelope.JournalID != request.Storage.Journal.ID || event.Envelope.SessionID != payload.Manifest.ParentSessionID || event.Envelope.RuntimeGenerationID != payload.Manifest.RuntimeGenerationID || event.Envelope.TaskID == "" || event.Envelope.TurnID == "" {
+			return parentHead, false, false, fmt.Errorf("invalid subagent request during recovery preflight")
+		}
+		if _, exists := manifests[payload.Manifest.AttemptID]; !exists {
+			attemptOrder = append(attemptOrder, payload.Manifest.AttemptID)
+			manifests[payload.Manifest.AttemptID] = protocol.DeepCopy(payload.Manifest)
+		}
+	}
+	for _, attemptID := range attemptOrder {
+		manifest := manifests[attemptID]
+		child, inspectErr := s.deps.ChildSessions.InspectSession(ctx, manifest.ChildSessionID)
+		switch {
+		case inspectErr == nil:
+			inspectedChildren[attemptID] = inspectedChild{inspection: child}
+		case errors.Is(inspectErr, journal.ErrSessionNotFound):
+			inspectedChildren[attemptID] = inspectedChild{absent: true}
+		default:
+			return parentHead, false, false, fmt.Errorf("inspect sequential child session %q: %w", manifest.ChildSessionID, inspectErr)
+		}
+	}
+
+	// Replay the parent history in commit order. A durable parent attachment is
+	// accepted only after the exact receipt has been hydrated from its child
+	// journal at that historical boundary. This closes the previous attempt
+	// before the next request is projected without trusting parent data alone.
+	hydrated := make(map[protocol.DelegationAttemptID]bool)
+	hydrateReceipt := func(attemptID protocol.DelegationAttemptID) error {
+		if hydrated[attemptID] {
+			return nil
+		}
+		inspected, ok := inspectedChildren[attemptID]
+		if !ok || inspected.absent {
+			return fmt.Errorf("attached sequential child %q has no inspectable receipt", manifests[attemptID].ChildSessionID)
+		}
+		for _, childEvent := range inspected.inspection.Events {
+			if childEvent.Envelope.Kind != protocol.EventSubagentManifest && childEvent.Envelope.Kind != protocol.EventSubagentReceipt {
+				continue
+			}
+			if err := decodeSubagentRecoveryEvent(&childEvent); err != nil {
+				return err
+			}
+			var applyErr error
+			state, applyErr = projector.Apply(state, childEvent)
+			if applyErr != nil {
+				return fmt.Errorf("project child subagent recovery: %w", applyErr)
+			}
+		}
+		hydrated[attemptID] = true
+		return nil
+	}
+	for _, event := range parentEvents {
+		if event.Envelope.Kind != protocol.EventSubagentRequested && event.Envelope.Kind != protocol.EventSubagentWaiting && event.Envelope.Kind != protocol.EventSubagentResultAttached {
+			continue
+		}
+		if err := decodeSubagentRecoveryEvent(&event); err != nil {
+			return parentHead, false, false, err
+		}
+		if event.Envelope.Kind == protocol.EventSubagentResultAttached {
+			payload, ok := event.Decoded.(*protocol.SubagentResultAttachedV1)
+			if !ok {
+				return parentHead, false, false, fmt.Errorf("decoded subagent attachment has unexpected type")
+			}
+			if err := hydrateReceipt(payload.AttemptID); err != nil {
+				return parentHead, false, false, err
+			}
 		}
 		state, err = projector.Apply(state, event)
 		if err != nil {
 			return parentHead, false, false, fmt.Errorf("project parent subagent recovery: %w", err)
 		}
 	}
-	type inspectedChild struct {
-		inspection journal.Inspection
-		absent     bool
-	}
-	inspectedChildren := make(map[protocol.DelegationAttemptID]inspectedChild, len(state.Attempts))
-	for _, attempt := range state.Attempts {
+	// Hydrate only the currently unresolved attempt after historical parent
+	// replay. A terminal receipt must not close an attempt before its parent
+	// attachment appears in the committed order.
+	for _, attemptID := range attemptOrder {
+		attempt := state.Attempts[attemptID]
 		if attempt.State != receiptprojector.StateWaiting && attempt.State != receiptprojector.StateTerminal {
 			continue
 		}
-		child, inspectErr := s.deps.ChildSessions.InspectSession(ctx, attempt.Manifest.ChildSessionID)
-		switch {
-		case inspectErr == nil:
-			inspectedChildren[attempt.AttemptID] = inspectedChild{inspection: child}
-		case errors.Is(inspectErr, journal.ErrSessionNotFound):
-			inspectedChildren[attempt.AttemptID] = inspectedChild{absent: true}
-		default:
-			return parentHead, false, false, fmt.Errorf("inspect sequential child session %q: %w", attempt.Manifest.ChildSessionID, inspectErr)
+		if inspected := inspectedChildren[attemptID]; !inspected.absent {
+			if err := hydrateReceipt(attemptID); err != nil {
+				return parentHead, false, false, err
+			}
 		}
 	}
 	changed := false
-	for _, initial := range state.Attempts {
+	for _, attemptID := range attemptOrder {
+		initial := state.Attempts[attemptID]
 		if initial.State != receiptprojector.StateWaiting && initial.State != receiptprojector.StateTerminal {
 			continue
 		}
@@ -430,30 +500,7 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 		childState := receiptprojector.ChildRecoveryState{Exists: !inspected.absent, CommitKnown: inspected.absent || childInspectionCommitKnown(child)}
 		attempt := initial
 		if !inspected.absent {
-			for _, event := range child.Events {
-				if event.Envelope.Kind != protocol.EventSubagentManifest && event.Envelope.Kind != protocol.EventSubagentReceipt {
-					continue
-				}
-				if err := decodeSubagentRecoveryEvent(&event); err != nil {
-					return parentHead, changed, false, err
-				}
-				state, err = projector.Apply(state, event)
-				if err != nil {
-					return parentHead, changed, false, fmt.Errorf("project child subagent recovery: %w", err)
-				}
-			}
 			attempt = state.Attempts[initial.AttemptID]
-			for _, attachment := range attachments {
-				payload, ok := attachment.Decoded.(*protocol.SubagentResultAttachedV1)
-				if !ok || payload.AttemptID != initial.AttemptID {
-					continue
-				}
-				state, err = projector.Apply(state, attachment)
-				if err != nil {
-					return parentHead, changed, false, fmt.Errorf("project parent receipt attachment: %w", err)
-				}
-				attempt = state.Attempts[initial.AttemptID]
-			}
 			if attempt.Receipt == nil {
 				childProjection, projectionErr := s.deps.Projection.InspectRecovery(ctx, child.Journal, child.Head)
 				if projectionErr != nil {

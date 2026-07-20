@@ -194,3 +194,41 @@ go test -json ./... -count=1  PASS
 go vet ./internal/subagent ./internal/orchestrator ./internal/app  PASS
 git diff --check  PASS
 ```
+
+## Multi-attempt recovery closure
+
+- Parent subagent recovery now replays request, wait, and attachment records in
+  their committed historical order. At each attachment boundary it hydrates
+  the exact child manifest and receipt from the pre-inspected child journal,
+  validates the receipt cursor/digest through the production projector, and
+  only then closes that attempt. A later request is never projected while an
+  earlier attempt remains falsely active, and a parent attachment is never
+  trusted without its cross-journal receipt proof.
+- Every child named by the durable parent requests is inspected before any
+  recovery repair is written. A transient infrastructure failure on a later
+  attempt therefore leaves earlier and current attempts untouched and remains
+  retryable; only typed `ErrSessionNotFound` proves absence.
+- `TestSubagentRecoveryCreatesReservedChildOnceAndContinuesParent` is now a
+  two-attempt production-shaped restart fixture: an earlier receipt and exact
+  attachment precede the currently waiting attempt. It proves recovery does
+  not reattach, rerun, or resume the earlier child, creates/runs the reserved
+  current child exactly once, attaches its exact receipt, and continues the
+  parent exactly once.
+- `TestRecoveryChildInspectionInfrastructureFailureRemainsRetryable` now uses
+  the same historical multi-attempt shape with a terminal current child whose
+  inspection fails transiently. It proves deterministic preflight order, no
+  parent-journal mutation, and no continuation.
+
+TDD and final verification:
+
+```text
+RED: go test ./internal/orchestrator -run '^TestSubagentRecoveryCreatesReservedChildOnceAndContinuesParent$' -count=1
+     FAIL: project parent subagent recovery: parent already has an active subagent
+GREEN: same focused command  PASS
+go test ./internal/subagent ./internal/orchestrator ./internal/app -count=1  PASS
+go test -race ./internal/orchestrator -run '^(TestSubagentRecoveryCreatesReservedChildOnceAndContinuesParent|TestRecoveryChildInspectionInfrastructureFailureRemainsRetryable|TestRecoveryProviderContinuationFailureTerminalizesParentWithSubagentDiagnostic|TestRecoveryUnhealthyChildInspectionIsUncertainAndNeverResumed)$' -count=1  PASS
+go test -race ./internal/subagent ./internal/orchestrator ./internal/app -count=1  PASS
+go test ./... -count=1  PASS
+go vet ./...  PASS
+git diff --check  PASS
+```
