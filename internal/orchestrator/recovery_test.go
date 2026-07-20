@@ -17,6 +17,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/eventcodec"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	receiptprojector "github.com/muratmirgun/yordam/internal/subagent"
 	"github.com/muratmirgun/yordam/internal/tooling"
 )
 
@@ -407,7 +408,7 @@ func (r *recoveryRepository) ReadRange(_ context.Context, request journal.ReadRa
 		if start+index+1 == len(all) {
 			txn = r.heads[request.Journal].TransactionID
 		}
-		records[index] = protocol.EventRecord{Envelope: protocol.EventEnvelope{JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, SessionID: event.SessionID, Kind: event.Kind, Seq: uint64(start + index + 1), TransactionID: txn, Payload: event.Payload}}
+		records[index] = protocol.EventRecord{Envelope: protocol.EventEnvelope{JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, SessionID: event.SessionID, Kind: event.Kind, Seq: uint64(start + index + 1), TransactionID: txn, Payload: event.Payload, TaskID: event.TaskID, TurnID: event.TurnID, ActivityID: event.ActivityID, Actor: event.Actor, RuntimeGenerationID: event.RuntimeGenerationID}}
 	}
 	cursor := request.After
 	if end > start {
@@ -471,3 +472,27 @@ func (r *recoveryRepository) appendRequests() []journal.AppendRequest {
 func joinKinds(kinds []string) string { return strings.Join(kinds, ",") }
 
 var _ journal.Repository = (*recoveryRepository)(nil)
+
+func TestRecoveryReconstructsExactSubagentToolResultContinuation(t *testing.T) {
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "parent"}
+	head := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 2, TransactionID: "tail"}
+	repository := newRecoveryRepository(&recordLog{}, protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "control"}, protocol.CommittedCursor{}, ref, head, head)
+	intent := protocol.ToolUseBlock{CallID: "delegation-call", Alias: "subagent", Arguments: json.RawMessage(`{"task":"exact durable request"}`)}
+	commandID := protocol.CommandID("parent-command")
+	attempt := receiptprojector.Attempt{ParentTurnID: "parent-turn", ActivityID: protocol.ActivityID(stableID("activity", string(commandID), "subagent", intent.CallID))}
+	repository.events[ref] = []protocol.ProposedEvent{
+		{Kind: protocol.EventAssistantMessage, SessionID: "parent", TurnID: attempt.ParentTurnID, Payload: mustCanonical(protocol.AssistantMessageV1{ToolIntents: []protocol.ToolUseBlock{intent}})},
+		{Kind: protocol.EventProviderAttemptTerminal, SessionID: "parent", TurnID: attempt.ParentTurnID, Payload: mustCanonical(protocol.ProviderAttemptTerminalV1{Status: "completed"})},
+	}
+	service, err := NewService(Dependencies{Repository: repository, Lane: NewOperationLane()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, providerAttempt, err := service.recoverSubagentIntent(context.Background(), StartTurnRequest{SessionID: "parent", ExpectedHead: head, Command: CommandMetadata{CommandID: commandID}}, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, intent) || providerAttempt != 1 {
+		t.Fatalf("intent=%+v provider_attempt=%d", got, providerAttempt)
+	}
+}

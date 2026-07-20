@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/authorization"
@@ -671,6 +672,8 @@ func (s *Service) recoverSubagentIntent(ctx context.Context, request StartTurnRe
 		return protocol.ToolUseBlock{}, 0, err
 	}
 	providerAttempts := 0
+	var recovered protocol.ToolUseBlock
+	found := false
 	for _, event := range events {
 		if event.Envelope.TurnID != attempt.ParentTurnID {
 			continue
@@ -687,9 +690,15 @@ func (s *Service) recoverSubagentIntent(ctx context.Context, request StartTurnRe
 		}
 		for _, intent := range assistant.ToolIntents {
 			if protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "subagent", intent.CallID)) == attempt.ActivityID {
-				return intent, providerAttempts, nil
+				if found && !reflect.DeepEqual(recovered, intent) {
+					return protocol.ToolUseBlock{}, 0, fmt.Errorf("subagent recovery tool use is conflicting")
+				}
+				recovered, found = protocol.DeepCopy(intent), true
 			}
 		}
+	}
+	if found {
+		return recovered, providerAttempts, nil
 	}
 	return protocol.ToolUseBlock{}, 0, fmt.Errorf("subagent recovery assistant tool use is not reconstructible")
 }

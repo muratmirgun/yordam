@@ -99,3 +99,9 @@ complete package stream, so it is not claimed as a full-suite completion.
 Verification: `go test ./internal/session/jsonl ./internal/subagent
 ./internal/orchestrator ./internal/app -run 'Test(InspectMissingSessionReturnsTypedNotFound|.*Subagent.*Recover|.*Subagent.*Cancel|Recovery)' -count=1` — PASS;
 `git diff --check` — PASS.
+
+- `TestRecoveryReconstructsExactSubagentToolResultContinuation` verifies that
+  recovery finds the original assistant subagent tool use by its deterministic
+  activity binding and counts the already-terminal provider activity before
+  starting the authorized continuation (so the continuation cannot collide
+  with the prior provider activity ID).
