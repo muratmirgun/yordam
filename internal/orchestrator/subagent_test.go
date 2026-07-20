@@ -229,6 +229,87 @@ func TestRunTurnSubagentChildDepthRejectsHiddenDelegation(t *testing.T) {
 	}
 }
 
+func TestRunTurnSubagentChildToolCallLimitTerminalizesReceipt(t *testing.T) {
+	runtime := validRuntimeManifest(t, "observation")
+	runtime.Body.SkillCatalogRevision = "skills-a"
+	runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+	runtime.Body.Tools = append(runtime.Body.Tools, subagenttool.BuiltinDescriptor())
+	refreshRuntimeDigest(t, &runtime)
+	manifest := protocol.SubagentManifestV1{AttemptID: "cap", ParentSessionID: "parent", ParentCursor: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "parent", CommitSeq: 1, TransactionID: "p"}, ChildSessionID: "child", ChildTaskID: protocol.TaskID(stableID("task", "cap")), ChildTurnID: protocol.TurnID(stableID("turn", "cap")), RuntimeGenerationID: runtime.ID, SkillCatalogRevision: "skills-a", MaxToolCalls: 1, Deadline: time.Now().Add(time.Second)}
+	repo := &recordingRepository{head: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 1, TransactionID: "create"}}
+	service, err := NewService(Dependencies{Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repo, TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: &recordLog{}}, Providers: fakeProviderCatalog{log: &recordLog{}}, Provider: &twoToolThenFinalProvider{log: &recordLog{}}, Tools: noToolService{}, Authorization: &allowingAuthorization{log: &recordLog{}}, Evidence: noEvidenceRecorder{}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validStartTurnRequest()
+	request.Command.CommandID = "cap-command"
+	request.Command.IdempotencyKey = "cap-command"
+	request.Command.RequestDigest, _ = canonicaljson.Digest("cap")
+	request.SessionID = "child"
+	request.ExpectedHead = repo.head
+	request.Runtime = runtime
+	request.child = &childTurnConfig{manifest: manifest, exposure: mustChildExposure(t, runtime)}
+	if _, err := service.RunTurn(context.Background(), request); err == nil {
+		t.Fatal("child accepted two tool calls against max one")
+	}
+	receipt, ok := receiptFromRepo(repo)
+	if !ok || receipt.Status != "failed" {
+		t.Fatalf("receipt=%+v ok=%v", receipt, ok)
+	}
+}
+
+func TestRunTurnSubagentHardDenyPreventsChildReservation(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	request.Runtime.Body.SkillCatalogRevision = "skills-a"
+	request.Runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+	request.Runtime.Body.Tools = append(request.Runtime.Body.Tools, subagenttool.BuiltinDescriptor())
+	refreshRuntimeDigest(t, &request.Runtime)
+	log := &recordLog{}
+	repo := &recordingRepository{head: request.ExpectedHead, log: log}
+	child := protocol.SubagentManifestV1{AttemptID: "seed", ParentSessionID: request.SessionID, ParentCursor: request.ExpectedHead, ChildSessionID: "child", ChildTaskID: "child-task", ChildTurnID: "child-turn", RuntimeGenerationID: request.Runtime.ID, SkillCatalogRevision: "skills-a", MaxToolCalls: 1, Deadline: testSubagentDeadline()}
+	children := &subagentTestChildren{receipt: childReceipt(child, "succeeded", "done", protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 2, TransactionID: "t"}, unknownUsage(), nil, nil), workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}}
+	service, err := NewService(Dependencies{Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repo, TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &subagentTestProvider{log: log}, Tools: subagentPlanService{}, Authorization: denyingSubagentAuthorization{}, Evidence: recordingEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now), ChildSessions: children, ParentSessions: subagentParentInspector{children}, Children: subagentTestCoordinator{children: children, log: log}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); err == nil {
+		t.Fatal("hard deny unexpectedly succeeded")
+	}
+	if children.reservations != 0 {
+		t.Fatalf("deny reserved %d children", children.reservations)
+	}
+}
+
+type denyingSubagentAuthorization struct{}
+
+func (denyingSubagentAuthorization) Decide(_ context.Context, request protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error) {
+	return protocol.AuthorizationDecision{Request: request, Action: "deny", Scope: protocol.CanonicalAuthorizationScope{Capability: request.Action, Source: request.Source, Resources: request.Resources, Constraints: []protocol.AuthorizationConstraint{}}, Constraints: []protocol.AuthorizationConstraint{}, Lifetime: protocol.AuthorizationLifetimeOnce, PolicySource: "test", PolicyGeneration: request.PolicyGeneration, Reason: "hard deny", DecidedAt: time.Now().UTC(), PlanDigest: request.PlanDigest, DecisionNonce: "deny"}, nil
+}
+func (denyingSubagentAuthorization) ResolveInteractive(context.Context, protocol.AuthorizationRequest, protocol.AuthorizationDecision, protocol.ApprovalResponse) (protocol.AuthorizationDecision, error) {
+	return protocol.AuthorizationDecision{}, fmt.Errorf("unexpected")
+}
+func (denyingSubagentAuthorization) Issue(context.Context, authorization.CommitReference) (authorization.CommittedToken, error) {
+	return authorization.CommittedToken{}, fmt.Errorf("unexpected")
+}
+func (denyingSubagentAuthorization) Dispatch(context.Context, authorization.CommittedToken, authorization.DispatchBinding, func(context.Context) error) error {
+	return fmt.Errorf("unexpected")
+}
+
+func receiptFromRepo(repo *recordingRepository) (protocol.SubagentReceiptV1, bool) {
+	for _, request := range repo.appendRequests() {
+		for _, event := range request.Events {
+			if event.Kind == protocol.EventSubagentReceipt {
+				var receipt protocol.SubagentReceiptV1
+				if json.Unmarshal(event.Payload, &receipt) == nil {
+					return receipt, true
+				}
+			}
+		}
+	}
+	return protocol.SubagentReceiptV1{}, false
+}
+
 func mustChildExposure(t *testing.T, runtime protocol.RuntimeGenerationManifest) protocol.ToolExposure {
 	t.Helper()
 	exposure, err := derivedChildExposure(runtime)
