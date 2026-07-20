@@ -36,6 +36,7 @@ const (
 	traceEvidence    = "PRD-FR-03/04/05; Capability 3.2/3.4; Foundation 10; Acceptance 6.1"
 	traceCatalog     = "PRD-FR-06/07; Capability 3.3/3.5; Foundation 14-15"
 	traceApplication = "PRD-FR-02/03/10; Capability 3.9/4.3; Foundation 16; Acceptance 6.2"
+	traceSkills      = "Yordam v0.3 Skills; Acceptance 8"
 )
 
 func acceptFoundationMigration(t *testing.T) {
@@ -140,6 +141,12 @@ func acceptFoundationApplicationProtocol(t *testing.T) {
 	runFoundationGoTest(t, traceApplication, "./internal/tui", `^Test(DurableStateEventUpdatesStatusAndProjectsOpenedSession|DurableReplayRendersRecoveryReadOnlyToolsAndTerminalState|ConfiguredSecretPromptIsRedactedBeforeConversationRendering)$`)
 	assertSyntheticSecretSplit(t)
 	assertApplicationConsumerEquivalence(t)
+}
+
+func acceptFoundationSkills(t *testing.T) {
+	t.Logf("trace=%s", traceSkills)
+	runFoundationGoTest(t, traceSkills, "./internal/skills", `^Test(Discover|Build|ProjectCatalogDigest|TrustProjector)`)
+	runFoundationGoTest(t, traceSkills, "./internal/tools/skill", `^Test(Prepare|Execute|Tool)`)
 }
 
 func runFoundationGoTest(t *testing.T, trace, pkg, pattern string) {

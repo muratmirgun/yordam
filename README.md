@@ -122,6 +122,7 @@ Each run creates a session by default. Common startup options are:
 | `/mode` | Choose `safe`, `ask`, or `auto`. |
 | `/model` | Choose a configured profile and model. |
 | `/reload` | Validate and apply `~/.config/yordam/config.jsonc`. |
+| `/skills` | Inspect frozen skill metadata and decide a project catalog when policy is `ask`. |
 | `/compact` | Compact older conversation context. |
 | `/help` | Show commands and keybindings. |
 | `/quit` | Exit, confirming first if a turn is active. |
@@ -152,6 +153,28 @@ Summary evidence is a derived aid for rebuilding context, not a replacement for
 the original journal evidence. If compaction is cancelled, its final durable
 state reports cancellation. If the journal cannot prove whether a final commit
 was recorded, Yordam reports an uncertain outcome rather than guessing.
+
+## Filesystem skills
+
+Global skills live at `~/.config/yordam/skills/<name>/SKILL.md`; project skills
+live at `.yordam/skills/<name>/SKILL.md` below the canonical workspace. Names
+use lowercase ASCII letters, digits, and single hyphens. Each file is UTF-8
+Markdown with exactly `name` and `description` frontmatter fields, a nonempty
+body, and a 128 KiB limit. Symlinked roots, directories, and files are rejected.
+
+Global skills are active user-managed input. Project `skills.projectPolicy` is
+`ask` by default, with `allow` and `deny` alternatives. Under `ask`, `/skills`
+records an allow/deny decision bound to the exact canonical workspace and
+project catalog digest; an edit makes trust stale. A trusted project skill
+shadows a same-name global skill, while `/skills` displays both.
+
+Provider context initially receives metadata only. Full content is available
+only when the model explicitly calls the read-only `skill` tool with an active
+canonical name; it accepts no path and is not a file reader. Reload validates a
+new generation, so changed files affect future turns only. Parent-to-child
+handoff uses that frozen catalog snapshot, never child filesystem discovery.
+Skill text is untrusted context: it cannot install hooks or URLs, execute code,
+change policy, reveal credentials, or bypass normal permission approval.
 
 ## Session locations
 
