@@ -150,3 +150,50 @@ func TestSchemaContextParity(t *testing.T) {
 		})
 	}
 }
+
+func TestSchemaSubagentParity(t *testing.T) {
+	compiler := jsonschema.NewCompiler()
+	schema, err := compiler.Compile(filepath.Join("..", "..", "schema", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name         string
+		body         string
+		schemaValid  bool
+		runtimeValid bool
+	}{
+		{name: "defaults", body: validConfig, schemaValid: true, runtimeValid: true},
+		{name: "enabled bounds", body: withSubagents(validConfig, `{"enabled": true, "maxPerTurn": 4, "maxToolCalls": 64, "timeoutSeconds": 1800}`), schemaValid: true, runtimeValid: true},
+		{name: "disabled bounds", body: withSubagents(validConfig, `{"enabled": false, "maxPerTurn": 1, "maxToolCalls": 1, "timeoutSeconds": 1}`), schemaValid: true, runtimeValid: true},
+		{name: "unknown", body: withSubagents(validConfig, `{"extra": true}`)},
+		{name: "null", body: withSubagents(validConfig, `null`)},
+		{name: "wrong type", body: withSubagents(validConfig, `{"enabled": "true"}`)},
+		{name: "max per turn low", body: withSubagents(validConfig, `{"maxPerTurn": 0}`)},
+		{name: "max per turn high", body: withSubagents(validConfig, `{"maxPerTurn": 5}`)},
+		{name: "tool calls low", body: withSubagents(validConfig, `{"maxToolCalls": 0}`)},
+		{name: "tool calls high", body: withSubagents(validConfig, `{"maxToolCalls": 65}`)},
+		{name: "timeout low", body: withSubagents(validConfig, `{"timeoutSeconds": 0}`)},
+		{name: "timeout high", body: withSubagents(validConfig, `{"timeoutSeconds": 1801}`)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value, err := hujson.Parse([]byte(test.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			value.Standardize()
+			var instance any
+			if err := json.Unmarshal(value.Pack(), &instance); err != nil {
+				t.Fatal(err)
+			}
+			if err := schema.Validate(instance); (err == nil) != test.schemaValid {
+				t.Fatalf("schema error=%v want valid=%t", err, test.schemaValid)
+			}
+			_, runtimeErr := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, test.body)})
+			if (runtimeErr == nil) != test.runtimeValid {
+				t.Fatalf("runtime error=%v want valid=%t", runtimeErr, test.runtimeValid)
+			}
+		})
+	}
+}

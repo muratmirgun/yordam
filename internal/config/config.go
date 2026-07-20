@@ -24,6 +24,8 @@ const (
 	reservedModelID            = "your-model-id"
 )
 
+var defaultSubagentConfig = SubagentConfig{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 16, TimeoutSeconds: 600}
+
 type Profile struct {
 	Name                string
 	BaseURL             string
@@ -50,6 +52,13 @@ type SkillConfig struct {
 	ProjectPolicy ProjectSkillPolicy
 }
 
+type SubagentConfig struct {
+	Enabled        bool
+	MaxPerTurn     int
+	MaxToolCalls   int
+	TimeoutSeconds int
+}
+
 type Config struct {
 	ActiveProfile       string
 	Profiles            map[string]Profile
@@ -57,6 +66,7 @@ type Config struct {
 	ShellTimeoutSeconds int
 	Context             ContextConfig
 	Skills              SkillConfig
+	Subagents           SubagentConfig
 	raw                 []byte
 	lookupEnv           func(string) (string, bool)
 }
@@ -84,12 +94,13 @@ type ResolvedProfile struct {
 }
 
 type document struct {
-	Schema   string                      `json:"$schema,omitempty"`
-	Model    string                      `json:"model"`
-	Provider map[string]documentProvider `json:"provider"`
-	Limits   documentLimits              `json:"limits,omitempty"`
-	Context  documentContext             `json:"context,omitempty"`
-	Skills   documentSkills              `json:"skills,omitempty"`
+	Schema    string                      `json:"$schema,omitempty"`
+	Model     string                      `json:"model"`
+	Provider  map[string]documentProvider `json:"provider"`
+	Limits    documentLimits              `json:"limits,omitempty"`
+	Context   documentContext             `json:"context,omitempty"`
+	Skills    documentSkills              `json:"skills,omitempty"`
+	Subagents documentSubagents           `json:"subagents,omitempty"`
 }
 
 type documentProvider struct {
@@ -122,8 +133,15 @@ type documentSkills struct {
 	ProjectPolicy *ProjectSkillPolicy `json:"projectPolicy,omitempty"`
 }
 
+type documentSubagents struct {
+	Enabled        *bool `json:"enabled,omitempty"`
+	MaxPerTurn     *int  `json:"maxPerTurn,omitempty"`
+	MaxToolCalls   *int  `json:"maxToolCalls,omitempty"`
+	TimeoutSeconds *int  `json:"timeoutSeconds,omitempty"`
+}
+
 func (d *document) UnmarshalJSON(data []byte) error {
-	fields, err := decodeExactObject(data, "$schema", "model", "provider", "limits", "context", "skills")
+	fields, err := decodeExactObject(data, "$schema", "model", "provider", "limits", "context", "skills", "subagents")
 	if err != nil {
 		return err
 	}
@@ -143,7 +161,10 @@ func (d *document) UnmarshalJSON(data []byte) error {
 	if err := decodeField(fields, "context", &d.Context); err != nil {
 		return err
 	}
-	return decodeField(fields, "skills", &d.Skills)
+	if err := decodeField(fields, "skills", &d.Skills); err != nil {
+		return err
+	}
+	return decodeField(fields, "subagents", &d.Subagents)
 }
 
 func (d *documentProvider) UnmarshalJSON(data []byte) error {
@@ -254,6 +275,43 @@ func (d *documentSkills) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (d *documentSubagents) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "enabled", "maxPerTurn", "maxToolCalls", "timeoutSeconds")
+	if err != nil {
+		return err
+	}
+	*d = documentSubagents{}
+	if _, ok := fields["enabled"]; ok {
+		var value bool
+		if err := decodeField(fields, "enabled", &value); err != nil {
+			return err
+		}
+		d.Enabled = &value
+	}
+	if _, ok := fields["maxPerTurn"]; ok {
+		var value int
+		if err := decodeField(fields, "maxPerTurn", &value); err != nil {
+			return err
+		}
+		d.MaxPerTurn = &value
+	}
+	if _, ok := fields["maxToolCalls"]; ok {
+		var value int
+		if err := decodeField(fields, "maxToolCalls", &value); err != nil {
+			return err
+		}
+		d.MaxToolCalls = &value
+	}
+	if _, ok := fields["timeoutSeconds"]; ok {
+		var value int
+		if err := decodeField(fields, "timeoutSeconds", &value); err != nil {
+			return err
+		}
+		d.TimeoutSeconds = &value
+	}
+	return nil
+}
+
 func decodeExactObject(data []byte, allowed ...string) (map[string]json.RawMessage, error) {
 	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
 		return nil, fmt.Errorf("object must not be null")
@@ -345,6 +403,7 @@ func normalizeDocument(decoded document) (Config, error) {
 		ShellTimeoutSeconds: defaultShellTimeoutSeconds,
 		Context:             ContextConfig{AutoCompact: true},
 		Skills:              SkillConfig{ProjectPolicy: ProjectSkillsAsk},
+		Subagents:           defaultSubagentConfig,
 	}
 	if decoded.Limits.MaxToolCalls != nil {
 		cfg.MaxToolCalls = *decoded.Limits.MaxToolCalls
@@ -358,6 +417,18 @@ func normalizeDocument(decoded document) (Config, error) {
 	cfg.Context.CompactReserveTokens = cloneInt64(decoded.Context.CompactReserveTokens)
 	if decoded.Skills.ProjectPolicy != nil {
 		cfg.Skills.ProjectPolicy = *decoded.Skills.ProjectPolicy
+	}
+	if decoded.Subagents.Enabled != nil {
+		cfg.Subagents.Enabled = *decoded.Subagents.Enabled
+	}
+	if decoded.Subagents.MaxPerTurn != nil {
+		cfg.Subagents.MaxPerTurn = *decoded.Subagents.MaxPerTurn
+	}
+	if decoded.Subagents.MaxToolCalls != nil {
+		cfg.Subagents.MaxToolCalls = *decoded.Subagents.MaxToolCalls
+	}
+	if decoded.Subagents.TimeoutSeconds != nil {
+		cfg.Subagents.TimeoutSeconds = *decoded.Subagents.TimeoutSeconds
 	}
 	for id, provider := range decoded.Provider {
 		if id == "" {
@@ -415,6 +486,15 @@ func (c Config) Validate() error {
 	}
 	if c.Skills.ProjectPolicy != ProjectSkillsAsk && c.Skills.ProjectPolicy != ProjectSkillsAllow && c.Skills.ProjectPolicy != ProjectSkillsDeny {
 		return fmt.Errorf("projectPolicy must be ask, allow, or deny")
+	}
+	if c.Subagents.MaxPerTurn < 1 || c.Subagents.MaxPerTurn > 4 {
+		return fmt.Errorf("maxPerTurn must be 1..4")
+	}
+	if c.Subagents.MaxToolCalls < 1 || c.Subagents.MaxToolCalls > 64 {
+		return fmt.Errorf("subagent maxToolCalls must be 1..64")
+	}
+	if c.Subagents.TimeoutSeconds < 1 || c.Subagents.TimeoutSeconds > 1800 {
+		return fmt.Errorf("subagent timeoutSeconds must be 1..1800")
 	}
 	profile, ok := c.Profiles[c.ActiveProfile]
 	if !ok {

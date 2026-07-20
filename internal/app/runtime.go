@@ -88,10 +88,11 @@ func (s RuntimeSet) Validate() error {
 	if err := canonicaljson.ValidateDigest(s.Manifest.Body, s.Manifest.Digest); err != nil {
 		return fmt.Errorf("runtime generation manifest: %w", err)
 	}
-	if len(s.Manifest.Body.Models) == 0 || s.Manifest.Body.Limits.MaxToolCalls < 1 || s.Manifest.Body.Limits.MaxToolCalls > 128 || s.Manifest.Body.Limits.ShellTimeoutNanos <= 0 || s.Manifest.Body.Limits.ApplicationQueueCapacity <= 0 {
+	limits := s.Manifest.Body.Limits
+	if len(s.Manifest.Body.Models) == 0 || limits.MaxToolCalls < 1 || limits.MaxToolCalls > 128 || limits.ShellTimeoutNanos <= 0 || limits.ApplicationQueueCapacity <= 0 || limits.Subagents.MaxPerTurn < 1 || limits.Subagents.MaxPerTurn > 4 || limits.Subagents.MaxToolCalls < 1 || limits.Subagents.MaxToolCalls > 64 || limits.Subagents.TimeoutNanos <= 0 || limits.Subagents.TimeoutNanos > int64(1800*time.Second) {
 		return fmt.Errorf("runtime generation manifest limits or models are invalid")
 	}
-	reserve := s.Manifest.Body.Limits.CompactReserveTokens
+	reserve := limits.CompactReserveTokens
 	if err := reserve.Validate(); err != nil || (reserve.State != protocol.ValueKnown && reserve.State != protocol.ValueUnknown) || (reserve.State == protocol.ValueKnown && reserve.Value <= 0) {
 		return fmt.Errorf("runtime generation compact reserve is invalid")
 	}
@@ -427,7 +428,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		ExecutionProfiles:       []string{"network", "restricted", "unsandboxed"},
 		Limits: protocol.RuntimeLimits{
 			MaxToolCalls: effectiveMaxToolCalls(cfg, b.cli), ShellTimeoutNanos: int64(effectiveShellTimeout(cfg, b.cli)), ApplicationQueueCapacity: 64,
-			AutoCompact: cfg.Context.AutoCompact, CompactReserveTokens: runtimeCompactReserve(cfg),
+			AutoCompact: cfg.Context.AutoCompact, CompactReserveTokens: runtimeCompactReserve(cfg), Subagents: runtimeSubagentLimits(cfg),
 		},
 	}
 	manifestDigest, err := canonicaljson.Digest(body)

@@ -83,6 +83,15 @@ func runtimeCompactReserve(cfg config.Config) protocol.ValueInt64 {
 	return protocol.ValueInt64{State: protocol.ValueKnown, Value: *cfg.Context.CompactReserveTokens, Provenance: "configured"}
 }
 
+func runtimeSubagentLimits(cfg config.Config) protocol.SubagentLimits {
+	return protocol.SubagentLimits{
+		Enabled:      cfg.Subagents.Enabled,
+		MaxPerTurn:   cfg.Subagents.MaxPerTurn,
+		MaxToolCalls: cfg.Subagents.MaxToolCalls,
+		TimeoutNanos: int64(time.Duration(cfg.Subagents.TimeoutSeconds) * time.Second),
+	}
+}
+
 func runtimeCompactionMetadata(sessionID protocol.SessionID, head protocol.CommittedCursor, generation protocol.RuntimeGenerationID) (orchestrator.CommandMetadata, error) {
 	identity, err := canonicaljson.Digest(struct {
 		SessionID  protocol.SessionID           `json:"session_id"`

@@ -21,7 +21,8 @@
     },
     "limits": {"$ref": "#/$defs/limits"},
     "context": {"$ref": "#/$defs/context"},
-    "skills": {"$ref": "#/$defs/skills"}
+    "skills": {"$ref": "#/$defs/skills"},
+    "subagents": {"$ref": "#/$defs/subagents"}
   },
   "$defs": {
     "provider": {
@@ -82,6 +83,16 @@
       "additionalProperties": false,
       "properties": {
         "projectPolicy": {"type": "string", "enum": ["ask", "allow", "deny"], "default": "ask"}
+      }
+    },
+    "subagents": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "default": true},
+        "maxPerTurn": {"type": "integer", "minimum": 1, "maximum": 4, "default": 4},
+        "maxToolCalls": {"type": "integer", "minimum": 1, "maximum": 64, "default": 16},
+        "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 1800, "default": 600}
       }
     }
   }

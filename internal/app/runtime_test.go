@@ -938,6 +938,55 @@ func TestRuntimeBuilderProjectsCompactionPolicyIntoImmutableManifest(t *testing.
 	}
 }
 
+func TestRuntimeBuilderBindsSubagentLimitsIntoManifestDigest(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Subagents = config.SubagentConfig{Enabled: false, MaxPerTurn: 3, MaxToolCalls: 12, TimeoutSeconds: 300}
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := protocol.SubagentLimits{Enabled: false, MaxPerTurn: 3, MaxToolCalls: 12, TimeoutNanos: int64(300 * time.Second)}
+	if got := set.Manifest.Body.Limits.Subagents; got != want {
+		t.Fatalf("subagent limits=%+v want=%+v", got, want)
+	}
+	canonical, err := canonicaljson.Digest(set.Manifest.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.Manifest.Digest != canonical {
+		t.Fatalf("manifest digest=%+v want=%+v", set.Manifest.Digest, canonical)
+	}
+
+	cfg.Subagents.Enabled = true
+	changedBuilder := newRuntimeBuilderForTest(t, nil)
+	changed, err := changedBuilder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Manifest.Digest == set.Manifest.Digest {
+		t.Fatal("subagent configuration did not affect manifest digest")
+	}
+}
+
+func TestRuntimeSetRejectsInvalidSubagentLimits(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.Manifest.Body.Limits.Subagents.MaxPerTurn = 0
+	set.Manifest.Digest, err = canonicaljson.Digest(set.Manifest.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := set.Validate(); err == nil {
+		t.Fatal("invalid subagent limits accepted")
+	}
+}
+
 func TestProductionCompactProtocolCommandUsesRuntimeCompactionService(t *testing.T) {
 	t.Setenv("PRIMARY_KEY", "primary-secret")
 	builder := newRuntimeBuilderForTest(t, nil)

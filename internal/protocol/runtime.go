@@ -1,11 +1,19 @@
 package protocol
 
 type RuntimeLimits struct {
-	MaxToolCalls             int        `json:"max_tool_calls"`
-	ShellTimeoutNanos        int64      `json:"shell_timeout_nanos"`
-	ApplicationQueueCapacity int        `json:"application_queue_capacity"`
-	AutoCompact              bool       `json:"auto_compact"`
-	CompactReserveTokens     ValueInt64 `json:"compact_reserve_tokens"`
+	MaxToolCalls             int            `json:"max_tool_calls"`
+	ShellTimeoutNanos        int64          `json:"shell_timeout_nanos"`
+	ApplicationQueueCapacity int            `json:"application_queue_capacity"`
+	AutoCompact              bool           `json:"auto_compact"`
+	CompactReserveTokens     ValueInt64     `json:"compact_reserve_tokens"`
+	Subagents                SubagentLimits `json:"subagents"`
+}
+
+type SubagentLimits struct {
+	Enabled      bool  `json:"enabled"`
+	MaxPerTurn   int   `json:"max_per_turn"`
+	MaxToolCalls int   `json:"max_tool_calls"`
+	TimeoutNanos int64 `json:"timeout_nanos"`
 }
 
 type RuntimeGenerationBody struct {

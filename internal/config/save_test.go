@@ -40,6 +40,8 @@ func TestEnsureGlobalCreatesSecureEnvironmentOnlyTemplate(t *testing.T) {
 		`// Format: provider/model`,
 		`// Project skills may come from the repository and need your trust.`,
 		`// Omit projectPolicy to ask before using project skills.`,
+		`// Enable sequential subagents for bounded delegated work.`,
+		`// maxPerTurn, maxToolCalls, and timeoutSeconds remain enforced when disabled.`,
 	} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("template missing %q:\n%s", want, raw)
@@ -85,7 +87,7 @@ func TestSaveGlobalWritesStrictJSONAndRoundTrips(t *testing.T) {
 	}
 	if loaded.DefaultSelection() != (domain.ModelSelection{Profile: "primary", Model: "model-a"}) ||
 		!slices.Equal(loaded.Models(), []domain.ModelSelection{{Profile: "primary", Model: "model-a"}, {Profile: "primary", Model: "model-b"}}) ||
-		loaded.MaxToolCalls != 64 || loaded.ShellTimeoutSeconds != 300 || !loaded.Context.AutoCompact || loaded.Context.CompactReserveTokens == nil || *loaded.Context.CompactReserveTokens != 8192 || loaded.Profiles["primary"].ModelContextWindows["model-a"] != 128000 {
+		loaded.MaxToolCalls != 64 || loaded.ShellTimeoutSeconds != 300 || loaded.Subagents != (config.SubagentConfig{Enabled: true, MaxPerTurn: 3, MaxToolCalls: 12, TimeoutSeconds: 300}) || !loaded.Context.AutoCompact || loaded.Context.CompactReserveTokens == nil || *loaded.Context.CompactReserveTokens != 8192 || loaded.Profiles["primary"].ModelContextWindows["model-a"] != 128000 {
 		t.Fatalf("round-tripped config=%+v models=%v", loaded, loaded.Models())
 	}
 	resolved, err := loaded.Resolve(config.ResolveOptions{})
@@ -107,6 +109,23 @@ func TestSaveGlobalDefaultsOmittedProjectPolicyToAsk(t *testing.T) {
 	}
 	if loaded.Skills.ProjectPolicy != config.ProjectSkillsAsk {
 		t.Fatalf("project policy=%q want ask", loaded.Skills.ProjectPolicy)
+	}
+}
+
+func TestSaveGlobalDefaultsOmittedSubagentConfiguration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.jsonc")
+	cfg := savedConfig()
+	cfg.Subagents = config.SubagentConfig{}
+	if err := config.SaveGlobal(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(config.LoadOptions{ConfigPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := config.SubagentConfig{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 16, TimeoutSeconds: 600}
+	if loaded.Subagents != want {
+		t.Fatalf("subagents=%+v want=%+v", loaded.Subagents, want)
 	}
 }
 
@@ -232,6 +251,7 @@ func savedConfig() config.Config {
 		},
 		MaxToolCalls:        64,
 		ShellTimeoutSeconds: 300,
+		Subagents:           config.SubagentConfig{Enabled: true, MaxPerTurn: 3, MaxToolCalls: 12, TimeoutSeconds: 300},
 		Context:             config.ContextConfig{AutoCompact: true, CompactReserveTokens: &reserve},
 		Skills:              config.SkillConfig{ProjectPolicy: config.ProjectSkillsAsk},
 	}

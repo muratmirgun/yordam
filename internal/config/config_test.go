@@ -50,6 +50,10 @@ const (
 	exactConfig         = `{"$schema":"` + config.SchemaURL + `","model":"primary/model-a","provider":` + exactProviderMap + `,"limits":` + exactLimitsObject + `}`
 )
 
+func withSubagents(body, subagents string) string {
+	return strings.Replace(body, "\n}", "\n  \"subagents\": "+subagents+"\n}", 1)
+}
+
 func TestLoadJSONCAndResolveProvider(t *testing.T) {
 	path := writeConfig(t, validConfig)
 	t.Setenv("PRIMARY_KEY", "secret-value")
@@ -122,6 +126,60 @@ func TestLoadAppliesDefaultsOnlyToOmittedLimits(t *testing.T) {
 	}
 	if cfg.MaxToolCalls != 32 || cfg.ShellTimeoutSeconds != 120 {
 		t.Fatalf("limits=%d/%d", cfg.MaxToolCalls, cfg.ShellTimeoutSeconds)
+	}
+}
+
+func TestLoadSubagentDefaultsAndExplicitDisable(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want config.SubagentConfig
+	}{
+		{name: "omitted", body: validConfig, want: config.SubagentConfig{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 16, TimeoutSeconds: 600}},
+		{name: "disabled", body: withSubagents(validConfig, `{"enabled": false, "maxPerTurn": 4, "maxToolCalls": 16, "timeoutSeconds": 600}`), want: config.SubagentConfig{Enabled: false, MaxPerTurn: 4, MaxToolCalls: 16, TimeoutSeconds: 600}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, test.body)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Subagents != test.want {
+				t.Fatalf("subagents=%+v want=%+v", cfg.Subagents, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidSubagentConfiguration(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "unknown field", body: withSubagents(validConfig, `{"extra": true}`), want: `unknown field "extra"`},
+		{name: "null object", body: withSubagents(validConfig, `null`), want: "subagents must not be null"},
+		{name: "null enabled", body: withSubagents(validConfig, `{"enabled": null}`), want: "enabled must not be null"},
+		{name: "null max per turn", body: withSubagents(validConfig, `{"maxPerTurn": null}`), want: "maxPerTurn must not be null"},
+		{name: "null max tool calls", body: withSubagents(validConfig, `{"maxToolCalls": null}`), want: "maxToolCalls must not be null"},
+		{name: "null timeout", body: withSubagents(validConfig, `{"timeoutSeconds": null}`), want: "timeoutSeconds must not be null"},
+		{name: "wrong type", body: withSubagents(validConfig, `{"enabled": "true"}`), want: "cannot unmarshal string into Go value of type bool"},
+		{name: "below max per turn", body: withSubagents(validConfig, `{"enabled": false, "maxPerTurn": 0}`), want: "maxPerTurn must be 1..4"},
+		{name: "above max per turn", body: withSubagents(validConfig, `{"enabled": false, "maxPerTurn": 5}`), want: "maxPerTurn must be 1..4"},
+		{name: "below max tool calls", body: withSubagents(validConfig, `{"enabled": false, "maxToolCalls": 0}`), want: "subagent maxToolCalls must be 1..64"},
+		{name: "above max tool calls", body: withSubagents(validConfig, `{"enabled": false, "maxToolCalls": 65}`), want: "subagent maxToolCalls must be 1..64"},
+		{name: "below timeout", body: withSubagents(validConfig, `{"enabled": false, "timeoutSeconds": 0}`), want: "subagent timeoutSeconds must be 1..1800"},
+		{name: "above timeout", body: withSubagents(validConfig, `{"enabled": false, "timeoutSeconds": 1801}`), want: "subagent timeoutSeconds must be 1..1800"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := config.Load(config.LoadOptions{ConfigPath: writeConfig(t, test.body)})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error=%v want containing %q", err, test.want)
+			}
+		})
 	}
 }
 

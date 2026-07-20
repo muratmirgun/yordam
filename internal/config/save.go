@@ -52,6 +52,15 @@ var defaultTemplate = []byte(`{
     // Supported values: ask, allow, deny.
   },
 
+  "subagents": {
+    // Enable sequential subagents for bounded delegated work.
+    "enabled": true,
+    // maxPerTurn, maxToolCalls, and timeoutSeconds remain enforced when disabled.
+    "maxPerTurn": 4,
+    "maxToolCalls": 16,
+    "timeoutSeconds": 600
+  },
+
   "limits": {
     "maxToolCalls": 32,
     "shellTimeoutSeconds": 120
@@ -133,6 +142,9 @@ func SaveGlobal(path string, cfg Config) (err error) {
 	if cfg.Skills.ProjectPolicy == "" {
 		cfg.Skills.ProjectPolicy = ProjectSkillsAsk
 	}
+	if cfg.Subagents == (SubagentConfig{}) {
+		cfg.Subagents = defaultSubagentConfig
+	}
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -200,6 +212,10 @@ func marshalConfig(cfg Config) ([]byte, error) {
 			CompactReserveTokens: cloneInt64(cfg.Context.CompactReserveTokens),
 		},
 		Skills: documentSkills{ProjectPolicy: projectSkillPolicyPointer(cfg.Skills.ProjectPolicy)},
+		Subagents: documentSubagents{
+			Enabled: boolPointer(cfg.Subagents.Enabled), MaxPerTurn: intPointer(cfg.Subagents.MaxPerTurn),
+			MaxToolCalls: intPointer(cfg.Subagents.MaxToolCalls), TimeoutSeconds: intPointer(cfg.Subagents.TimeoutSeconds),
+		},
 	}
 	for name, profile := range cfg.Profiles {
 		models := make(map[string]documentModel, len(profile.Models))
@@ -222,6 +238,8 @@ func marshalConfig(cfg Config) ([]byte, error) {
 }
 
 func boolPointer(value bool) *bool { return &value }
+
+func intPointer(value int) *int { return &value }
 
 func projectSkillPolicyPointer(value ProjectSkillPolicy) *ProjectSkillPolicy { return &value }
 
