@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -690,6 +691,70 @@ func TestSequentialChildCoordinatorCancellationReadsCancelledReceipt(t *testing.
 	if receipt.Status != "cancelled" {
 		t.Fatalf("receipt=%+v", receipt)
 	}
+}
+
+func TestSubagentCancelDuringChildProviderStreamCommitsOneCancelledReceipt(t *testing.T) {
+	parent := validStartTurnRequest()
+	parent.Runtime = validRuntimeManifest(t, "observation")
+	parent.Runtime.Body.SkillCatalogRevision = "skills-a"
+	parent.Runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+	parent.Runtime.Body.Tools = append(parent.Runtime.Body.Tools, subagenttool.BuiltinDescriptor())
+	refreshRuntimeDigest(t, &parent.Runtime)
+	manifest := protocol.SubagentManifestV1{AttemptID: "stream-cancel", ParentSessionID: parent.SessionID, ParentCursor: parent.ExpectedHead, ChildSessionID: "child-stream", ChildTaskID: "child-task", ChildTurnID: "child-turn", RuntimeGenerationID: parent.Runtime.ID, SkillCatalogRevision: "skills-a", MaxToolCalls: 1, Deadline: time.Now().Add(time.Minute)}
+	exposure, err := derivedChildExposure(parent.Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := &recordLog{}
+	repository := &recordingRepository{head: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(manifest.ChildSessionID), CommitSeq: 1, TransactionID: "create"}, log: log}
+	provider := &blockingChildProvider{started: make(chan struct{}), cancelled: make(chan struct{})}
+	service, err := NewService(Dependencies{Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository, TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: provider, Tools: noToolService{}, Authorization: &allowingAuthorization{log: log}, Evidence: noEvidenceRecorder{}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := protocol.DeepCopy(parent)
+	child.SessionID, child.ExpectedHead, child.Prompt = manifest.ChildSessionID, repository.head, "child"
+	child.child = &childTurnConfig{manifest: manifest, exposure: exposure}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, runErr := service.RunTurn(ctx, child); done <- runErr }()
+	<-provider.started
+	cancel()
+	if runErr := <-done; !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("run error=%v", runErr)
+	}
+	<-provider.cancelled
+	receipt, ok := receiptFromRepo(repository)
+	// A provider activity has crossed its durable start boundary. Its stream was
+	// cancelled, but recovery must not claim an effect-free retry; the receipt is
+	// visibly uncertain while the provider is proven stopped.
+	if !ok || receipt.Status != "uncertain" || receipt.Error == nil || receipt.Error.Retryable {
+		t.Fatalf("receipt=%+v present=%t", receipt, ok)
+	}
+	if countBatchKind(repository.batchKinds(), protocol.EventSubagentReceipt) != 1 || provider.streams != 1 {
+		t.Fatalf("receipts=%d streams=%d", countBatchKind(repository.batchKinds(), protocol.EventSubagentReceipt), provider.streams)
+	}
+}
+
+type blockingChildProvider struct {
+	started, cancelled chan struct{}
+	streams            int
+}
+
+func (*blockingChildProvider) Prepare(context.Context, protocol.ActivityID, string, protocol.ModelRequest, protocol.Digest) (provider.ProviderHandle, error) {
+	return provider.ProviderHandle{}, nil
+}
+
+func (p *blockingChildProvider) Stream(ctx context.Context, _ provider.ProviderHandle, _ authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	p.streams++
+	close(p.started)
+	stream := make(chan protocol.ModelEvent)
+	go func() {
+		<-ctx.Done()
+		close(p.cancelled)
+		close(stream)
+	}()
+	return stream, nil
 }
 
 type headChangingCoordinator struct {
