@@ -196,6 +196,46 @@ func TestRunTurnSubagentAttemptsOneThroughFourThenRejectsFifth(t *testing.T) {
 	if children.reservations != 4 {
 		t.Fatalf("reserved child IDs=%d", children.reservations)
 	}
+	if len(children.attempts) != 4 || children.attempts[0].AttemptID == children.attempts[1].AttemptID || children.attempts[0].ChildSessionID == children.attempts[1].ChildSessionID {
+		t.Fatalf("attempt identities=%+v", children.attempts)
+	}
+}
+
+func TestRunTurnSubagentChildDepthRejectsHiddenDelegation(t *testing.T) {
+	runtime := validRuntimeManifest(t, "observation")
+	runtime.Body.SkillCatalogRevision = "skills-a"
+	runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+	runtime.Body.Tools = append(runtime.Body.Tools, subagenttool.BuiltinDescriptor())
+	refreshRuntimeDigest(t, &runtime)
+	manifest := protocol.SubagentManifestV1{AttemptID: "depth", ParentSessionID: "parent", ParentCursor: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "parent", CommitSeq: 1, TransactionID: "p"}, ChildSessionID: "child", ChildTaskID: protocol.TaskID(stableID("task", "depth")), ChildTurnID: protocol.TurnID(stableID("turn", "depth")), RuntimeGenerationID: runtime.ID, SkillCatalogRevision: "skills-a", MaxToolCalls: 1, Deadline: time.Now().Add(time.Second)}
+	repo := &recordingRepository{head: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 1, TransactionID: "create"}}
+	service, err := NewService(Dependencies{Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repo, TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: &recordLog{}}, Providers: fakeProviderCatalog{log: &recordLog{}}, Provider: &subagentTestProvider{log: &recordLog{}}, Tools: noToolService{}, Authorization: &allowingAuthorization{log: &recordLog{}}, Evidence: noEvidenceRecorder{}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validStartTurnRequest()
+	request.Command.CommandID = "depth-command"
+	request.Command.IdempotencyKey = "depth-command"
+	request.Command.RequestDigest, _ = canonicaljson.Digest("depth")
+	request.SessionID = "child"
+	request.ExpectedHead = repo.head
+	request.Runtime = runtime
+	request.child = &childTurnConfig{manifest: manifest, exposure: mustChildExposure(t, runtime)}
+	if _, err := service.RunTurn(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if containsBatchKind(repo.batchKinds(), protocol.EventSubagentRequested) {
+		t.Fatalf("nested child delegation escaped depth limit: %v", repo.batchKinds())
+	}
+}
+
+func mustChildExposure(t *testing.T, runtime protocol.RuntimeGenerationManifest) protocol.ToolExposure {
+	t.Helper()
+	exposure, err := derivedChildExposure(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exposure
 }
 
 type productionCoordinatorStore struct {
@@ -241,6 +281,7 @@ type subagentTestChildren struct {
 	receipt      protocol.SubagentReceiptV1
 	workspace    domain.Workspace
 	reservations int
+	attempts     []protocol.SubagentManifestV1
 }
 
 func (s *subagentTestChildren) ReserveSessionID() (protocol.SessionID, error) {
@@ -273,6 +314,7 @@ type subagentTestCoordinator struct {
 
 func (s subagentTestCoordinator) RunChild(_ context.Context, request ChildRunRequest) (protocol.SubagentReceiptV1, error) {
 	s.log.add("child.terminal")
+	s.children.attempts = append(s.children.attempts, request.Manifest)
 	s.children.receipt.Manifest = request.Manifest
 	s.children.receipt.TerminalCursor.JournalID = protocol.JournalID(request.Manifest.ChildSessionID)
 	return s.children.receipt, nil
