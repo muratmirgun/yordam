@@ -5,12 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
+	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/eventcodec"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/tooling"
@@ -135,7 +139,11 @@ func TestDurablePrefixPagesAtThousandRecords(t *testing.T) {
 	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "child"}
 	r := newRecoveryRepository(&recordLog{}, protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "control"}, protocol.CommittedCursor{JournalKind: protocol.JournalWorkspaceControl, JournalID: "control"}, ref, protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child"}, protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 1001, TransactionID: "tail"})
 	for i := 0; i < 1001; i++ {
-		r.events[ref] = append(r.events[ref], protocol.ProposedEvent{Kind: protocol.EventActivityProgress, SessionID: "child"})
+		kind := protocol.EventActivityProgress
+		if i == 1000 {
+			kind = protocol.EventTransactionCommitted
+		}
+		r.events[ref] = append(r.events[ref], protocol.ProposedEvent{Kind: kind, SessionID: "child"})
 	}
 	r.heads[ref] = protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 1001, TransactionID: "tail"}
 	service, err := NewService(Dependencies{Repository: r, Lane: NewOperationLane()})
@@ -157,12 +165,24 @@ func TestDurablePrefixRejectsWrongCursorIdentity(t *testing.T) {
 	}
 }
 
+func TestDurablePrefixStopsAtMarkerInsidePageWithLaterTail(t *testing.T) {
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "child"}
+	r := newRecoveryRepository(&recordLog{}, protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "control"}, protocol.CommittedCursor{}, ref, protocol.CommittedCursor{}, protocol.CommittedCursor{})
+	r.events[ref] = []protocol.ProposedEvent{{Kind: protocol.EventActivityProgress, SessionID: "child"}, {Kind: protocol.EventTransactionCommitted, SessionID: "child"}, {Kind: protocol.EventActivityProgress, SessionID: "child"}}
+	r.heads[ref] = protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 3, TransactionID: "tail"}
+	service, _ := NewService(Dependencies{Repository: r, Lane: NewOperationLane()})
+	events, err := service.durablePrefix(context.Background(), ref, protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 2, TransactionID: "page"})
+	if err != nil || len(events) != 2 || events[1].Envelope.Kind != protocol.EventTransactionCommitted {
+		t.Fatalf("events=%+v err=%v", events, err)
+	}
+}
+
 func TestRecoveryChildReceiptBindsManifestRuntimeAndTerminalCursor(t *testing.T) {
 	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "child"}
 	head := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 3, TransactionID: "child-head"}
 	r := newRecoveryRepository(&recordLog{}, protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "control"}, protocol.CommittedCursor{}, ref, head, head)
 	manifest := protocol.SubagentManifestV1{AttemptID: "attempt", ParentSessionID: "parent", ParentCursor: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "parent", CommitSeq: 1, TransactionID: "parent-tx"}, ChildSessionID: "child", ChildTaskID: "child-task", ChildTurnID: "child-turn", RuntimeGenerationID: "child-runtime", SkillCatalogRevision: "skills", MaxToolCalls: 1, Deadline: time.Now().Add(time.Minute)}
-	r.events[ref] = []protocol.ProposedEvent{{Kind: protocol.EventSubagentManifest, SessionID: "child", TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID, RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: mustCanonical(manifest)}, {Kind: protocol.EventActivityStarted, SessionID: "child", ActivityID: "child-activity"}, {Kind: protocol.EventTurnAccepted, SessionID: "child", TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID}}
+	r.events[ref] = []protocol.ProposedEvent{{Kind: protocol.EventSubagentManifest, SessionID: "child", TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID, RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: mustCanonical(manifest)}, {Kind: protocol.EventActivityStarted, SessionID: "child", ActivityID: "child-activity"}, {Kind: protocol.EventTransactionCommitted, SessionID: "child", TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID}}
 	service, err := NewService(Dependencies{Repository: r, Lane: NewOperationLane()})
 	if err != nil {
 		t.Fatal(err)
@@ -188,6 +208,29 @@ func TestRecoveryChildReceiptBindsManifestRuntimeAndTerminalCursor(t *testing.T)
 	if err := receipt.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	seq := head.CommitSeq + uint64(len(appended.Events))
+	envelope := protocol.EventEnvelope{SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: event.PayloadVersion, JournalKind: ref.Kind, JournalID: ref.ID, EventID: event.EventID, SessionID: event.SessionID, Seq: seq, Time: event.Time, Kind: event.Kind, TaskID: event.TaskID, TurnID: event.TurnID, Actor: event.Actor, RuntimeGenerationID: event.RuntimeGenerationID, TransactionID: appended.TransactionID, Payload: event.Payload}
+	raw, _ := canonicaljson.Marshal(envelope)
+	registry, _ := eventcodec.New(eventcodec.FoundationDescriptors())
+	record, err := registry.Decode(raw)
+	if err != nil || registry.Validate(record) != nil {
+		t.Fatalf("committed receipt envelope invalid: %v", err)
+	}
+	store := recoveryChildStore{inspection: journal.Inspection{Journal: ref, Head: receipt.TerminalCursor, Events: []protocol.EventRecord{{Envelope: envelope}}}}
+	got, err := committedChildReceipt(context.Background(), store, manifest)
+	if err != nil || !reflect.DeepEqual(got, receipt) {
+		t.Fatalf("committed receipt=%+v err=%v", got, err)
+	}
+}
+
+type recoveryChildStore struct{ inspection journal.Inspection }
+
+func (s recoveryChildStore) ReserveSessionID() (protocol.SessionID, error) { return "", nil }
+func (s recoveryChildStore) CreateWithIdentity(context.Context, protocol.SessionID, domain.Workspace, domain.PermissionMode, domain.ModelSelection, *journal.SessionLineage) (domain.Session, error) {
+	return domain.Session{}, nil
+}
+func (s recoveryChildStore) InspectSession(context.Context, protocol.SessionID) (journal.Inspection, error) {
+	return s.inspection, nil
 }
 
 func TestEveryRecoveryDispatchAndTerminalBarrierLeavesDurableControlTerminal(t *testing.T) {
@@ -333,7 +376,11 @@ func (r *recoveryRepository) ReadRange(_ context.Context, request journal.ReadRa
 	}
 	records := make([]protocol.EventRecord, end-start)
 	for index, event := range all[start:end] {
-		records[index] = protocol.EventRecord{Envelope: protocol.EventEnvelope{JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, SessionID: event.SessionID, Kind: event.Kind, Seq: uint64(start + index + 1), Payload: event.Payload}}
+		txn := protocol.TransactionID("page")
+		if start+index+1 == len(all) {
+			txn = r.heads[request.Journal].TransactionID
+		}
+		records[index] = protocol.EventRecord{Envelope: protocol.EventEnvelope{JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, SessionID: event.SessionID, Kind: event.Kind, Seq: uint64(start + index + 1), TransactionID: txn, Payload: event.Payload}}
 	}
 	cursor := request.After
 	if end > start {

@@ -39,3 +39,8 @@ Final recovery hardening validates exact prefix identity and transaction,
 stops at the requested committed cursor even when more records exist, and
 projects normal terminal receipts through the actual committed head. Recovery
 contract coverage verifies the child manifest runtime/task/turn receipt binding.
+
+The prefix reader now stops on the exact committed transaction marker even when
+the same page has newer records. Recovery coverage materializes and eventcodec-
+validates the committed receipt envelope before reading it through the child
+receipt boundary.

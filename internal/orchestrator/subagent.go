@@ -298,9 +298,21 @@ func (s *Service) durablePrefix(ctx context.Context, ref protocol.JournalRef, th
 			return nil, err
 		}
 		for _, event := range page.Events {
-			if through.CommitSeq == 0 || event.Envelope.Seq <= through.CommitSeq {
+			if through.CommitSeq == 0 {
 				events = append(events, event)
+				continue
 			}
+			if event.Envelope.Seq > through.CommitSeq {
+				return nil, fmt.Errorf("journal range records exceed durable prefix")
+			}
+			if event.Envelope.Seq == through.CommitSeq {
+				if event.Envelope.TransactionID != through.TransactionID {
+					return nil, fmt.Errorf("durable prefix marker does not bind target transaction")
+				}
+				events = append(events, event)
+				return events, nil
+			}
+			events = append(events, event)
 		}
 		if page.Cursor.JournalKind != ref.Kind || page.Cursor.JournalID != ref.ID {
 			return nil, fmt.Errorf("journal range cursor does not bind journal")
@@ -308,11 +320,11 @@ func (s *Service) durablePrefix(ctx context.Context, ref protocol.JournalRef, th
 		if through.CommitSeq != 0 && page.Cursor.CommitSeq > through.CommitSeq {
 			return nil, fmt.Errorf("journal range cursor exceeds durable prefix")
 		}
-		if through.CommitSeq != 0 && page.Cursor.CommitSeq == through.CommitSeq {
-			if page.Cursor.TransactionID != through.TransactionID {
-				return nil, fmt.Errorf("journal range cursor transaction does not bind durable prefix")
-			}
+		if through.CommitSeq != 0 && page.Cursor == through {
 			return events, nil
+		}
+		if through.CommitSeq != 0 && page.Cursor.CommitSeq >= through.CommitSeq {
+			return nil, fmt.Errorf("durable prefix marker is absent")
 		}
 		if !page.More {
 			if through.CommitSeq != 0 {
