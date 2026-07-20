@@ -94,6 +94,22 @@ func TestSaveGlobalWritesStrictJSONAndRoundTrips(t *testing.T) {
 	}
 }
 
+func TestSaveGlobalDefaultsOmittedProjectPolicyToAsk(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.jsonc")
+	cfg := savedConfig()
+	cfg.Skills.ProjectPolicy = ""
+	if err := config.SaveGlobal(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(config.LoadOptions{ConfigPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Skills.ProjectPolicy != config.ProjectSkillsAsk {
+		t.Fatalf("project policy=%q want ask", loaded.Skills.ProjectPolicy)
+	}
+}
+
 func TestSaveGlobalDoesNotReplaceExistingFileWhenConfigIsInvalid(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.jsonc")
 	if err := os.WriteFile(path, []byte("unchanged"), 0o600); err != nil {

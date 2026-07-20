@@ -128,6 +128,11 @@ func ensureGlobal(
 func SaveGlobal(path string, cfg Config) (err error) {
 	saveMu.Lock()
 	defer saveMu.Unlock()
+	// Programmatic callers commonly omit the optional policy. Persist the same
+	// safe default that the document loader applies to an omitted field.
+	if cfg.Skills.ProjectPolicy == "" {
+		cfg.Skills.ProjectPolicy = ProjectSkillsAsk
+	}
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
