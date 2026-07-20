@@ -37,6 +37,11 @@
   test blocks a real child `RunTurn`, cancels it, verifies the provider context
   stops, exactly one terminal receipt is committed, and the receipt is
   non-retryable `uncertain` (the provider activity crossed its start boundary).
+- RED: `TestRecoveryChildInspectionInfrastructureFailureRemainsRetryable`
+  returned nil because an arbitrary child-inspection error was classified as
+  semantic uncertainty and terminalized the parent. GREEN: the same full
+  `RecoverTurn` regression now receives the wrapped sentinel error, observes
+  no parent-journal append, and still projects the original active turn.
 
 ## Verification
 
@@ -159,10 +164,14 @@ left explicit for review rather than represented by a mock-only startup test.
   control command complete consistently. The latest continuation cursor is
   carried into terminalization, so a dispatched provider activity remains
   durably `uncertain` instead of being lost behind the earlier attachment head.
-- Journal/inspection infrastructure failures and commit-unknown errors remain
-  ordinary recovery errors rather than being misrepresented as semantic child
-  failures. A regression fixture proves a parent-session inspection failure
-  leaves the parent journal unterminated for a safe retry.
+- Parent- and child-inspection infrastructure failures remain ordinary wrapped
+  recovery errors rather than being misrepresented as semantic child failures.
+  Recovery preflights every candidate child before mutation, so a transient
+  inspection error leaves all parent and child journals untouched for a safe
+  retry. Typed `ErrSessionNotFound` alone proves absence/create-once, while a
+  successful but non-writable, incomplete, or `recovery.available` inspection
+  remains semantic commit-unknown and terminalizes the parent with the
+  structured non-retryable uncertain diagnostic.
 - Child inspection success is no longer sufficient proof of a known commit.
   Read-only JSONL views, incomplete transactions, and `recovery.available`
   diagnostics classify the exact child as `uncertain`, are never resumed, and
@@ -179,8 +188,9 @@ Final review verification:
 
 ```text
 go test ./internal/subagent ./internal/orchestrator ./internal/app -count=1  PASS
-go test -race ./internal/subagent ./internal/orchestrator ./internal/app -run 'Test(SubagentRecover|RecoveryProviderContinuationFailure|RecoveryParentReconstructionFailure|RecoveryParentInspectionInfrastructureFailure|RecoveryUnhealthyChildInspection|.*Subagent.*Cancel)' -count=1  PASS
+go test ./internal/orchestrator -run 'TestRecovery(ChildInspectionInfrastructureFailure|UnhealthyChildInspection|ParentInspectionInfrastructureFailure)|TestSubagentRecoveryCreatesReservedChildOnceAndContinuesParent' -count=1  PASS
+go test -race ./internal/orchestrator -run 'TestRecovery(ChildInspectionInfrastructureFailure|UnhealthyChildInspection|ParentInspectionInfrastructureFailure)|TestSubagentRecoveryCreatesReservedChildOnceAndContinuesParent' -count=1  PASS
 go test -json ./... -count=1  PASS
-go vet ./...  PASS
+go vet ./internal/subagent ./internal/orchestrator ./internal/app  PASS
 git diff --check  PASS
 ```

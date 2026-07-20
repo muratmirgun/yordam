@@ -878,6 +878,41 @@ func TestRecoveryParentInspectionInfrastructureFailureRemainsRetryable(t *testin
 	}
 }
 
+func TestRecoveryChildInspectionInfrastructureFailureRemainsRetryable(t *testing.T) {
+	continuation := &capturingFinalProvider{log: &recordLog{}, name: "must-not-run"}
+	service, request, repository, children, _ := recoveredParentFailureFixture(t, domain.ModelSelection{Profile: "provider-a", Model: "model-a"}, continuation)
+	inspectionFault := errors.New("child inspection transient fault")
+	service.deps.ChildSessions = transientRecoveryChildStore{restartRecoveryChildStore: children, err: inspectionFault}
+
+	if _, err := service.RecoverTurn(context.Background(), request); !errors.Is(err, inspectionFault) {
+		t.Fatalf("infrastructure failure=%v want wrapped %v", err, inspectionFault)
+	}
+	for _, appendRequest := range repository.appendRequests() {
+		if appendRequest.Journal != request.Storage.Journal {
+			continue
+		}
+		if len(appendRequest.Events) != 0 {
+			t.Fatalf("child inspection infrastructure failure changed parent journal: %v", flattenAppendKinds([]journal.AppendRequest{appendRequest}))
+		}
+	}
+	projection, err := service.deps.Projection.InspectRecovery(context.Background(), request.Storage.Journal, repository.recovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.ActiveTurnID != "turn-original" || continuation.request.ModelID != "" {
+		t.Fatalf("parent active turn=%q continuation=%+v", projection.ActiveTurnID, continuation.request)
+	}
+}
+
+type transientRecoveryChildStore struct {
+	*restartRecoveryChildStore
+	err error
+}
+
+func (s transientRecoveryChildStore) InspectSession(context.Context, protocol.SessionID) (journal.Inspection, error) {
+	return journal.Inspection{}, s.err
+}
+
 type failingRecoveryParentInspector struct {
 	calls     int
 	selection domain.ModelSelection

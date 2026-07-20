@@ -401,21 +401,35 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 			return parentHead, false, false, fmt.Errorf("project parent subagent recovery: %w", err)
 		}
 	}
+	type inspectedChild struct {
+		inspection journal.Inspection
+		absent     bool
+	}
+	inspectedChildren := make(map[protocol.DelegationAttemptID]inspectedChild, len(state.Attempts))
+	for _, attempt := range state.Attempts {
+		if attempt.State != receiptprojector.StateWaiting && attempt.State != receiptprojector.StateTerminal {
+			continue
+		}
+		child, inspectErr := s.deps.ChildSessions.InspectSession(ctx, attempt.Manifest.ChildSessionID)
+		switch {
+		case inspectErr == nil:
+			inspectedChildren[attempt.AttemptID] = inspectedChild{inspection: child}
+		case errors.Is(inspectErr, journal.ErrSessionNotFound):
+			inspectedChildren[attempt.AttemptID] = inspectedChild{absent: true}
+		default:
+			return parentHead, false, false, fmt.Errorf("inspect sequential child session %q: %w", attempt.Manifest.ChildSessionID, inspectErr)
+		}
+	}
 	changed := false
 	for _, initial := range state.Attempts {
 		if initial.State != receiptprojector.StateWaiting && initial.State != receiptprojector.StateTerminal {
 			continue
 		}
-		child, inspectErr := s.deps.ChildSessions.InspectSession(ctx, initial.Manifest.ChildSessionID)
-		childState := receiptprojector.ChildRecoveryState{Exists: inspectErr == nil, CommitKnown: inspectErr == nil && childInspectionCommitKnown(child)}
-		if errors.Is(inspectErr, journal.ErrSessionNotFound) {
-			// Only a typed not-found result is proof that the identity reserved in
-			// the parent wait transaction has never been created. Timeouts, I/O
-			// errors, and malformed views remain unknown and are never retried.
-			childState.CommitKnown = true
-		}
+		inspected := inspectedChildren[initial.AttemptID]
+		child := inspected.inspection
+		childState := receiptprojector.ChildRecoveryState{Exists: !inspected.absent, CommitKnown: inspected.absent || childInspectionCommitKnown(child)}
 		attempt := initial
-		if inspectErr == nil {
+		if !inspected.absent {
 			for _, event := range child.Events {
 				if event.Envelope.Kind != protocol.EventSubagentManifest && event.Envelope.Kind != protocol.EventSubagentReceipt {
 					continue
@@ -476,7 +490,7 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 							return parentHead, changed, false, appendErr
 						} else {
 							changed = true
-							child, inspectErr = s.deps.ChildSessions.InspectSession(ctx, initial.Manifest.ChildSessionID)
+							child, inspectErr := s.deps.ChildSessions.InspectSession(ctx, initial.Manifest.ChildSessionID)
 							if inspectErr != nil {
 								return parentHead, changed, false, inspectErr
 							}
