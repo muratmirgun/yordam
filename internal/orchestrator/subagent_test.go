@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -734,6 +735,190 @@ func TestSubagentCancelDuringChildProviderStreamCommitsOneCancelledReceipt(t *te
 	if countBatchKind(repository.batchKinds(), protocol.EventSubagentReceipt) != 1 || provider.streams != 1 {
 		t.Fatalf("receipts=%d streams=%d", countBatchKind(repository.batchKinds(), protocol.EventSubagentReceipt), provider.streams)
 	}
+}
+
+// This deliberately drives the ordinary child RunTurn path.  The approver is
+// a small production-boundary fixture: it owns a pending prompt until the
+// child context is cancelled, exactly as the application broker does.
+func TestSubagentCancelDuringChildApprovalRemovesPromptWithoutGrantOrRetry(t *testing.T) {
+	parent := validStartTurnRequest()
+	parent.Runtime = validRuntimeManifest(t, "observation")
+	parent.Runtime.Body.SkillCatalogRevision = "skills-a"
+	refreshRuntimeDigest(t, &parent.Runtime)
+	manifest := protocol.SubagentManifestV1{AttemptID: "approval-cancel", ParentSessionID: parent.SessionID, ParentCursor: parent.ExpectedHead, ChildSessionID: "child-approval", ChildTaskID: "child-task", ChildTurnID: "child-turn", RuntimeGenerationID: parent.Runtime.ID, SkillCatalogRevision: "skills-a", MaxToolCalls: 1, Deadline: time.Now().Add(time.Minute)}
+	repository := &recordingRepository{head: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(manifest.ChildSessionID), CommitSeq: 1, TransactionID: "create"}, log: &recordLog{}}
+	authorization := &askingChildAuthorization{allowingAuthorization: allowingAuthorization{log: &recordLog{}}}
+	approver := &pendingChildApprover{shown: make(chan struct{}), removed: make(chan struct{})}
+	service, err := NewService(Dependencies{Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository, TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: &recordLog{}}, Providers: fakeProviderCatalog{log: &recordLog{}}, Provider: childToolIntentProvider{}, Tools: observationToolService{log: &recordLog{}}, Authorization: authorization, Approver: approver, Evidence: noEvidenceRecorder{}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := protocol.DeepCopy(parent)
+	child.SessionID, child.ExpectedHead, child.Prompt = manifest.ChildSessionID, repository.head, "child"
+	child.child = &childTurnConfig{manifest: manifest, exposure: mustChildExposure(t, parent.Runtime)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, runErr := service.RunTurn(ctx, child); done <- runErr }()
+	<-approver.shown
+	cancel()
+	if runErr := <-done; !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("run error=%v", runErr)
+	}
+	<-approver.removed
+	if approver.pending || authorization.resolved != 0 || authorization.issued != 0 || authorization.dispatched != 0 {
+		t.Fatalf("pending=%t resolved=%d issued=%d dispatched=%d", approver.pending, authorization.resolved, authorization.issued, authorization.dispatched)
+	}
+	receipt, ok := receiptFromRepo(repository)
+	if !ok || receipt.Status != "cancelled" || receipt.Error == nil || receipt.Error.Retryable || countBatchKind(repository.batchKinds(), protocol.EventSubagentReceipt) != 1 {
+		t.Fatalf("receipt=%+v present=%t", receipt, ok)
+	}
+}
+
+type childToolIntentProvider struct{}
+
+func (childToolIntentProvider) Prepare(context.Context, protocol.ActivityID, string, protocol.ModelRequest, protocol.Digest) (provider.ProviderHandle, error) {
+	return provider.ProviderHandle{}, nil
+}
+
+func (childToolIntentProvider) Stream(context.Context, provider.ProviderHandle, authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	out := make(chan protocol.ModelEvent, 2)
+	out <- protocol.ModelEvent{Kind: protocol.ModelEventToolIntent, Sequence: 1, ToolIntent: &protocol.ToolUseBlock{CallID: "approval-call", Alias: "read", Arguments: json.RawMessage(`{"path":"a.go"}`)}}
+	out <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "tool_use"}}
+	close(out)
+	return out, nil
+}
+
+type pendingChildApprover struct {
+	shown, removed chan struct{}
+	pending        bool
+}
+
+func (a *pendingChildApprover) Approve(ctx context.Context, decision protocol.AuthorizationDecision) (protocol.ApprovalResponse, error) {
+	if decision.Request.SessionID != "child-approval" {
+		return protocol.ApprovalResponse{}, fmt.Errorf("approval did not target child: %q", decision.Request.SessionID)
+	}
+	a.pending = true
+	close(a.shown)
+	<-ctx.Done()
+	a.pending = false
+	close(a.removed)
+	return protocol.ApprovalResponse{}, ctx.Err()
+}
+
+type askingChildAuthorization struct {
+	allowingAuthorization
+	resolved, issued, dispatched int
+}
+
+func TestSubagentCancelDuringChildShellProcessStopsProcessAndWritesOneReceipt(t *testing.T) {
+	parent := validStartTurnRequest()
+	parent.Runtime = validRuntimeManifest(t, "mutation")
+	parent.Runtime.Body.SkillCatalogRevision = "skills-a"
+	parent.Runtime.Body.Tools[0].Body.Identity.Name = "shell"
+	parent.Runtime.Body.Tools[0].Body.ExecutionLoci = []string{"process"}
+	parent.Runtime.Body.Tools[0].DescriptorDigest, _ = canonicaljson.Digest(parent.Runtime.Body.Tools[0].Body)
+	refreshRuntimeDigest(t, &parent.Runtime)
+	manifest := protocol.SubagentManifestV1{AttemptID: "shell-cancel", ParentSessionID: parent.SessionID, ParentCursor: parent.ExpectedHead, ChildSessionID: "child-shell", ChildTaskID: "child-task", ChildTurnID: "child-turn", RuntimeGenerationID: parent.Runtime.ID, SkillCatalogRevision: "skills-a", MaxToolCalls: 1, Deadline: time.Now().Add(time.Minute)}
+	repository := &recordingRepository{head: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(manifest.ChildSessionID), CommitSeq: 1, TransactionID: "create"}, log: &recordLog{}}
+	tools := &blockingProcessTool{started: make(chan int, 1), stopped: make(chan struct{})}
+	authorization := &contextDispatchAuthorization{allowingAuthorization: allowingAuthorization{log: &recordLog{}}}
+	service, err := NewService(Dependencies{Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository, TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: &recordLog{}}, Providers: fakeProviderCatalog{log: &recordLog{}}, Provider: childShellIntentProvider{}, Tools: tools, Authorization: authorization, Evidence: noEvidenceRecorder{}, Recovery: recordingRecovery{log: &recordLog{}}, Verification: verification.NewService(time.Now)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := protocol.DeepCopy(parent)
+	child.SessionID, child.ExpectedHead, child.Prompt = manifest.ChildSessionID, repository.head, "child"
+	child.child = &childTurnConfig{manifest: manifest, exposure: mustChildExposure(t, parent.Runtime)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, runErr := service.RunTurn(ctx, child); done <- runErr }()
+	pid := <-tools.started
+	if pid <= 0 {
+		t.Fatalf("shell pid=%d", pid)
+	}
+	cancel()
+	if runErr := <-done; !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("run error=%v", runErr)
+	}
+	<-tools.stopped
+	receipt, ok := receiptFromRepo(repository)
+	if !ok || receipt.Status != "uncertain" || receipt.Error == nil || receipt.Error.Retryable || tools.runs != 1 || countBatchKind(repository.batchKinds(), protocol.EventSubagentReceipt) != 1 {
+		t.Fatalf("receipt=%+v present=%t runs=%d", receipt, ok, tools.runs)
+	}
+}
+
+type childShellIntentProvider struct{}
+
+func (childShellIntentProvider) Prepare(context.Context, protocol.ActivityID, string, protocol.ModelRequest, protocol.Digest) (provider.ProviderHandle, error) {
+	return provider.ProviderHandle{}, nil
+}
+func (childShellIntentProvider) Stream(context.Context, provider.ProviderHandle, authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	out := make(chan protocol.ModelEvent, 2)
+	out <- protocol.ModelEvent{Kind: protocol.ModelEventToolIntent, Sequence: 1, ToolIntent: &protocol.ToolUseBlock{CallID: "shell-call", Alias: "shell", Arguments: json.RawMessage(`{"command":"sleep 30"}`)}}
+	out <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "tool_use"}}
+	close(out)
+	return out, nil
+}
+
+type contextDispatchAuthorization struct{ allowingAuthorization }
+
+func (a *contextDispatchAuthorization) Dispatch(ctx context.Context, _ authorization.CommittedToken, _ authorization.DispatchBinding, callback func(context.Context) error) error {
+	a.dispatches.Add(1)
+	return callback(ctx)
+}
+
+type blockingProcessTool struct {
+	started chan int
+	stopped chan struct{}
+	runs    int
+}
+
+func (t *blockingProcessTool) Plan(context.Context, tooling.PlanRequest) (tooling.ActionHandle, protocol.ActionPlan, error) {
+	return tooling.ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("unexpected observation plan")
+}
+func (t *blockingProcessTool) PlanPreviewInspection(_ context.Context, request tooling.PlanRequest) (tooling.ActionHandle, protocol.ActionPlan, error) {
+	return tooling.ActionHandle{}, testActionPlan(request, "observation", "not_applicable"), nil
+}
+func (t *blockingProcessTool) PreparePreview(context.Context, tooling.ActionHandle, authorization.CommittedToken) (tooling.PreviewResult, protocol.ActionPlan, []protocol.EvidenceCandidate, error) {
+	return tooling.PreviewResult{}, protocol.ActionPlan{}, nil, nil
+}
+func (t *blockingProcessTool) PlanMutation(_ context.Context, _ tooling.PreviewResult, request tooling.PlanRequest) (tooling.ActionHandle, protocol.ActionPlan, error) {
+	return tooling.ActionHandle{}, testActionPlan(request, "mutation", "exact"), nil
+}
+func (t *blockingProcessTool) Revalidate(context.Context, tooling.ActionHandle) (protocol.ActionPlan, bool, error) {
+	return protocol.ActionPlan{}, false, nil
+}
+func (t *blockingProcessTool) Execute(ctx context.Context, _ tooling.ActionHandle, _ authorization.CommittedToken) (protocol.ExecutionResult, error) {
+	t.runs++
+	command := exec.CommandContext(ctx, "sh", "-c", "exec sleep 30")
+	if err := command.Start(); err != nil {
+		return protocol.ExecutionResult{}, err
+	}
+	t.started <- command.Process.Pid
+	err := command.Wait()
+	close(t.stopped)
+	if ctx.Err() != nil {
+		return protocol.ExecutionResult{}, ctx.Err()
+	}
+	return protocol.ExecutionResult{}, err
+}
+
+func (a *askingChildAuthorization) Decide(ctx context.Context, request protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error) {
+	decision, err := a.allowingAuthorization.Decide(ctx, request)
+	decision.Action, decision.Reason = "ask", "child approval required"
+	return decision, err
+}
+func (a *askingChildAuthorization) ResolveInteractive(context.Context, protocol.AuthorizationRequest, protocol.AuthorizationDecision, protocol.ApprovalResponse) (protocol.AuthorizationDecision, error) {
+	a.resolved++
+	return protocol.AuthorizationDecision{}, fmt.Errorf("cancelled child approval was resolved")
+}
+func (a *askingChildAuthorization) Issue(context.Context, authorization.CommitReference) (authorization.CommittedToken, error) {
+	a.issued++
+	return authorization.CommittedToken{}, fmt.Errorf("cancelled child approval was granted")
+}
+func (a *askingChildAuthorization) Dispatch(context.Context, authorization.CommittedToken, authorization.DispatchBinding, func(context.Context) error) error {
+	a.dispatched++
+	return fmt.Errorf("cancelled child approval was dispatched")
 }
 
 type blockingChildProvider struct {
