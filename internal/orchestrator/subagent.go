@@ -274,7 +274,9 @@ func childReceipt(manifest protocol.SubagentManifestV1, status, summary string, 
 // constructing its terminal transaction, so assistant response prose can
 // never become effect evidence.
 func (s *Service) projectChildReceipt(ctx context.Context, state *turnState, manifest protocol.SubagentManifestV1, status, summary string, cursor protocol.CommittedCursor, usage protocol.ModelUsage, public *protocol.PublicError) (protocol.SubagentReceiptV1, error) {
-	events, err := s.durablePrefix(ctx, state.ref, cursor)
+	// The receipt cursor is predicted for the terminal transaction. Evidence
+	// must stop at the actual committed head, never chase that future cursor.
+	events, err := s.durablePrefix(ctx, state.ref, state.head)
 	if err != nil {
 		return protocol.SubagentReceiptV1{}, err
 	}
@@ -282,6 +284,9 @@ func (s *Service) projectChildReceipt(ctx context.Context, state *turnState, man
 }
 
 func (s *Service) durablePrefix(ctx context.Context, ref protocol.JournalRef, through protocol.CommittedCursor) ([]protocol.EventRecord, error) {
+	if through.CommitSeq != 0 && (through.JournalKind != ref.Kind || through.JournalID != ref.ID) {
+		return nil, fmt.Errorf("durable prefix cursor does not bind journal")
+	}
 	after := protocol.CommittedCursor{}
 	events := make([]protocol.EventRecord, 0)
 	for {
@@ -297,10 +302,25 @@ func (s *Service) durablePrefix(ctx context.Context, ref protocol.JournalRef, th
 				events = append(events, event)
 			}
 		}
-		if !page.More {
+		if page.Cursor.JournalKind != ref.Kind || page.Cursor.JournalID != ref.ID {
+			return nil, fmt.Errorf("journal range cursor does not bind journal")
+		}
+		if through.CommitSeq != 0 && page.Cursor.CommitSeq > through.CommitSeq {
+			return nil, fmt.Errorf("journal range cursor exceeds durable prefix")
+		}
+		if through.CommitSeq != 0 && page.Cursor.CommitSeq == through.CommitSeq {
+			if page.Cursor.TransactionID != through.TransactionID {
+				return nil, fmt.Errorf("journal range cursor transaction does not bind durable prefix")
+			}
 			return events, nil
 		}
-		if page.Cursor == after {
+		if !page.More {
+			if through.CommitSeq != 0 {
+				return nil, fmt.Errorf("journal range ended before durable prefix")
+			}
+			return events, nil
+		}
+		if page.Cursor == after || page.Cursor.CommitSeq <= after.CommitSeq {
 			return nil, fmt.Errorf("journal range cursor did not advance")
 		}
 		after = page.Cursor

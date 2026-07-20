@@ -283,7 +283,7 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 		receipt := receiptprojector.ProjectReceipt(*projection.ChildManifest, receiptCursor, status, "turn interrupted during journal recovery", protocol.ModelUsage{}, &protocol.PublicError{Code: "recovery_interrupted", Message: "turn interrupted during journal recovery"}, prefix)
 		events = append(events, protocol.ProposedEvent{EventID: eventID(request.Control.Command.CommandID, "recovery-session-terminal", len(events), protocol.EventSubagentReceipt), Time: now, PayloadVersion: 1, Kind: protocol.EventSubagentReceipt, SessionID: protocol.SessionID(request.Storage.Journal.ID), TaskID: projection.ChildManifest.ChildTaskID, TurnID: projection.ChildManifest.ChildTurnID, Actor: &actor, RuntimeGenerationID: projection.ChildManifest.RuntimeGenerationID, Payload: mustCanonical(receipt)})
 	}
-	if err := validateProposedEvents(events, request.Storage.Journal); err != nil {
+	if err := validateProposedEventsAt(events, request.Storage.Journal, expected.CommitSeq+1, transactionID); err != nil {
 		return protocol.CommittedCursor{}, err
 	}
 	appendResult, err := s.appendBatch(ctx, journal.AppendRequest{Journal: request.Storage.Journal, ExpectedHead: expected, TransactionID: transactionID, Events: events})

@@ -34,3 +34,8 @@ recovery emits a projected child receipt when it finds a durable child manifest.
 Second recovery follow-up: durable prefix reads page at 1,000 records with
 context and cursor-progress guards; recovery receipt envelopes use the child
 manifest runtime generation. A 1,001-record pagination regression is covered.
+
+Final recovery hardening validates exact prefix identity and transaction,
+stops at the requested committed cursor even when more records exist, and
+projects normal terminal receipts through the actual committed head. Recovery
+contract coverage verifies the child manifest runtime/task/turn receipt binding.
