@@ -154,6 +154,155 @@ func TestApplicationLegacyAdapterContextPlanDoesNotGuessPolicy(t *testing.T) {
 
 func TestApplicationLegacyAdapterDerivesSkillProvenanceOnlyFromCanonicalPlan(t *testing.T) {
 	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{})
+	activityID, available := startSkillActivityForTest(t, adapter)
+	output, err := adapter.Event(compactionApplicationEvent(protocol.EventToolResultAvailable, activityID, string(available)))
+	if err != nil || output.Kind != app.EventToolOutput || output.Runtime.Skill == nil || output.Runtime.Progress == nil || output.Runtime.Progress.Text != "bounded skill body" || !output.Runtime.Progress.Truncated {
+		t.Fatalf("output=%+v err=%v", output, err)
+	}
+	completed, err := adapter.Event(compactionApplicationEvent(protocol.EventActivitySucceeded, activityID, `{}`))
+	if err != nil || completed.Kind != app.EventToolCompleted || completed.Runtime.Result == nil || completed.Runtime.Result.Status != domain.ToolSucceeded || completed.Runtime.Result.Content != "bounded skill body" || !completed.Runtime.Result.Truncated || completed.Runtime.Result.Duration != time.Second {
+		t.Fatalf("completed=%+v err=%v", completed, err)
+	}
+	if _, ok := adapter.SkillProvenance(activityID); ok {
+		t.Fatal("terminal skill activity retained provenance")
+	}
+}
+
+func TestApplicationLegacyAdapterSkillTransientLifecycleRejectsMismatchesAndDuplicates(t *testing.T) {
+	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{})
+	activityID, available := startSkillActivityForTest(t, adapter)
+	var mismatched protocol.ToolResultAvailableV1
+	if err := json.Unmarshal(available, &mismatched); err != nil {
+		t.Fatal(err)
+	}
+	mismatched.CallID = "another-call"
+	mismatchRaw, err := json.Marshal(mismatched)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventToolResultAvailable, activityID, string(mismatchRaw))); err != nil || got.Kind != "" {
+		t.Fatalf("mismatched output=%+v err=%v", got, err)
+	}
+	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventToolResultAvailable, activityID, string(available))); err != nil || got.Kind != app.EventToolOutput {
+		t.Fatalf("first output=%+v err=%v", got, err)
+	}
+	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventToolResultAvailable, activityID, string(available))); err != nil || got.Kind != "" {
+		t.Fatalf("duplicate output=%+v err=%v", got, err)
+	}
+	terminal, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityFailed, activityID, `{}`))
+	if err != nil || terminal.Kind != app.EventToolCompleted || terminal.Runtime.Result == nil || terminal.Runtime.Result.Status != domain.ToolFailed || terminal.Runtime.Result.Content != "bounded skill body" {
+		t.Fatalf("terminal=%+v err=%v", terminal, err)
+	}
+	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventToolResultAvailable, activityID, string(available))); err != nil || got.Kind != "" {
+		t.Fatalf("late output=%+v err=%v", got, err)
+	}
+}
+
+func TestApplicationLegacyAdapterSkillTerminalWithoutTransientCreatesEmptyCard(t *testing.T) {
+	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{})
+	activityID, _ := startSkillActivityForTest(t, adapter)
+	terminal, err := adapter.Event(compactionApplicationEvent(protocol.EventActivitySucceeded, activityID, `{}`))
+	if err != nil || terminal.Kind != app.EventToolCompleted || terminal.Runtime.Result == nil || terminal.Runtime.Result.CallID != "skill-call" || terminal.Runtime.Result.Status != domain.ToolSucceeded || terminal.Runtime.Result.Content != "" {
+		t.Fatalf("terminal=%+v err=%v", terminal, err)
+	}
+	if _, ok := adapter.SkillProvenance(activityID); ok {
+		t.Fatal("terminal without transient retained provenance")
+	}
+}
+
+func TestApplicationLegacyAdapterInvalidReplacementPlanClearsSkillState(t *testing.T) {
+	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{})
+	activityID, available := startSkillActivityForTest(t, adapter)
+	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityPlanned, activityID, `{"kind":"tool"}`)); err != nil || got.Kind != "" {
+		t.Fatalf("replacement plan=%+v err=%v", got, err)
+	}
+	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventToolResultAvailable, activityID, string(available))); err != nil || got.Kind != "" {
+		t.Fatalf("stale output=%+v err=%v", got, err)
+	}
+	if got, err := adapter.Event(compactionApplicationEvent(protocol.EventActivitySucceeded, activityID, `{}`)); err != nil || got.Kind != "" {
+		t.Fatalf("stale terminal=%+v err=%v", got, err)
+	}
+}
+
+func TestApplicationLegacyAdapterRejectsNonCanonicalSkillPlans(t *testing.T) {
+	activityID := protocol.ActivityID("skill-activity")
+	basePlan, baseStart := canonicalSkillLifecycleForTest(t, activityID)
+	for _, test := range []struct {
+		name   string
+		mutate func(*protocol.ActivityPlannedV1)
+	}{
+		{"descriptor_digest", func(p *protocol.ActivityPlannedV1) { p.Plan.Body.DescriptorDigest.Value = strings.Repeat("b", 64) }},
+		{"source_revision", func(p *protocol.ActivityPlannedV1) { p.Plan.Body.SourceRevision = "forged-revision" }},
+		{"body_semantics", func(p *protocol.ActivityPlannedV1) { p.Plan.Body.Purpose = "execute" }},
+		{"resource_runtime_relation", func(p *protocol.ActivityPlannedV1) { p.Plan.Body.Resources[0].Attributes[0].Value = "other-runtime" }},
+		{"source_workspace_relation", func(p *protocol.ActivityPlannedV1) { p.Plan.Body.Resources[0].Attributes[1].Value = "global" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{})
+			planned := protocol.DeepCopy(basePlan)
+			test.mutate(&planned)
+			digest, err := canonicaljson.Digest(planned.Plan.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			planned.Plan.Digest = digest
+			start := protocol.DeepCopy(baseStart)
+			start.PlanDigest = digest
+			plannedRaw, err := json.Marshal(planned)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityPlanned, activityID, string(plannedRaw))); err != nil || got.Kind != "" {
+				t.Fatalf("planned=%+v err=%v", got, err)
+			}
+			startedRaw, err := json.Marshal(start)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityStarted, activityID, string(startedRaw))); err != nil || got.Kind != "" {
+				t.Fatalf("started=%+v err=%v", got, err)
+			}
+		})
+	}
+}
+
+func startSkillActivityForTest(t *testing.T, adapter *app.LegacyAdapter) (protocol.ActivityID, []byte) {
+	t.Helper()
+	activityID := protocol.ActivityID("skill-activity")
+	planned, start := canonicalSkillLifecycleForTest(t, activityID)
+	raw, err := json.Marshal(planned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityPlanned, activityID, string(raw))); err != nil {
+		t.Fatal(err)
+	}
+	startedPayload, err := json.Marshal(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongState := protocol.DeepCopy(start)
+	wrongState.DispatchState = "started"
+	wrongStatePayload, err := json.Marshal(wrongState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ignored, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityStarted, activityID, string(wrongStatePayload))); err != nil || ignored.Kind != "" {
+		t.Fatalf("wrong dispatch state=%+v err=%v", ignored, err)
+	}
+	started, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityStarted, activityID, string(startedPayload)))
+	if err != nil || started.Kind != app.EventToolStarted || started.Runtime.Skill == nil || started.Runtime.Skill.Name != "go-testing" || started.Runtime.Progress == nil || started.Runtime.Progress.CallID != "skill-call" {
+		t.Fatalf("started=%+v err=%v", started, err)
+	}
+	available, err := json.Marshal(protocol.ToolResultAvailableV1{ActivityID: activityID, CallID: start.CallID, Status: string(domain.ToolSucceeded), Content: "bounded skill body", DurationNanos: int64(time.Second), Truncated: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return activityID, available
+}
+
+func canonicalSkillLifecycleForTest(t *testing.T, activityID protocol.ActivityID) (protocol.ActivityPlannedV1, protocol.ActivityStartedV1) {
+	t.Helper()
 	digest := protocol.Digest{Algorithm: "sha256", Value: strings.Repeat("a", 64)}
 	descriptor := skilltool.BuiltinDescriptor()
 	body := protocol.ActionPlanBody{
@@ -166,36 +315,8 @@ func TestApplicationLegacyAdapterDerivesSkillProvenanceOnlyFromCanonicalPlan(t *
 		t.Fatal(err)
 	}
 	planned := protocol.ActivityPlannedV1{Kind: "tool", Purpose: "tool observation", PurposeActor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorAgent}, Source: "builtin", RequestedProfile: "restricted", EffectiveProfile: "restricted", Plan: &protocol.ActionPlan{Body: body, Digest: planDigest}}
-	raw, err := json.Marshal(planned)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityPlanned, "skill-activity", string(raw))); err != nil {
-		t.Fatal(err)
-	}
-	startedPayload, err := json.Marshal(protocol.ActivityStartedV1{DecisionNonce: "nonce", DecisionEventID: "decision", ActivityID: "skill-activity", CallID: "skill-call", PlanDigest: planDigest, RequestDigest: digest, DispatchDigest: digest, RuntimeGenerationID: "runtime-1", DispatchState: "started"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	started, err := adapter.Event(compactionApplicationEvent(protocol.EventActivityStarted, "skill-activity", string(startedPayload)))
-	if err != nil || started.Kind != app.EventToolStarted || started.Runtime.Skill == nil || started.Runtime.Skill.Name != "go-testing" || started.Runtime.Progress == nil || started.Runtime.Progress.CallID != "skill-call" {
-		t.Fatalf("started=%+v err=%v", started, err)
-	}
-	available, err := json.Marshal(protocol.ToolResultAvailableV1{ActivityID: "skill-activity", CallID: "skill-call", Status: string(domain.ToolSucceeded), Content: "bounded skill body", DurationNanos: int64(time.Second), Truncated: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	completedWithBody, err := adapter.Event(compactionApplicationEvent("runtime.tool_result_available", "skill-activity", string(available)))
-	if err != nil || completedWithBody.Kind != app.EventToolCompleted || completedWithBody.Runtime.Result == nil || completedWithBody.Runtime.Result.Content != "bounded skill body" || !completedWithBody.Runtime.Result.Truncated || completedWithBody.Runtime.Result.Duration != time.Second {
-		t.Fatalf("completed body=%+v err=%v", completedWithBody, err)
-	}
-	completed, err := adapter.Event(compactionApplicationEvent(protocol.EventActivitySucceeded, "skill-activity", `{}`))
-	if err != nil || completed.Kind != "" {
-		t.Fatalf("completed=%+v err=%v", completed, err)
-	}
-	if _, ok := adapter.SkillProvenance("skill-activity"); ok {
-		t.Fatal("terminal skill activity retained provenance")
-	}
+	started := protocol.ActivityStartedV1{DecisionNonce: "nonce", DecisionEventID: "decision", ActivityID: activityID, CallID: body.CallID, PlanDigest: planDigest, RequestDigest: digest, DispatchDigest: digest, RuntimeGenerationID: body.RuntimeGenerationID, DispatchState: "registered"}
+	return planned, started
 }
 
 func compactionApplicationEvent(kind string, activityID protocol.ActivityID, body string) protocol.ApplicationEvent {

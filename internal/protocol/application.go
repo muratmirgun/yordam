@@ -23,6 +23,8 @@ type CommandExpectation struct {
 	Session           *CommittedCursor `json:"session,omitempty"`
 }
 
+const EventToolResultAvailable = "runtime.tool_result_available"
+
 type ToolResultAvailableV1 struct {
 	ActivityID    ActivityID `json:"activity_id"`
 	CallID        string     `json:"call_id"`
@@ -30,6 +32,21 @@ type ToolResultAvailableV1 struct {
 	Content       string     `json:"content"`
 	DurationNanos int64      `json:"duration_nanos"`
 	Truncated     bool       `json:"truncated"`
+}
+
+func (p ToolResultAvailableV1) Validate() error {
+	if err := ValidateBounds(p); err != nil {
+		return fmt.Errorf("transient tool result bounds: %w", err)
+	}
+	if p.ActivityID == "" || p.CallID == "" || p.DurationNanos < 0 || len(p.Content) > MaxStringBytes {
+		return fmt.Errorf("invalid transient tool result")
+	}
+	switch p.Status {
+	case "succeeded", "failed", "denied", "cancelled":
+		return nil
+	default:
+		return fmt.Errorf("invalid transient tool result status")
+	}
 }
 
 type Command struct {

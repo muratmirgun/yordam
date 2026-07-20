@@ -676,11 +676,19 @@ func (s *Service) publishToolPresentation(ctx context.Context, request StartTurn
 	if !ok {
 		return nil
 	}
-	payload, err := canonicaljson.Marshal(protocol.ToolResultAvailableV1{ActivityID: activityID, CallID: execution.ToolResult.CallID, Status: execution.ToolResult.Status, Content: execution.Presentation.Content, DurationNanos: execution.Presentation.DurationNanos, Truncated: execution.Presentation.Truncated})
+	content, err := s.deps.Admission.SanitizeText(ctx, request.Runtime.ID, execution.Presentation.Content)
 	if err != nil {
 		return err
 	}
-	return publisher.PublishTransient(protocol.ApplicationEvent{Correlation: protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), SessionID: request.SessionID, TurnID: state.turnID, ActivityID: activityID}, Time: time.Now().UTC(), Kind: "runtime.tool_result_available", PayloadVersion: 1, Payload: payload})
+	available := protocol.ToolResultAvailableV1{ActivityID: activityID, CallID: execution.ToolResult.CallID, Status: execution.ToolResult.Status, Content: content, DurationNanos: execution.Presentation.DurationNanos, Truncated: execution.Presentation.Truncated}
+	if err := available.Validate(); err != nil {
+		return err
+	}
+	payload, err := canonicaljson.Marshal(available)
+	if err != nil {
+		return err
+	}
+	return publisher.PublishTransient(protocol.ApplicationEvent{Correlation: protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), SessionID: request.SessionID, TurnID: state.turnID, ActivityID: activityID}, Time: time.Now().UTC(), Kind: protocol.EventToolResultAvailable, PayloadVersion: 1, Payload: payload})
 }
 
 func (s *Service) sanitizeToolResult(ctx context.Context, generation protocol.RuntimeGenerationID, result protocol.ToolResultBlock) (protocol.ToolResultBlock, error) {

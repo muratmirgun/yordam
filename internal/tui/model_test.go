@@ -437,6 +437,25 @@ func TestAppEventsBuildConversationAndFinishTurn(t *testing.T) {
 	}
 }
 
+func TestSkillOutputThenDurableTerminalCompletesOneCard(t *testing.T) {
+	model := tui.NewModel(tui.OptionsForTest())
+	provenance := domain.SkillProvenance{Name: "go-testing", Source: protocol.SkillSourceProject, Digest: protocol.Digest{Algorithm: "sha256", Value: strings.Repeat("a", 64)}}
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventToolOutput, Runtime: agent.RuntimeEvent{
+		Skill: &provenance, Progress: &domain.ToolProgress{CallID: "skill-call", Text: "sanitized preview", Truncated: true},
+	}})
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventToolCompleted, Runtime: agent.RuntimeEvent{
+		Skill: &provenance, Result: &domain.ToolResult{CallID: "skill-call", Status: domain.ToolFailed, Content: "durable terminal content", Duration: time.Second, Truncated: true},
+	}})
+	blocks := model.ConversationBlocksForTest()
+	if len(blocks) != 1 {
+		t.Fatalf("blocks=%+v", blocks)
+	}
+	block := blocks[0]
+	if block.Kind != components.BlockTool || block.CallID != "skill-call" || block.Name != "skill go-testing [project sha256:aaaaaaa]" || block.Status != components.ToolFailed || block.Content != "durable terminal content" || block.Duration != time.Second || !block.Truncated {
+		t.Fatalf("tool block=%+v", block)
+	}
+}
+
 func TestTurnProgressOnlyShowsTheCurrentActivePhase(t *testing.T) {
 	model := tui.NewModel(tui.OptionsForTest())
 	model = tui.UpdateForTest(model, tea.WindowSizeMsg{Width: 80, Height: 20})

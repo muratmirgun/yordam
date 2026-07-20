@@ -123,7 +123,11 @@ func (model Model) handleAppEvent(event app.Event) Model {
 		model = model.setTurnActive(true)
 		model = model.setTurnProgress(progressTool)
 		if progress := event.Runtime.Progress; progress != nil {
-			model.conversation.ReplaceToolOutput(progress.CallID, "shell", progress.Text, progress.Truncated)
+			name := skillCardName(event.Runtime.Skill)
+			if name == "" {
+				name = "shell"
+			}
+			model.conversation.ReplaceToolOutput(progress.CallID, name, progress.Text, progress.Truncated)
 		}
 	case app.EventToolCompleted:
 		model = model.setTurnActive(true)
