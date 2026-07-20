@@ -2,6 +2,8 @@ package subagent
 
 import (
 	"context"
+	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -19,6 +21,19 @@ func TestSubagentDescriptorIsCanonicalTrustedAndOrchestrated(t *testing.T) {
 	descriptor := tool.Descriptor()
 	if descriptor.Name != "subagent" || descriptor.Mutation != domain.MutationProcess || !strings.Contains(string(descriptor.InputSchema), `"task"`) || !strings.Contains(string(descriptor.InputSchema), `"additionalProperties":false`) {
 		t.Fatalf("descriptor=%#v", descriptor)
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Pattern  string `json:"pattern"`
+			MaxBytes int    `json:"x-max-bytes"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(descriptor.InputSchema, &schema); err != nil || schema.Properties["task"].Pattern != `[\s\S]*\S[\s\S]*` || schema.Properties["task"].MaxBytes != protocol.MaxSubagentTaskBytes || schema.Properties["expected_output"].MaxBytes != protocol.MaxSubagentExpectedOutputBytes || schema.Properties["context"].MaxBytes != protocol.MaxSubagentContextBytes {
+		t.Fatalf("descriptor schema does not advertise byte-aware nonblank task rule: %s", descriptor.InputSchema)
+	}
+	pattern, err := regexp.Compile(schema.Properties["task"].Pattern)
+	if err != nil || pattern.MatchString(" \t\n") || !pattern.MatchString(" \tobjective\n") {
+		t.Fatalf("task schema pattern=%q err=%v", schema.Properties["task"].Pattern, err)
 	}
 	canonical := tool.CanonicalDescriptor()
 	if canonical.Body.Identity != (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "subagent"}) || canonical.Body.Effect != "orchestration" || canonical.Body.Mutation != "orchestration" || canonical.Body.ClassificationSource != "trusted_adapter" || canonical.DescriptorDigest.Validate() != nil {
@@ -60,6 +75,24 @@ func TestSubagentPlansExactBoundedInputAndFailsClosedOnDirectExecution(t *testin
 		t.Run(name, func(t *testing.T) {
 			if _, err := tool.Prepare(context.Background(), domain.ToolRequest{CallID: "call-1", Name: "subagent", Input: []byte(raw)}); err == nil {
 				t.Fatal("invalid input was planned")
+			}
+		})
+	}
+	for name, raw := range map[string]string{
+		"task exact multibyte byte bound":     `{"task":"` + strings.Repeat("é", protocol.MaxSubagentTaskBytes/len("é")) + `"}`,
+		"task multibyte byte overflow":        `{"task":"` + strings.Repeat("é", protocol.MaxSubagentTaskBytes/len("é")+1) + `"}`,
+		"expected exact multibyte byte bound": `{"task":"x","expected_output":"` + strings.Repeat("é", protocol.MaxSubagentExpectedOutputBytes/len("é")) + `"}`,
+		"expected multibyte byte overflow":    `{"task":"x","expected_output":"` + strings.Repeat("é", protocol.MaxSubagentExpectedOutputBytes/len("é")+1) + `"}`,
+		"context exact multibyte byte bound":  `{"task":"x","context":"` + strings.Repeat("é", protocol.MaxSubagentContextBytes/len("é")) + `"}`,
+		"context multibyte byte overflow":     `{"task":"x","context":"` + strings.Repeat("é", protocol.MaxSubagentContextBytes/len("é")+1) + `"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := tool.Prepare(context.Background(), domain.ToolRequest{CallID: "call-1", Name: "subagent", Input: []byte(raw)})
+			if strings.Contains(name, "overflow") && err == nil {
+				t.Fatal("multibyte byte overflow was planned")
+			}
+			if strings.Contains(name, "exact") && err != nil {
+				t.Fatalf("exact multibyte byte bound failed: %v", err)
 			}
 		})
 	}

@@ -28,8 +28,8 @@ type Catalog struct {
 }
 
 // ToolExposureFilter selects the exact aliases a derived model exposure may
-// contain. A supplied revision must already be a stable caller-owned revision;
-// otherwise Filter derives one from the parent catalog and selected bindings.
+// contain. Revision, when present, is an assertion of the canonical derived
+// revision; it can never override the catalog-derived value.
 type ToolExposureFilter struct {
 	AllowedAliases []string
 	Revision       string
@@ -224,13 +224,13 @@ func (c *Catalog) Filter(filter ToolExposureFilter) (protocol.ToolExposure, erro
 			entries = append(entries, entry)
 		}
 	}
-	revision := filter.Revision
-	if revision == "" {
-		var err error
-		revision, err = derivedExposureRevision(c.revision, entries)
-		if err != nil {
-			return protocol.ToolExposure{}, err
-		}
+	bindings := c.expose("", entries).Aliases
+	revision, err := DerivedExposureRevision(c.Expose(), bindings)
+	if err != nil {
+		return protocol.ToolExposure{}, err
+	}
+	if filter.Revision != "" && filter.Revision != revision {
+		return protocol.ToolExposure{}, fmt.Errorf("tool exposure revision assertion mismatch")
 	}
 	exposure := c.expose(revision, entries)
 	if err := exposure.Validate(); err != nil {
@@ -274,25 +274,74 @@ func (c *Catalog) expose(revision string, entries []catalogEntry) protocol.ToolE
 	return exposure
 }
 
-func derivedExposureRevision(parent string, entries []catalogEntry) (string, error) {
+// DerivedExposureRevision returns the only valid revision for a retained
+// ordered binding subset of parent. It is intentionally independent of a live
+// Catalog so child contexts can validate frozen parent and child exposures.
+func DerivedExposureRevision(parent protocol.ToolExposure, bindings []protocol.ToolAliasBinding) (string, error) {
+	if err := parent.Validate(); err != nil {
+		return "", fmt.Errorf("parent tool exposure: %w", err)
+	}
 	type binding struct {
 		Alias            string                `json:"alias"`
 		Identity         protocol.ToolIdentity `json:"identity"`
 		SourceRevision   string                `json:"source_revision"`
 		DescriptorDigest protocol.Digest       `json:"descriptor_digest"`
 	}
-	bindings := make([]binding, 0, len(entries))
-	for _, entry := range entries {
-		bindings = append(bindings, binding{Alias: entry.alias, Identity: entry.descriptor.Body.Identity, SourceRevision: entry.descriptor.Body.SourceRevision, DescriptorDigest: entry.descriptor.DescriptorDigest})
+	canonicalBindings := make([]binding, 0, len(bindings))
+	for _, entry := range bindings {
+		canonicalBindings = append(canonicalBindings, binding{Alias: entry.Alias, Identity: entry.Identity, SourceRevision: entry.SourceRevision, DescriptorDigest: entry.DescriptorDigest})
 	}
 	digest, err := canonicaljson.Digest(struct {
 		Parent   string    `json:"parent"`
 		Bindings []binding `json:"bindings"`
-	}{Parent: parent, Bindings: bindings})
+	}{Parent: parent.CatalogRevision, Bindings: canonicalBindings})
 	if err != nil {
 		return "", fmt.Errorf("derive tool exposure revision: %w", err)
 	}
 	return "derived:" + digest.Value, nil
+}
+
+// ValidateDerivedExposure proves that child is an ordered exact subset of
+// parent and that its revision binds precisely those retained bindings and no
+// caller-selected text. Tool schemas are checked too, so callers cannot use a
+// genuine binding with substituted provider-visible schema bytes.
+func ValidateDerivedExposure(parent, child protocol.ToolExposure) error {
+	if err := parent.Validate(); err != nil {
+		return fmt.Errorf("parent tool exposure: %w", err)
+	}
+	if err := child.Validate(); err != nil {
+		return fmt.Errorf("child tool exposure: %w", err)
+	}
+	parentBindings := make(map[string]protocol.ToolAliasBinding, len(parent.Aliases))
+	parentTools := make(map[string]protocol.ExposedTool, len(parent.Tools))
+	parentOrder := make(map[string]int, len(parent.Aliases))
+	for index, binding := range parent.Aliases {
+		parentBindings[binding.Alias], parentOrder[binding.Alias] = binding, index
+	}
+	for _, tool := range parent.Tools {
+		parentTools[tool.Alias] = tool
+	}
+	last := -1
+	for _, binding := range child.Aliases {
+		parentBinding, ok := parentBindings[binding.Alias]
+		if !ok || parentBinding != binding || parentOrder[binding.Alias] <= last {
+			return fmt.Errorf("child tool binding %q is not an ordered parent binding", binding.Alias)
+		}
+		last = parentOrder[binding.Alias]
+	}
+	for _, tool := range child.Tools {
+		if parentTool, ok := parentTools[tool.Alias]; !ok || !reflect.DeepEqual(parentTool, tool) {
+			return fmt.Errorf("child exposed tool %q does not match parent", tool.Alias)
+		}
+	}
+	expected, err := DerivedExposureRevision(parent, child.Aliases)
+	if err != nil {
+		return err
+	}
+	if child.CatalogRevision != expected {
+		return fmt.Errorf("child tool exposure revision does not match canonical derivation")
+	}
+	return nil
 }
 
 func (c *Catalog) Descriptor(alias string) (protocol.ToolDescriptor, bool) {
@@ -317,6 +366,31 @@ func (c *Catalog) OrchestratedKind(alias string, descriptor protocol.ToolDescrip
 		return "", false
 	}
 	return marker.OrchestratedKind(), true
+}
+
+// ResolveExposure resolves an alias only when the supplied full or derived
+// exposure is exactly catalog-bound. It is the pre-dispatch seam used to reject
+// a hidden child alias before any ordinary tool planning occurs.
+func (c *Catalog) ResolveExposure(exposure protocol.ToolExposure, alias string) (protocol.ToolDescriptor, error) {
+	if c == nil {
+		return protocol.ToolDescriptor{}, fmt.Errorf("tool catalog is nil")
+	}
+	parent := c.Expose()
+	if !reflect.DeepEqual(exposure, parent) {
+		if err := ValidateDerivedExposure(parent, exposure); err != nil {
+			return protocol.ToolDescriptor{}, err
+		}
+	}
+	entry, exists := c.byAlias[alias]
+	if !exists {
+		return protocol.ToolDescriptor{}, fmt.Errorf("unknown tool alias %q", alias)
+	}
+	for _, binding := range exposure.Aliases {
+		if binding.Alias == alias && binding.Identity == entry.descriptor.Body.Identity && binding.SourceRevision == entry.descriptor.Body.SourceRevision && binding.DescriptorDigest == entry.descriptor.DescriptorDigest {
+			return cloneDescriptor(entry.descriptor), nil
+		}
+	}
+	return protocol.ToolDescriptor{}, fmt.Errorf("tool alias %q is not exposed", alias)
 }
 
 // SourceAnnotation returns the provider-authored descriptor as an untrusted

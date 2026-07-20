@@ -37,6 +37,7 @@ import (
 	searchtool "github.com/muratmirgun/yordam/internal/tools/search"
 	shelltool "github.com/muratmirgun/yordam/internal/tools/shell"
 	skilltool "github.com/muratmirgun/yordam/internal/tools/skill"
+	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 	"github.com/muratmirgun/yordam/internal/verification"
 )
 
@@ -104,10 +105,20 @@ func (s RuntimeSet) Validate() error {
 			return fmt.Errorf("runtime generation model is invalid")
 		}
 	}
+	subagentPresent := false
 	for _, descriptor := range s.Manifest.Body.Tools {
 		if err := descriptor.Body.Validate(); err != nil || canonicaljson.ValidateDigest(descriptor.Body, descriptor.DescriptorDigest) != nil {
 			return fmt.Errorf("runtime generation tool is invalid")
 		}
+		if descriptor.Body.Identity == (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: subagenttool.Kind}) {
+			if subagentPresent || !subagenttool.IsCanonicalDescriptor(descriptor) {
+				return fmt.Errorf("runtime subagent descriptor is not canonical")
+			}
+			subagentPresent = true
+		}
+	}
+	if subagentPresent != limits.Subagents.Enabled {
+		return fmt.Errorf("runtime subagent descriptor does not match configured limits")
 	}
 	if s.Skills == nil {
 		return fmt.Errorf("runtime skill catalog is not configured")
@@ -380,6 +391,11 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		readtool.New(readtool.Options{Workspace: b.workspace.CanonicalPath, Output: outputOptions}),
 		searchtool.New(searchtool.Options{Workspace: b.workspace.CanonicalPath, Output: outputOptions}),
 		skilltool.New(skillCatalog, outputOptions),
+	}
+	if cfg.Subagents.Enabled {
+		toolItems = append(toolItems, subagenttool.New())
+	}
+	toolItems = append(toolItems,
 		edittool.New(edittool.Options{Workspace: b.workspace.CanonicalPath, Output: outputOptions}),
 		shelltool.New(shelltool.Options{
 			Workspace:       b.workspace.CanonicalPath,
@@ -388,7 +404,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 			Output:          outputOptions,
 			Progress:        progress,
 		}),
-	}
+	)
 	toolCatalogRevision := "builtin-v1"
 	toolCatalog, err := tooling.NewCatalog(toolCatalogRevision, toolItems...)
 	if err != nil {

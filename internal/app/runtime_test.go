@@ -674,8 +674,11 @@ func TestRuntimeBuilderBindsProvidersToolsLimitsAndCredentials(t *testing.T) {
 	if _, ok := set.Runtime.(*agent.OrchestratedRunner); !ok || set.Manifest.Body.Limits.MaxToolCalls != 7 || set.Manifest.Body.Limits.ShellTimeoutNanos != int64(time.Second) {
 		t.Fatalf("runtime=%T limits=%+v", set.Runtime, set.Manifest.Body.Limits)
 	}
-	if len(set.ProviderCatalog.List()) != 3 || len(set.Manifest.Body.Tools) != 5 {
+	if len(set.ProviderCatalog.List()) != 3 || len(set.Manifest.Body.Tools) != 6 {
 		t.Fatalf("provider models=%d tool descriptors=%d", len(set.ProviderCatalog.List()), len(set.Manifest.Body.Tools))
+	}
+	if err := set.Validate(); err != nil {
+		t.Fatalf("enabled runtime did not validate: %v", err)
 	}
 }
 
@@ -723,7 +726,7 @@ func TestRuntimeBuilderBindsCatalogSkillsToConfigAndWorkspaceRoots(t *testing.T)
 			for _, descriptor := range set.Manifest.Body.Tools {
 				aliases = append(aliases, descriptor.Body.Identity.Name)
 			}
-			if !slices.Equal(aliases, []string{"read", "search", "skill", "edit", "shell"}) {
+			if !slices.Equal(aliases, []string{"read", "search", "skill", "subagent", "edit", "shell"}) {
 				t.Fatalf("tool order=%v", aliases)
 			}
 			writeRuntimeSkill(t, projectPath, "Project skill.", "changed-after-build")
@@ -950,6 +953,14 @@ func TestRuntimeBuilderBindsSubagentLimitsIntoManifestDigest(t *testing.T) {
 	want := protocol.SubagentLimits{Enabled: false, MaxPerTurn: 3, MaxToolCalls: 12, TimeoutNanos: int64(300 * time.Second)}
 	if got := set.Manifest.Body.Limits.Subagents; got != want {
 		t.Fatalf("subagent limits=%+v want=%+v", got, want)
+	}
+	if err := set.Validate(); err != nil {
+		t.Fatalf("disabled runtime did not validate: %v", err)
+	}
+	for _, descriptor := range set.Manifest.Body.Tools {
+		if descriptor.Body.Identity == (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "subagent"}) {
+			t.Fatalf("disabled runtime exposed subagent: %#v", descriptor)
+		}
 	}
 	canonical, err := canonicaljson.Digest(set.Manifest.Body)
 	if err != nil {

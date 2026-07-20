@@ -140,7 +140,7 @@ func TestBootstrapComposesCanonicalRedactedRuntime(t *testing.T) {
 		t.Fatalf("visible output was not redacted: %q", visible.String())
 	}
 	request := <-requests
-	if request.authorization != "Bearer "+processKey || !slices.Equal(request.tools, []string{"read", "search", "skill", "edit", "shell"}) {
+	if request.authorization != "Bearer "+processKey || !slices.Equal(request.tools, []string{"read", "search", "skill", "subagent", "edit", "shell"}) {
 		t.Fatalf("provider request=%+v", request)
 	}
 	application.Commands() <- app.Command{Kind: app.CommandShutdown}

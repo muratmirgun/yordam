@@ -103,6 +103,19 @@ func TestCatalogWithoutSubagentDerivesChildExposureWithoutChangingOtherDescripto
 	if _, err := catalog.Without("missing"); err == nil {
 		t.Fatal("unknown exclusion did not fail closed")
 	}
+	if _, err := catalog.Filter(ToolExposureFilter{AllowedAliases: []string{"read"}, Revision: "forged-child-revision"}); err == nil {
+		t.Fatal("arbitrary child revision was accepted")
+	}
+	asserted, err := catalog.Filter(ToolExposureFilter{AllowedAliases: []string{"read"}, Revision: childRevisionForAlias(t, catalog, "read")})
+	if err != nil || asserted.CatalogRevision == "" {
+		t.Fatalf("asserted exposure=%#v err=%v", asserted, err)
+	}
+	if _, err := catalog.ResolveExposure(child, "subagent"); err == nil {
+		t.Fatal("hidden subagent alias resolved for dispatch")
+	}
+	if resolved, err := catalog.ResolveExposure(child, "read"); err != nil || resolved.Body.Identity.Name != "read" {
+		t.Fatalf("read resolution=%#v err=%v", resolved, err)
+	}
 	descriptor, ok := catalog.Descriptor("subagent")
 	if !ok {
 		t.Fatal("subagent descriptor not found")
@@ -118,6 +131,15 @@ func TestCatalogWithoutSubagentDerivesChildExposureWithoutChangingOtherDescripto
 	if kind, ok := catalog.OrchestratedKind("read", descriptor); ok || kind != "" {
 		t.Fatalf("alias-only marker kind=%q ok=%t", kind, ok)
 	}
+}
+
+func childRevisionForAlias(t *testing.T, catalog *Catalog, alias string) string {
+	t.Helper()
+	exposure, err := catalog.Filter(ToolExposureFilter{AllowedAliases: []string{alias}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exposure.CatalogRevision
 }
 
 func catalogDigest(fill string) protocol.Digest {

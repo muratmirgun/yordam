@@ -8,6 +8,7 @@ import (
 
 	contextplanner "github.com/muratmirgun/yordam/internal/context"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/tooling"
 	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 )
 
@@ -43,11 +44,23 @@ func TestContextPlanRecordsProvenanceBudgetAndDigest(t *testing.T) {
 }
 
 func TestChildPlannerBindsDerivedExposureAndRejectsCanonicalSubagent(t *testing.T) {
-	childExposure := protocol.ToolExposure{
-		CatalogRevision: "derived:child-tools", Tools: []protocol.ExposedTool{{Alias: "read", Identity: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "read"}, Description: "Read", InputSchema: []byte(`{"type":"object"}`)}},
+	parentExposure := protocol.ToolExposure{
+		CatalogRevision: "parent-tools", Tools: []protocol.ExposedTool{{Alias: "read", Identity: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "read"}, Description: "Read", InputSchema: []byte(`{"type":"object"}`)}},
 		Aliases: []protocol.ToolAliasBinding{{Alias: "read", Identity: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "read"}, SourceRevision: "builtin-v1", DescriptorDigest: contextDigest("a")}},
 	}
-	planner, err := contextplanner.NewChildPlanner(childExposure, nil)
+	childExposure := protocol.ToolExposure{
+		CatalogRevision: "forged-child-revision", Tools: protocol.DeepCopy(parentExposure.Tools),
+		Aliases: protocol.DeepCopy(parentExposure.Aliases),
+	}
+	if _, err := contextplanner.NewChildPlanner(parentExposure, childExposure, nil); err == nil {
+		t.Fatal("child planner accepted forged child exposure revision")
+	}
+	derived, err := tooling.DerivedExposureRevision(parentExposure, childExposure.Aliases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childExposure.CatalogRevision = derived
+	planner, err := contextplanner.NewChildPlanner(parentExposure, childExposure, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,9 +70,15 @@ func TestChildPlannerBindsDerivedExposureAndRejectsCanonicalSubagent(t *testing.
 	}
 	blocked := protocol.DeepCopy(childExposure)
 	descriptor := subagenttool.BuiltinDescriptor()
+	parentExposure.Tools = append(parentExposure.Tools, protocol.ExposedTool{Alias: "subagent", Identity: descriptor.Body.Identity, Description: descriptor.Body.Description, InputSchema: descriptor.Body.InputSchema})
+	parentExposure.Aliases = append(parentExposure.Aliases, protocol.ToolAliasBinding{Alias: "subagent", Identity: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest})
 	blocked.Tools = append(blocked.Tools, protocol.ExposedTool{Alias: "renamed", Identity: descriptor.Body.Identity, Description: descriptor.Body.Description, InputSchema: descriptor.Body.InputSchema})
 	blocked.Aliases = append(blocked.Aliases, protocol.ToolAliasBinding{Alias: "renamed", Identity: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest})
-	if _, err := contextplanner.NewChildPlanner(blocked, nil); err == nil {
+	blocked.CatalogRevision, err = tooling.DerivedExposureRevision(parentExposure, blocked.Aliases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := contextplanner.NewChildPlanner(parentExposure, blocked, nil); err == nil {
 		t.Fatal("child planner accepted canonical subagent exposure")
 	}
 	parent, err := contextplanner.NewPlannerForExposure(blocked, nil)

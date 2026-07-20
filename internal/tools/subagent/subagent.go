@@ -22,7 +22,10 @@ import (
 const Kind = "subagent"
 
 var (
-	inputSchema = json.RawMessage(`{"type":"object","additionalProperties":false,"required":["task"],"properties":{"task":{"type":"string","minLength":1,"maxLength":32768},"expected_output":{"type":"string","maxLength":16384},"context":{"type":"string","maxLength":65536}}}`)
+	// JSON Schema maxLength counts characters, whereas the protocol limits are
+	// bytes. The x-max-bytes annotations state the authoritative wire bounds;
+	// SubagentCallV1.Validate enforces them for every input encoding.
+	inputSchema = json.RawMessage(`{"type":"object","additionalProperties":false,"required":["task"],"properties":{"task":{"type":"string","minLength":1,"pattern":"[\\s\\S]*\\S[\\s\\S]*","x-max-bytes":32768},"expected_output":{"type":"string","x-max-bytes":16384},"context":{"type":"string","x-max-bytes":65536}}}`)
 
 	ErrOrchestratorDispatchRequired = errors.New("subagent requires orchestrator dispatch")
 )
