@@ -84,6 +84,9 @@ func applyRequest(current, next Projection, event protocol.EventRecord) (Project
 		return current, fmt.Errorf("invalid subagent request")
 	}
 	if existing, exists := next.Attempts[payload.Manifest.AttemptID]; exists {
+		if existing.State == StateConflict {
+			return next, nil
+		}
 		if existing.Call != payload.Call || !reflect.DeepEqual(existing.Manifest, payload.Manifest) || existing.ParentTaskID != event.Envelope.TaskID || existing.ParentTurnID != event.Envelope.TurnID {
 			return conflict(next, payload.Manifest.AttemptID, "request binding changed"), nil
 		}
@@ -108,6 +111,9 @@ func applyWaiting(current, next Projection, event protocol.EventRecord) (Project
 	if !exists || attempt.Manifest.ChildSessionID != payload.ChildSessionID || attempt.Manifest.RuntimeGenerationID != event.Envelope.RuntimeGenerationID || attempt.ParentTaskID != event.Envelope.TaskID || attempt.ParentTurnID != event.Envelope.TurnID {
 		return current, fmt.Errorf("subagent waiting has no matching request")
 	}
+	if attempt.State == StateConflict {
+		return next, nil
+	}
 	if attempt.State == StateWaiting {
 		return next, nil
 	}
@@ -126,7 +132,13 @@ func applyManifest(current, next Projection, event protocol.EventRecord) (Projec
 		return current, fmt.Errorf("invalid subagent child manifest")
 	}
 	attempt, exists := next.Attempts[payload.AttemptID]
-	if !exists || !reflect.DeepEqual(attempt.Manifest, *payload) || attempt.State != StateWaiting {
+	if !exists || !reflect.DeepEqual(attempt.Manifest, *payload) {
+		return current, fmt.Errorf("subagent child manifest is out of order")
+	}
+	if attempt.State == StateConflict {
+		return next, nil
+	}
+	if attempt.State != StateWaiting {
 		return current, fmt.Errorf("subagent child manifest is out of order")
 	}
 	if attempt.ChildManifested {
@@ -145,6 +157,9 @@ func applyReceipt(current, next Projection, event protocol.EventRecord) (Project
 	attempt, exists := next.Attempts[payload.Manifest.AttemptID]
 	if !exists || !reflect.DeepEqual(attempt.Manifest, payload.Manifest) || !attempt.ChildManifested {
 		return current, fmt.Errorf("subagent receipt is out of order")
+	}
+	if attempt.State == StateConflict {
+		return next, nil
 	}
 	digest, err := canonicaljson.Digest(*payload)
 	if err != nil {
@@ -172,6 +187,9 @@ func applyAttachment(current, next Projection, event protocol.EventRecord) (Proj
 	attempt, exists := next.Attempts[payload.AttemptID]
 	if !exists || attempt.Manifest.ChildSessionID != payload.ChildSessionID || attempt.Manifest.RuntimeGenerationID != event.Envelope.RuntimeGenerationID || attempt.ParentTaskID != event.Envelope.TaskID || attempt.ParentTurnID != event.Envelope.TurnID || attempt.Receipt == nil {
 		return current, fmt.Errorf("subagent attachment is out of order")
+	}
+	if attempt.State == StateConflict {
+		return next, nil
 	}
 	if payload.TerminalCursor != attempt.TerminalCursor || payload.ReceiptDigest != attempt.ReceiptDigest {
 		return conflict(next, payload.AttemptID, "attachment does not match terminal receipt"), nil
@@ -227,6 +245,9 @@ func attemptsForTurn(state Projection, turnID protocol.TurnID) int {
 
 func conflict(state Projection, attemptID protocol.DelegationAttemptID, reason string) Projection {
 	attempt := state.Attempts[attemptID]
+	if attempt.State == StateConflict {
+		return state
+	}
 	attempt.State, attempt.Conflict = StateConflict, reason
 	state.Attempts[attemptID] = attempt
 	return state
