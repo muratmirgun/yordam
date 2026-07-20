@@ -609,7 +609,9 @@ func effectiveShellTimeout(cfg config.Config, options cli.Options) time.Duration
 
 func configurationError(path, message string, cause error) error {
 	if path != "" {
-		message = path + ": " + message
+		// Keep the recovery diagnostic on the first terminal line. Canonical paths
+		// can be long enough to hide parser failures in a bounded TUI viewport.
+		message += "\nconfig: " + path
 	}
 	return &domain.TypedError{Kind: domain.ErrorConfigurationInvalid, Message: message, Cause: cause}
 }

@@ -621,6 +621,23 @@ func TestRuntimeSetReadyReturnsConfigurationErrorBeforeCompatibilityBypass(t *te
 	}
 }
 
+func TestConfigurationErrorPrioritizesRecoveryDiagnosticBeforeCanonicalPath(t *testing.T) {
+	path := "/private/var/folders/wn/np4wy_7x0bq4d5v1b7yb15r40000gn/T/" + strings.Repeat("very-long-config-parent/", 5) + ".config/yordam/config.jsonc"
+	cause := errors.New("invalid JSONC at line 2, column 11")
+	err := configurationError(path, "configuration is invalid (invalid JSONC at line 2, column 11); edit the file and run /reload", cause)
+
+	var typed *domain.TypedError
+	if !errors.As(err, &typed) {
+		t.Fatalf("configuration error type=%T", err)
+	}
+	if !strings.HasPrefix(typed.Message, "configuration is invalid (invalid JSONC at line 2, column 11); edit the file and run /reload") {
+		t.Fatalf("recovery diagnostic was not prioritized: %q", typed.Message)
+	}
+	if !strings.Contains(typed.Message, "\nconfig: "+path) || !errors.Is(typed, cause) {
+		t.Fatalf("configuration error lost its canonical path or cause: %+v", typed)
+	}
+}
+
 func TestRuntimeBuilderBindsProvidersToolsLimitsAndCredentials(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		response.Header().Set("Content-Type", "text/event-stream")
