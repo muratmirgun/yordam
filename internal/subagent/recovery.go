@@ -44,10 +44,15 @@ type ChildRecoveryState struct {
 // journal. Mutation is deliberately left to the orchestrator, which writes a
 // child receipt before a parent attachment under its lane/lease discipline.
 func Reconcile(request ReconcileRequest, attempt Attempt, child ChildRecoveryState) (ReconcileResult, error) {
-	if err := reconcileBinding(request, attempt); err != nil {
-		return ReconcileResult{}, err
+	result := ReconcileResult{
+		AttemptID:      attempt.AttemptID,
+		ChildSessionID: attempt.Manifest.ChildSessionID,
+		ChildStatus:    "uncertain",
 	}
-	result := ReconcileResult{AttemptID: attempt.AttemptID, ChildSessionID: attempt.Manifest.ChildSessionID}
+	if err := reconcileBinding(request, attempt); err != nil {
+		result.Diagnostic = err.Error()
+		return result, err
+	}
 	if attempt.State == StateConflict {
 		result.ChildStatus, result.Diagnostic = "uncertain", "conflicting subagent journal state"
 		return result, nil

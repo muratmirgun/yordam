@@ -148,3 +148,39 @@ before generic terminalization. There is not yet a real-JSONL application
 bootstrap fixture that corrupts a parent tail and observes the structured child
 diagnostic through an application subscription; that integration assertion is
 left explicit for review rather than represented by a mock-only startup test.
+
+## Final review closure
+
+- Recovered-parent reconstruction and continuation failures no longer escape
+  with the parent active. Semantic model/reconstruction failures and provider,
+  authorization, or tool continuation failures persist one structured
+  `subagent.recovery_uncertain` diagnostic, interrupt the parent with a
+  non-retryable `subagent_recovery_uncertain` public error, and let the recovery
+  control command complete consistently. The latest continuation cursor is
+  carried into terminalization, so a dispatched provider activity remains
+  durably `uncertain` instead of being lost behind the earlier attachment head.
+- Journal/inspection infrastructure failures and commit-unknown errors remain
+  ordinary recovery errors rather than being misrepresented as semantic child
+  failures. A regression fixture proves a parent-session inspection failure
+  leaves the parent journal unterminated for a safe retry.
+- Child inspection success is no longer sufficient proof of a known commit.
+  Read-only JSONL views, incomplete transactions, and `recovery.available`
+  diagnostics classify the exact child as `uncertain`, are never resumed, and
+  persist the child identity, status, terminal cursor, and receipt digest in the
+  parent diagnostic.
+- Parent reconstruction now selects the exact frozen provider/model pair from
+  the durable session selection. Duplicate model IDs across providers cannot
+  switch the provider.
+- `Reconcile` returns the bounded attempt/child identity and `uncertain` status
+  even when binding validation fails, preventing an empty `child_status` in the
+  structured diagnostic.
+
+Final review verification:
+
+```text
+go test ./internal/subagent ./internal/orchestrator ./internal/app -count=1  PASS
+go test -race ./internal/subagent ./internal/orchestrator ./internal/app -run 'Test(SubagentRecover|RecoveryProviderContinuationFailure|RecoveryParentReconstructionFailure|RecoveryParentInspectionInfrastructureFailure|RecoveryUnhealthyChildInspection|.*Subagent.*Cancel)' -count=1  PASS
+go test -json ./... -count=1  PASS
+go vet ./...  PASS
+git diff --check  PASS
+```

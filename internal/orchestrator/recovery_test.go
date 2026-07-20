@@ -489,7 +489,23 @@ func (p terminalAwareRecoveryProjection) InspectRecovery(_ context.Context, ref 
 			}
 		}
 	}
-	return protocol.DeepCopy(p.active), nil
+	projection := protocol.DeepCopy(p.active)
+	for _, request := range p.repository.appendRequests() {
+		if request.Journal != ref {
+			continue
+		}
+		for _, event := range request.Events {
+			switch event.Kind {
+			case protocol.EventActivityStarted:
+				if !slices.Contains(projection.StartedActivities, event.ActivityID) {
+					projection.StartedActivities = append(projection.StartedActivities, event.ActivityID)
+				}
+			case protocol.EventActivitySucceeded, protocol.EventActivityFailed, protocol.EventActivityInterruptedNoEffect, protocol.EventActivityUncertain:
+				projection.StartedActivities = slices.DeleteFunc(projection.StartedActivities, func(id protocol.ActivityID) bool { return id == event.ActivityID })
+			}
+		}
+	}
+	return projection, nil
 }
 
 type recoveryChildStore struct{ inspection journal.Inspection }
@@ -752,5 +768,241 @@ func TestRecoveryReconstructsExactSubagentToolResultContinuation(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, intent) || providerAttempt != 1 {
 		t.Fatalf("intent=%+v provider_attempt=%d", got, providerAttempt)
+	}
+}
+
+func TestRecoveryParentReconstructionBindsExactFrozenProviderAndModelPair(t *testing.T) {
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-a"}
+	head := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 2, TransactionID: "parent-head"}
+	repository := newRecoveryRepository(&recordLog{}, protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "control"}, protocol.CommittedCursor{}, ref, head, head)
+	runtime := validRuntimeManifest(t, "observation")
+	second := protocol.DeepCopy(runtime.Body.Models[0])
+	second.ProviderID = "provider-b"
+	second.DisplayName = "Provider B Model A"
+	second.CredentialBindingRef = "credential-b"
+	runtime.Body.Models = append(runtime.Body.Models, second)
+	refreshRuntimeDigest(t, &runtime)
+	actor := protocol.ActorRef{ID: "user", Kind: protocol.ActorUser}
+	events := []protocol.EventRecord{
+		{Envelope: protocol.EventEnvelope{Kind: protocol.EventCommandAccepted, TurnID: "parent-turn", RuntimeGenerationID: runtime.ID, Actor: &actor, Payload: mustCanonical(protocol.CommandAcceptedV1{CommandID: "parent-command", RequestDigest: repeatedDigest("4"), IdempotencyKey: "parent-key"})}},
+		{Envelope: protocol.EventEnvelope{Kind: protocol.EventTurnAccepted, TurnID: "parent-turn", RuntimeGenerationID: runtime.ID, Payload: mustCanonical(protocol.TurnAcceptedV1{CommandID: "parent-command", Goal: "continue exact parent"})}},
+	}
+	children := &restartRecoveryChildStore{workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}, selection: domain.ModelSelection{Profile: "provider-b", Model: "model-a"}}
+	service, err := NewService(Dependencies{Repository: repository, Lane: NewOperationLane(), ParentSessions: restartRecoveryParent{children}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := receiptprojector.Attempt{Manifest: protocol.SubagentManifestV1{ChildSessionID: "child", RuntimeGenerationID: runtime.ID}, ParentTurnID: "parent-turn"}
+	request := RecoveryControlRequest{Control: ControlRequest{Runtime: runtime}, Storage: journal.RecoveryRequest{Journal: ref}}
+	projection := RecoveryProjection{OriginalCommandID: "parent-command", OriginalRequestDigest: repeatedDigest("4")}
+
+	got, err := service.recoverParentStartRequest(context.Background(), request, projection, attempt, head, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProviderID != "provider-b" || got.ModelID != "model-a" {
+		t.Fatalf("reconstructed provider/model=%q/%q", got.ProviderID, got.ModelID)
+	}
+}
+
+func TestRecoveryChildInspectionHealthControlsCommitKnowledge(t *testing.T) {
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "child"}
+	for _, test := range []struct {
+		name       string
+		inspection journal.Inspection
+		want       bool
+	}{
+		{name: "healthy", inspection: journal.Inspection{Journal: ref, Writable: true}, want: true},
+		{name: "read only", inspection: journal.Inspection{Journal: ref, Writable: false}},
+		{name: "incomplete transaction", inspection: journal.Inspection{Journal: ref, Writable: true, IncompleteTransaction: "child-incomplete"}},
+		{name: "recovery available", inspection: journal.Inspection{Journal: ref, Writable: true, Diagnostics: []protocol.Diagnostic{{Code: "recovery.available", Message: "journal has bytes beyond its validated committed prefix", Journal: ref}}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := childInspectionCommitKnown(test.inspection); got != test.want {
+				t.Fatalf("commit known=%v want=%v inspection=%+v", got, test.want, test.inspection)
+			}
+		})
+	}
+}
+
+func TestRecoveryProviderContinuationFailureTerminalizesParentWithSubagentDiagnostic(t *testing.T) {
+	service, request, repository, _, manifest := recoveredParentFailureFixture(t, domain.ModelSelection{Profile: "provider-a", Model: "model-a"}, failingProviderService{})
+
+	result, err := service.RecoverTurn(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CommandResult.Status != "completed" {
+		t.Fatalf("recovery control result=%+v", result)
+	}
+	assertRecoveredParentFailureTerminalized(t, repository, manifest, "resume recovered parent continuation: provider stream fault")
+	wantProviderActivity := protocol.ActivityID(stableID("activity", "command-original", "provider", "1"))
+	foundUncertain := false
+	for _, request := range repository.appendRequests() {
+		for _, event := range request.Events {
+			foundUncertain = foundUncertain || event.Kind == protocol.EventActivityUncertain && event.ActivityID == wantProviderActivity
+		}
+	}
+	if !foundUncertain {
+		t.Fatalf("provider continuation effect was not preserved as uncertain: %v", flattenBatches(repository.appendRequests()))
+	}
+}
+
+func TestRecoveryParentReconstructionFailureTerminalizesParentWithSubagentDiagnostic(t *testing.T) {
+	continuation := &capturingFinalProvider{log: &recordLog{}, name: "must-not-run"}
+	service, request, repository, _, manifest := recoveredParentFailureFixture(t, domain.ModelSelection{Profile: "provider-missing", Model: "model-a"}, continuation)
+
+	result, err := service.RecoverTurn(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CommandResult.Status != "completed" || continuation.request.ModelID != "" {
+		t.Fatalf("recovery control result=%+v continuation=%+v", result, continuation.request)
+	}
+	assertRecoveredParentFailureTerminalized(t, repository, manifest, "reconstruct recovered parent continuation: subagent recovery frozen model is unavailable")
+}
+
+func TestRecoveryParentInspectionInfrastructureFailureRemainsRetryable(t *testing.T) {
+	continuation := &capturingFinalProvider{log: &recordLog{}, name: "must-not-run"}
+	selection := domain.ModelSelection{Profile: "provider-a", Model: "model-a"}
+	service, request, repository, _, _ := recoveredParentFailureFixture(t, selection, continuation)
+	service.deps.ParentSessions = &failingRecoveryParentInspector{selection: selection}
+
+	if _, err := service.RecoverTurn(context.Background(), request); err == nil || !strings.Contains(err.Error(), "parent inspection fault") {
+		t.Fatalf("infrastructure failure=%v", err)
+	}
+	for _, batch := range flattenBatches(repository.appendRequests()) {
+		if slices.Contains(batch, protocol.EventTurnInterrupted) || slices.Contains(batch, protocol.EventRecoveryDiagnostic) {
+			t.Fatalf("infrastructure failure was converted to a parent terminal: %v", batch)
+		}
+	}
+}
+
+type failingRecoveryParentInspector struct {
+	calls     int
+	selection domain.ModelSelection
+}
+
+func (p *failingRecoveryParentInspector) InspectSession(_ context.Context, id protocol.SessionID) (journal.SessionInspection, error) {
+	p.calls++
+	if p.calls > 1 {
+		return journal.SessionInspection{}, errors.New("parent inspection fault")
+	}
+	return journal.SessionInspection{Session: domain.Session{ID: string(id), Workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}, Mode: domain.ModeAsk, Selection: p.selection}}, nil
+}
+
+func TestRecoveryUnhealthyChildInspectionIsUncertainAndNeverResumed(t *testing.T) {
+	continuation := &capturingFinalProvider{log: &recordLog{}, name: "must-not-run"}
+	service, request, repository, children, manifest := recoveredParentFailureFixture(t, domain.ModelSelection{Profile: "provider-a", Model: "model-a"}, continuation)
+	// This mirrors the fail-closed shape returned by the production JSONL
+	// inspector when a committed prefix has an incomplete trailing transaction.
+	children.inspection.Writable = false
+	children.inspection.IncompleteTransaction = "child-incomplete"
+	children.inspection.Diagnostics = []protocol.Diagnostic{{
+		Code: "recovery.available", Message: "journal has bytes beyond its validated committed prefix",
+		Journal: children.inspection.Journal, AtSeq: children.inspection.Head.CommitSeq + 1,
+	}}
+
+	result, err := service.RecoverTurn(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CommandResult.Status != "completed" || continuation.request.ModelID != "" {
+		t.Fatalf("recovery control result=%+v continuation=%+v", result, continuation.request)
+	}
+	assertRecoveredParentFailureTerminalized(t, repository, manifest, "child journal commit is unknown")
+}
+
+func recoveredParentFailureFixture(t *testing.T, selection domain.ModelSelection, continuation ProviderService) (*Service, RecoveryControlRequest, *recoveryRepository, *restartRecoveryChildStore, protocol.SubagentManifestV1) {
+	t.Helper()
+	service, request, repository, recoveryLog := recoveryBarrierFixture(t, NoopBarrierProbe())
+	request.Control.Runtime.Body.SkillCatalogRevision = "skills-a"
+	request.Control.Runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Minute)}
+	refreshRuntimeDigest(t, &request.Control.Runtime)
+	parentRef := request.Storage.Journal
+	manifest := protocol.SubagentManifestV1{
+		AttemptID: "restart-attempt", ParentSessionID: "session-a",
+		ParentCursor:   protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: parentRef.ID, CommitSeq: 1, TransactionID: "parent-provider"},
+		ChildSessionID: "child-reserved", ChildTaskID: "child-task", ChildTurnID: "child-turn",
+		RuntimeGenerationID: request.Control.Runtime.ID, SkillCatalogRevision: request.Control.Runtime.Body.SkillCatalogRevision,
+		MaxToolCalls: 1, Deadline: time.Now().Add(time.Minute),
+	}
+	intent := protocol.ToolUseBlock{CallID: "delegate", Alias: "subagent", Arguments: json.RawMessage(`{"task":"durable child task"}`)}
+	activityID := protocol.ActivityID(stableID("activity", "command-original", "subagent", intent.CallID))
+	recoveredHead := protocol.CommittedCursor{JournalKind: parentRef.Kind, JournalID: parentRef.ID, CommitSeq: 7, TransactionID: "recovered-parent-wait"}
+	repository.recovered, repository.result.Cursor, repository.heads[parentRef] = recoveredHead, recoveredHead, recoveredHead
+	repository.events[parentRef] = []protocol.ProposedEvent{
+		{EventID: "command-original", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventCommandAccepted, SessionID: "session-a", TurnID: "turn-original", Actor: &protocol.ActorRef{ID: "user", Kind: protocol.ActorUser}, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.CommandAcceptedV1{CommandID: "command-original", RequestDigest: repeatedDigest("5"), IdempotencyKey: "parent-key"})},
+		{EventID: "turn-accepted", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventTurnAccepted, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.TurnAcceptedV1{CommandID: "command-original", Goal: "durable parent goal"})},
+		{EventID: "assistant-tool-use", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventAssistantMessage, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.AssistantMessageV1{ToolIntents: []protocol.ToolUseBlock{intent}})},
+		{EventID: "provider-terminal", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventProviderAttemptTerminal, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.ProviderAttemptTerminalV1{Status: "completed"})},
+		{EventID: "parent-activity", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventActivityStarted, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: activityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.ActivityOutcomeV1{Status: "started"})},
+		{EventID: "subagent-request", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentRequested, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: activityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.SubagentRequestedV1{Call: protocol.SubagentCallV1{Task: "durable child task"}, Manifest: manifest})},
+		{EventID: "subagent-wait", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentWaiting, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: activityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.SubagentWaitingV1{AttemptID: manifest.AttemptID, ChildSessionID: manifest.ChildSessionID})},
+	}
+	receipt := childReceipt(manifest, "succeeded", "child completed", protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(manifest.ChildSessionID), CommitSeq: 2, TransactionID: "child-terminal"}, unknownUsage(), nil, nil)
+	children := &restartRecoveryChildStore{
+		workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}, selection: selection,
+		created: manifest.ChildSessionID, log: recoveryLog,
+		inspection: journal.Inspection{
+			Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(manifest.ChildSessionID)}, Head: receipt.TerminalCursor, Writable: true,
+			Events: []protocol.EventRecord{
+				{Envelope: protocol.EventEnvelope{SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1, JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(manifest.ChildSessionID), SessionID: manifest.ChildSessionID, EventID: "child-manifest", Seq: 1, Time: time.Now().UTC(), Kind: protocol.EventSubagentManifest, TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID, TransactionID: "child-manifest", RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: mustCanonical(manifest)}},
+				{Envelope: protocol.EventEnvelope{SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: 1, JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(manifest.ChildSessionID), SessionID: manifest.ChildSessionID, EventID: "child-receipt", Seq: receipt.TerminalCursor.CommitSeq, Time: time.Now().UTC(), Kind: protocol.EventSubagentReceipt, TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID, TransactionID: receipt.TerminalCursor.TransactionID, RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: mustCanonical(receipt)}},
+			},
+		},
+	}
+	coordinator, err := NewSequentialChildCoordinator(children, restartRecoveryParent{children}, func(context.Context, StartTurnRequest) (RunResult, error) {
+		return RunResult{}, errors.New("recovered terminal child must not run again")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.deps.ChildSessions, service.deps.ParentSessions, service.deps.Children = children, restartRecoveryParent{children}, coordinator
+	service.deps.Evidence = recordingEvidence{log: recoveryLog}
+	service.deps.Context, service.deps.Providers, service.deps.Provider = fakeContextPlanner{log: &recordLog{}}, fakeProviderCatalog{log: &recordLog{}}, continuation
+	service.deps.Instructions, service.deps.Verification = emptyInstructionService{}, verification.NewService(time.Now)
+	service.deps.Projection = terminalAwareRecoveryProjection{
+		repository: repository,
+		active:     RecoveryProjection{ActiveTurnID: "turn-original", TaskID: "task-original", OriginalCommandID: "command-original", OriginalRequestDigest: repeatedDigest("5"), StartedActivities: []protocol.ActivityID{activityID}},
+	}
+	return service, request, repository, children, manifest
+}
+
+func assertRecoveredParentFailureTerminalized(t *testing.T, repository *recoveryRepository, manifest protocol.SubagentManifestV1, reason string) {
+	t.Helper()
+	var diagnostic protocol.DiagnosticV1
+	var completed protocol.CommandCompletedV1
+	turnInterrupted := 0
+	for _, request := range repository.appendRequests() {
+		if request.Journal != repository.sessionRef {
+			continue
+		}
+		for _, event := range request.Events {
+			switch event.Kind {
+			case protocol.EventTurnInterrupted:
+				turnInterrupted++
+			case protocol.EventRecoveryDiagnostic:
+				if err := json.Unmarshal(event.Payload, &diagnostic); err != nil {
+					t.Fatal(err)
+				}
+			case protocol.EventCommandCompleted:
+				var candidate protocol.CommandCompletedV1
+				if err := json.Unmarshal(event.Payload, &candidate); err != nil {
+					t.Fatal(err)
+				}
+				if candidate.CommandID == "command-original" {
+					completed = candidate
+				}
+			}
+		}
+	}
+	var details SubagentRecoveryDiagnostic
+	if err := json.Unmarshal(diagnostic.Diagnostic.Details, &details); err != nil {
+		t.Fatal(err)
+	}
+	wantMessage := "sequential child recovery state is uncertain: " + reason
+	if turnInterrupted != 1 || diagnostic.Diagnostic.Code != "subagent.recovery_uncertain" || details.AttemptID != manifest.AttemptID || details.ChildSessionID != manifest.ChildSessionID || details.ChildStatus != "uncertain" || details.TerminalCursor.Validate() != nil || details.TerminalCursor.JournalID != protocol.JournalID(manifest.ChildSessionID) || details.ReceiptDigest.Validate() != nil || details.Reason != reason || completed.Error == nil || completed.Error.Code != "subagent_recovery_uncertain" || completed.Error.Message != wantMessage || completed.Error.Retryable {
+		t.Fatalf("turn_interrupted=%d diagnostic=%+v details=%+v completed=%+v", turnInterrupted, diagnostic, details, completed)
 	}
 }

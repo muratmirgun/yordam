@@ -103,3 +103,26 @@ func TestSubagentRecoverRestartAndCancellationMatrix(t *testing.T) {
 		})
 	}
 }
+
+func TestSubagentRecoverBindingErrorRemainsVisiblyUncertain(t *testing.T) {
+	manifest := projectorManifest()
+	attempt := Attempt{AttemptID: manifest.AttemptID, Manifest: manifest, State: StateWaiting}
+	request := ReconcileRequest{
+		ParentSessionID: manifest.ParentSessionID,
+		ParentCursor: protocol.CommittedCursor{
+			JournalKind:   protocol.JournalSession,
+			JournalID:     protocol.JournalID(manifest.ParentSessionID),
+			CommitSeq:     manifest.ParentCursor.CommitSeq - 1,
+			TransactionID: "older-parent",
+		},
+		Runtime: protocol.RuntimeGenerationManifest{ID: manifest.RuntimeGenerationID},
+	}
+
+	result, err := Reconcile(request, attempt, ChildRecoveryState{Exists: true, CommitKnown: true})
+	if err == nil {
+		t.Fatal("invalid parent binding was accepted")
+	}
+	if result.ChildStatus != "uncertain" || result.AttemptID != manifest.AttemptID || result.ChildSessionID != manifest.ChildSessionID {
+		t.Fatalf("reconcile error result=%+v err=%v", result, err)
+	}
+}
