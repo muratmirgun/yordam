@@ -36,6 +36,7 @@ func TestV030Skills(t *testing.T) {
 	t.Run("bootstrap_trust_reload_restart_and_explicit_load", assertV030SkillsAcceptance)
 	t.Run("discovery_rejects_hostile_filesystem_entries", assertV030SkillDiscoveryBoundaries)
 	t.Run("catalog_bound_tool_and_discovery_inventory", func(t *testing.T) {
+		runV030GoTest(t, "./internal/app", "TestRuntimeSetChildSkillCatalogHandoffIsFrozenAndExact")
 		runV030GoTest(t, "./internal/tools/skill", "TestSkillCapturesCatalogEntryAndReturnsCanonicalContent")
 		runV030GoTest(t, "./internal/tools/skill", "TestSkillRejectsStrictAndUnavailableInputs")
 		runV030GoTest(t, "./internal/tools/skill", "TestSkillGenerationAdmissionRedactsJSONEscapedSecretsBeforeEncoding")
@@ -184,11 +185,11 @@ release:
 	if after.Skills.CatalogDigest != before.Skills.CatalogDigest {
 		t.Fatal("restart did not project matching durable trust digest")
 	}
-	// This is the child-handoff seam: copied snapshot data, never a discovery
-	// request, remains exactly equal to the frozen restarted parent snapshot.
+	// This verifies only the local client DTO copy. The production child-handoff
+	// seam is covered by TestRuntimeSetChildSkillCatalogHandoffIsFrozenAndExact.
 	child := after.Skills.Clone()
 	if !reflect.DeepEqual(child, after.Skills) || strings.Contains(v030JSON(child), hostile) {
-		t.Fatalf("child catalog snapshot is not exact metadata-only handoff: %+v", child)
+		t.Fatalf("client skill snapshot clone is not exact metadata-only data: %+v", child)
 	}
 	done = runV030App(t, restarted)
 	var observed []app.Event

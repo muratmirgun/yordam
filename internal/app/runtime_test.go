@@ -735,6 +735,60 @@ func TestRuntimeBuilderBindsCatalogSkillsToConfigAndWorkspaceRoots(t *testing.T)
 	}
 }
 
+func TestRuntimeSetChildSkillCatalogHandoffIsFrozenAndExact(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "child-handoff-skill-key")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Skills.ProjectPolicy = config.ProjectSkillsAllow
+	builder := newRuntimeBuilderForTest(t, nil)
+	configDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder.configPath = filepath.Join(configDir, "config.jsonc")
+	globalPath := filepath.Join(configDir, "skills", "go-testing", "SKILL.md")
+	projectPath := filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md")
+	writeRuntimeSkill(t, globalPath, "Global parent metadata.", "global-parent-body")
+	writeRuntimeSkill(t, projectPath, "Project parent metadata.", "project-parent-body")
+
+	parent, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.retireSecrets()
+	parentCatalog := parent.SkillCatalogSnapshot()
+	parentLoaded, ok := parent.Skills.Load("go-testing")
+	if !ok || parentLoaded.Identity.Source != protocol.SkillSourceProject || !strings.Contains(string(parentLoaded.Content), "project-parent-body") {
+		t.Fatalf("parent admitted catalog=%+v loaded=%+v", parentCatalog, parentLoaded)
+	}
+
+	writeRuntimeSkill(t, projectPath, "Project child metadata.", "project-child-body")
+
+	// This is the production child-handoff seam. It must not discover or build
+	// from the mutable filesystem after the parent generation was captured.
+	childCatalog := parent.SkillCatalogSnapshot()
+	childLoaded, ok := parent.Skills.Load("go-testing")
+	if !ok {
+		t.Fatal("child handoff lost the admitted skill")
+	}
+	if childCatalog.Revision != parentCatalog.Revision || childCatalog.Digest != parentCatalog.Digest || !reflect.DeepEqual(childCatalog.Active, parentCatalog.Active) || !reflect.DeepEqual(childCatalog.Discovered, parentCatalog.Discovered) || !reflect.DeepEqual(childCatalog.Diagnostics, parentCatalog.Diagnostics) || !reflect.DeepEqual(childCatalog, parentCatalog) {
+		t.Fatalf("child catalog is not the exact frozen parent catalog:\nparent=%+v\nchild=%+v", parentCatalog, childCatalog)
+	}
+	if childLoaded.Identity.ContentDigest != parentLoaded.Identity.ContentDigest || childLoaded.Identity.RuntimeGenerationID != parentLoaded.Identity.RuntimeGenerationID || !reflect.DeepEqual(childLoaded, parentLoaded) || !strings.Contains(string(childLoaded.Content), "project-parent-body") || strings.Contains(string(childLoaded.Content), "project-child-body") {
+		t.Fatalf("child loaded skill is not the frozen parent body:\nparent=%+v\nchild=%+v", parentLoaded, childLoaded)
+	}
+
+	fresh, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.retireSecrets()
+	freshCatalog := fresh.SkillCatalogSnapshot()
+	freshLoaded, ok := fresh.Skills.Load("go-testing")
+	if !ok || reflect.DeepEqual(freshCatalog, parentCatalog) || freshLoaded.Identity.ContentDigest == parentLoaded.Identity.ContentDigest || !strings.Contains(string(freshLoaded.Content), "project-child-body") {
+		t.Fatalf("fresh runtime did not observe mutated project skill:\ncatalog=%+v\nloaded=%+v", freshCatalog, freshLoaded)
+	}
+}
+
 func writeRuntimeSkill(t *testing.T, path, description, body string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
