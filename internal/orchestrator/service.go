@@ -220,7 +220,9 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 			results = append(results, protocol.ContentBlock{Kind: protocol.ContentToolResult, ToolResult: &resultCopy})
 			completedTools++
 		}
-		extraMessages = make([]protocol.ModelMessage, 0, len(results))
+		// Tool-result messages are not independent durable transcript events;
+		// retain every result from this turn so later provider continuations can
+		// still resolve all earlier committed assistant tool calls.
 		for _, result := range results {
 			extraMessages = append(extraMessages, protocol.ModelMessage{Role: "tool", Blocks: []protocol.ContentBlock{result}})
 		}

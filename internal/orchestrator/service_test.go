@@ -374,6 +374,45 @@ func TestSequentialToolIntentsExecuteFIFOInProviderOrder(t *testing.T) {
 	}
 }
 
+func TestSequentialToolContinuationsRetainEveryPriorResult(t *testing.T) {
+	log := &recordLog{}
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	providerService := &threeRoundToolProvider{log: log}
+	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{},
+		Lane: NewOperationLane(), Repository: &recordingRepository{head: request.ExpectedHead}, TurnLeases: &recordingTurnLeaseManager{},
+		Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: providerService,
+		Tools: observationToolService{log: log}, Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log},
+		Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	providerService.mu.Lock()
+	requests := protocol.DeepCopy(providerService.requests)
+	providerService.mu.Unlock()
+	if len(requests) != 4 {
+		t.Fatalf("provider requests=%d want four", len(requests))
+	}
+	for requestIndex, modelRequest := range requests {
+		var resultIDs []string
+		for _, message := range modelRequest.Messages {
+			if message.Role != "tool" || len(message.Blocks) != 1 || message.Blocks[0].ToolResult == nil {
+				continue
+			}
+			resultIDs = append(resultIDs, message.Blocks[0].ToolResult.CallID)
+		}
+		want := []string{"round-call-1", "round-call-2", "round-call-3"}[:requestIndex]
+		if !slices.Equal(resultIDs, want) {
+			t.Fatalf("request %d tool results=%v want=%v", requestIndex, resultIDs, want)
+		}
+	}
+}
+
 func TestRunTurnEventsValidateFoundationRegistry(t *testing.T) {
 	log := &recordLog{}
 	request := validStartTurnRequest()
@@ -1147,6 +1186,36 @@ type toolThenFinalProvider struct {
 type twoToolThenFinalProvider struct {
 	log     *recordLog
 	streams atomic.Int64
+}
+
+type threeRoundToolProvider struct {
+	log      *recordLog
+	streams  atomic.Int64
+	mu       sync.Mutex
+	requests []protocol.ModelRequest
+}
+
+func (p *threeRoundToolProvider) Prepare(_ context.Context, _ protocol.ActivityID, _ string, request protocol.ModelRequest, _ protocol.Digest) (provider.ProviderHandle, error) {
+	p.log.add("provider.prepare")
+	p.mu.Lock()
+	p.requests = append(p.requests, protocol.DeepCopy(request))
+	p.mu.Unlock()
+	return provider.ProviderHandle{}, nil
+}
+
+func (p *threeRoundToolProvider) Stream(context.Context, provider.ProviderHandle, authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	p.log.add("provider.stream")
+	round := int(p.streams.Add(1))
+	stream := make(chan protocol.ModelEvent, 2)
+	if round <= 3 {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventToolIntent, Sequence: 1, ToolIntent: &protocol.ToolUseBlock{CallID: fmt.Sprintf("round-call-%d", round), Alias: "read", Arguments: json.RawMessage(`{"path":"a.go"}`)}}
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "tool_use"}}
+	} else {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: "done"}}
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "stop"}}
+	}
+	close(stream)
+	return stream, nil
 }
 
 func (s *twoToolThenFinalProvider) Prepare(context.Context, protocol.ActivityID, string, protocol.ModelRequest, protocol.Digest) (provider.ProviderHandle, error) {
