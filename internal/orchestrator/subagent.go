@@ -74,6 +74,7 @@ func (s *Service) runSubagentIntent(ctx context.Context, lease managedOperationL
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
 	state.activeRequiresToolResult = false
+	state.activeToolCallID, state.activeProviderVisibleTool = intent.CallID, true
 	if _, err := s.authorizeActivity(ctx, lease, request, state, activityID, intent.CallID, label, authorizationRequest); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
@@ -203,6 +204,7 @@ func (s *Service) rejectSubagentIntent(ctx context.Context, request StartTurnReq
 func (s *Service) attachSubagentReceipt(ctx context.Context, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock, activityID protocol.ActivityID, receipt protocol.SubagentReceiptV1) (protocol.ToolResultBlock, error) {
 	if state.activeActivityID == activityID {
 		state.activeRequiresToolResult = true
+		state.activeToolCallID, state.activeProviderVisibleTool = intent.CallID, true
 	}
 	encoded, err := canonicaljson.Marshal(receipt)
 	if err != nil {
@@ -258,11 +260,13 @@ func (s *Service) attachSubagentReceipt(ctx context.Context, request StartTurnRe
 		if state.head != terminalHead && state.activeActivityID == activityID {
 			state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
 			state.activeRequiresToolResult = false
+			state.activeToolCallID, state.activeProviderVisibleTool = "", false
 		}
 		return protocol.ToolResultBlock{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
 	state.activeRequiresToolResult = false
+	state.activeToolCallID, state.activeProviderVisibleTool = "", false
 	return result, nil
 }
 

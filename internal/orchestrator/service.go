@@ -325,11 +325,13 @@ func (s *Service) runProviderActivity(ctx context.Context, lease managedOperatio
 		if state.head != plannedHead {
 			state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
 			state.activeRequiresToolResult = false
+			state.activeToolCallID, state.activeProviderVisibleTool = "", false
 		}
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
 	state.activeRequiresToolResult = false
+	state.activeToolCallID, state.activeProviderVisibleTool = "", false
 	token, err := s.authorizeActivity(ctx, lease, request, state, activityID, callID, label, authorizationRequest)
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
@@ -376,11 +378,13 @@ func (s *Service) runProviderActivity(ctx context.Context, lease managedOperatio
 		if state.head != terminalHead {
 			state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
 			state.activeRequiresToolResult = false
+			state.activeToolCallID, state.activeProviderVisibleTool = "", false
 		}
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
 	state.activeRequiresToolResult = false
+	state.activeToolCallID, state.activeProviderVisibleTool = "", false
 	return message, terminal, nil
 }
 
@@ -459,11 +463,13 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 			if state.head != plannedHead {
 				state.activeActivityID, state.activeStarted, state.activeDispatched = previewActivityID, false, false
 				state.activeRequiresToolResult = false
+				state.activeToolCallID, state.activeProviderVisibleTool = "", false
 			}
 			return protocol.ToolResultBlock{}, err
 		}
 		state.activeActivityID, state.activeStarted, state.activeDispatched = previewActivityID, false, false
 		state.activeRequiresToolResult = false
+		state.activeToolCallID, state.activeProviderVisibleTool = "", false
 		barrierState := state.barrierState()
 		barrierState.ActivityID, barrierState.PlanDigest = previewActivityID, previewPlan.Digest
 		if err := s.cross(ctx, BarrierActionPlanCommitted, barrierState); err != nil {
@@ -519,11 +525,13 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 			if state.head != plannedHead {
 				state.activeActivityID, state.activeStarted, state.activeDispatched = mutationActivityID, false, false
 				state.activeRequiresToolResult = false
+				state.activeToolCallID, state.activeProviderVisibleTool = intent.CallID, true
 			}
 			return protocol.ToolResultBlock{}, err
 		}
 		state.activeActivityID, state.activeStarted, state.activeDispatched = mutationActivityID, false, false
 		state.activeRequiresToolResult = false
+		state.activeToolCallID, state.activeProviderVisibleTool = intent.CallID, true
 		checkpoint, err := s.prepareCheckpoint(ctx, request, state, mutationActivityID, mutationLabel, preview, mutationPlan, previewRecords)
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
@@ -671,11 +679,13 @@ func (s *Service) runObservationIntent(ctx context.Context, lease managedOperati
 		if state.head != plannedHead {
 			state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
 			state.activeRequiresToolResult = false
+			state.activeToolCallID, state.activeProviderVisibleTool = intent.CallID, true
 		}
 		return protocol.ToolResultBlock{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
 	state.activeRequiresToolResult = false
+	state.activeToolCallID, state.activeProviderVisibleTool = intent.CallID, true
 	barrierState := state.barrierState()
 	barrierState.ActivityID, barrierState.PlanDigest = activityID, plan.Digest
 	if err := s.cross(ctx, BarrierActionPlanCommitted, barrierState); err != nil {
@@ -909,12 +919,14 @@ func (s *Service) appendActivityEvidence(ctx context.Context, request StartTurnR
 		if state.head != terminalHead && state.activeActivityID == activityID {
 			state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
 			state.activeRequiresToolResult = false
+			state.activeToolCallID, state.activeProviderVisibleTool = "", false
 		}
 		return err
 	}
 	if state.activeActivityID == activityID {
 		state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
 		state.activeRequiresToolResult = false
+		state.activeToolCallID, state.activeProviderVisibleTool = "", false
 	}
 	barrierState := state.barrierState()
 	barrierState.ActivityID = activityID
@@ -1092,12 +1104,14 @@ func (s *Service) abandonDriftRound(ctx context.Context, request StartTurnReques
 		if state.head != terminalHead && state.activeActivityID == activityID {
 			state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
 			state.activeRequiresToolResult = false
+			state.activeToolCallID, state.activeProviderVisibleTool = "", false
 		}
 		return err
 	}
 	if state.activeActivityID == activityID {
 		state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
 		state.activeRequiresToolResult = false
+		state.activeToolCallID, state.activeProviderVisibleTool = "", false
 	}
 	return nil
 }
@@ -1160,12 +1174,14 @@ func (s *Service) authorizeActivity(ctx context.Context, lease managedOperationL
 			if state.head != decisionHead {
 				state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
 				state.activeRequiresToolResult = false
+				state.activeToolCallID, state.activeProviderVisibleTool = "", false
 				return authorization.CommittedToken{}, errors.Join(denied, appendErr)
 			}
 			return authorization.CommittedToken{}, appendErr
 		}
 		state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
 		state.activeRequiresToolResult = false
+		state.activeToolCallID, state.activeProviderVisibleTool = "", false
 		return authorization.CommittedToken{}, denied
 	}
 	decisionEventID := eventID(state.command.CommandID, label+"-decision", 0, protocol.EventAuthorizationDecided)
@@ -1362,6 +1378,8 @@ func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, st
 	return RunResult{TaskID: state.taskID, TurnID: state.turnID, Cursor: state.head, Status: "completed", CommandResult: commandResult, Assistant: protocol.DeepCopy(assistant)}, nil
 }
 
+const incompleteToolResultText = "tool activity ended before producing a result"
+
 func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnRequest, state *turnState, cause error) (RunResult, error) {
 	turnKind, turnStatus := protocol.EventTurnFailed, "failed"
 	commandStatus := "failed"
@@ -1395,8 +1413,13 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 		activityStatus = "cancelled"
 	}
 	eventCount := 3
-	terminalizeActiveActivity := state.activeActivityID != "" && !state.activeRequiresToolResult
+	unknownEffectRequiresRecovery := state.activeProviderVisibleTool && state.activeDispatched
+	terminalizeActiveActivity := state.activeActivityID != "" && !state.activeRequiresToolResult && !unknownEffectRequiresRecovery
+	appendCleanupToolResult := terminalizeActiveActivity && state.activeProviderVisibleTool && state.activeToolCallID != ""
 	if terminalizeActiveActivity {
+		eventCount++
+	}
+	if appendCleanupToolResult {
 		eventCount++
 	}
 	if request.child != nil {
@@ -1431,10 +1454,36 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 			"failed": protocol.EventActivityFailed, "denied": protocol.EventActivityDenied,
 			"cancelled": protocol.EventActivityCancelled, "uncertain": protocol.EventActivityUncertain,
 		}[activityStatus]
-		activityEvents, eventErr := s.activityEvents(*state, request.Runtime.ID, state.activeActivityID, "turn-failure-active", []struct {
+		activityValues := make([]struct {
 			kind    string
 			payload any
-		}{{activityKind, protocol.ActivityOutcomeV1{Status: activityStatus}}})
+		}, 0, 2)
+		if appendCleanupToolResult {
+			result, sanitizeErr := s.sanitizeToolResult(ctx, request.Runtime.ID, protocol.ToolResultBlock{
+				CallID: state.activeToolCallID,
+				Status: activityStatus,
+				Text:   incompleteToolResultText,
+			})
+			if sanitizeErr != nil {
+				return RunResult{}, sanitizeErr
+			}
+			// The sanitizer owns admitted content, while the orchestrator owns the
+			// provider call binding and terminal status.
+			result.CallID = state.activeToolCallID
+			result.Status = activityStatus
+			if validateErr := result.Validate(); validateErr != nil {
+				return RunResult{}, fmt.Errorf("validate cleanup tool result: %w", validateErr)
+			}
+			activityValues = append(activityValues, struct {
+				kind    string
+				payload any
+			}{protocol.EventToolMessage, protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result}}})
+		}
+		activityValues = append(activityValues, struct {
+			kind    string
+			payload any
+		}{activityKind, protocol.ActivityOutcomeV1{Status: activityStatus}})
+		activityEvents, eventErr := s.activityEvents(*state, request.Runtime.ID, state.activeActivityID, "turn-failure-active", activityValues)
 		if eventErr != nil {
 			return RunResult{}, eventErr
 		}
@@ -1502,6 +1551,7 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 		return RunResult{}, fmt.Errorf("failure terminal cursor prediction mismatch")
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched, state.activeRequiresToolResult, state.terminal = "", false, false, false, true
+	state.activeToolCallID, state.activeProviderVisibleTool = "", false
 	return RunResult{TaskID: state.taskID, TurnID: state.turnID, Cursor: state.head, Status: commandStatus, CommandResult: commandResult}, nil
 }
 
@@ -1893,6 +1943,10 @@ type turnState struct {
 	activeActivityID  protocol.ActivityID
 	activeStarted     bool
 	activeDispatched  bool
+	// Provider-visible tool activities retain their sanitized provider call ID
+	// from activation so pre-result cleanup can atomically pair the terminal.
+	activeToolCallID          string
+	activeProviderVisibleTool bool
 	// Once terminal result assembly begins, generic turn-failure cleanup must
 	// leave this activity unresolved rather than commit a resultless terminal.
 	activeRequiresToolResult bool

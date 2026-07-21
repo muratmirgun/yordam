@@ -792,6 +792,160 @@ func TestToolResultBindsHostileToolOutputToIntentAndTerminalStatus(t *testing.T)
 	}
 }
 
+func TestToolResultGenericCleanupPairsObservationPreResultFailures(t *testing.T) {
+	tests := []struct {
+		name       string
+		authorizer AuthorizationService
+		probe      BarrierProbe
+	}{
+		{
+			name:       "authorization error",
+			authorizer: &failingToolAuthorization{allowingAuthorization: allowingAuthorization{log: &recordLog{}}},
+		},
+		{
+			name:       "action-plan barrier",
+			authorizer: &allowingAuthorization{log: &recordLog{}},
+			probe:      phaseBarrierProbe{barrier: BarrierActionPlanCommitted, phase: "after"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := validStartTurnRequest()
+			request.Runtime = validRuntimeManifest(t, "observation")
+			repository := &recordingRepository{head: request.ExpectedHead}
+			log := &recordLog{}
+			service, err := NewService(Dependencies{
+				Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository,
+				TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &toolThenFinalProvider{log: log},
+				Tools: observationToolService{log: log}, Authorization: test.authorizer, Evidence: recordingEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now), BarrierProbe: test.probe,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.RunTurn(context.Background(), request); err == nil {
+				t.Fatal("pre-result observation failure unexpectedly succeeded")
+			}
+			activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "tool", "call-a"))
+			assertAtomicCleanupToolResult(t, repository.appendRequests(), activityID, "call-a", "cancelled")
+		})
+	}
+}
+
+func TestToolResultGenericCleanupPairsFinalMutationPreResultFailure(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "mutation")
+	repository := &recordingRepository{head: request.ExpectedHead}
+	log := &recordLog{}
+	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository,
+		TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &toolThenFinalProvider{log: log},
+		Tools: mutationToolService{log: log}, Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log}, Recovery: recordingRecovery{log: log}, Verification: verification.NewService(time.Now),
+		BarrierProbe: phaseBarrierProbe{barrier: BarrierCheckpointReady, phase: "after"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); !errors.Is(err, errInjectedBarrier) {
+		t.Fatalf("mutation barrier error=%v", err)
+	}
+	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "mutation", "call-a", "0"))
+	assertAtomicCleanupToolResult(t, repository.appendRequests(), activityID, "call-a", "cancelled")
+}
+
+func TestToolResultDispatchedUnknownEffectStaysUnresolved(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	repository := &recordingRepository{head: request.ExpectedHead}
+	log := &recordLog{}
+	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "tool", "call-a"))
+	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository,
+		TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &toolThenFinalProvider{log: log},
+		Tools: observationToolService{log: log}, Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+		BarrierProbe: activityPhaseBarrierProbe{activityID: activityID, barrier: BarrierEffectDispatch, phase: "after"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); !errors.Is(err, errInjectedBarrier) {
+		t.Fatalf("effect-dispatch barrier error=%v", err)
+	}
+	if got := activityTerminalCount(repository.appendRequests(), activityID); got != 0 {
+		t.Fatalf("unknown-effect activity committed %d terminals: %v", got, repository.batchKinds())
+	}
+	if _, _, ok := terminalToolResult(repository.appendRequests(), protocol.EventActivityUncertain, "call-a"); ok {
+		t.Fatalf("unknown-effect activity persisted a synthetic result: %v", repository.batchKinds())
+	}
+}
+
+func assertAtomicCleanupToolResult(t *testing.T, requests []journal.AppendRequest, activityID protocol.ActivityID, callID, status string) {
+	t.Helper()
+	matchingTransactions := 0
+	for _, request := range requests {
+		terminal := false
+		terminalStatus := ""
+		var messages []protocol.ToolMessageV1
+		for _, event := range request.Events {
+			if event.ActivityID != activityID {
+				continue
+			}
+			switch event.Kind {
+			case protocol.EventActivitySucceeded, protocol.EventActivityFailed, protocol.EventActivityDenied,
+				protocol.EventActivityCancelled, protocol.EventActivityInterruptedNoEffect, protocol.EventActivityUncertain:
+				terminal = true
+				var outcome protocol.ActivityOutcomeV1
+				if err := json.Unmarshal(event.Payload, &outcome); err != nil {
+					t.Fatalf("decode cleanup activity outcome: %v", err)
+				}
+				terminalStatus = outcome.Status
+			case protocol.EventToolMessage:
+				var message protocol.ToolMessageV1
+				if err := json.Unmarshal(event.Payload, &message); err != nil {
+					t.Fatalf("decode cleanup tool.message: %v", err)
+				}
+				messages = append(messages, message)
+			}
+		}
+		if !terminal {
+			continue
+		}
+		matchingTransactions++
+		if len(messages) != 1 || len(messages[0].Results) != 1 {
+			t.Fatalf("cleanup transaction has %d messages: %+v", len(messages), request)
+		}
+		result := messages[0].Results[0]
+		if result.CallID != callID || result.Status != status || result.Text != "tool activity ended before producing a result" || result.JSON != nil || len(result.EvidenceIDs) != 0 {
+			t.Fatalf("cleanup result=%+v want call=%q status=%q", result, callID, status)
+		}
+		if terminalStatus != result.Status {
+			t.Fatalf("cleanup terminal status=%q result status=%q", terminalStatus, result.Status)
+		}
+	}
+	if matchingTransactions != 1 {
+		t.Fatalf("cleanup terminal transactions=%d want=1", matchingTransactions)
+	}
+}
+
+type activityPhaseBarrierProbe struct {
+	activityID protocol.ActivityID
+	barrier    Barrier
+	phase      string
+}
+
+func (p activityPhaseBarrierProbe) Before(_ context.Context, barrier Barrier, state BarrierState) error {
+	if p.phase == "before" && barrier == p.barrier && state.ActivityID == p.activityID {
+		return errInjectedBarrier
+	}
+	return nil
+}
+
+func (p activityPhaseBarrierProbe) After(_ context.Context, barrier Barrier, state BarrierState) error {
+	if p.phase == "after" && barrier == p.barrier && state.ActivityID == p.activityID {
+		return errInjectedBarrier
+	}
+	return nil
+}
+
 func activityTerminalCount(requests []journal.AppendRequest, activityID protocol.ActivityID) int {
 	count := 0
 	for _, request := range requests {
@@ -1754,6 +1908,15 @@ func (a *toolDenyingAuthorization) Decide(ctx context.Context, request protocol.
 		decision.Reason = "policy denied tool"
 	}
 	return decision, err
+}
+
+type failingToolAuthorization struct{ allowingAuthorization }
+
+func (a *failingToolAuthorization) Decide(ctx context.Context, request protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error) {
+	if request.Source.Source != "provider" {
+		return protocol.AuthorizationDecision{}, errors.New("raw tool authorization failure")
+	}
+	return a.allowingAuthorization.Decide(ctx, request)
 }
 
 func (a *allowingAuthorization) Decide(_ context.Context, request protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error) {

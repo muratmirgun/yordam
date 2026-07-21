@@ -283,6 +283,63 @@ func TestSubagentAttachmentFailurePreservesAtomicResultInvariant(t *testing.T) {
 	}
 }
 
+func TestSubagentPreResultFailuresCommitAtomicConservativeResult(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*subagentTestChildren, *recordLog) (ChildSessionStore, ChildCoordinator)
+	}{
+		{
+			name: "child reserve",
+			configure: func(children *subagentTestChildren, log *recordLog) (ChildSessionStore, ChildCoordinator) {
+				return &failingSubagentChildStore{subagentTestChildren: children, reserveErr: errors.New("raw child reserve failure")}, subagentTestCoordinator{children: children, log: log}
+			},
+		},
+		{
+			name: "child run",
+			configure: func(children *subagentTestChildren, _ *recordLog) (ChildSessionStore, ChildCoordinator) {
+				return children, failingSubagentCoordinator{}
+			},
+		},
+		{
+			name: "child verification",
+			configure: func(children *subagentTestChildren, log *recordLog) (ChildSessionStore, ChildCoordinator) {
+				return &failingSubagentChildStore{subagentTestChildren: children, inspectErr: errors.New("raw child verification failure")}, subagentTestCoordinator{children: children, log: log}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := validStartTurnRequest()
+			request.Runtime = validRuntimeManifest(t, "observation")
+			request.Runtime.Body.SkillCatalogRevision = "skills-a"
+			request.Runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+			request.Runtime.Body.Limits.MaxToolCalls = 5
+			request.Runtime.Body.Tools = append(request.Runtime.Body.Tools, subagenttool.BuiltinDescriptor())
+			refreshRuntimeDigest(t, &request.Runtime)
+			repository := &recordingRepository{head: request.ExpectedHead}
+			log := &recordLog{}
+			manifest := protocol.SubagentManifestV1{AttemptID: "attempt", ParentSessionID: request.SessionID, ParentCursor: request.ExpectedHead, ChildSessionID: "child", ChildTaskID: "child-task", ChildTurnID: "child-turn", RuntimeGenerationID: request.Runtime.ID, SkillCatalogRevision: "skills-a", MaxToolCalls: 1, Deadline: testSubagentDeadline()}
+			receipt := childReceipt(manifest, "succeeded", "child done", protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 2, TransactionID: "child-terminal"}, unknownUsage(), nil, nil)
+			children := &subagentTestChildren{receipt: receipt, workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}}
+			childStore, coordinator := test.configure(children, log)
+			service, err := NewService(Dependencies{
+				Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository,
+				TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &subagentTestProvider{log: log},
+				Tools: subagentPlanService{}, Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+				ChildSessions: childStore, ParentSessions: subagentParentInspector{children}, Children: coordinator,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.RunTurn(context.Background(), request); err == nil {
+				t.Fatal("subagent pre-result failure unexpectedly succeeded")
+			}
+			activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "subagent", "delegate"))
+			assertAtomicCleanupToolResult(t, repository.appendRequests(), activityID, "delegate", "failed")
+		})
+	}
+}
+
 // subagentActivityRecords turns the exact persisted parent candidates into the
 // stateful records consumed by the activity projector.  Filtering is deliberate:
 // the projector ignores all other foundation events, while this regression
@@ -1245,6 +1302,32 @@ type subagentTestChildren struct {
 	workspace    domain.Workspace
 	reservations int
 	attempts     []protocol.SubagentManifestV1
+}
+
+type failingSubagentChildStore struct {
+	*subagentTestChildren
+	reserveErr error
+	inspectErr error
+}
+
+func (s *failingSubagentChildStore) ReserveSessionID() (protocol.SessionID, error) {
+	if s.reserveErr != nil {
+		return "", s.reserveErr
+	}
+	return s.subagentTestChildren.ReserveSessionID()
+}
+
+func (s *failingSubagentChildStore) InspectSession(ctx context.Context, id protocol.SessionID) (journal.Inspection, error) {
+	if s.inspectErr != nil {
+		return journal.Inspection{}, s.inspectErr
+	}
+	return s.subagentTestChildren.InspectSession(ctx, id)
+}
+
+type failingSubagentCoordinator struct{}
+
+func (failingSubagentCoordinator) RunChild(context.Context, ChildRunRequest) (protocol.SubagentReceiptV1, error) {
+	return protocol.SubagentReceiptV1{}, errors.New("raw child run failure")
 }
 
 func (s *subagentTestChildren) ReserveSessionID() (protocol.SessionID, error) {
