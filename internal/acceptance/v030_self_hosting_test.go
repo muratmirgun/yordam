@@ -68,7 +68,7 @@ func TestV030SelfHosting(t *testing.T) {
 	session.WaitForAfter(t, turnOffset, "Child session:", 30*time.Second)
 	session.WaitForAfter(t, turnOffset, "y: allow once | s: allow session | n/Esc: deny", 30*time.Second)
 	session.Write(t, "y")
-	waitForSelfHostAuthorization(t, checkout.DataDir, "parent-complete-test", "go test ./...", 30*time.Second)
+	parentAuthorization := waitForSelfHostAuthorization(t, checkout.DataDir, "parent-complete-test", "shell", "go test ./...", 30*time.Second)
 	session.WaitForCurrentScreen(t, "AUTO SHELL WARNING", 30*time.Second)
 	session.WaitForCurrentScreen(t, "PERMISSION", 30*time.Second)
 	session.WaitForCurrentScreen(t, "y: allow once | s: allow session | n/Esc: deny", 30*time.Second)
@@ -76,7 +76,7 @@ func TestV030SelfHosting(t *testing.T) {
 		t.Fatalf("parent permission screen retained child lineage:\n%s", screen)
 	}
 	session.Write(t, "y")
-	if err := waitForSelfHostAuthorizationConsumed(checkout.DataDir, "parent-complete-test", 5*time.Second); err != nil {
+	if err := waitForSelfHostAuthorizationConsumed(checkout.DataDir, parentAuthorization.RequestID, 5*time.Second); err != nil {
 		t.Fatalf("parent permission input was not consumed: %v\ncurrent screen:\n%s\nraw PTY:\n%q", err, session.CurrentScreen(), session.Output())
 	}
 	session.WaitForAfter(t, turnOffset, "self-hosting change and complete verification succeeded", 420*time.Second)
@@ -110,31 +110,31 @@ func TestV030SelfHosting(t *testing.T) {
 	}
 }
 
-func waitForSelfHostAuthorization(t *testing.T, dataDir, callID, command string, timeout time.Duration) {
+func waitForSelfHostAuthorization(t *testing.T, dataDir, callID, action, command string, timeout time.Duration) protocol.AuthorizationRequest {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		found, err := selfHostAuthorizationRequested(dataDir, callID, command)
+		request, err := selfHostAuthorizationRequested(dataDir, callID, action, command)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if found {
-			return
+		if request != nil {
+			return *request
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for canonical authorization request %q", callID)
+			t.Fatalf("timed out waiting for canonical authorization request call=%q action=%q", callID, action)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-func selfHostAuthorizationRequested(dataDir, callID, command string) (bool, error) {
-	found := false
+func selfHostAuthorizationRequested(dataDir, callID, action, command string) (*protocol.AuthorizationRequest, error) {
+	var found *protocol.AuthorizationRequest
 	err := filepath.WalkDir(filepath.Join(dataDir, "workspaces"), func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if found || entry.IsDir() || entry.Name() != "events.jsonl" {
+		if found != nil || entry.IsDir() || entry.Name() != "events.jsonl" {
 			return nil
 		}
 		raw, err := os.ReadFile(path)
@@ -147,8 +147,9 @@ func selfHostAuthorizationRequested(dataDir, callID, command string) (bool, erro
 				continue
 			}
 			var requested protocol.AuthorizationRequestedV1
-			if json.Unmarshal(envelope.Payload, &requested) == nil && requested.Request.CallID == callID && selfHostAuthorizationHasCommand(requested.Request, command) {
-				found = true
+			if json.Unmarshal(envelope.Payload, &requested) == nil && requested.Request.CallID == callID && requested.Request.Action == action && selfHostAuthorizationHasCommand(requested.Request, command) {
+				copy := requested.Request
+				found = &copy
 				break
 			}
 		}
@@ -168,10 +169,10 @@ func selfHostAuthorizationHasCommand(request protocol.AuthorizationRequest, comm
 	return false
 }
 
-func waitForSelfHostAuthorizationConsumed(dataDir, callID string, timeout time.Duration) error {
+func waitForSelfHostAuthorizationConsumed(dataDir, requestID string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
-		found, err := selfHostAuthorizationConsumed(dataDir, callID)
+		found, err := selfHostAuthorizationConsumed(dataDir, requestID)
 		if err != nil {
 			return err
 		}
@@ -179,13 +180,13 @@ func waitForSelfHostAuthorizationConsumed(dataDir, callID string, timeout time.D
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for canonical authorization decision consumption %q", callID)
+			return fmt.Errorf("timed out waiting for canonical authorization decision consumption %q", requestID)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-func selfHostAuthorizationConsumed(dataDir, callID string) (bool, error) {
+func selfHostAuthorizationConsumed(dataDir, requestID string) (bool, error) {
 	found := false
 	err := filepath.WalkDir(filepath.Join(dataDir, "workspaces"), func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -204,7 +205,7 @@ func selfHostAuthorizationConsumed(dataDir, callID string) (bool, error) {
 				continue
 			}
 			var consumed protocol.AuthorizationDecisionConsumedV1
-			if json.Unmarshal(envelope.Payload, &consumed) == nil && consumed.CallID == callID {
+			if json.Unmarshal(envelope.Payload, &consumed) == nil && consumed.RequestID == requestID {
 				found = true
 				break
 			}
