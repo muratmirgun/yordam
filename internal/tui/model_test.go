@@ -673,6 +673,34 @@ func TestConversationScrollAndToolExpansionKeys(t *testing.T) {
 	}
 }
 
+func TestConversationMouseWheelScrollsUp(t *testing.T) {
+	model := tui.NewModel(tui.OptionsForTest())
+	model = tui.UpdateForTest(model, tea.WindowSizeMsg{Width: 80, Height: 8})
+	for index := range 20 {
+		model = tui.AppendConversationForTest(model, components.BlockNotice, fmt.Sprintf("notice-%d", index))
+	}
+
+	view := model.View()
+	if view.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("mouse mode=%v want cell motion", view.MouseMode)
+	}
+	if view.OnMouse == nil {
+		t.Fatal("conversation view has no mouse handler")
+	}
+	command := view.OnMouse(tea.MouseWheelMsg{X: 1, Y: 2, Button: tea.MouseWheelUp})
+	if command == nil {
+		t.Fatal("conversation mouse wheel was ignored")
+	}
+	message := command()
+	if _, loopsThroughMouseHandler := message.(tea.MouseMsg); loopsThroughMouseHandler {
+		t.Fatalf("mouse handler re-emitted a mouse message: %T", message)
+	}
+	model = tui.UpdateForTest(model, message)
+	if model.ConversationAtBottomForTest() {
+		t.Fatal("mouse wheel up did not scroll conversation")
+	}
+}
+
 func TestTerminalReplayPreservesManualConversationScroll(t *testing.T) {
 	replay := domain.SessionReplay{Session: domain.Session{ID: "session"}}
 	for index := range 20 {
