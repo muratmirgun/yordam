@@ -447,7 +447,7 @@ func assertSelfHostEvidenceAndReconstruction(t *testing.T, dataDir, workspaceID 
 		t.Fatal(err)
 	}
 	defer lease.Close()
-	store, err := evidence.New(dataDir, lease)
+	store, err := evidence.New(filepath.Join(dataDir, "evidence"), lease)
 	if err != nil {
 		t.Fatal(err)
 	}
