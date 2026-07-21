@@ -66,6 +66,8 @@ func TestV030SelfHosting(t *testing.T) {
 	session.WaitForAfter(t, turnOffset, "skill go-development [project", 20*time.Second)
 	session.WaitForAfter(t, turnOffset, "CHILD", 20*time.Second)
 	session.WaitForAfter(t, turnOffset, "Child session:", 30*time.Second)
+	session.WaitForAfter(t, turnOffset, "y: allow once | s: allow session | n/Esc: deny", 30*time.Second)
+	session.WaitForQuiet(t, 100*time.Millisecond, 5*time.Second)
 	parentPermissionOffset := session.OutputOffset()
 	session.Write(t, "y")
 	waitForSelfHostAuthorization(t, checkout.DataDir, "parent-complete-test", 30*time.Second)
