@@ -45,3 +45,18 @@
 ## Carried Dependencies
 
 - Resolved by Compaction Task 6: production `RuntimeLimits` projection/validation and real manifest-path coverage.
+
+## Durable Tool-Result Transcript
+
+- Branch: `codex/durable-tool-results`
+- Worktree: `/Users/murat/oss/tui-yordam-v0.1/.worktrees/durable-tool-results`
+- Starting commit: `3cc62e7`
+- Plan: `docs/superpowers/plans/2026-07-21-durable-tool-result-transcript.md`
+- Baseline: `go test ./... -count=1` passed.
+- Preflight conflicts: none.
+- Task 1: complete (commits `3cc62e7..97f6c09`, spec and quality review clean; transactional continuation, recovery, and compaction constraints remain explicitly assigned to Tasks 3-4).
+- Task 2: complete (commits `97f6c09..ffa3a29`, two Important findings fixed; re-review approved with no remaining findings; persistence and grouping remain assigned to Tasks 3-4).
+- Task 3: complete (commits `ffa3a29..fd8c1a1`, atomic persistence hardened across four review rounds; resultless cleanup, call/status binding, and dispatched subagent recovery findings fixed; final review approved; Task 4 grouping remains pending).
+- Task 4: complete (commits `fd8c1a1..6455daf`, both compaction boundaries, historical compatibility reconstruction, malformed-history validation, projection forms, and safe normalization hardened across three review rounds; final review approved).
+- Task 5: complete (commits `6455daf..0a0a9e4`, real OpenAI wire ordering and malformed-history no-egress regressions; exact ordering finding fixed; re-review approved; full tests and vet passed).
+- Final whole-branch review: complete (`3cc62e7..16ec0ed`; durable unknown-effect recovery, clean-prefix bootstrap recovery, legacy subagent repair, typed transcript errors, retry identities, incomplete-attempt supersession, and cross-generation physical-tail resume hardened across four fix rounds; independent final review reported CLEAN/READY with no Critical or Important findings; full tests, vet, and diff checks passed on `16ec0ed`).
