@@ -20,6 +20,8 @@ import (
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/recovery"
 	"github.com/muratmirgun/yordam/internal/tooling"
+	toolset "github.com/muratmirgun/yordam/internal/tools"
+	edittool "github.com/muratmirgun/yordam/internal/tools/edit"
 	"github.com/muratmirgun/yordam/internal/verification"
 )
 
@@ -603,11 +605,15 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
+		fileChange, err := structuredFileChangedEffect(mutationPlan, execution, records)
+		if err != nil {
+			return protocol.ToolResultBlock{}, err
+		}
 		status := execution.Outcome.Status
 		if status == "" {
 			status = "failed"
 		}
-		if err := s.appendActivityEvidence(ctx, request, state, mutationActivityID, mutationLabel+"-terminal", status, records); err != nil {
+		if err := s.appendActivityEvidence(ctx, request, state, mutationActivityID, mutationLabel+"-terminal", status, records, fileChange); err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
 		execution.ToolResult.EvidenceIDs = evidenceIDs(records)
@@ -825,7 +831,7 @@ func (s *Service) recordEvidence(ctx context.Context, request StartTurnRequest, 
 	return records, nil
 }
 
-func (s *Service) appendActivityEvidence(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, label, status string, records []protocol.EvidenceRecord) error {
+func (s *Service) appendActivityEvidence(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, label, status string, records []protocol.EvidenceRecord, fileChanges ...*protocol.FileChangedV1) error {
 	kind := map[string]string{
 		"succeeded": protocol.EventActivitySucceeded, "failed": protocol.EventActivityFailed,
 		"denied": protocol.EventActivityDenied, "cancelled": protocol.EventActivityCancelled,
@@ -837,7 +843,15 @@ func (s *Service) appendActivityEvidence(ctx context.Context, request StartTurnR
 	values := make([]struct {
 		kind    string
 		payload any
-	}, 0, 1+len(records)*2)
+	}, 0, 1+len(records)*2+len(fileChanges))
+	for _, fileChange := range fileChanges {
+		if fileChange != nil {
+			values = append(values, struct {
+				kind    string
+				payload any
+			}{protocol.EventFileChanged, *fileChange})
+		}
+	}
 	values = append(values, struct {
 		kind    string
 		payload any
@@ -871,6 +885,37 @@ func (s *Service) appendActivityEvidence(ctx context.Context, request StartTurnR
 	barrierState := state.barrierState()
 	barrierState.ActivityID = activityID
 	return s.cross(ctx, BarrierActionTerminalCommitted, barrierState)
+}
+
+func structuredFileChangedEffect(plan protocol.ActionPlan, execution protocol.ExecutionResult, records []protocol.EvidenceRecord) (*protocol.FileChangedV1, error) {
+	if execution.FileChange == nil {
+		return nil, nil
+	}
+	expectedDescriptor := edittool.BuiltinDescriptor()
+	expectedClassification := toolset.EditClassification()
+	if plan.Body.Tool != expectedDescriptor.Body.Identity || plan.Body.SourceRevision != expectedDescriptor.Body.SourceRevision || plan.Body.DescriptorDigest != expectedDescriptor.DescriptorDigest ||
+		plan.Body.Action != "edit" || plan.Body.Purpose != "mutate" || plan.Body.Effect != expectedClassification.Effect || plan.Body.ExecutionLocus != expectedClassification.ExecutionLoci[0] ||
+		plan.Body.Reversibility != expectedClassification.Reversibility || plan.Body.VerificationCoverage != expectedClassification.VerificationCoverage || plan.Body.RequestedProfile != expectedClassification.RequestedProfile || plan.Body.EffectiveProfile != expectedClassification.EffectiveProfile ||
+		plan.Body.Boundary != expectedClassification.Boundary {
+		return nil, fmt.Errorf("structured file change requires the canonical edit tool")
+	}
+	if err := canonicaljson.ValidateDigest(plan.Body, plan.Digest); err != nil {
+		return nil, fmt.Errorf("structured file change plan digest: %w", err)
+	}
+	change := protocol.DeepCopy(*execution.FileChange)
+	if change.CallID == "" || change.CallID != plan.Body.CallID || change.Subject.Kind != "file" || change.Subject.ID == "" || change.Subject.Validate() != nil || change.Before.Validate() != nil || change.After.Validate() != nil || len(plan.Body.Resources) != 1 {
+		return nil, fmt.Errorf("structured file change is incomplete or unbound")
+	}
+	resource := plan.Body.Resources[0]
+	create := len(resource.Attributes) == 1 && resource.Attributes[0] == (protocol.ResourceAttribute{Name: "create", Value: "true"})
+	const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if resource.Kind != "file" || resource.CanonicalID != change.Subject.ID ||
+		create && (resource.Digest != "" || resource.ParentID == "" || change.Before.Value != emptySHA256) ||
+		!create && (len(resource.Attributes) != 0 || resource.ParentID != "" || resource.Digest != change.Before.Value) {
+		return nil, fmt.Errorf("structured file change does not match the authorized resource")
+	}
+	change.EvidenceIDs = evidenceIDs(records)
+	return &change, nil
 }
 
 func (s *Service) prepareCheckpoint(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, label string, preview tooling.PreviewResult, plan protocol.ActionPlan, evidence []protocol.EvidenceRecord) (protocol.CheckpointBody, error) {

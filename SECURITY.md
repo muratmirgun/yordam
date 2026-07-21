@@ -40,3 +40,35 @@ Yordam runs with the permissions of the local user who starts it. Model output a
 - Filesystem skills are untrusted context. Only bounded UTF-8 `SKILL.md` files under `~/.config/yordam/skills/<name>/` or `.yordam/skills/<name>/` below the canonical workspace are considered; symlinked roots, directories, and files are rejected. Metadata is visible before an explicit catalog-bound read-only load. Project trust is bound to the workspace and catalog digest and gives no shell, file, provider, child, or permission authority. Loaded text cannot bypass a normal permission prompt or disclose configured secrets.
 
 Permission prompts reduce accidental execution; they are not a sandbox or a guarantee that a command is safe. Use a separate OS account, container, or virtual machine when stronger isolation is required.
+
+## Sequential subagents
+
+A sequential child is another local turn under the same configured provider,
+model, operating-system user, workspace, and immutable runtime generation. It
+does not form a new security sandbox. The child receives a depth-one tool
+catalog without `subagent`, an attempt-specific session identity, a bounded
+deadline and tool budget, and the parent's current permission mode as an upper
+authority limit.
+
+The handoff deliberately excludes parent mutable permission grants and the
+parent trusted-shell acknowledgement. File and shell effects are planned and
+authorized in the child session with exact child/parent/attempt correlation.
+The built-in `subagent` marker itself authorizes only local orchestration: it
+has no file resource, shell capability, or ordinary tool-dispatch handle.
+Provider credentials are used only in the configured provider authorization
+header. Registered secret values are redacted from parent and child model
+bodies, receipts, durable and application events, TUI output, debug logs, and
+public errors.
+
+The parent releases its operation lane only after committing its request and
+wait state. The child commits a terminal receipt before the parent can attach
+it and continue. Changed files and commands/tests in that receipt come only
+from structured durable effect events, not from assistant claims. A receipt is
+evidence about the child attempt; it is not proof that the broader parent goal
+is correct or complete.
+
+Cancellation is propagated to provider, approval, and shell boundaries. On
+restart, an exact committed receipt can be recovered and attached once. If the
+journal cannot prove whether a dispatched effect completed, the attempt is
+`uncertain`; Yordam does not automatically retry that effect. A later explicit
+delegation receives a new child session and attempt identity.

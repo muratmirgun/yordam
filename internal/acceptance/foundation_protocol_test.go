@@ -37,6 +37,7 @@ const (
 	traceCatalog     = "PRD-FR-06/07; Capability 3.3/3.5; Foundation 14-15"
 	traceApplication = "PRD-FR-02/03/10; Capability 3.9/4.3; Foundation 16; Acceptance 6.2"
 	traceSkills      = "Yordam v0.3 Skills; Acceptance 8"
+	traceSubagents   = "Yordam v0.3 Sequential Subagent; Acceptance 9"
 )
 
 func acceptFoundationMigration(t *testing.T) {
@@ -141,6 +142,14 @@ func acceptFoundationApplicationProtocol(t *testing.T) {
 	runFoundationGoTest(t, traceApplication, "./internal/tui", `^Test(DurableStateEventUpdatesStatusAndProjectsOpenedSession|DurableReplayRendersRecoveryReadOnlyToolsAndTerminalState|ConfiguredSecretPromptIsRedactedBeforeConversationRendering)$`)
 	assertSyntheticSecretSplit(t)
 	assertApplicationConsumerEquivalence(t)
+	acceptFoundationSubagents(t)
+}
+
+func acceptFoundationSubagents(t *testing.T) {
+	t.Logf("trace=%s", traceSubagents)
+	runFoundationGoTest(t, traceSubagents, "./internal/orchestrator", `^Test(RunTurnSubagentUsesRealSequentialCoordinatorAndContinuesParent|ManagedOperationLeasePreservesFIFOAndReacquiresAfterChildTerminal|SubagentRecoveryCreatesReservedChildOnceAndContinuesParent|SubagentCancelDuringChildApprovalRemovesPromptWithoutGrantOrRetry|SubagentCancelDuringChildShellProcessStopsProcessAndWritesOneReceipt)$`)
+	runFoundationGoTest(t, traceSubagents, "./internal/subagent", `^Test(SubagentProjectorAcceptsEveryTerminalStatus|ProjectReceiptUsesOnlyDurableEffectsAndMarksUnmatchedActivityUncertain|SubagentRecoverRestartAndCancellationMatrix)$`)
+	runFoundationGoTest(t, traceSubagents, "./internal/app", `^Test(AppChildPermissionPromptsRouteSameChildCallIDByDisplayedCorrelation|AppChildShellAcknowledgementCommandDoesNotMutateParentAutoPolicy|RuntimeSetChildSkillCatalogHandoffIsFrozenAndExact|ProjectSubagentCardsUsesDurableParentAndChildFactsWithRedaction)$`)
 }
 
 func acceptFoundationSkills(t *testing.T) {

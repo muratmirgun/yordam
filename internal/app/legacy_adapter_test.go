@@ -45,6 +45,28 @@ func TestApplicationLegacyAdapterPreservesCommandAndRedactedEventSemantics(t *te
 	}
 }
 
+func TestApplicationLegacyAdapterAcceptsTypedTransientSubagentStage(t *testing.T) {
+	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{Actor: protocol.ActorRef{ID: "user-1", Kind: protocol.ActorUser}, SelectedSessionID: "parent"})
+	stage := protocol.SubagentStageV1{AttemptID: "attempt", ParentSessionID: "parent", ChildSessionID: "child", Stage: protocol.SubagentStageRunning}
+	payload, err := json.Marshal(stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "parent", CommitSeq: 2, TransactionID: "parent-head"}
+	event := protocol.ApplicationEvent{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, StreamEventID: "child-stage:parent", Cursor: protocol.ApplicationCursor{WorkspaceControl: protocol.CommittedCursor{JournalKind: protocol.JournalWorkspaceControl, JournalID: "workspace", CommitSeq: 1, TransactionID: "workspace-head"}, SelectedSession: &selected},
+		Correlation: protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: "child", SessionID: "child", TaskID: "child-task", TurnID: "child-turn", ParentSessionID: "parent", DelegationAttemptID: "attempt"},
+		Time:        time.Unix(2, 0).UTC(), Kind: protocol.EventSubagentManifest, Classification: "transient", PayloadVersion: 1, Payload: payload,
+	}
+	legacy, err := adapter.Event(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Kind != app.EventSubagentStage || legacy.Subagent == nil || *legacy.Subagent != stage {
+		t.Fatalf("legacy subagent stage=%+v", legacy)
+	}
+}
+
 func TestApplicationLegacyAdapterProjectsManualCompactionLifecycleWithoutProviderContent(t *testing.T) {
 	cursor := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "session-1", CommitSeq: 9, TransactionID: "tx-9"}
 	adapter := app.NewLegacyAdapter(app.LegacyAdapterOptions{Actor: protocol.ActorRef{ID: "user-1", Kind: protocol.ActorUser}, RuntimeGenerationID: "runtime-a", Cursor: adapterCursor("session-1", cursor)})

@@ -21,6 +21,8 @@ import (
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/provider"
 	"github.com/muratmirgun/yordam/internal/tooling"
+	toolset "github.com/muratmirgun/yordam/internal/tools"
+	edittool "github.com/muratmirgun/yordam/internal/tools/edit"
 	"github.com/muratmirgun/yordam/internal/verification"
 )
 
@@ -391,6 +393,83 @@ func TestRunTurnEventsValidateFoundationRegistry(t *testing.T) {
 		t.Fatal(err)
 	}
 	validateAppendRequests(t, repository.appendRequests())
+}
+
+func TestStructuredFileChangedEffectBindsCanonicalEditAndFailsClosed(t *testing.T) {
+	descriptor := edittool.BuiltinDescriptor()
+	classification := toolset.EditClassification()
+	body := protocol.ActionPlanBody{
+		CallID: "edit-call", Tool: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest,
+		Action: "edit", Purpose: "mutate", Resources: []protocol.ResourceTarget{{Kind: "file", CanonicalID: "/workspace/target.txt", Digest: strings.Repeat("a", 64)}},
+		ExecutionLocus: classification.ExecutionLoci[0], Effect: classification.Effect, Boundary: classification.Boundary, Reversibility: classification.Reversibility,
+		VerificationCoverage: classification.VerificationCoverage, RequestedProfile: classification.RequestedProfile, EffectiveProfile: classification.EffectiveProfile, RuntimeGenerationID: "runtime-a",
+	}
+	planDigest, err := canonicaljson.Digest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := protocol.ActionPlan{Body: body, Digest: planDigest}
+	change := protocol.FileChangedV1{
+		CallID: "edit-call", Subject: protocol.SubjectRef{Kind: "file", ID: "/workspace/target.txt"},
+		Before: repeatedDigest("a"), After: repeatedDigest("b"), EvidenceIDs: []protocol.EvidenceID{},
+	}
+	records := []protocol.EvidenceRecord{{Body: protocol.EvidenceRecordBody{ID: "evidence-b"}}, {Body: protocol.EvidenceRecordBody{ID: "evidence-a"}}}
+
+	got, err := structuredFileChangedEffect(plan, protocol.ExecutionResult{FileChange: &change}, records)
+	if err != nil || got == nil || !slices.Equal(got.EvidenceIDs, []protocol.EvidenceID{"evidence-a", "evidence-b"}) {
+		t.Fatalf("effect=%+v err=%v", got, err)
+	}
+	if got.Subject != change.Subject || got.Before != change.Before || got.After != change.After {
+		t.Fatalf("effect changed structured facts: %+v", got)
+	}
+
+	malformed := change
+	malformed.After.Value = strings.ToUpper(malformed.After.Value)
+	if _, err := structuredFileChangedEffect(plan, protocol.ExecutionResult{FileChange: &malformed}, nil); err == nil {
+		t.Fatal("uppercase digest was accepted")
+	}
+	lookalike := plan
+	lookalike.Body.Tool = protocol.ToolIdentity{Source: "mcp", Authority: "attacker", Name: "edit"}
+	if _, err := structuredFileChangedEffect(lookalike, protocol.ExecutionResult{FileChange: &change}, nil); err == nil {
+		t.Fatal("non-canonical edit synthesized a file change")
+	}
+	forgedDescriptor := plan
+	forgedDescriptor.Body.SourceRevision = "forged-v1"
+	forgedDescriptor.Body.DescriptorDigest = repeatedDigest("f")
+	forgedDescriptor.Digest, _ = canonicaljson.Digest(forgedDescriptor.Body)
+	if _, err := structuredFileChangedEffect(forgedDescriptor, protocol.ExecutionResult{FileChange: &change}, nil); err == nil {
+		t.Fatal("forged edit descriptor synthesized a file change")
+	}
+	wrongPath := change
+	wrongPath.Subject.ID = "/workspace/other.txt"
+	if _, err := structuredFileChangedEffect(plan, protocol.ExecutionResult{FileChange: &wrongPath}, nil); err == nil {
+		t.Fatal("unbound path was accepted")
+	}
+}
+
+func TestFileChangedEffectSharesTheUncertainTerminalTransactionAndIdentity(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	repository := &recordingRepository{head: request.ExpectedHead}
+	service := &Service{repository: repository, probe: NoopBarrierProbe()}
+	state := newTurnState(request)
+	state.activeActivityID, state.activeStarted, state.activeDispatched = "edit-activity", true, true
+	change := protocol.FileChangedV1{
+		CallID: "edit-call", Subject: protocol.SubjectRef{Kind: "file", ID: "/workspace/target.txt"},
+		Before: repeatedDigest("a"), After: repeatedDigest("b"), EvidenceIDs: []protocol.EvidenceID{},
+	}
+	if err := service.appendActivityEvidence(context.Background(), request, &state, "edit-activity", "edit-terminal", "uncertain", nil, &change); err != nil {
+		t.Fatal(err)
+	}
+	requests := repository.appendRequests()
+	if len(requests) != 1 || !appendHasKinds(requests[0], protocol.EventFileChanged, protocol.EventActivityUncertain) {
+		t.Fatalf("terminal append=%+v", requests)
+	}
+	for _, event := range requests[0].Events {
+		if event.SessionID != request.SessionID || event.TaskID != state.taskID || event.TurnID != state.turnID || event.ActivityID != "edit-activity" || event.RuntimeGenerationID != request.Runtime.ID {
+			t.Fatalf("effect/terminal identity mismatch: %+v", event)
+		}
+	}
 }
 
 func TestRunTurnConcurrentDuplicateExecutesProviderExactlyOnce(t *testing.T) {

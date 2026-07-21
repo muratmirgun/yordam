@@ -25,7 +25,92 @@ import (
 	"github.com/muratmirgun/yordam/internal/tools/edit"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 	"github.com/muratmirgun/yordam/internal/tools/read"
+	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 )
+
+func TestPlanOrchestratedAuthorizationAcceptsOnlyExactCanonicalMarkerAndBindsRequest(t *testing.T) {
+	catalog, err := NewCatalog("revision-1", subagenttool.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(catalog)
+	request := planRequest("subagent", `{"task":"bounded child"}`)
+	_, first, err := service.PlanOrchestratedAuthorization(context.Background(), request, subagenttool.Kind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Body.Effect != "orchestration" || first.Body.Tool != subagenttool.BuiltinDescriptor().Body.Identity || first.Body.Action != "subagent" || first.Body.ExecutionLocus != "orchestrator" {
+		t.Fatalf("orchestrated authorization plan lost canonical authority shape: %+v", first)
+	}
+	service.mu.Lock()
+	planned := len(service.actions)
+	service.mu.Unlock()
+	if planned != 0 {
+		t.Fatalf("orchestrated authorization left %d dispatchable tool handles", planned)
+	}
+	changed := request
+	changed.CallID = "different-call"
+	_, second, err := service.PlanOrchestratedAuthorization(context.Background(), changed, subagenttool.Kind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Digest == first.Digest {
+		t.Fatal("orchestrated authorization digest did not bind the exact call")
+	}
+	changed = request
+	changed.TurnID = "different-turn"
+	_, third, err := service.PlanOrchestratedAuthorization(context.Background(), changed, subagenttool.Kind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Digest != first.Digest {
+		t.Fatal("action-plan digest unexpectedly included queue identity; authorization request owns turn binding")
+	}
+	if _, _, err := service.PlanOrchestratedAuthorization(context.Background(), request, "lookalike"); err == nil {
+		t.Fatal("mismatched orchestrated marker was accepted")
+	}
+	if _, _, err := service.PlanPreviewInspection(context.Background(), request); err == nil {
+		t.Fatal("ordinary observation-preview seam accepted orchestrated tool")
+	}
+}
+
+func TestExecutionResultCarriesOnlyStructuredFileChangeFacts(t *testing.T) {
+	result := executionResult(domain.ToolResult{
+		CallID:  "edit-call",
+		Status:  domain.ToolSucceeded,
+		Content: "untrusted diff text",
+		FileChange: &domain.FileChange{
+			CallID:       "edit-call",
+			Path:         "/workspace/target.txt",
+			BeforeSHA256: strings.Repeat("a", 64),
+			AfterSHA256:  strings.Repeat("b", 64),
+			Diff:         "must not enter the structured effect",
+		},
+	})
+	if result.FileChange == nil {
+		t.Fatal("structured file change was dropped")
+	}
+	want := protocol.FileChangedV1{
+		CallID:      "edit-call",
+		Subject:     protocol.SubjectRef{Kind: "file", ID: "/workspace/target.txt"},
+		Before:      protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)},
+		After:       protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("b", 64)},
+		EvidenceIDs: []protocol.EvidenceID{},
+	}
+	if !reflect.DeepEqual(*result.FileChange, want) {
+		t.Fatalf("file change=%+v want=%+v", *result.FileChange, want)
+	}
+
+	created := executionResult(domain.ToolResult{CallID: "create-call", Status: domain.ToolSucceeded, FileChange: &domain.FileChange{CallID: "create-call", Path: "/workspace/new.txt", AfterSHA256: strings.Repeat("c", 64)}})
+	if created.FileChange == nil || created.FileChange.Before != (protocol.Digest{Algorithm: protocol.DigestSHA256, Value: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}) {
+		t.Fatalf("create preimage=%+v", created.FileChange)
+	}
+
+	uncertain := executionResult(domain.ToolResult{CallID: "edit-uncertain", Status: domain.ToolFailed, FileChange: &domain.FileChange{CallID: "edit-uncertain", Path: "/workspace/target.txt", BeforeSHA256: strings.Repeat("d", 64), AfterSHA256: strings.Repeat("e", 64)}})
+	if uncertain.Outcome.Status != "uncertain" || uncertain.ToolResult.Status != "uncertain" || uncertain.FileChange == nil {
+		t.Fatalf("possible file effect was not conservative: %+v", uncertain)
+	}
+}
 
 func TestDispatchToolExecuteConsumesHandleAndTokenBeforeOneEffect(t *testing.T) {
 	tool := newDispatchTool("mutate", trustedRemoteClassification())

@@ -68,6 +68,12 @@ The generated JSONC template is intentionally incomplete. Replace both `your-mod
       }
     }
   },
+  "subagents": {
+    "enabled": true,
+    "maxPerTurn": 4,
+    "maxToolCalls": 16,
+    "timeoutSeconds": 600
+  },
   "limits": {
     "maxToolCalls": 32,
     "shellTimeoutSeconds": 120
@@ -176,6 +182,36 @@ startup. Parent-to-child
 handoff uses that frozen catalog snapshot, never child filesystem discovery.
 Skill text is untrusted context: it cannot install hooks or URLs, execute code,
 change policy, reveal credentials, or bypass normal permission approval.
+
+## Sequential subagents
+
+When `subagents.enabled` is true, the model can delegate one bounded objective
+to a sequential child turn. The defaults allow four attempts in one parent
+turn, sixteen child tool calls per attempt, and a 600-second deadline. Only one
+child can be active for a parent turn, and delegation has depth one: a child
+does not receive the `subagent` tool and cannot create another child.
+
+The child uses the same provider and model as its parent and receives the exact
+frozen skill catalog from the parent runtime generation. The parent's current
+permission mode is a ceiling, but mutable session grants and the parent's
+trusted-shell acknowledgement are not inherited. Child edits and shell calls
+therefore pass through the child's own normal permission decisions; a child
+shell command can still require a visible approval even when the parent has
+acknowledged shell use in `auto` mode.
+
+Parent execution waits while the child owns the operation lane. A durable child
+receipt is committed before it is attached to the parent and supplied as the
+exact tool result for parent continuation. Receipts derive changed files,
+commands, tests, evidence IDs, and uncertain effects from committed child
+events. Assistant prose is only a bounded summary.
+The receipt does not verify the parent task. Cancellation propagates to an
+active child. Restart recovery attaches an
+already committed receipt or conservatively reports an uncertain effect; it
+does not silently repeat an ambiguous mutation.
+
+This release does not provide concurrent child execution, worktree isolation,
+network-hosted agent transport, free-form child messaging, or a per-child model
+choice.
 
 ## Session locations
 

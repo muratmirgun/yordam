@@ -96,7 +96,13 @@ func (t *Tool) Descriptor() domain.ToolDescriptor {
 }
 
 func (t *Tool) CanonicalDescriptor() protocol.ToolDescriptor {
-	return toolset.BuiltinCanonicalDescriptor(t.Descriptor(), toolset.EditClassification())
+	return BuiltinDescriptor()
+}
+
+// BuiltinDescriptor is the immutable identity and schema authority used to
+// distinguish the built-in edit tool from aliases and lookalikes.
+func BuiltinDescriptor() protocol.ToolDescriptor {
+	return toolset.BuiltinCanonicalDescriptor((&Tool{}).Descriptor(), toolset.EditClassification())
 }
 
 func (*Tool) TrustedClassification() domain.ToolClassification { return toolset.EditClassification() }

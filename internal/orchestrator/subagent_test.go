@@ -50,6 +50,53 @@ func TestRunTurnSubagentInterceptsOnlyTheCanonicalDescriptor(t *testing.T) {
 	}
 }
 
+func TestSubagentAuthorizationRequestBindsExactCanonicalPlanAndTurnIdentity(t *testing.T) {
+	catalog, err := tooling.NewCatalog("subagent-auth-catalog", subagenttool.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := tooling.NewService(catalog)
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	state := newTurnState(request)
+	planRequest := tooling.PlanRequest{
+		TurnID: state.turnID, ActivityID: "subagent-activity", CallID: "delegate-call", Alias: subagenttool.Kind,
+		Arguments: json.RawMessage(`{"task":"bounded child"}`), RuntimeGenerationID: request.Runtime.ID,
+	}
+	_, plan, err := tools.PlanOrchestratedAuthorization(context.Background(), planRequest, subagenttool.Kind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizationRequest, err := toolAuthorizationRequest(request, &state, planRequest, plan, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRequestDigest, err := canonicaljson.Digest(planRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := subagenttool.BuiltinDescriptor()
+	if err := authorizationRequest.Validate(); err != nil {
+		t.Fatalf("authorization request invalid: %v", err)
+	}
+	if authorizationRequest.SessionID != request.SessionID || authorizationRequest.TaskID != state.taskID || authorizationRequest.TurnID != state.turnID || authorizationRequest.ActivityID != planRequest.ActivityID || authorizationRequest.CallID != planRequest.CallID || authorizationRequest.QueueID != string(state.turnID) || authorizationRequest.RuntimeGenerationID != request.Runtime.ID {
+		t.Fatalf("authorization lineage is not exact: %+v", authorizationRequest)
+	}
+	if authorizationRequest.Source != descriptor.Body.Identity || authorizationRequest.SourceRevision != descriptor.Body.SourceRevision || authorizationRequest.DescriptorDigest != descriptor.DescriptorDigest || authorizationRequest.Action != subagenttool.Kind || authorizationRequest.Effect != "orchestration" || authorizationRequest.ExecutionLocus != "orchestrator" || len(authorizationRequest.Resources) != 0 || authorizationRequest.PlanDigest != plan.Digest || authorizationRequest.RequestDigest != wantRequestDigest {
+		t.Fatalf("authorization authority is not exact: request=%+v plan=%+v", authorizationRequest, plan)
+	}
+
+	changed := planRequest
+	changed.TurnID = "different-turn"
+	changedDigest, err := canonicaljson.Digest(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedDigest == authorizationRequest.RequestDigest {
+		t.Fatal("turn identity did not change the authorization request digest")
+	}
+}
+
 func TestRunTurnSubagentDerivesChildExposureWithoutSubagent(t *testing.T) {
 	runtime := validRuntimeManifest(t, "observation")
 	runtime.Body.Tools = append(runtime.Body.Tools, subagenttool.BuiltinDescriptor())
@@ -1134,8 +1181,11 @@ func countBatchKind(batches [][]string, kind string) int {
 
 type subagentPlanService struct{ noToolService }
 
-func (subagentPlanService) PlanPreviewInspection(_ context.Context, request tooling.PlanRequest) (tooling.ActionHandle, protocol.ActionPlan, error) {
-	return tooling.ActionHandle{}, testActionPlan(request, "observation", "not_applicable"), nil
+func (subagentPlanService) PlanOrchestratedAuthorization(_ context.Context, request tooling.PlanRequest, kind string) (tooling.ActionHandle, protocol.ActionPlan, error) {
+	if kind != subagenttool.Kind {
+		return tooling.ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("unexpected orchestrated kind %q", kind)
+	}
+	return tooling.ActionHandle{}, testActionPlan(request, "orchestration", "not_applicable"), nil
 }
 
 type subagentTestProvider struct {

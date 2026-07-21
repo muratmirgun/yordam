@@ -47,7 +47,13 @@ func (s *Service) runSubagentIntent(ctx context.Context, lease managedOperationL
 	}
 	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "subagent", intent.CallID))
 	planRequest := tooling.PlanRequest{TurnID: state.turnID, ActivityID: activityID, CallID: intent.CallID, Alias: intent.Alias, Arguments: protocol.DeepCopy(intent.Arguments), RuntimeGenerationID: request.Runtime.ID}
-	_, plan, err := s.deps.Tools.PlanPreviewInspection(ctx, planRequest)
+	planner, ok := s.deps.Tools.(interface {
+		PlanOrchestratedAuthorization(context.Context, tooling.PlanRequest, string) (tooling.ActionHandle, protocol.ActionPlan, error)
+	})
+	if !ok {
+		return protocol.ToolResultBlock{}, fmt.Errorf("subagent authorization planner is unavailable")
+	}
+	_, plan, err := planner.PlanOrchestratedAuthorization(ctx, planRequest, subagenttool.Kind)
 	if err != nil {
 		return protocol.ToolResultBlock{}, err
 	}

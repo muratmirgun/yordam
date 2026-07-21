@@ -223,6 +223,7 @@ type ExecutionResult struct {
 	ToolResult   ToolResultBlock        `json:"tool_result"`
 	Presentation ToolResultPresentation `json:"presentation"`
 	Evidence     []EvidenceCandidate    `json:"evidence"`
+	FileChange   *FileChangedV1         `json:"file_change,omitempty"`
 }
 
 func validateJSONObject(raw json.RawMessage, label string) error {

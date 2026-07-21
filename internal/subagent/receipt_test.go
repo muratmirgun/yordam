@@ -2,6 +2,7 @@ package subagent
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/muratmirgun/yordam/internal/protocol"
@@ -46,6 +47,19 @@ func TestProjectReceiptExcludesShellPlansThatNeverStarted(t *testing.T) {
 	receipt := ProjectReceipt(protocol.SubagentManifestV1{}, protocol.CommittedCursor{}, "failed", "", protocol.ModelUsage{}, nil, []protocol.EventRecord{plan, denied})
 	if len(receipt.CommandsAndTests) != 0 {
 		t.Fatalf("unstarted command was reported: %v", receipt.CommandsAndTests)
+	}
+}
+
+func TestProjectReceiptRetainsStructuredFileEffectWhenActivityIsUncertain(t *testing.T) {
+	manifest := protocol.SubagentManifestV1{ChildSessionID: "child"}
+	events := []protocol.EventRecord{
+		activityReceiptEvent(protocol.EventFileChanged, "edit", protocol.FileChangedV1{CallID: "call", Subject: protocol.SubjectRef{Kind: "file", ID: "/workspace/a.go"}, Before: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)}, After: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("b", 64)}, EvidenceIDs: []protocol.EvidenceID{}}),
+		activityReceiptEvent(protocol.EventActivityStarted, "edit", protocol.ActivityStartedV1{}),
+		activityReceiptEvent(protocol.EventActivityUncertain, "edit", protocol.ActivityOutcomeV1{Status: "uncertain"}),
+	}
+	receipt := ProjectReceipt(manifest, protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child"}, "failed", "durability uncertain", protocol.ModelUsage{}, nil, events)
+	if receipt.Status != "uncertain" || !equalStrings(receipt.ChangedFiles, []string{"/workspace/a.go"}) || len(receipt.UnknownEffects) != 1 || receipt.UnknownEffects[0] != "edit" {
+		t.Fatalf("receipt=%+v", receipt)
 	}
 }
 
