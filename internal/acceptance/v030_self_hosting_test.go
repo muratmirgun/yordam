@@ -77,7 +77,7 @@ func TestV030SelfHosting(t *testing.T) {
 	}
 	session.Write(t, "y")
 	if err := waitForSelfHostAuthorizationConsumed(checkout.DataDir, parentAuthorization.RequestID, 5*time.Second); err != nil {
-		t.Fatalf("parent permission input was not consumed: %v\ncurrent screen:\n%s\nraw PTY:\n%q", err, session.CurrentScreen(), session.Output())
+		t.Fatalf("parent permission input was not consumed: %v\njournal suffix:\n%s\ncurrent screen:\n%s\nraw PTY:\n%q", err, selfHostAuthorizationSuffix(checkout.DataDir, parentAuthorization.RequestID), session.CurrentScreen(), session.Output())
 	}
 	session.WaitForAfter(t, turnOffset, "self-hosting change and complete verification succeeded", 420*time.Second)
 	session.WaitForQuiet(t, 300*time.Millisecond, 10*time.Second)
@@ -108,6 +108,45 @@ func TestV030SelfHosting(t *testing.T) {
 	if len(provider.Requests) != len(steps) {
 		t.Fatalf("restart retried provider effects: requests=%d want=%d", len(provider.Requests), len(steps))
 	}
+}
+
+func selfHostAuthorizationSuffix(dataDir, requestID string) string {
+	var target protocol.EventEnvelope
+	files := make([]string, 0)
+	_ = filepath.WalkDir(filepath.Join(dataDir, "workspaces"), func(path string, entry os.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() && entry.Name() == "events.jsonl" {
+			files = append(files, path)
+		}
+		return nil
+	})
+	for _, path := range files {
+		raw, _ := os.ReadFile(path)
+		for _, line := range bytes.Split(raw, []byte{'\n'}) {
+			var envelope protocol.EventEnvelope
+			if json.Unmarshal(line, &envelope) != nil || envelope.Kind != protocol.EventAuthorizationRequested {
+				continue
+			}
+			var requested protocol.AuthorizationRequestedV1
+			if json.Unmarshal(envelope.Payload, &requested) == nil && requested.Request.RequestID == requestID {
+				target = envelope
+			}
+		}
+	}
+	if target.EventID == "" {
+		return "authorization request not found"
+	}
+	lines := make([]string, 0)
+	for _, path := range files {
+		raw, _ := os.ReadFile(path)
+		for _, line := range bytes.Split(raw, []byte{'\n'}) {
+			var envelope protocol.EventEnvelope
+			if json.Unmarshal(line, &envelope) != nil || envelope.JournalID != target.JournalID || envelope.Seq < target.Seq || envelope.Seq > target.Seq+8 {
+				continue
+			}
+			lines = append(lines, fmt.Sprintf("seq=%d kind=%s tx=%s runtime=%s actor=%+v payload=%s", envelope.Seq, envelope.Kind, envelope.TransactionID, envelope.RuntimeGenerationID, envelope.Actor, envelope.Payload))
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func waitForSelfHostAuthorization(t *testing.T, dataDir, callID, action, command string, timeout time.Duration) protocol.AuthorizationRequest {
