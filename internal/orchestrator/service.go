@@ -178,7 +178,7 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 	completedTools := 0
 	zeroByteRetries := 0
 	for attempt := 0; ; attempt++ {
-		assistant, terminal, err := s.runProviderActivity(ctx, request, &state, attempt, extraMessages)
+		assistant, terminal, err := s.runProviderActivity(ctx, lease, request, &state, attempt, extraMessages)
 		if err != nil {
 			var proved ProvenZeroByteProviderError
 			if errors.As(err, &proved) && proved.Retryable() && proved.ZeroBytesSent() && zeroByteRetries == 0 && state.activeActivityID != "" {
@@ -236,7 +236,7 @@ func commandResultCursor(result protocol.CommandResult) protocol.CommittedCursor
 	return result.Cursor.WorkspaceControl
 }
 
-func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequest, state *turnState, attempt int, extra []protocol.ModelMessage) (protocol.AssistantMessageV1, protocol.ProviderAttemptTerminalV1, error) {
+func (s *Service) runProviderActivity(ctx context.Context, lease managedOperationLease, request StartTurnRequest, state *turnState, attempt int, extra []protocol.ModelMessage) (protocol.AssistantMessageV1, protocol.ProviderAttemptTerminalV1, error) {
 	model, ok := selectedRuntimeModel(request)
 	if !ok {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("selected model %q/%q is not in runtime generation %q", request.ProviderID, request.ModelID, request.Runtime.ID)
@@ -286,7 +286,7 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 		if !decision.ShouldCompact {
 			break
 		}
-		compacted, compactErr := s.compactWithinTurn(ctx, request, state, state.head, history)
+		compacted, compactErr := s.compactWithinTurn(ctx, lease, request, state, state.head, history)
 		if compactErr != nil {
 			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, compactErr
 		}
@@ -339,7 +339,7 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
-	token, err := s.authorizeActivity(ctx, request, state, activityID, callID, label, authorizationRequest)
+	token, err := s.authorizeActivity(ctx, lease, request, state, activityID, callID, label, authorizationRequest)
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
@@ -432,7 +432,7 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 	}
 	mutating := descriptor.Body.Effect != "observation"
 	if !mutating {
-		return s.runObservationIntent(ctx, request, state, intent)
+		return s.runObservationIntent(ctx, lease, request, state, intent)
 	}
 	for round := 0; round < 3; round++ {
 		previewActivityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "preview", intent.CallID, fmt.Sprint(round)))
@@ -474,7 +474,7 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 		if err := s.cross(ctx, BarrierActionPlanCommitted, barrierState); err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
-		previewToken, err := s.authorizeActivity(ctx, request, state, previewActivityID, intent.CallID, previewLabel, previewAuthorization)
+		previewToken, err := s.authorizeActivity(ctx, lease, request, state, previewActivityID, intent.CallID, previewLabel, previewAuthorization)
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
@@ -572,7 +572,7 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 		if err := s.append(ctx, state, mutationLabel+"-authorization", events); err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
-		token, err := s.authorizeActivity(ctx, request, state, mutationActivityID, intent.CallID, mutationLabel, mutationAuthorization)
+		token, err := s.authorizeActivity(ctx, lease, request, state, mutationActivityID, intent.CallID, mutationLabel, mutationAuthorization)
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
@@ -624,7 +624,7 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 	return protocol.ToolResultBlock{CallID: intent.CallID, Status: "failed", Text: "resource drift did not stabilize"}, nil
 }
 
-func (s *Service) runObservationIntent(ctx context.Context, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock) (protocol.ToolResultBlock, error) {
+func (s *Service) runObservationIntent(ctx context.Context, lease managedOperationLease, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock) (protocol.ToolResultBlock, error) {
 	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "tool", intent.CallID))
 	planRequest := tooling.PlanRequest{TurnID: state.turnID, ActivityID: activityID, CallID: intent.CallID, Alias: intent.Alias, Arguments: protocol.DeepCopy(intent.Arguments), RuntimeGenerationID: request.Runtime.ID}
 	handle, plan, err := s.deps.Tools.Plan(ctx, planRequest)
@@ -670,7 +670,7 @@ func (s *Service) runObservationIntent(ctx context.Context, request StartTurnReq
 	if err := s.cross(ctx, BarrierActionPlanCommitted, barrierState); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
-	token, err := s.authorizeActivity(ctx, request, state, activityID, intent.CallID, label, authRequest)
+	token, err := s.authorizeActivity(ctx, lease, request, state, activityID, intent.CallID, label, authRequest)
 	if err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
@@ -1050,7 +1050,7 @@ func (s *Service) abandonDriftRound(ctx context.Context, request StartTurnReques
 	return nil
 }
 
-func (s *Service) authorizeActivity(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, callID, label string, authorizationRequest protocol.AuthorizationRequest) (authorization.CommittedToken, error) {
+func (s *Service) authorizeActivity(ctx context.Context, lease managedOperationLease, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, callID, label string, authorizationRequest protocol.AuthorizationRequest) (authorization.CommittedToken, error) {
 	decision, err := s.deps.Authorization.Decide(ctx, authorizationRequest)
 	if err != nil {
 		return authorization.CommittedToken{}, err
@@ -1059,7 +1059,7 @@ func (s *Service) authorizeActivity(ctx context.Context, request StartTurnReques
 		if s.deps.Approver == nil {
 			return authorization.CommittedToken{}, fmt.Errorf("interactive approver is required")
 		}
-		response, approveErr := s.deps.Approver.Approve(ctx, decision)
+		response, approveErr := s.awaitInteractiveApproval(ctx, lease, decision)
 		if approveErr != nil {
 			return authorization.CommittedToken{}, approveErr
 		}
@@ -1155,6 +1155,19 @@ func (s *Service) authorizeActivity(ctx context.Context, request StartTurnReques
 		DecisionEventID: decisionEventID, StartTransactionID: protocol.TransactionID(stableID("transaction", string(state.command.CommandID), label+"-start")),
 		ConsumedEventID: consumedEventID, StartedEventID: startedEventID,
 	})
+}
+
+func (s *Service) awaitInteractiveApproval(ctx context.Context, lease managedOperationLease, decision protocol.AuthorizationDecision) (protocol.ApprovalResponse, error) {
+	if lease == nil {
+		return protocol.ApprovalResponse{}, fmt.Errorf("interactive approval requires an operation lease")
+	}
+	var response protocol.ApprovalResponse
+	err := lease.Yield(ctx, func(yielded context.Context) error {
+		var approveErr error
+		response, approveErr = s.deps.Approver.Approve(yielded, decision)
+		return approveErr
+	})
+	return response, err
 }
 
 func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, state *turnState, assistant protocol.AssistantMessageV1, terminal protocol.ProviderAttemptTerminalV1) (RunResult, error) {

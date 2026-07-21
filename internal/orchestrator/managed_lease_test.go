@@ -5,7 +5,43 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
+
+type laneAcquiringApprover struct {
+	lane OperationLane
+}
+
+func (a laneAcquiringApprover) Approve(ctx context.Context, decision protocol.AuthorizationDecision) (protocol.ApprovalResponse, error) {
+	control, err := a.lane.Acquire(ctx, OperationClaim{Kind: OperationControl, SessionID: decision.Request.SessionID, ControlOperationID: "approval-control"})
+	if err != nil {
+		return protocol.ApprovalResponse{}, err
+	}
+	control.Release()
+	return protocol.ApprovalResponse{Action: "allow", Lifetime: protocol.AuthorizationLifetimeOnce}, nil
+}
+
+func TestInteractiveApprovalYieldsTurnLaneForDurableControl(t *testing.T) {
+	lane := NewOperationLane()
+	turn, err := acquireManagedOperationLease(t.Context(), lane, OperationClaim{Kind: OperationTurn, SessionID: "parent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer turn.Release()
+	service := &Service{deps: Dependencies{Approver: laneAcquiringApprover{lane: lane}}}
+	decision := protocol.AuthorizationDecision{Request: protocol.AuthorizationRequest{SessionID: "parent"}}
+	response, err := service.awaitInteractiveApproval(t.Context(), turn, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Action != "allow" {
+		t.Fatalf("approval action=%q want allow", response.Action)
+	}
+	if turn.Claim() != (OperationClaim{Kind: OperationTurn, SessionID: "parent"}) {
+		t.Fatalf("turn claim was not reacquired: %+v", turn.Claim())
+	}
+}
 
 func TestManagedOperationLeaseYieldsAndReacquiresTheIdenticalClaim(t *testing.T) {
 	lane := NewOperationLane()

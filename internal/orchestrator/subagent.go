@@ -73,7 +73,7 @@ func (s *Service) runSubagentIntent(ctx context.Context, lease managedOperationL
 		return protocol.ToolResultBlock{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
-	if _, err := s.authorizeActivity(ctx, request, state, activityID, intent.CallID, label, authorizationRequest); err != nil {
+	if _, err := s.authorizeActivity(ctx, lease, request, state, activityID, intent.CallID, label, authorizationRequest); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
 

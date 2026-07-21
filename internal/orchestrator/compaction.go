@@ -170,7 +170,7 @@ type compactionState struct {
 // compactWithinTurn compacts one safe source range while the caller retains
 // the turn's lane and lease. It deliberately uses the turn state and append
 // path directly: calling RunCompaction here would try to acquire both again.
-func (s *Service) compactWithinTurn(ctx context.Context, request StartTurnRequest, state *turnState, head protocol.CommittedCursor, history []protocol.EventRecord) (bool, error) {
+func (s *Service) compactWithinTurn(ctx context.Context, lease managedOperationLease, request StartTurnRequest, state *turnState, head protocol.CommittedCursor, history []protocol.EventRecord) (bool, error) {
 	if state == nil || state.head != head {
 		return false, fmt.Errorf("automatic compaction turn head changed")
 	}
@@ -224,7 +224,7 @@ func (s *Service) compactWithinTurn(ctx context.Context, request StartTurnReques
 		return false, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
-	token, err := s.authorizeActivity(ctx, request, state, activityID, callID, label, authorizationRequest)
+	token, err := s.authorizeActivity(ctx, lease, request, state, activityID, callID, label, authorizationRequest)
 	if err != nil {
 		return false, err
 	}

@@ -817,7 +817,7 @@ func (s *Service) resumeRecoveredParent(ctx context.Context, lease managedOperat
 	extra := []protocol.ModelMessage{{Role: "tool", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolResult, ToolResult: &resultBlock}}}}
 	completedTools := 1
 	for providerAttempt := providerAttempts; ; providerAttempt++ {
-		assistant, terminal, runErr := s.runProviderActivity(ctx, request, &state, providerAttempt, extra)
+		assistant, terminal, runErr := s.runProviderActivity(ctx, lease, request, &state, providerAttempt, extra)
 		if runErr != nil {
 			if errors.Is(runErr, ErrCommitUncertain) {
 				return RunResult{TaskID: state.taskID, TurnID: state.turnID, Cursor: state.head, Status: "uncertain"}, runErr

@@ -246,7 +246,7 @@ func TestAutomaticCompactionDeduplicatesAnUnchangedSourceDigest(t *testing.T) {
 	state := newTurnState(request)
 	state.head = request.ExpectedHead
 	state.compactedSources[selection.SourceDigest] = struct{}{}
-	compacted, err := service.compactWithinTurn(context.Background(), request, &state, state.head, history.Events)
+	compacted, err := service.compactWithinTurn(context.Background(), nil, request, &state, state.head, history.Events)
 	if err != nil || compacted || provider.compactions.Load() != 0 {
 		t.Fatalf("compacted=%t requests=%d error=%v", compacted, provider.compactions.Load(), err)
 	}
