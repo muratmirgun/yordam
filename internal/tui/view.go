@@ -11,10 +11,29 @@ import (
 
 const splitGap = 3
 
+type conversationMouseWheelMsg struct {
+	wheel tea.MouseWheelMsg
+}
+
 func (model Model) View() tea.View {
 	rendered := model.render()
 	view := tea.NewView(rendered)
 	view.AltScreen = true
+	if model.screen == ScreenConversation && model.layout() != LayoutContextOnly && model.modal == ModalNone {
+		streamWidth := model.renderWidth()
+		if model.layout() == LayoutSplit {
+			streamWidth = (streamWidth - splitGap) * 2 / 3
+		}
+		view.MouseMode = tea.MouseModeCellMotion
+		view.OnMouse = func(message tea.MouseMsg) tea.Cmd {
+			mouse := message.Mouse()
+			wheel, ok := message.(tea.MouseWheelMsg)
+			if !ok || mouse.X < 0 || mouse.X >= streamWidth || mouse.Y < 2 || mouse.Y >= 2+model.conversation.Height() {
+				return nil
+			}
+			return func() tea.Msg { return conversationMouseWheelMsg{wheel: wheel} }
+		}
+	}
 	if model.screen == ScreenConversation && model.layout() != LayoutContextOnly && model.modal == ModalNone && model.focusedComponent == focusComposer {
 		if cursor := model.composer.Cursor(); cursor != nil {
 			cursor.Position.Y += 3 + renderedLineCount(model.renderConversation(model.renderWidth())) + model.progressHeight()

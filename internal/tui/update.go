@@ -31,6 +31,10 @@ func (model Model) updateMessage(message tea.Msg) Model {
 				model = model.updateComposer(message)
 			}
 		}
+	case conversationMouseWheelMsg:
+		if model.screen == ScreenConversation && model.layout() != LayoutContextOnly && model.modal == ModalNone {
+			model.conversation, _ = model.conversation.Update(message.wheel)
+		}
 	case appEventMsg:
 		if message.ok {
 			model = model.handleAppEvent(message.event)
