@@ -101,8 +101,8 @@ func (c *SequentialChildCoordinator) RunChild(ctx context.Context, request Child
 		prompt += "\n\nContext:\n" + request.Call.Context
 	}
 	childRequest := StartTurnRequest{
-		Command:   CommandMetadata{CommandID: protocol.CommandID(stableID("subagent-child-command", string(request.Manifest.AttemptID))), IdempotencyKey: string(request.Manifest.AttemptID), RequestDigest: digest, Actor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}},
-		SessionID: request.Manifest.ChildSessionID, ExpectedHead: childJournal.Head, Prompt: prompt,
+		Command:     CommandMetadata{CommandID: protocol.CommandID(stableID("subagent-child-command", string(request.Manifest.AttemptID))), IdempotencyKey: string(request.Manifest.AttemptID), RequestDigest: digest, Actor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}},
+		WorkspaceID: request.Parent.WorkspaceID, SessionID: request.Manifest.ChildSessionID, ExpectedHead: childJournal.Head, Prompt: prompt,
 		ProviderID: request.Parent.ProviderID, ModelID: request.Parent.ModelID, Runtime: protocol.DeepCopy(request.Parent.Runtime),
 		child: &childTurnConfig{manifest: protocol.DeepCopy(request.Manifest), exposure: exposure},
 	}

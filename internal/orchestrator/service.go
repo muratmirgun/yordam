@@ -772,7 +772,7 @@ func (s *Service) recordEvidence(ctx context.Context, request StartTurnRequest, 
 		if candidate.ID == "" {
 			candidate.ID = protocol.EvidenceID(stableID("evidence", string(request.Command.CommandID), string(activityID), fmt.Sprint(index)))
 		}
-		candidate.WorkspaceID = protocol.WorkspaceID(request.SessionID)
+		candidate.WorkspaceID = effectiveWorkspaceID(request.WorkspaceID, request.SessionID)
 		candidate.SessionID = request.SessionID
 		candidate.ProducingActivityID = activityID
 		if candidate.Actor.Validate() != nil {
@@ -959,7 +959,7 @@ func (s *Service) prepareCheckpoint(ctx context.Context, request StartTurnReques
 		} else if putErr != nil {
 			return protocol.CheckpointBody{}, s.failCheckpoint(ctx, request, state, activityID, label, plan.Digest, putErr)
 		} else {
-			if err := validateRecoveryMaterialMetadata(material, protocol.WorkspaceID(request.SessionID), activityID, body, plan); err != nil {
+			if err := validateRecoveryMaterialMetadata(material, effectiveWorkspaceID(request.WorkspaceID, request.SessionID), activityID, body, plan); err != nil {
 				return protocol.CheckpointBody{}, s.failCheckpoint(ctx, request, state, activityID, label, plan.Digest, fmt.Errorf("recovery material binding mismatch"))
 			}
 			body.Coverage[0].RecoveryMaterialID = material.ID
@@ -2925,6 +2925,15 @@ func validateStartTurnRequest(request StartTurnRequest) error {
 		return fmt.Errorf("selected model %q/%q is not in runtime generation", request.ProviderID, request.ModelID)
 	}
 	return nil
+}
+
+func effectiveWorkspaceID(workspaceID protocol.WorkspaceID, sessionID protocol.SessionID) protocol.WorkspaceID {
+	if workspaceID != "" {
+		return workspaceID
+	}
+	// Legacy/internal callers created before workspace provenance was carried on
+	// orchestration requests remain replayable; production builders always bind it.
+	return protocol.WorkspaceID(sessionID)
 }
 
 func selectedRuntimeModel(request StartTurnRequest) (protocol.ModelDescriptor, bool) {

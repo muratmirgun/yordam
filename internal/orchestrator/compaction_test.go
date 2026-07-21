@@ -59,7 +59,7 @@ func TestRunCompactionLifecycleOrdersAuthorizationEvidenceAndNativeEvent(t *test
 	if payload.From != result.From || payload.Through != result.Through || payload.SummaryEvidenceID != result.SummaryEvidence.Body.ID || payload.Revision != result.Revision {
 		t.Fatalf("payload=%+v result=%+v", payload, result)
 	}
-	if evidence.candidate.Kind != "context_summary" || evidence.candidate.Limit != compaction.MaxSummaryBytes || evidence.candidate.SessionID != request.SessionID || evidence.candidate.WorkspaceID != protocol.WorkspaceID(request.SessionID) || evidence.candidate.Actor != (protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}) {
+	if evidence.candidate.Kind != "context_summary" || evidence.candidate.Limit != compaction.MaxSummaryBytes || evidence.candidate.SessionID != request.SessionID || evidence.candidate.WorkspaceID != request.WorkspaceID || evidence.candidate.Actor != (protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}) {
 		t.Fatalf("evidence=%+v", evidence.candidate)
 	}
 	var binding struct {
@@ -315,7 +315,7 @@ func TestCollectCompactionSummaryRejectsContentAfterImmutableBlock(t *testing.T)
 
 func validCompactRequest(t *testing.T, head protocol.CommittedCursor) CompactRequest {
 	t.Helper()
-	return CompactRequest{Command: validStartTurnRequest().Command, SessionID: "session-a", ExpectedHead: head, ProviderID: "provider-a", ModelID: "model-a", Runtime: validRuntimeManifest(t, "observation"), Trigger: compaction.TriggerManual}
+	return CompactRequest{Command: validStartTurnRequest().Command, WorkspaceID: "workspace-a", SessionID: "session-a", ExpectedHead: head, ProviderID: "provider-a", ModelID: "model-a", Runtime: validRuntimeManifest(t, "observation"), Trigger: compaction.TriggerManual}
 }
 
 func newCompactionService(t *testing.T, repository *compactionRepository, log *recordLog, provider ProviderService, evidence EvidenceRecorder) *Service {

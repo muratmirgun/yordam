@@ -201,7 +201,7 @@ func (s *Service) compactWithinTurn(ctx context.Context, lease managedOperationL
 	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "automatic-compaction", selection.SourceDigest.Value, string(request.Runtime.ID)))
 	callID := stableID("compaction-call", string(request.Command.CommandID), "automatic", selection.SourceDigest.Value, string(request.Runtime.ID))
 	label := "automatic-compaction-" + selection.SourceDigest.Value
-	compactRequest := CompactRequest{Command: request.Command, SessionID: request.SessionID, ExpectedHead: head, ProviderID: request.ProviderID, ModelID: request.ModelID, Runtime: request.Runtime, Trigger: compaction.TriggerAutomatic}
+	compactRequest := CompactRequest{Command: request.Command, WorkspaceID: request.WorkspaceID, SessionID: request.SessionID, ExpectedHead: head, ProviderID: request.ProviderID, ModelID: request.ModelID, Runtime: request.Runtime, Trigger: compaction.TriggerAutomatic}
 	handle, err := s.deps.Provider.Prepare(ctx, activityID, callID, modelRequest, selection.SourceDigest)
 	if err != nil {
 		return false, err
@@ -455,7 +455,7 @@ func (s *Service) recordCompactionEvidence(ctx context.Context, request CompactR
 	if err != nil {
 		return protocol.EvidenceRecord{}, err
 	}
-	candidate := protocol.EvidenceCandidate{ID: protocol.EvidenceID(stableID("evidence", string(request.Command.CommandID), selection.SourceDigest.Value, string(request.Runtime.ID))), Kind: "context_summary", WorkspaceID: protocol.WorkspaceID(request.SessionID), SessionID: request.SessionID, MediaType: "application/json", ProducingActivityID: activityID, Actor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}, Subject: protocol.SubjectRef{Kind: "context_compaction_summary", ID: encodedBinding}, Content: summary, Limit: compaction.MaxSummaryBytes}
+	candidate := protocol.EvidenceCandidate{ID: protocol.EvidenceID(stableID("evidence", string(request.Command.CommandID), selection.SourceDigest.Value, string(request.Runtime.ID))), Kind: "context_summary", WorkspaceID: effectiveWorkspaceID(request.WorkspaceID, request.SessionID), SessionID: request.SessionID, MediaType: "application/json", ProducingActivityID: activityID, Actor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorSystem}, Subject: protocol.SubjectRef{Kind: "context_compaction_summary", ID: encodedBinding}, Content: summary, Limit: compaction.MaxSummaryBytes}
 	record, err := s.deps.Evidence.Put(ctx, candidate)
 	if err != nil {
 		return protocol.EvidenceRecord{}, err

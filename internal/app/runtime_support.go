@@ -784,7 +784,7 @@ func (d runtimeCommandDispatcher) DispatchCommand(ctx context.Context, metadata 
 		}
 		state := ProjectSessionState(LegacyReplayFromInspection(inspection))
 		result, err := d.Orchestrator.RunTurn(ctx, orchestrator.StartTurnRequest{
-			Command: metadata, SessionID: command.Expected.SelectedSessionID, ExpectedHead: *command.Expected.Session,
+			Command: metadata, WorkspaceID: d.WorkspaceID, SessionID: command.Expected.SelectedSessionID, ExpectedHead: *command.Expected.Session,
 			Prompt: payload.Prompt, ProviderID: protocol.ProviderID(state.Selection.Profile), ModelID: protocol.ModelID(state.Selection.Model), Runtime: protocol.DeepCopy(d.Manifest),
 		})
 		return result.CommandResult, err
@@ -838,7 +838,7 @@ func (d runtimeCommandDispatcher) DispatchCommand(ctx context.Context, metadata 
 			providerID, modelID = d.Manifest.Body.Models[0].ProviderID, d.Manifest.Body.Models[0].ModelID
 		}
 		_, runErr := d.Orchestrator.RunCompaction(ctx, orchestrator.CompactRequest{
-			Command: metadata, SessionID: command.Expected.SelectedSessionID, ExpectedHead: *command.Expected.Session,
+			Command: metadata, WorkspaceID: d.WorkspaceID, SessionID: command.Expected.SelectedSessionID, ExpectedHead: *command.Expected.Session,
 			ProviderID: providerID, ModelID: modelID,
 			Runtime: protocol.DeepCopy(d.Manifest), Trigger: compaction.TriggerManual,
 		})

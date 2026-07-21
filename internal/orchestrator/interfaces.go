@@ -24,6 +24,7 @@ type CommandMetadata struct {
 
 type StartTurnRequest struct {
 	Command      CommandMetadata
+	WorkspaceID  protocol.WorkspaceID
 	SessionID    protocol.SessionID
 	ExpectedHead protocol.CommittedCursor
 	Prompt       string
@@ -36,6 +37,7 @@ type StartTurnRequest struct {
 
 type CompactRequest struct {
 	Command      CommandMetadata
+	WorkspaceID  protocol.WorkspaceID
 	SessionID    protocol.SessionID
 	ExpectedHead protocol.CommittedCursor
 	ProviderID   protocol.ProviderID

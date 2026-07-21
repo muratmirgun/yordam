@@ -779,7 +779,7 @@ func (s *Service) recoverParentStartRequest(ctx context.Context, control Recover
 	if !foundModel {
 		return StartTurnRequest{}, terminalRecoveredParentFailuref("subagent recovery frozen model is unavailable")
 	}
-	return StartTurnRequest{Command: CommandMetadata{CommandID: command.CommandID, IdempotencyKey: command.IdempotencyKey, RequestDigest: command.RequestDigest, Actor: actor}, SessionID: protocol.SessionID(control.Storage.Journal.ID), ExpectedHead: head, Prompt: accepted.Goal, ProviderID: model.ProviderID, ModelID: model.ModelID, Runtime: protocol.DeepCopy(control.Control.Runtime)}, nil
+	return StartTurnRequest{Command: CommandMetadata{CommandID: command.CommandID, IdempotencyKey: command.IdempotencyKey, RequestDigest: command.RequestDigest, Actor: actor}, WorkspaceID: protocol.WorkspaceID(parent.Session.Workspace.ID), SessionID: protocol.SessionID(control.Storage.Journal.ID), ExpectedHead: head, Prompt: accepted.Goal, ProviderID: model.ProviderID, ModelID: model.ModelID, Runtime: protocol.DeepCopy(control.Control.Runtime)}, nil
 }
 
 func childInspectionCommitKnown(child journal.Inspection) bool {

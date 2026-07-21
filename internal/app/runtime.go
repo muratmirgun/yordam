@@ -614,7 +614,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 			return err
 		}
 		_, err = service.RunCompaction(ctx, orchestrator.CompactRequest{
-			Command: metadata, SessionID: protocol.SessionID(session.ID), ExpectedHead: head,
+			Command: metadata, WorkspaceID: protocol.WorkspaceID(b.workspace.ID), SessionID: protocol.SessionID(session.ID), ExpectedHead: head,
 			ProviderID: protocol.ProviderID(session.Selection.Profile), ModelID: protocol.ModelID(session.Selection.Model),
 			Runtime: protocol.DeepCopy(manifest), Trigger: compaction.TriggerManual,
 		})
@@ -627,7 +627,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 				return orchestrator.StartTurnRequest{}, fmt.Errorf("turn input has no committed command or session head")
 			}
 			return orchestrator.StartTurnRequest{
-				Command: input.Command, ExpectedHead: input.ExpectedHead,
+				Command: input.Command, WorkspaceID: protocol.WorkspaceID(b.workspace.ID), ExpectedHead: input.ExpectedHead,
 				ProviderID: protocol.ProviderID(input.Session.Selection.Profile), ModelID: protocol.ModelID(input.Session.Selection.Model),
 				Runtime: protocol.DeepCopy(manifest),
 			}, nil
