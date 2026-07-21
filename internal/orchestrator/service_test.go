@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -124,6 +126,42 @@ func TestRunTurnProviderPrepareReceivesProjectedAssistantAndToolMessages(t *test
 	providerService.mu.Unlock()
 	if len(requests) != 1 || len(requests[0].Messages) != 2 || requests[0].Messages[0].Role != "assistant" || requests[0].Messages[0].Blocks[0].ToolUse == nil || requests[0].Messages[0].Blocks[0].ToolUse.CallID != tool.CallID || requests[0].Messages[1].Role != "tool" || requests[0].Messages[1].Blocks[0].ToolResult == nil || requests[0].Messages[1].Blocks[0].ToolResult.CallID != tool.CallID {
 		t.Fatalf("prepare requests=%#v", requests)
+	}
+}
+
+func TestRunTurnRejectsMissingToolHistoryBeforeProviderHTTP(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	intent := protocol.ToolUseBlock{CallID: "call-missing-result", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	assistant := proposedSessionEvent(protocol.EventAssistantMessage, request.SessionID, protocol.AssistantMessageV1{
+		Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}},
+	})
+	assistant.EventID = "event-unmatched-assistant"
+	assistant.TurnID = "turn-previous"
+	repository := &recordingRepository{head: request.ExpectedHead, events: []protocol.ProposedEvent{assistant}}
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	providerService := &httpProviderService{client: server.Client(), endpoint: server.URL}
+	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(),
+		Repository: repository, TurnLeases: &recordingTurnLeaseManager{}, Context: contextplanner.NewPlanner(request.Runtime.Body.ToolCatalogRevision, nil),
+		Providers: fakeProviderCatalog{log: &recordLog{}}, Provider: providerService, Tools: noToolService{},
+		Authorization: &allowingAuthorization{log: &recordLog{}}, Evidence: noEvidenceRecorder{}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.RunTurn(context.Background(), request)
+	if err == nil || !strings.Contains(err.Error(), intent.CallID) || !strings.Contains(err.Error(), string(assistant.EventID)) {
+		t.Errorf("error=%v", err)
+	}
+	if providerService.prepares.Load() != 0 || providerService.streams.Load() != 0 || requests.Load() != 0 {
+		t.Fatalf("malformed transcript reached provider: prepares=%d streams=%d http=%d", providerService.prepares.Load(), providerService.streams.Load(), requests.Load())
 	}
 }
 
@@ -1787,6 +1825,36 @@ func (p *capturingProviderService) Stream(context.Context, provider.ProviderHand
 type countingProviderService struct {
 	delegate fakeProviderService
 	streams  atomic.Int64
+}
+
+type httpProviderService struct {
+	client   *http.Client
+	endpoint string
+	prepares atomic.Int64
+	streams  atomic.Int64
+}
+
+func (s *httpProviderService) Prepare(context.Context, protocol.ActivityID, string, protocol.ModelRequest, protocol.Digest) (provider.ProviderHandle, error) {
+	s.prepares.Add(1)
+	return provider.ProviderHandle{}, nil
+}
+
+func (s *httpProviderService) Stream(ctx context.Context, _ provider.ProviderHandle, _ authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	s.streams.Add(1)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	response, err := s.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	_ = response.Body.Close()
+	stream := make(chan protocol.ModelEvent, 2)
+	stream <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: "done"}}
+	stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "stop"}}
+	close(stream)
+	return stream, nil
 }
 
 func (s *countingProviderService) Prepare(ctx context.Context, activityID protocol.ActivityID, callID string, request protocol.ModelRequest, digest protocol.Digest) (provider.ProviderHandle, error) {
