@@ -1,6 +1,7 @@
 package context
 
 import (
+	"bytes"
 	stdcontext "context"
 	"encoding/json"
 	"fmt"
@@ -231,11 +232,12 @@ func adaptEventSuffix(events []protocol.EventRecord, compactionIndex int, from, 
 			if !ok {
 				continue
 			}
-			kind, blocks = "assistant_message", protocol.DeepCopy(assistant.Blocks)
-			for _, intent := range assistant.ToolIntents {
-				intentCopy := protocol.DeepCopy(intent)
-				blocks = append(blocks, protocol.ContentBlock{Kind: protocol.ContentToolUse, ToolUse: &intentCopy})
+			var blockErr error
+			blocks, blockErr = canonicalAssistantBlocks(assistant)
+			if blockErr != nil {
+				return nil, nil, "", fmt.Errorf("assistant event %q: %w", event.Envelope.EventID, blockErr)
 			}
+			kind = "assistant_message"
 			if len(blocks) == 0 {
 				continue
 			}
@@ -253,6 +255,48 @@ func adaptEventSuffix(events []protocol.EventRecord, compactionIndex int, from, 
 		sources = append(sources, source)
 	}
 	return sources, excluded, compactionRevision, nil
+}
+
+func canonicalAssistantBlocks(assistant protocol.AssistantMessageV1) ([]protocol.ContentBlock, error) {
+	type occurrence struct {
+		intent protocol.ToolUseBlock
+		modern bool
+		legacy bool
+	}
+	blocks := protocol.DeepCopy(assistant.Blocks)
+	seen := make(map[string]occurrence)
+	for _, block := range blocks {
+		if block.Kind != protocol.ContentToolUse {
+			continue
+		}
+		if block.ToolUse == nil || block.ToolUse.CallID == "" {
+			return nil, fmt.Errorf("invalid modern tool intent")
+		}
+		if _, duplicate := seen[block.ToolUse.CallID]; duplicate {
+			return nil, fmt.Errorf("duplicate modern tool intent %q", block.ToolUse.CallID)
+		}
+		seen[block.ToolUse.CallID] = occurrence{intent: protocol.DeepCopy(*block.ToolUse), modern: true}
+	}
+	for _, intent := range assistant.ToolIntents {
+		if intent.CallID == "" {
+			return nil, fmt.Errorf("invalid legacy tool intent")
+		}
+		if existing, found := seen[intent.CallID]; found {
+			if existing.legacy {
+				return nil, fmt.Errorf("duplicate legacy tool intent %q", intent.CallID)
+			}
+			if existing.intent.Alias != intent.Alias || !bytes.Equal(existing.intent.Arguments, intent.Arguments) {
+				return nil, fmt.Errorf("conflicting tool intent %q", intent.CallID)
+			}
+			existing.legacy = true
+			seen[intent.CallID] = existing
+			continue
+		}
+		intentCopy := protocol.DeepCopy(intent)
+		blocks = append(blocks, protocol.ContentBlock{Kind: protocol.ContentToolUse, ToolUse: &intentCopy})
+		seen[intent.CallID] = occurrence{intent: intentCopy, legacy: true}
+	}
+	return blocks, nil
 }
 
 func validNativeCompaction(event protocol.EventRecord, session protocol.SessionID, payload protocol.ContextCompactedV1) bool {

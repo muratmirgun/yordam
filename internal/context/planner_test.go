@@ -121,6 +121,55 @@ func TestContextPlanAdaptsEventTranscriptAndLegacyCompaction(t *testing.T) {
 	}
 }
 
+func TestContextPlanDoesNotDuplicateDualEncodedToolIntents(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "load-skill", Alias: "skill", Arguments: json.RawMessage(`{"name":"go-development"}`)}
+	event := contextEvent("assistant-tool", 2, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{
+		Blocks:      []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}},
+		ToolIntents: []protocol.ToolUseBlock{intent},
+	})
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
+		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
+		Events: []protocol.EventRecord{event}, Model: contextModel(1024), OutputReserve: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Body.Sources) != 1 || len(plan.Body.Sources[0].Content) != 1 || plan.Body.Sources[0].Content[0].Kind != protocol.ContentToolUse || plan.Body.Sources[0].Content[0].ToolUse == nil || plan.Body.Sources[0].Content[0].ToolUse.CallID != intent.CallID {
+		t.Fatalf("dual-encoded tool intent was not projected exactly once: %+v", plan.Body.Sources)
+	}
+}
+
+func TestContextPlanKeepsLegacyToolIntentsOnly(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "legacy-call", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	event := contextEvent("legacy-assistant-tool", 2, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{ToolIntents: []protocol.ToolUseBlock{intent}})
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
+		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
+		Events: []protocol.EventRecord{event}, Model: contextModel(1024), OutputReserve: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Body.Sources) != 1 || len(plan.Body.Sources[0].Content) != 1 || plan.Body.Sources[0].Content[0].ToolUse == nil || plan.Body.Sources[0].Content[0].ToolUse.CallID != intent.CallID || plan.Body.Sources[0].Content[0].ToolUse.Alias != intent.Alias || string(plan.Body.Sources[0].Content[0].ToolUse.Arguments) != string(intent.Arguments) {
+		t.Fatalf("legacy tool intent was not preserved exactly once: %+v", plan.Body.Sources)
+	}
+}
+
+func TestContextPlanRejectsConflictingDualEncodedToolIntent(t *testing.T) {
+	modern := protocol.ToolUseBlock{CallID: "same-call", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	conflict := protocol.ToolUseBlock{CallID: "same-call", Alias: "read", Arguments: json.RawMessage(`{"path":"SECURITY.md"}`)}
+	event := contextEvent("conflicting-assistant-tool", 2, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{
+		Blocks:      []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &modern}},
+		ToolIntents: []protocol.ToolUseBlock{conflict},
+	})
+	_, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
+		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
+		Events: []protocol.EventRecord{event}, Model: contextModel(1024), OutputReserve: 64,
+	})
+	if err == nil || !strings.Contains(err.Error(), "conflicting tool intent") {
+		t.Fatalf("conflicting dual encoding error=%v", err)
+	}
+}
+
 func TestContextPlanDecodesEventPayloadWhenProjectionIsUnavailable(t *testing.T) {
 	record := protocol.EventRecord{Envelope: protocol.EventEnvelope{EventID: "event-raw", Seq: 1, Kind: protocol.EventUserMessage, Payload: json.RawMessage(`{"content":"from raw"}`)}}
 	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
