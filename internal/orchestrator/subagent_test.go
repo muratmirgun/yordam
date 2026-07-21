@@ -283,25 +283,33 @@ func TestSubagentAttachmentFailurePreservesAtomicResultInvariant(t *testing.T) {
 	}
 }
 
-func TestSubagentPreResultFailuresCommitAtomicConservativeResult(t *testing.T) {
+func TestSubagentPreResultFailureCleanupRespectsDispatchBoundary(t *testing.T) {
 	tests := []struct {
-		name      string
-		configure func(*subagentTestChildren, *recordLog) (ChildSessionStore, ChildCoordinator)
+		name       string
+		configure  func(*subagentTestChildren, *recordLog) (ChildSessionStore, ChildCoordinator)
+		wantAtomic bool
 	}{
 		{
-			name: "child reserve",
+			name:       "pre-dispatch child reserve",
+			wantAtomic: true,
 			configure: func(children *subagentTestChildren, log *recordLog) (ChildSessionStore, ChildCoordinator) {
 				return &failingSubagentChildStore{subagentTestChildren: children, reserveErr: errors.New("raw child reserve failure")}, subagentTestCoordinator{children: children, log: log}
 			},
 		},
 		{
-			name: "child run",
+			name: "dispatched child run",
 			configure: func(children *subagentTestChildren, _ *recordLog) (ChildSessionStore, ChildCoordinator) {
 				return children, failingSubagentCoordinator{}
 			},
 		},
 		{
-			name: "child verification",
+			name: "post-dispatch receipt validation",
+			configure: func(children *subagentTestChildren, _ *recordLog) (ChildSessionStore, ChildCoordinator) {
+				return children, invalidSubagentReceiptCoordinator{}
+			},
+		},
+		{
+			name: "post-dispatch receipt inspection",
 			configure: func(children *subagentTestChildren, log *recordLog) (ChildSessionStore, ChildCoordinator) {
 				return &failingSubagentChildStore{subagentTestChildren: children, inspectErr: errors.New("raw child verification failure")}, subagentTestCoordinator{children: children, log: log}
 			},
@@ -335,8 +343,56 @@ func TestSubagentPreResultFailuresCommitAtomicConservativeResult(t *testing.T) {
 				t.Fatal("subagent pre-result failure unexpectedly succeeded")
 			}
 			activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "subagent", "delegate"))
-			assertAtomicCleanupToolResult(t, repository.appendRequests(), activityID, "delegate", "failed")
+			if test.wantAtomic {
+				assertAtomicCleanupToolResult(t, repository.appendRequests(), activityID, "delegate", "failed")
+				if countKind(flattenAppendKinds(repository.appendRequests()), protocol.EventSubagentWaiting) != 0 {
+					t.Fatalf("pre-dispatch failure persisted subagent waiting state: %v", repository.batchKinds())
+				}
+				return
+			}
+			assertDispatchedSubagentUnresolved(t, repository.appendRequests(), activityID)
+			kinds := flattenAppendKinds(repository.appendRequests())
+			if countKind(kinds, protocol.EventTurnFailed) != 1 || countKind(kinds, protocol.EventCommandCompleted) != 1 {
+				t.Fatalf("dispatched failure terminal lifecycle=%v", kinds)
+			}
 		})
+	}
+}
+
+func assertDispatchedSubagentUnresolved(t *testing.T, requests []journal.AppendRequest, activityID protocol.ActivityID) {
+	t.Helper()
+	terminals, toolMessages := 0, 0
+	requested, waiting, attached := 0, 0, 0
+	for _, request := range requests {
+		for _, event := range request.Events {
+			switch event.Kind {
+			case protocol.EventActivitySucceeded, protocol.EventActivityFailed, protocol.EventActivityDenied,
+				protocol.EventActivityCancelled, protocol.EventActivityInterruptedNoEffect, protocol.EventActivityUncertain:
+				if event.ActivityID == activityID {
+					terminals++
+				}
+			case protocol.EventToolMessage:
+				if event.ActivityID == activityID {
+					toolMessages++
+				}
+			case protocol.EventSubagentRequested:
+				requested++
+			case protocol.EventSubagentWaiting:
+				waiting++
+				var value protocol.SubagentWaitingV1
+				if err := json.Unmarshal(event.Payload, &value); err != nil {
+					t.Fatalf("decode subagent waiting: %v", err)
+				}
+				if value.AttemptID == "" || value.ChildSessionID == "" {
+					t.Fatalf("unbound subagent waiting payload: %+v", value)
+				}
+			case protocol.EventSubagentResultAttached:
+				attached++
+			}
+		}
+	}
+	if terminals != 0 || toolMessages != 0 || requested != 1 || waiting != 1 || attached != 0 {
+		t.Fatalf("dispatched unresolved state terminals=%d tool_messages=%d requested=%d waiting=%d attached=%d", terminals, toolMessages, requested, waiting, attached)
 	}
 }
 
@@ -900,6 +956,8 @@ func TestRunTurnSubagentParentHeadMismatchWritesNoEvidence(t *testing.T) {
 	if _, err := service.RunTurn(context.Background(), request); err == nil {
 		t.Fatal("head mismatch unexpectedly succeeded")
 	}
+	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "subagent", "delegate"))
+	assertDispatchedSubagentUnresolved(t, repo.appendRequests(), activityID)
 	if countPrefix(log.snapshot(), "evidence.put") != 0 {
 		t.Fatalf("evidence persisted after head mismatch: %v", log.snapshot())
 	}
@@ -1328,6 +1386,12 @@ type failingSubagentCoordinator struct{}
 
 func (failingSubagentCoordinator) RunChild(context.Context, ChildRunRequest) (protocol.SubagentReceiptV1, error) {
 	return protocol.SubagentReceiptV1{}, errors.New("raw child run failure")
+}
+
+type invalidSubagentReceiptCoordinator struct{}
+
+func (invalidSubagentReceiptCoordinator) RunChild(context.Context, ChildRunRequest) (protocol.SubagentReceiptV1, error) {
+	return protocol.SubagentReceiptV1{}, nil
 }
 
 func (s *subagentTestChildren) ReserveSessionID() (protocol.SessionID, error) {

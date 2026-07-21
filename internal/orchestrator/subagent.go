@@ -122,6 +122,7 @@ func (s *Service) runSubagentIntent(ctx context.Context, lease managedOperationL
 		childCtx, cancel := context.WithDeadline(childParent, manifest.Deadline)
 		defer cancel()
 		var runErr error
+		state.activeDispatched = true
 		receipt, runErr = s.deps.Children.RunChild(childCtx, ChildRunRequest{Manifest: manifest, Call: call, Parent: protocol.DeepCopy(request)})
 		return runErr
 	})
