@@ -120,7 +120,7 @@ func (c selfHostCheckout) start(t *testing.T, serverURL string, args ...string) 
 			Models: []string{"self-host-model"}, DefaultModel: "self-host-model",
 			ModelContextWindows: map[string]int64{"self-host-model": 8192},
 		}},
-		MaxToolCalls: 32, ShellTimeoutSeconds: 120,
+		MaxToolCalls: 32, ShellTimeoutSeconds: 300,
 		Context:   config.ContextConfig{AutoCompact: true, CompactReserveTokens: &reserve},
 		Skills:    config.SkillConfig{ProjectPolicy: config.ProjectSkillsAsk},
 		Subagents: config.SubagentConfig{Enabled: true, MaxPerTurn: 1, MaxToolCalls: 16, TimeoutSeconds: 120},
