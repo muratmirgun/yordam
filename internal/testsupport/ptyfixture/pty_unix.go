@@ -27,6 +27,8 @@ type Session struct {
 	mu                 sync.Mutex
 	output             bytes.Buffer
 	emulator           *vt.Emulator
+	emulatorStop       func()
+	outputDone         chan struct{}
 }
 
 const scriptedSSE = "data: {\"choices\":[{\"delta\":{\"content\":\"scripted PTY response\"}}]}\n\ndata: [DONE]\n"
@@ -50,8 +52,10 @@ func start(t testing.TB, redact func(string) string, binary, workspace string, e
 	if err != nil {
 		t.Fatal(formatDiagnostic(redact, "start PTY: %v", err))
 	}
-	session := &Session{command: command, terminal: terminal, done: make(chan error, 1), diagnosticRedactor: redact, emulator: newPTYEmulator(120, 32)}
+	emulator, stopEmulator := newPTYEmulator(120, 32)
+	session := &Session{command: command, terminal: terminal, done: make(chan error, 1), diagnosticRedactor: redact, emulator: emulator, emulatorStop: stopEmulator, outputDone: make(chan struct{})}
 	go func() {
+		defer close(session.outputDone)
 		_, _ = io.Copy(lockedWriter{session: session}, terminal)
 	}()
 	go func() { session.done <- command.Wait() }()
@@ -61,17 +65,51 @@ func start(t testing.TB, redact func(string) string, binary, workspace string, e
 			_ = command.Process.Kill()
 			<-session.done
 		}
-		_ = session.emulator.Close()
+		<-session.outputDone
+		session.emulatorStop()
 	})
 	return session
 }
 
-func newPTYEmulator(width, height int) *vt.Emulator {
+func newPTYEmulator(width, height int) (*vt.Emulator, func()) {
 	emulator := vt.NewEmulator(width, height)
+	stop := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(io.Discard, emulator)
+		defer close(done)
+		buffer := make([]byte, 256)
+		for {
+			if _, err := emulator.Read(buffer); err != nil {
+				return
+			}
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
 	}()
-	return emulator
+	var once sync.Once
+	return emulator, func() {
+		once.Do(func() {
+			close(stop)
+			// Wake the response reader without racing Emulator.Close against Read.
+			// DEC operating-status query deterministically emits a response.
+			wakeDone := make(chan struct{})
+			go func() {
+				_, _ = emulator.Write([]byte("\x1b[5n"))
+				close(wakeDone)
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+			}
+			select {
+			case <-wakeDone:
+			case <-time.After(time.Second):
+			}
+		})
+	}
 }
 
 func (s *Session) Write(t testing.TB, value string) {

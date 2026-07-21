@@ -34,8 +34,9 @@ func TestSecretDiagnosticFormattingRedactsConfiguredSentinel(t *testing.T) {
 }
 
 func TestCurrentScreenExcludesReplacedTerminalHistory(t *testing.T) {
-	session := &Session{emulator: newPTYEmulator(12, 3)}
-	t.Cleanup(func() { _ = session.emulator.Close() })
+	emulator, stop := newPTYEmulator(12, 3)
+	session := &Session{emulator: emulator}
+	t.Cleanup(stop)
 	writer := lockedWriter{session: session}
 	if _, err := writer.Write([]byte("PERMISSION")); err != nil {
 		t.Fatal(err)
@@ -53,8 +54,9 @@ func TestCurrentScreenExcludesReplacedTerminalHistory(t *testing.T) {
 }
 
 func TestCurrentScreenEmulatorDoesNotBlockOnTerminalQueries(t *testing.T) {
-	session := &Session{emulator: newPTYEmulator(12, 3)}
-	t.Cleanup(func() { _ = session.emulator.Close() })
+	emulator, stop := newPTYEmulator(12, 3)
+	session := &Session{emulator: emulator}
+	t.Cleanup(stop)
 	done := make(chan error, 1)
 	go func() {
 		_, err := (lockedWriter{session: session}).Write([]byte("\x1b[c"))
