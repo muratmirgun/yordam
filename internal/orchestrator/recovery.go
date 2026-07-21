@@ -247,6 +247,14 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 
 func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request RecoveryControlRequest, projection RecoveryProjection, expected protocol.CommittedCursor) (protocol.CommittedCursor, error) {
 	eventCount := len(projection.StartedActivities) + 2
+	for _, activityID := range projection.StartedActivities {
+		if callID, tool := projection.ProviderVisibleToolCalls[activityID]; tool {
+			if callID == "" {
+				return protocol.CommittedCursor{}, fmt.Errorf("provider-visible tool call binding is unresolved for activity %q", activityID)
+			}
+			eventCount++
+		}
+	}
 	if projection.OriginalCommandID != "" {
 		eventCount++
 	}
@@ -264,15 +272,34 @@ func (s *Service) appendRecoverySessionTerminal(ctx context.Context, request Rec
 	actor := protocol.ActorRef{ID: "recovery-orchestrator", Kind: protocol.ActorSystem}
 	now := time.Now().UTC()
 	events := make([]protocol.ProposedEvent, 0, eventCount)
-	for index, activityID := range projection.StartedActivities {
+	for _, activityID := range projection.StartedActivities {
 		status, kind := "uncertain", protocol.EventActivityUncertain
 		if s.deps.EffectProbe != nil {
 			if noEffect, err := s.deps.EffectProbe.ProvesNoEffect(ctx, activityID); err == nil && noEffect {
 				status, kind = "interrupted_no_effect", protocol.EventActivityInterruptedNoEffect
 			}
 		}
+		if callID, tool := projection.ProviderVisibleToolCalls[activityID]; tool {
+			if s.deps.Admission == nil {
+				return protocol.CommittedCursor{}, fmt.Errorf("generation admission service is required for recovery tool result")
+			}
+			result, sanitizeErr := s.sanitizeToolResult(ctx, request.Control.Runtime.ID, protocol.ToolResultBlock{CallID: callID, Status: status, Text: "tool activity result recovered after interruption"})
+			if sanitizeErr != nil {
+				return protocol.CommittedCursor{}, sanitizeErr
+			}
+			result.CallID, result.Status = callID, status
+			if validateErr := result.Validate(); validateErr != nil {
+				return protocol.CommittedCursor{}, fmt.Errorf("validate recovery tool result: %w", validateErr)
+			}
+			events = append(events, protocol.ProposedEvent{
+				EventID: eventID(request.Control.Command.CommandID, "recovery-session-terminal", len(events), protocol.EventToolMessage), Time: now, PayloadVersion: 1,
+				Kind: protocol.EventToolMessage, SessionID: protocol.SessionID(request.Storage.Journal.ID), TaskID: projection.TaskID, TurnID: projection.ActiveTurnID,
+				ActivityID: activityID, Actor: &actor, RuntimeGenerationID: request.Control.Runtime.ID,
+				Payload: mustCanonical(protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result}}),
+			})
+		}
 		events = append(events, protocol.ProposedEvent{
-			EventID: eventID(request.Control.Command.CommandID, "recovery-session-terminal", index, kind), Time: now, PayloadVersion: 1,
+			EventID: eventID(request.Control.Command.CommandID, "recovery-session-terminal", len(events), kind), Time: now, PayloadVersion: 1,
 			Kind: kind, SessionID: protocol.SessionID(request.Storage.Journal.ID), TaskID: projection.TaskID, TurnID: projection.ActiveTurnID,
 			ActivityID: activityID, Actor: &actor, RuntimeGenerationID: request.Control.Runtime.ID,
 			Payload: mustCanonical(protocol.ActivityOutcomeV1{Status: status}),
@@ -490,10 +517,21 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 		}
 	}
 	changed := false
-	for _, attemptID := range attemptOrder {
+attemptLoop:
+	for attemptIndex, attemptID := range attemptOrder {
 		initial := state.Attempts[attemptID]
-		if initial.State != receiptprojector.StateWaiting && initial.State != receiptprojector.StateTerminal {
+		if initial.State != receiptprojector.StateWaiting && initial.State != receiptprojector.StateTerminal && initial.State != receiptprojector.StateAttached {
 			continue
+		}
+		if initial.State == receiptprojector.StateAttached {
+			// A later request in the same active turn proves this attachment was
+			// already consumed by a prior continuation. Only the latest attached
+			// attempt can represent the interrupted continuation boundary.
+			for _, laterID := range attemptOrder[attemptIndex+1:] {
+				if state.Attempts[laterID].ParentTurnID == initial.ParentTurnID {
+					continue attemptLoop
+				}
+			}
 		}
 		inspected := inspectedChildren[initial.AttemptID]
 		child := inspected.inspection
@@ -607,6 +645,13 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 				}
 				return parentHead, changed, false, recoveredParentContinuationError(projection, initial, attempt, "reconstruct recovered parent continuation", rebuildErr)
 			}
+			repairedHead, repaired, repairErr := s.ensureAttachedSubagentToolResult(ctx, parentRequest, parentEvents, initial)
+			if repairErr != nil {
+				return parentHead, changed, false, repairErr
+			}
+			if repaired {
+				parentHead, parentRequest.ExpectedHead, changed = repairedHead, repairedHead, true
+			}
 			resumed, resumeErr := s.resumeRecoveredParent(ctx, lease, parentRequest, initial)
 			if resumeErr != nil {
 				if !isRecoveredParentTerminalFailure(resumeErr) {
@@ -661,6 +706,76 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 		}
 	}
 	return parentHead, changed, false, nil
+}
+
+func (s *Service) ensureAttachedSubagentToolResult(ctx context.Context, request StartTurnRequest, parentEvents []protocol.EventRecord, attempt receiptprojector.Attempt) (protocol.CommittedCursor, bool, error) {
+	if attempt.State != receiptprojector.StateAttached || attempt.Receipt == nil || attempt.Attachment == nil {
+		return request.ExpectedHead, false, fmt.Errorf("attached subagent result repair lacks a verified attachment")
+	}
+	intent, _, err := s.recoverSubagentIntent(ctx, request, attempt)
+	if err != nil {
+		return request.ExpectedHead, false, err
+	}
+	encoded, err := canonicaljson.Marshal(*attempt.Receipt)
+	if err != nil {
+		return request.ExpectedHead, false, err
+	}
+	expected, err := s.sanitizeToolResult(ctx, request.Runtime.ID, protocol.ToolResultBlock{
+		CallID: intent.CallID, Status: attempt.Receipt.Status, JSON: encoded,
+		EvidenceIDs: []protocol.EvidenceID{attempt.Attachment.ReceiptEvidenceID},
+	})
+	if err != nil {
+		return request.ExpectedHead, false, err
+	}
+	expected.CallID, expected.Status = intent.CallID, attempt.Receipt.Status
+	if err := expected.Validate(); err != nil {
+		return request.ExpectedHead, false, fmt.Errorf("validate attached subagent repair result: %w", err)
+	}
+	matches := 0
+	for _, event := range parentEvents {
+		if event.Envelope.Kind != protocol.EventToolMessage {
+			continue
+		}
+		var message protocol.ToolMessageV1
+		if err := json.Unmarshal(event.Envelope.Payload, &message); err != nil || message.Validate() != nil {
+			return request.ExpectedHead, false, fmt.Errorf("invalid durable tool message while repairing attached subagent")
+		}
+		for _, result := range message.Results {
+			if result.CallID != intent.CallID {
+				continue
+			}
+			if event.Envelope.ActivityID != attempt.ActivityID || !reflect.DeepEqual(result, expected) {
+				return request.ExpectedHead, false, fmt.Errorf("attached subagent tool result conflicts with verified receipt")
+			}
+			matches++
+		}
+	}
+	if matches > 1 {
+		return request.ExpectedHead, false, fmt.Errorf("attached subagent has duplicate canonical tool results")
+	}
+	if matches == 1 {
+		return request.ExpectedHead, false, nil
+	}
+	state := turnState{
+		ref: requestSessionRef(request), head: request.ExpectedHead, command: request.Command,
+		taskID: attempt.ParentTaskID, turnID: attempt.ParentTurnID,
+	}
+	label := "subagent-tool-result-repair-" + string(attempt.AttemptID)
+	events, err := s.activityEvents(state, request.Runtime.ID, attempt.ActivityID, label, []struct {
+		kind    string
+		payload any
+	}{{protocol.EventToolMessage, protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{expected}}}})
+	if err != nil {
+		return request.ExpectedHead, false, err
+	}
+	if err := s.append(ctx, &state, label, events); err != nil {
+		return state.head, state.head != request.ExpectedHead, err
+	}
+	return state.head, true, nil
+}
+
+func requestSessionRef(request StartTurnRequest) protocol.JournalRef {
+	return protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(request.SessionID)}
 }
 
 func recoveredParentContinuationError(projection *RecoveryProjection, initial, attempt receiptprojector.Attempt, phase string, cause error) error {

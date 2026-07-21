@@ -24,6 +24,8 @@ func TestToolMessageValidate(t *testing.T) {
 		{name: "empty", value: protocol.ToolMessageV1{}, wantErr: true},
 		{name: "invalid", value: protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{Status: "failed"}}}, wantErr: true},
 		{name: "duplicate", value: protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{valid, valid}}, wantErr: true},
+		{name: "oversized collection", value: protocol.ToolMessageV1{Results: make([]protocol.ToolResultBlock, protocol.MaxCollectionMembers+1)}, wantErr: true},
+		{name: "oversized call ID", value: protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: strings.Repeat("c", protocol.MaxStringBytes+1), Status: "failed"}}}, wantErr: true},
 		{name: "ordered", value: protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{valid, {CallID: "call-2", Status: "failed", Text: "no"}}}},
 	}
 	for _, test := range tests {

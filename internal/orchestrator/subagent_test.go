@@ -352,8 +352,8 @@ func TestSubagentPreResultFailureCleanupRespectsDispatchBoundary(t *testing.T) {
 			}
 			assertDispatchedSubagentUnresolved(t, repository.appendRequests(), activityID)
 			kinds := flattenAppendKinds(repository.appendRequests())
-			if countKind(kinds, protocol.EventTurnFailed) != 1 || countKind(kinds, protocol.EventCommandCompleted) != 1 {
-				t.Fatalf("dispatched failure terminal lifecycle=%v", kinds)
+			if countKind(kinds, protocol.EventTurnFailed) != 0 || countKind(kinds, protocol.EventTurnInterrupted) != 0 || countKind(kinds, protocol.EventCommandCompleted) != 0 {
+				t.Fatalf("dispatched failure bypassed recovery with terminal lifecycle=%v", kinds)
 			}
 		})
 	}

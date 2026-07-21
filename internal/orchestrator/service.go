@@ -115,7 +115,16 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 	if err != nil {
 		return RunResult{}, err
 	}
-	defer func() { _ = turnLease.Release(context.WithoutCancel(ctx), state.head) }()
+	defer func() {
+		releaseCtx := context.WithoutCancel(ctx)
+		if !state.terminal {
+			if unresolved, ok := turnLease.(journal.UnresolvedTurnLease); ok {
+				_ = unresolved.Abandon(releaseCtx)
+				return
+			}
+		}
+		_ = turnLease.Release(releaseCtx, state.head)
+	}()
 	defer func() {
 		if runErr == nil || !state.accepted || state.terminal {
 			return
@@ -1381,6 +1390,13 @@ func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, st
 const incompleteToolResultText = "tool activity ended before producing a result"
 
 func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnRequest, state *turnState, cause error) (RunResult, error) {
+	if state.activeActivityID != "" && state.activeProviderVisibleTool && (state.activeDispatched || state.activeRequiresToolResult) {
+		// A provider-visible effect/result boundary without a committed canonical
+		// result must remain an active turn. Recovery owns the only safe terminal
+		// transaction; completing the turn here would let compatibility context
+		// synthesize a result and permit an ordinary successor turn.
+		return RunResult{TaskID: state.taskID, TurnID: state.turnID, Cursor: state.head, Status: "uncertain"}, nil
+	}
 	turnKind, turnStatus := protocol.EventTurnFailed, "failed"
 	commandStatus := "failed"
 	taskTo := string(protocol.TaskFailed)

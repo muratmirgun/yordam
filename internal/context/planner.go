@@ -20,6 +20,38 @@ const (
 	estimatorProvenance       = "byte_estimate_v1"
 )
 
+type TranscriptStructuralCategory string
+
+const (
+	TranscriptDuplicate  TranscriptStructuralCategory = "duplicate"
+	TranscriptUnknown    TranscriptStructuralCategory = "unknown"
+	TranscriptLate       TranscriptStructuralCategory = "late"
+	TranscriptUnresolved TranscriptStructuralCategory = "unresolved"
+)
+
+// TranscriptStructuralError preserves machine-readable transcript diagnostics
+// while retaining the stable human-readable planner errors.
+type TranscriptStructuralError struct {
+	Category      TranscriptStructuralCategory
+	CallID        string
+	SourceEventID protocol.EventID
+}
+
+func (e *TranscriptStructuralError) Error() string {
+	switch e.Category {
+	case TranscriptUnresolved:
+		return fmt.Sprintf("assistant event %q has unresolved tool call %q", e.SourceEventID, e.CallID)
+	default:
+		return fmt.Sprintf("tool result %q from source event %q is %s", e.CallID, e.SourceEventID, e.Category)
+	}
+}
+
+func (e *TranscriptStructuralError) TranscriptCategory() string { return string(e.Category) }
+func (e *TranscriptStructuralError) TranscriptCallID() string   { return e.CallID }
+func (e *TranscriptStructuralError) TranscriptSourceEventID() protocol.EventID {
+	return e.SourceEventID
+}
+
 type Planner interface {
 	Plan(stdcontext.Context, Request) (protocol.ContextPlan, error)
 }
@@ -294,7 +326,7 @@ func adaptEventSuffix(events []protocol.EventRecord, compactionIndex int, from, 
 		if !terminal || terminalSeq <= pending.assistant.seq {
 			for _, callID := range pending.ordered {
 				if _, unresolved := pending.remaining[callID]; unresolved {
-					return fmt.Errorf("assistant event %q has unresolved tool call %q", pending.assistant.eventID, callID)
+					return &TranscriptStructuralError{Category: TranscriptUnresolved, CallID: callID, SourceEventID: pending.assistant.eventID}
 				}
 			}
 		}
@@ -367,18 +399,25 @@ func adaptEventSuffix(events []protocol.EventRecord, compactionIndex int, from, 
 			if !ok {
 				return nil, nil, "", fmt.Errorf("tool message event %q is invalid", event.Envelope.EventID)
 			}
+			seenResults := make(map[string]struct{}, len(message.Results))
+			for _, result := range message.Results {
+				if _, duplicate := seenResults[result.CallID]; duplicate {
+					return nil, nil, "", &TranscriptStructuralError{Category: TranscriptDuplicate, CallID: result.CallID, SourceEventID: event.Envelope.EventID}
+				}
+				seenResults[result.CallID] = struct{}{}
+			}
 			if err := message.Validate(); err != nil {
 				return nil, nil, "", fmt.Errorf("tool message event %q: %w", event.Envelope.EventID, err)
 			}
 			for resultIndex, result := range message.Results {
 				if pending == nil {
-					return nil, nil, "", fmt.Errorf("tool result %q from source event %q is late", result.CallID, event.Envelope.EventID)
+					return nil, nil, "", &TranscriptStructuralError{Category: TranscriptLate, CallID: result.CallID, SourceEventID: event.Envelope.EventID}
 				}
 				if _, expected := pending.remaining[result.CallID]; !expected {
 					if containsToolCall(pending.ordered, result.CallID) {
-						return nil, nil, "", fmt.Errorf("tool result %q from source event %q is duplicate", result.CallID, event.Envelope.EventID)
+						return nil, nil, "", &TranscriptStructuralError{Category: TranscriptDuplicate, CallID: result.CallID, SourceEventID: event.Envelope.EventID}
 					}
-					return nil, nil, "", fmt.Errorf("tool result %q from source event %q is unknown", result.CallID, event.Envelope.EventID)
+					return nil, nil, "", &TranscriptStructuralError{Category: TranscriptUnknown, CallID: result.CallID, SourceEventID: event.Envelope.EventID}
 				}
 				id := string(event.Envelope.EventID)
 				if len(message.Results) > 1 {

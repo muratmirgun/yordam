@@ -337,6 +337,8 @@ func (l *turnLease) Release(ctx context.Context, cursor protocol.CommittedCursor
 	return l.releaseLocked()
 }
 
+func (l *turnLease) Abandon(context.Context) error { return l.abandon() }
+
 func (s *Store) transactionTerminalizesTurn(
 	ctx context.Context,
 	transaction *sessionTransaction,

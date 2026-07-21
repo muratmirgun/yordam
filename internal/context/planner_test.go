@@ -3,6 +3,7 @@ package context_test
 import (
 	stdcontext "context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -294,6 +295,7 @@ func TestContextPlanRejectsMissingResultForNonTerminalTurn(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), intent.CallID) || !strings.Contains(err.Error(), "unresolved tool call") {
 		t.Fatalf("error=%v", err)
 	}
+	assertTranscriptStructuralDiagnostic(t, err, "unresolved", intent.CallID, "assistant-event")
 }
 
 func TestContextPlanRejectsMalformedToolResultExchanges(t *testing.T) {
@@ -301,25 +303,26 @@ func TestContextPlanRejectsMalformedToolResultExchanges(t *testing.T) {
 	result := protocol.ToolResultBlock{CallID: intent.CallID, Status: "succeeded", Text: "contents"}
 	unknown := protocol.ToolResultBlock{CallID: "unknown-call", Status: "succeeded", Text: "contents"}
 	cases := []struct {
-		name    string
-		events  []protocol.EventRecord
-		callID  string
-		eventID string
+		name     string
+		category string
+		events   []protocol.EventRecord
+		callID   string
+		eventID  string
 	}{
-		{name: "duplicate", callID: intent.CallID, eventID: "second-result", events: []protocol.EventRecord{
+		{name: "duplicate", category: "duplicate", callID: intent.CallID, eventID: "second-result", events: []protocol.EventRecord{
 			contextEvent("assistant-event", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
 			contextEvent("first-result", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result}}),
 			contextEvent("second-result", 3, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result}}),
 		}},
-		{name: "same payload duplicate", callID: intent.CallID, eventID: "duplicate-result", events: []protocol.EventRecord{
+		{name: "same payload duplicate", category: "duplicate", callID: intent.CallID, eventID: "duplicate-result", events: []protocol.EventRecord{
 			contextEvent("assistant-event", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
 			contextEvent("duplicate-result", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result, result}}),
 		}},
-		{name: "unknown", callID: unknown.CallID, eventID: "unknown-result", events: []protocol.EventRecord{
+		{name: "unknown", category: "unknown", callID: unknown.CallID, eventID: "unknown-result", events: []protocol.EventRecord{
 			contextEvent("assistant-event", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
 			contextEvent("unknown-result", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{unknown}}),
 		}},
-		{name: "late", callID: result.CallID, eventID: "late-result", events: []protocol.EventRecord{
+		{name: "late", category: "late", callID: result.CallID, eventID: "late-result", events: []protocol.EventRecord{
 			contextEvent("assistant-event", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
 			contextEvent("result", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result}}),
 			contextEvent("user-event", 3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "next"}),
@@ -332,7 +335,19 @@ func TestContextPlanRejectsMalformedToolResultExchanges(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tc.callID) || !strings.Contains(err.Error(), tc.eventID) {
 				t.Fatalf("error=%v", err)
 			}
+			assertTranscriptStructuralDiagnostic(t, err, tc.category, tc.callID, tc.eventID)
 		})
+	}
+}
+
+func assertTranscriptStructuralDiagnostic(t *testing.T, err error, category, callID, eventID string) {
+	t.Helper()
+	var diagnostic *contextplanner.TranscriptStructuralError
+	if !errors.As(err, &diagnostic) {
+		t.Fatalf("error %T does not expose transcript structural diagnostics: %v", err, err)
+	}
+	if string(diagnostic.Category) != category || diagnostic.CallID != callID || string(diagnostic.SourceEventID) != eventID {
+		t.Fatalf("diagnostic category=%q call=%q event=%q", diagnostic.Category, diagnostic.CallID, diagnostic.SourceEventID)
 	}
 }
 

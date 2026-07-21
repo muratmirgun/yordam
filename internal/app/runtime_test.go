@@ -40,6 +40,64 @@ func TestNewUsesEmptyRedactorBindingWhenNoneIsSupplied(t *testing.T) {
 	}
 }
 
+func TestProductionRecoveryProjectionRetainsExactProviderVisibleToolBinding(t *testing.T) {
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-recovery"}
+	head := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 9, TransactionID: "active-tail"}
+	record := func(seq uint64, kind string, activityID protocol.ActivityID, payload any) protocol.EventRecord {
+		raw, err := canonicaljson.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return protocol.EventRecord{Envelope: protocol.EventEnvelope{JournalKind: ref.Kind, JournalID: ref.ID, SessionID: protocol.SessionID(ref.ID), EventID: protocol.EventID(fmt.Sprintf("event-%d", seq)), Seq: seq, Kind: kind, TaskID: "task-a", TurnID: "turn-a", ActivityID: activityID, Payload: raw}}
+	}
+	toolActivity, providerActivity, previewActivity := protocol.ActivityID("tool-activity"), protocol.ActivityID("provider-activity"), protocol.ActivityID("preview-activity")
+	events := []protocol.EventRecord{
+		record(1, protocol.EventCommandAccepted, "", protocol.CommandAcceptedV1{CommandID: "command-a", RequestDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)}}),
+		record(2, protocol.EventTaskCreated, "", protocol.TaskCreatedV1{Goal: "recover", OutcomeContractID: "contract", ContractVersion: 1}),
+		record(3, protocol.EventTurnAccepted, "", protocol.TurnAcceptedV1{CommandID: "command-a", Goal: "recover", OutcomeContractID: "contract", ContractVersion: 1}),
+		record(4, protocol.EventActivityPlanned, toolActivity, protocol.ActivityPlannedV1{Kind: "tool", Purpose: "tool observation", Plan: &protocol.ActionPlan{Body: protocol.ActionPlanBody{CallID: "call-a"}}}),
+		record(5, protocol.EventActivityStarted, toolActivity, protocol.ActivityStartedV1{ActivityID: toolActivity, CallID: "call-a"}),
+		record(6, protocol.EventActivityPlanned, providerActivity, protocol.ActivityPlannedV1{Kind: "provider", Purpose: "continue task"}),
+		record(7, protocol.EventActivityStarted, providerActivity, protocol.ActivityStartedV1{ActivityID: providerActivity, CallID: "provider-call"}),
+		record(8, protocol.EventActivityPlanned, previewActivity, protocol.ActivityPlannedV1{Kind: "tool", Purpose: "tool preview", Plan: &protocol.ActionPlan{Body: protocol.ActionPlanBody{CallID: "call-a"}}}),
+		record(9, protocol.EventActivityStarted, previewActivity, protocol.ActivityStartedV1{ActivityID: previewActivity, CallID: "call-a"}),
+	}
+	projection, err := (recoveryProjection{Repository: &inspectionOnlyRepository{inspection: journal.Inspection{Journal: ref, Head: head, Events: events}}}).InspectRecovery(context.Background(), ref, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.ActiveTurnID != "turn-a" || !slices.Equal(projection.StartedActivities, []protocol.ActivityID{previewActivity, providerActivity, toolActivity}) {
+		t.Fatalf("projection=%+v", projection)
+	}
+	if !reflect.DeepEqual(projection.ProviderVisibleToolCalls, map[protocol.ActivityID]string{toolActivity: "call-a"}) {
+		t.Fatalf("provider-visible bindings=%v", projection.ProviderVisibleToolCalls)
+	}
+}
+
+type inspectionOnlyRepository struct{ inspection journal.Inspection }
+
+func (r *inspectionOnlyRepository) Inspect(context.Context, protocol.JournalRef) (journal.Inspection, error) {
+	return protocol.DeepCopy(r.inspection), nil
+}
+func (*inspectionOnlyRepository) Head(context.Context, protocol.JournalRef) (protocol.CommittedCursor, error) {
+	return protocol.CommittedCursor{}, errors.New("unexpected Head")
+}
+func (*inspectionOnlyRepository) ReadRange(context.Context, journal.ReadRangeRequest) (journal.EventPage, error) {
+	return journal.EventPage{}, errors.New("unexpected ReadRange")
+}
+func (*inspectionOnlyRepository) AppendBatch(context.Context, journal.AppendRequest) (journal.AppendResult, error) {
+	return journal.AppendResult{}, errors.New("unexpected AppendBatch")
+}
+func (*inspectionOnlyRepository) LookupTransaction(context.Context, protocol.JournalRef, protocol.TransactionID) (journal.TransactionLookup, error) {
+	return journal.TransactionLookup{}, errors.New("unexpected LookupTransaction")
+}
+func (*inspectionOnlyRepository) ReadCommittedTransaction(context.Context, protocol.JournalRef, protocol.TransactionID) (journal.CommittedTransaction, error) {
+	return journal.CommittedTransaction{}, errors.New("unexpected ReadCommittedTransaction")
+}
+func (*inspectionOnlyRepository) Recover(context.Context, journal.RecoveryRequest) (journal.RecoveryResult, error) {
+	return journal.RecoveryResult{}, errors.New("unexpected Recover")
+}
+
 func TestInteractiveApproverProjectsChildPromptLineage(t *testing.T) {
 	registry := permission.NewSessionPolicyRegistry()
 	if err := registry.RegisterChild("child", domain.ModeAsk); err != nil {

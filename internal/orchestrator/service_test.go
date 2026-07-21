@@ -745,9 +745,7 @@ func TestToolResultAppendBarrierBlocksProviderContinuation(t *testing.T) {
 	if got := activityTerminalCount(base.appendRequests(), activityID); got != 0 {
 		t.Fatalf("failed atomic result append committed %d resultless tool terminals: %v", got, base.batchKinds())
 	}
-	if countKind(flattenAppendKinds(base.appendRequests()), protocol.EventTurnFailed) != 1 {
-		t.Fatalf("turn failure was not committed while tool activity stayed recoverable: %v", base.batchKinds())
-	}
+	assertUnresolvedToolTurnRecoveryGated(t, request, base.appendRequests(), "call-a")
 }
 
 func TestToolResultSanitizationFailureLeavesActivityForRecovery(t *testing.T) {
@@ -773,9 +771,7 @@ func TestToolResultSanitizationFailureLeavesActivityForRecovery(t *testing.T) {
 	if _, _, ok := terminalToolResult(repository.appendRequests(), protocol.EventActivitySucceeded, "call-a"); ok {
 		t.Fatalf("sanitization failure persisted rejected result: %v", repository.batchKinds())
 	}
-	if countKind(flattenAppendKinds(repository.appendRequests()), protocol.EventTurnFailed) != 1 {
-		t.Fatalf("turn failure was not committed while tool activity stayed recoverable: %v", repository.batchKinds())
-	}
+	assertUnresolvedToolTurnRecoveryGated(t, request, repository.appendRequests(), "call-a")
 }
 
 func TestToolResultBindsHostileToolOutputToIntentAndTerminalStatus(t *testing.T) {
@@ -913,6 +909,48 @@ func TestToolResultDispatchedUnknownEffectStaysUnresolved(t *testing.T) {
 	}
 	if _, _, ok := terminalToolResult(repository.appendRequests(), protocol.EventActivityUncertain, "call-a"); ok {
 		t.Fatalf("unknown-effect activity persisted a synthetic result: %v", repository.batchKinds())
+	}
+	assertUnresolvedToolTurnRecoveryGated(t, request, repository.appendRequests(), "call-a")
+}
+
+func assertUnresolvedToolTurnRecoveryGated(t *testing.T, start StartTurnRequest, requests []journal.AppendRequest, callID string) {
+	t.Helper()
+	turnID := protocol.TurnID(stableID("turn", string(start.Command.CommandID)))
+	for _, request := range requests {
+		for _, event := range request.Events {
+			if event.TurnID == turnID {
+				switch event.Kind {
+				case protocol.EventTurnCompleted, protocol.EventTurnFailed, protocol.EventTurnInterrupted:
+					t.Fatalf("unresolved tool turn was terminalized by %s: %v", event.Kind, flattenAppendKinds(requests))
+				}
+			}
+			if event.Kind == protocol.EventCommandCompleted && strings.Contains(string(event.Payload), string(start.Command.CommandID)) {
+				t.Fatalf("unresolved tool command was completed: %v", flattenAppendKinds(requests))
+			}
+		}
+	}
+	records := make([]protocol.EventRecord, 0)
+	var sequence uint64
+	for _, request := range requests {
+		for _, event := range request.Events {
+			sequence++
+			records = append(records, protocol.EventRecord{Envelope: protocol.EventEnvelope{
+				SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: event.PayloadVersion,
+				JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, SessionID: event.SessionID,
+				EventID: event.EventID, Seq: sequence, Time: event.Time, Kind: event.Kind,
+				TaskID: event.TaskID, TurnID: event.TurnID, ActivityID: event.ActivityID,
+				Actor: event.Actor, RuntimeGenerationID: event.RuntimeGenerationID, TransactionID: request.TransactionID,
+				Payload: event.Payload,
+			}})
+		}
+	}
+	_, err := contextplanner.NewPlanner(start.Runtime.Body.ToolCatalogRevision, nil).Plan(context.Background(), contextplanner.Request{
+		Session: start.SessionID, TaskID: protocol.TaskID(stableID("task", string(start.Command.CommandID))),
+		OutcomeContractID: protocol.OutcomeContractID(stableID("contract", string(start.Command.CommandID))), OutcomeContractVersion: 2,
+		Events: records, Model: start.Runtime.Body.Models[0], OutputReserve: 0,
+	})
+	if err == nil || !strings.Contains(err.Error(), callID) || !strings.Contains(err.Error(), "unresolved tool call") {
+		t.Fatalf("real planner bypassed unresolved tool call %q: %v", callID, err)
 	}
 }
 

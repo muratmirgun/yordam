@@ -203,8 +203,11 @@ type RecoveryProjection struct {
 	OriginalCommandID     protocol.CommandID
 	OriginalRequestDigest protocol.Digest
 	StartedActivities     []protocol.ActivityID
-	UnmatchedNoEffect     map[protocol.ActivityID]bool
-	ChildManifest         *protocol.SubagentManifestV1
+	// ProviderVisibleToolCalls contains only unresolved provider-visible tool
+	// activities. Provider activities and mutation previews are excluded.
+	ProviderVisibleToolCalls map[protocol.ActivityID]string
+	UnmatchedNoEffect        map[protocol.ActivityID]bool
+	ChildManifest            *protocol.SubagentManifestV1
 	// SubagentRecoveryDiagnostic is populated only when reconciliation cannot
 	// prove a waiting parent/child boundary.  It is recorded with the parent
 	// terminal transaction rather than silently degrading to a generic recovery

@@ -70,6 +70,14 @@ type TurnLease interface {
 	Release(context.Context, protocol.CommittedCursor) error
 }
 
+// UnresolvedTurnLease releases only the in-process/durable lock ownership. It
+// deliberately does not write or require a turn terminal; the journal remains
+// active so ordinary turns are recovery-gated.
+type UnresolvedTurnLease interface {
+	TurnLease
+	Abandon(context.Context) error
+}
+
 type TurnLeaseManager interface {
 	AcquireTurnLease(context.Context, protocol.SessionID, protocol.TurnID, protocol.CommittedCursor) (TurnLease, error)
 	AcquireTurnRecoveryLease(context.Context, protocol.SessionID, protocol.TurnID, protocol.CommittedCursor) (TurnLease, error)
