@@ -1182,11 +1182,11 @@ func (s *Service) reconcileInteractiveApprovalJournal(ctx context.Context, reque
 		return nil
 	}
 	if page.More || page.Cursor != page.Head || len(page.Events) != 1 || page.Head.CommitSeq != state.head.CommitSeq+1 {
-		return fmt.Errorf("interactive approval changed the turn journal outside the trusted-shell acknowledgement boundary")
+		return fmt.Errorf("interactive approval changed the turn journal outside the trusted-shell acknowledgement boundary: before=%d cursor=%d head=%d events=%d more=%t", state.head.CommitSeq, page.Cursor.CommitSeq, page.Head.CommitSeq, len(page.Events), page.More)
 	}
 	event := page.Events[0].Envelope
 	if event.Kind != protocol.EventTrustedExecutionAcknowledged || event.SessionID != request.SessionID || event.RuntimeGenerationID != request.Runtime.ID || event.Actor == nil || *event.Actor != request.Command.Actor || event.Seq != page.Head.CommitSeq || event.TransactionID != page.Head.TransactionID {
-		return fmt.Errorf("interactive approval journal suffix has invalid trusted-shell provenance")
+		return fmt.Errorf("interactive approval journal suffix has invalid trusted-shell provenance: kind=%q session=%q generation=%q actor=%+v seq=%d transaction=%q", event.Kind, event.SessionID, event.RuntimeGenerationID, event.Actor, event.Seq, event.TransactionID)
 	}
 	var acknowledged protocol.TrustedExecutionAcknowledgedV1
 	if err := json.Unmarshal(event.Payload, &acknowledged); err != nil || !acknowledged.Enabled || acknowledged.Profile != "unsandboxed" {
