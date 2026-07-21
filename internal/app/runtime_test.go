@@ -19,11 +19,13 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/agent"
+	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/cli"
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/journal"
+	"github.com/muratmirgun/yordam/internal/orchestrator"
 	"github.com/muratmirgun/yordam/internal/permission"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
@@ -138,6 +140,19 @@ func TestProductionBootstrapRecoversCleanUnresolvedToolTurn(t *testing.T) {
 	if slices.ContainsFunc(inspection.Journal.Diagnostics, func(d protocol.Diagnostic) bool { return d.Code == "recovery.available" }) {
 		t.Fatalf("regression requires a clean committed prefix: %+v", inspection.Journal.Diagnostics)
 	}
+	failingService, err := orchestrator.NewService(orchestrator.Dependencies{
+		Lane: orchestrator.NewOperationLane(), Repository: store, TurnLeases: store,
+		Authorization: bootstrapRecoveryDispatchFailure{AuthorizationService: first.runtimeSet.AuthorizationService},
+		Projection:    recoveryProjection{Repository: store}, Admission: bootstrapPassthroughAdmission{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failingRuntime := first.runtimeSet
+	failingRuntime.Orchestrator = failingService
+	if err := recoverBootstrapSession(t.Context(), store, failingRuntime, first.workspaceControl, protocol.SessionID(ref.ID)); err == nil || !strings.Contains(err.Error(), "transient bootstrap recovery dispatch failure") {
+		t.Fatalf("first bootstrap recovery attempt=%v", err)
+	}
 	first.runtimeSet.retireSecrets()
 
 	second, _, err := Bootstrap(t.Context(), BootstrapOptions{ConfigPath: configPath, CWD: workspace, CLI: cli.Options{Continue: true, Mode: domain.ModeAsk, DataDir: dataDir, MaxToolCalls: 32, ShellTimeout: time.Second}})
@@ -152,7 +167,79 @@ func TestProductionBootstrapRecoversCleanUnresolvedToolTurn(t *testing.T) {
 	if !slices.Contains(kinds, protocol.EventToolMessage) || !slices.Contains(kinds, protocol.EventActivityUncertain) || !slices.Contains(kinds, protocol.EventTurnInterrupted) {
 		t.Fatalf("bootstrap skipped clean unresolved turn recovery: %v", kinds)
 	}
+	workspaceInspection, err := second.sessions.(*jsonl.Store).Inspect(t.Context(), second.workspaceControl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recoveryCommands []protocol.CommandID
+	for _, event := range workspaceInspection.Events {
+		if event.Envelope.Kind != protocol.EventCommandAccepted {
+			continue
+		}
+		var payload protocol.CommandAcceptedV1
+		if json.Unmarshal(event.Envelope.Payload, &payload) == nil && strings.HasPrefix(string(payload.CommandID), "recovery-") {
+			recoveryCommands = append(recoveryCommands, payload.CommandID)
+		}
+	}
+	if len(recoveryCommands) != 2 || recoveryCommands[0] == recoveryCommands[1] || !strings.HasSuffix(string(recoveryCommands[0]), "-attempt-1") || !strings.HasSuffix(string(recoveryCommands[1]), "-attempt-2") {
+		t.Fatalf("bootstrap recovery control attempts=%v", recoveryCommands)
+	}
 }
+
+func TestRecoveryControlAttemptIdentityIsDeterministicAcrossTerminalAndIncompleteHistory(t *testing.T) {
+	base := "recovery-stable"
+	record := func(id, kind string, payload any) protocol.EventRecord {
+		return protocol.EventRecord{Envelope: protocol.EventEnvelope{EventID: protocol.EventID(id + "-" + kind), Kind: kind, Payload: runtimeMustCanonical(t, payload)}}
+	}
+	accepted := func(id string) protocol.EventRecord {
+		return record(id, protocol.EventCommandAccepted, protocol.CommandAcceptedV1{CommandID: protocol.CommandID(id), RequestDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)}})
+	}
+	completed := func(id string) protocol.EventRecord {
+		return record(id, protocol.EventCommandCompleted, protocol.CommandCompletedV1{CommandID: protocol.CommandID(id), RequestDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)}, Status: "failed", Result: json.RawMessage(`{}`)})
+	}
+	first, second := base+"-attempt-1", base+"-attempt-2"
+	for _, test := range []struct {
+		name   string
+		events []protocol.EventRecord
+		want   string
+	}{
+		{name: "first", want: first},
+		{name: "accepted incomplete attempt advances", events: []protocol.EventRecord{accepted(first)}, want: second},
+		{name: "terminal advances", events: []protocol.EventRecord{accepted(first), completed(first)}, want: second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := recoveryControlAttemptIdentity(test.events, base)
+			if err != nil || got != test.want {
+				t.Fatalf("identity=%q want=%q err=%v", got, test.want, err)
+			}
+		})
+	}
+}
+
+type bootstrapRecoveryDispatchFailure struct {
+	orchestrator.AuthorizationService
+}
+
+func (bootstrapRecoveryDispatchFailure) Dispatch(context.Context, authorization.CommittedToken, authorization.DispatchBinding, func(context.Context) error) error {
+	return errors.New("transient bootstrap recovery dispatch failure")
+}
+
+type bootstrapPassthroughAdmission struct{}
+
+func (bootstrapPassthroughAdmission) SanitizeText(_ context.Context, _ protocol.RuntimeGenerationID, value string) (string, error) {
+	return value, nil
+}
+func (bootstrapPassthroughAdmission) SanitizeJSON(_ context.Context, _ protocol.RuntimeGenerationID, value json.RawMessage) (json.RawMessage, error) {
+	return protocol.CloneRawMessage(value), nil
+}
+func (bootstrapPassthroughAdmission) OpenTextStream(context.Context, protocol.RuntimeGenerationID) (orchestrator.StreamingSanitizer, error) {
+	return bootstrapPassthroughStream{}, nil
+}
+
+type bootstrapPassthroughStream struct{}
+
+func (bootstrapPassthroughStream) Write(value string) (string, error) { return value, nil }
+func (bootstrapPassthroughStream) Close() (string, error)             { return "", nil }
 
 func writeRuntimeBootstrapConfig(t *testing.T, cfg config.Config) string {
 	t.Helper()

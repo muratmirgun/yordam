@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/authorization"
@@ -1055,7 +1057,7 @@ func validateRecoveryControlRequest(request RecoveryControlRequest) error {
 		return err
 	}
 	storage := request.Storage
-	if storage.OperationID == "" || storage.OperationID != request.Control.OperationID || storage.Journal.Kind != protocol.JournalSession || storage.Journal.Validate() != nil || storage.TransactionID == "" || storage.RuntimeGenerationID != request.Control.Runtime.ID {
+	if storage.OperationID == "" || !recoveryStorageOperationBound(request.Control.OperationID, storage.OperationID) || storage.Journal.Kind != protocol.JournalSession || storage.Journal.Validate() != nil || storage.TransactionID == "" || storage.RuntimeGenerationID != request.Control.Runtime.ID {
 		return fmt.Errorf("recovery storage request identity mismatch")
 	}
 	if err := validateExpectedHead(storage.ExpectedHead, storage.Journal); err != nil {
@@ -1065,6 +1067,18 @@ func validateRecoveryControlRequest(request RecoveryControlRequest) error {
 		return err
 	}
 	return nil
+}
+
+func recoveryStorageOperationBound(control, storage protocol.ControlOperationID) bool {
+	if control == storage {
+		return true
+	}
+	suffix, ok := strings.CutPrefix(string(control), string(storage)+"-attempt-")
+	if !ok {
+		return false
+	}
+	ordinal, err := strconv.Atoi(suffix)
+	return err == nil && ordinal > 0
 }
 
 func joinRecoveryErrors(primary, terminal error) error { return errors.Join(primary, terminal) }

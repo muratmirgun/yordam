@@ -102,6 +102,19 @@ func TestRecoveryAuthorizedControlTerminalizesCommittedSessionBeforeLeaseRelease
 	}
 }
 
+func TestRecoveryControlRequestRejectsUnboundStorageOperation(t *testing.T) {
+	_, request, _, _ := recoveryBarrierFixture(t, NoopBarrierProbe())
+	request.Storage.OperationID = "different-storage-operation"
+	if err := validateRecoveryControlRequest(request); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("unbound storage operation validation=%v", err)
+	}
+	request.Storage.OperationID = "recovery-operation-a"
+	request.Control.OperationID = "recovery-operation-a-attempt-2"
+	if err := validateRecoveryControlRequest(request); err != nil {
+		t.Fatalf("bound retry attempt validation=%v", err)
+	}
+}
+
 func TestRecoveryFailureAbandonsProductionLeaseForSameProcessRetry(t *testing.T) {
 	store := jsonl.New(t.TempDir(), jsonl.Options{Encoder: recoveryRawPayloadEncoder{}})
 	workspace, err := jsonl.WorkspaceFromPath(t.TempDir())

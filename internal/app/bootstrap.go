@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -309,10 +311,6 @@ func recoverBootstrapSession(ctx context.Context, store *jsonl.Store, runtime Ru
 	// parent attachment) before it falls back to generic turn terminalization.
 	// Keeping bootstrap at this single entry point prevents a second startup
 	// worker from racing provider, process, or approval cancellation cleanup.
-	controlHead, err := store.Head(ctx, workspaceControl)
-	if err != nil {
-		return err
-	}
 	identityDigest, err := canonicaljson.Digest(struct {
 		SessionID    protocol.SessionID       `json:"session_id"`
 		ExpectedHead protocol.CommittedCursor `json:"expected_head"`
@@ -321,11 +319,20 @@ func recoverBootstrapSession(ctx context.Context, store *jsonl.Store, runtime Ru
 	if err != nil {
 		return err
 	}
-	identity := "recovery-" + identityDigest.Value[:32]
+	storageIdentity := "recovery-" + identityDigest.Value[:32]
+	controlInspection, err := store.Inspect(ctx, workspaceControl)
+	if err != nil {
+		return err
+	}
+	identity, err := recoveryControlAttemptIdentity(controlInspection.Events, storageIdentity)
+	if err != nil {
+		return err
+	}
+	controlHead := controlInspection.Head
 	operationID := protocol.ControlOperationID(identity)
 	storage := journal.RecoveryRequest{
-		OperationID: operationID, Journal: inspection.Journal.Journal, ExpectedHead: inspection.Journal.Head,
-		ObservedTailDigest: observedTail, CleanPrefix: cleanPrefix, TransactionID: protocol.TransactionID(identity + "-storage"), RuntimeGenerationID: runtime.RuntimeGenerationID,
+		OperationID: protocol.ControlOperationID(storageIdentity), Journal: inspection.Journal.Journal, ExpectedHead: inspection.Journal.Head,
+		ObservedTailDigest: observedTail, CleanPrefix: cleanPrefix, TransactionID: protocol.TransactionID(storageIdentity + "-storage"), RuntimeGenerationID: runtime.RuntimeGenerationID,
 	}
 	descriptorDigest, err := canonicaljson.Digest(struct {
 		Name string `json:"name"`
@@ -374,6 +381,92 @@ func recoverBootstrapSession(ctx context.Context, store *jsonl.Store, runtime Ru
 		return fmt.Errorf("recovery status %q", result.Recovery.Status)
 	}
 	return nil
+}
+
+func recoveryControlAttemptIdentity(events []protocol.EventRecord, storageIdentity string) (string, error) {
+	if storageIdentity == "" {
+		return "", fmt.Errorf("recovery storage identity is required")
+	}
+	prefix := storageIdentity + "-attempt-"
+	type attemptState struct {
+		identity string
+		accepted bool
+		terminal bool
+	}
+	attempts := make(map[int]attemptState)
+	ordinal := func(commandID protocol.CommandID) (int, bool, error) {
+		identity := string(commandID)
+		if identity == storageIdentity { // pre-attempt-ordinal compatibility
+			return 1, true, nil
+		}
+		if !strings.HasPrefix(identity, prefix) {
+			return 0, false, nil
+		}
+		value, parseErr := strconv.Atoi(strings.TrimPrefix(identity, prefix))
+		if parseErr != nil || value <= 0 {
+			return 0, false, fmt.Errorf("invalid recovery control attempt identity %q", identity)
+		}
+		return value, true, nil
+	}
+	for _, event := range events {
+		var commandID protocol.CommandID
+		switch event.Envelope.Kind {
+		case protocol.EventCommandAccepted:
+			var payload protocol.CommandAcceptedV1
+			if err := json.Unmarshal(event.Envelope.Payload, &payload); err != nil {
+				return "", fmt.Errorf("decode recovery control attempt acceptance: %w", err)
+			}
+			commandID = payload.CommandID
+			value, relevant, err := ordinal(commandID)
+			if err != nil {
+				return "", err
+			}
+			if !relevant {
+				continue
+			}
+			state := attempts[value]
+			if state.accepted && state.identity != string(commandID) {
+				return "", fmt.Errorf("recovery control attempt ordinal %d has conflicting identities", value)
+			}
+			state.identity, state.accepted = string(commandID), true
+			attempts[value] = state
+		case protocol.EventCommandCompleted:
+			var payload protocol.CommandCompletedV1
+			if err := json.Unmarshal(event.Envelope.Payload, &payload); err != nil {
+				return "", fmt.Errorf("decode recovery control attempt terminal: %w", err)
+			}
+			commandID = payload.CommandID
+			value, relevant, err := ordinal(commandID)
+			if err != nil {
+				return "", err
+			}
+			if !relevant {
+				continue
+			}
+			state := attempts[value]
+			if state.identity != "" && state.identity != string(commandID) {
+				return "", fmt.Errorf("recovery control attempt ordinal %d terminal identity changed", value)
+			}
+			state.identity, state.terminal = string(commandID), true
+			attempts[value] = state
+		}
+	}
+	if len(attempts) == 0 {
+		return prefix + "1", nil
+	}
+	max := 0
+	for value := range attempts {
+		if value > max {
+			max = value
+		}
+	}
+	for value := 1; value <= max; value++ {
+		state, ok := attempts[value]
+		if !ok || !state.accepted || (value < max && !state.terminal) {
+			return "", fmt.Errorf("recovery control attempt history is non-contiguous at ordinal %d", value)
+		}
+	}
+	return prefix + strconv.Itoa(max+1), nil
 }
 
 func loadBootstrapConfig(options BootstrapOptions) (config.Config, string, error) {
