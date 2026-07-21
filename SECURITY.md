@@ -29,15 +29,20 @@ Maintainers will acknowledge receipt and coordinate validation, remediation, and
 
 Yordam runs with the permissions of the local user who starts it. Model output and tool requests should be treated as untrusted until their effects are understood.
 
+`safe`, `ask`, and `auto` are permission modes, not sandboxes. `safe` denies
+mutation and shell, `ask` requires approval for mutation and shell, and `auto`
+allows eligible inside-workspace file effects while retaining the explicit
+trusted-shell acknowledgement and outside-workspace prompts.
+
 - File tools canonicalize requested paths, classify them as inside or outside the workspace, present exact scopes to the permission policy, and re-resolve before execution.
 - `safe` mode denies edits and shell. `ask` mode prompts for edits, outside reads, and shell. `auto` mode permits inside-workspace file operations but still requires acknowledgement before trusted shell execution and prompts for outside file access.
 - Shell execution is not OS-sandboxed. Approved commands can access files outside the workspace, use the network, launch processes, and otherwise act with the user's privileges.
 - Shell commands do not inherit `YORDAM_API_KEY` or configured provider-key environment variables, but they do inherit other environment variables.
 - Configuration stores provider credential environment-variable names with `apiKeyEnv`, not credential values. Set those variables before starting Yordam. Protect `~/.config/yordam/config.jsonc`; Yordam creates its parent directory with mode `0700` and the file with mode `0600`.
 - Sessions are persisted locally and can contain prompts, responses, tool metadata, diffs, command summaries, and bounded output artifacts. Debug logs are opt-in and redacted, but users should still protect and review all persisted data.
-- Context compaction summaries are derived context aids, not original evidence. The source journal remains immutable and compaction stores a binding to the summarized range and its evidence. Treat both the journal and summary evidence as sensitive local session data.
+- Context compaction summaries are derived context aids, not original evidence. Compaction appends derived evidence and never deletes or rewrites the source journal. Treat both the journal and summary evidence as sensitive local session data.
 - Configured provider credentials are intentionally sent in the `Authorization` header to the configured provider. They and registered secret values are redacted from model and summary request bodies, stored summary evidence, durable events, application events, TUI output, debug logs, and public errors. Redaction reduces accidental disclosure; it cannot make arbitrary prompt or provider content safe to share.
-- Filesystem skills are untrusted context. Only bounded UTF-8 `SKILL.md` files under `~/.config/yordam/skills/<name>/` or `.yordam/skills/<name>/` below the canonical workspace are considered; symlinked roots, directories, and files are rejected. Metadata is visible before an explicit catalog-bound read-only load. Project trust is bound to the workspace and catalog digest and gives no shell, file, provider, child, or permission authority. Loaded text cannot bypass a normal permission prompt or disclose configured secrets.
+- Filesystem skills are untrusted context. Only bounded UTF-8 `SKILL.md` files under `~/.config/yordam/skills/<name>/` or `.yordam/skills/<name>/` below the canonical workspace are considered; symlinked roots, directories, and files are rejected. Metadata is visible before an explicit catalog-bound read-only load. Project trust does not grant file, shell, provider, child, or permission authority. Loaded text cannot bypass a normal permission prompt or disclose configured secrets.
 
 Permission prompts reduce accidental execution; they are not a sandbox or a guarantee that a command is safe. Use a separate OS account, container, or virtual machine when stronger isolation is required.
 
@@ -72,3 +77,12 @@ restart, an exact committed receipt can be recovered and attached once. If the
 journal cannot prove whether a dispatched effect completed, the attempt is
 `uncertain`; Yordam does not automatically retry that effect. A later explicit
 delegation receives a new child session and attempt identity.
+
+## Explicit capability boundaries
+
+Yordam has no permission-bypass mode. Skills are instruction-only; Yordam does
+not execute skills or load skill hooks. Project trust activates an exact catalog
+digest but grants no tool authority. Sequential children are depth one, use the
+parent's provider and model, and never run in parallel with the parent or another
+child. Compaction never rewrites history, and Yordam does not automatically
+retry an uncertain effect.

@@ -48,8 +48,8 @@ var defaultTemplate = []byte(`{
 
   "skills": {
     // Project skills may come from the repository and need your trust.
-    // Omit projectPolicy to ask before using project skills.
     // Supported values: ask, allow, deny.
+    "projectPolicy": "ask"
   },
 
   "subagents": {

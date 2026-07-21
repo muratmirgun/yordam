@@ -2,7 +2,9 @@ package config_test
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -10,6 +12,66 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"github.com/tailscale/hujson"
 )
+
+func TestV030SchemaHasExactStrictDecoderProperties(t *testing.T) {
+	raw := readSchemaDocument(t)
+	assertSchemaPropertyNames(t, raw, []string{"$schema", "context", "limits", "model", "provider", "skills", "subagents"})
+	if additional, ok := raw["additionalProperties"].(bool); !ok || additional {
+		t.Fatal("root schema must reject unknown strict-decoder fields")
+	}
+	definitions, ok := raw["$defs"].(map[string]any)
+	if !ok {
+		t.Fatal("schema definitions missing")
+	}
+	for name, want := range map[string][]string{
+		"provider":        {"models", "name", "options"},
+		"providerOptions": {"apiKeyEnv", "baseURL"},
+		"model":           {"contextWindow", "name"},
+		"limits":          {"maxToolCalls", "shellTimeoutSeconds"},
+		"context":         {"autoCompact", "compactReserveTokens"},
+		"skills":          {"projectPolicy"},
+		"subagents":       {"enabled", "maxPerTurn", "maxToolCalls", "timeoutSeconds"},
+	} {
+		node, ok := definitions[name].(map[string]any)
+		if !ok {
+			t.Fatalf("schema definition %q missing", name)
+		}
+		assertSchemaPropertyNames(t, node, want)
+		if additional, ok := node["additionalProperties"].(bool); !ok || additional {
+			t.Errorf("schema definition %q must reject unknown strict-decoder fields", name)
+		}
+	}
+}
+
+func readSchemaDocument(t *testing.T) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "schema", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	return document
+}
+
+func assertSchemaPropertyNames(t *testing.T, node map[string]any, want []string) {
+	t.Helper()
+	properties, ok := node["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("schema node has no properties")
+	}
+	got := make([]string, 0, len(properties))
+	for name := range properties {
+		got = append(got, name)
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("schema properties=%v want=%v", got, want)
+	}
+}
 
 func TestPublishedSchemaMatchesRuntimeValidation(t *testing.T) {
 	schemaPath := filepath.Join("..", "..", "schema", "config.json")

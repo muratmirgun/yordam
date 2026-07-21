@@ -39,7 +39,8 @@ func TestEnsureGlobalCreatesSecureEnvironmentOnlyTemplate(t *testing.T) {
 		`"apiKeyEnv": "OPENAI_API_KEY"`,
 		`// Format: provider/model`,
 		`// Project skills may come from the repository and need your trust.`,
-		`// Omit projectPolicy to ask before using project skills.`,
+		`// Supported values: ask, allow, deny.`,
+		`"projectPolicy": "ask"`,
 		`// Enable sequential subagents for bounded delegated work.`,
 		`// maxPerTurn, maxToolCalls, and timeoutSeconds remain enforced when disabled.`,
 	} {
@@ -52,6 +53,50 @@ func TestEnsureGlobalCreatesSecureEnvironmentOnlyTemplate(t *testing.T) {
 	}
 	if strings.Contains(string(raw), `"projectPolicy": "allow"`) {
 		t.Fatal("template implicitly enables project skills")
+	}
+}
+
+func TestGeneratedTemplateCoversV030StrictDecoderSurface(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path, _, err := config.EnsureGlobal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`// "contextWindow": 128000`,
+		`"autoCompact": true`,
+		`// "compactReserveTokens": 8192`,
+		`"projectPolicy": "ask"`,
+		`"enabled": true`,
+		`"maxPerTurn": 4`,
+		`"maxToolCalls": 16`,
+		`"timeoutSeconds": 600`,
+	} {
+		if strings.Count(string(raw), required) != 1 {
+			t.Errorf("generated template must contain exactly one %q", required)
+		}
+	}
+
+	configured := strings.ReplaceAll(string(raw), "your-model-id", "model-a")
+	configured = strings.Replace(configured, `// "contextWindow": 128000`, `"contextWindow": 128000`, 1)
+	configured = strings.Replace(configured, `// "compactReserveTokens": 8192`, `"compactReserveTokens": 8192`, 1)
+	if err := os.WriteFile(path, []byte(configured), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(config.LoadOptions{ConfigPath: path})
+	if err != nil {
+		t.Fatalf("generated v0.3 template does not pass strict decoder after placeholders are configured: %v", err)
+	}
+	if loaded.Profiles["openai"].ModelContextWindows["model-a"] != 128000 ||
+		!loaded.Context.AutoCompact || loaded.Context.CompactReserveTokens == nil || *loaded.Context.CompactReserveTokens != 8192 ||
+		loaded.Skills.ProjectPolicy != config.ProjectSkillsAsk ||
+		loaded.Subagents != (config.SubagentConfig{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 16, TimeoutSeconds: 600}) {
+		t.Fatalf("generated v0.3 template decoded incompletely: %+v", loaded)
 	}
 }
 

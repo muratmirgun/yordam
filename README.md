@@ -64,9 +64,19 @@ The generated JSONC template is intentionally incomplete. Replace both `your-mod
         "apiKeyEnv": "OPENAI_API_KEY"
       },
       "models": {
-        "your-model-id": {"name": "Your model"}
+        "your-model-id": {
+          "name": "Your model",
+          "contextWindow": 128000
+        }
       }
     }
+  },
+  "context": {
+    "autoCompact": true,
+    "compactReserveTokens": 8192
+  },
+  "skills": {
+    "projectPolicy": "ask"
   },
   "subagents": {
     "enabled": true,
@@ -91,6 +101,16 @@ yordam
 ```
 
 `/reload` validates and applies file changes without replacing the current session or its data. If `apiKeyEnv` names a variable that was missing when Yordam started, the edited configuration is loaded but requests remain blocked with restart guidance. Export the variable and restart Yordam; a running process cannot inherit later changes from another shell.
+
+`contextWindow` is optional and must be positive. `context.autoCompact` defaults
+to `true`, but automatic compaction is available only for a model with a known
+window. Omit `compactReserveTokens` to use ten percent of that window with a
+2,048-token minimum; an explicit positive reserve must be smaller than every
+configured window. `skills.projectPolicy` defaults to `ask` and accepts `ask`,
+`allow`, or `deny`. Sequential subagents default to enabled: `maxPerTurn` is
+`1..4` (default `4`), child `maxToolCalls` is `1..64` (default `16`), and
+`timeoutSeconds` is `1..1800` (default `600`). Unknown fields and `null` values
+are rejected by the strict decoder.
 
 ## Usage
 
@@ -170,9 +190,9 @@ body, and a 128 KiB limit. Symlinked roots, directories, and files are rejected.
 
 Global skills are active user-managed input. Project `skills.projectPolicy` is
 `ask` by default, with `allow` and `deny` alternatives. Under `ask`, `/skills`
-records an allow/deny decision bound to the exact canonical workspace and
-project catalog digest; an edit makes trust stale. A trusted project skill
-shadows a same-name global skill, while `/skills` displays both.
+records an allow/deny decision bound to the exact canonical workspace and project
+catalog digest; an edit makes trust stale. A trusted project skill shadows a
+same-name global skill, while `/skills` displays both.
 
 Provider context initially receives metadata only. Full content is available
 only when the model explicitly calls the read-only `skill` tool with an active
@@ -188,8 +208,8 @@ change policy, reveal credentials, or bypass normal permission approval.
 When `subagents.enabled` is true, the model can delegate one bounded objective
 to a sequential child turn. The defaults allow four attempts in one parent
 turn, sixteen child tool calls per attempt, and a 600-second deadline. Only one
-child can be active for a parent turn, and delegation has depth one: a child
-does not receive the `subagent` tool and cannot create another child.
+child can be active for a parent turn, and delegation has depth one: a child does
+not receive the `subagent` tool and cannot create another child.
 
 The child uses the same provider and model as its parent and receives the exact
 frozen skill catalog from the parent runtime generation. The parent's current
@@ -207,11 +227,21 @@ events. Assistant prose is only a bounded summary.
 The receipt does not verify the parent task. Cancellation propagates to an
 active child. Restart recovery attaches an
 already committed receipt or conservatively reports an uncertain effect; it
-does not silently repeat an ambiguous mutation.
+does not silently repeat an ambiguous mutation. Yordam does not automatically
+retry an uncertain effect.
 
 This release does not provide concurrent child execution, worktree isolation,
 network-hosted agent transport, free-form child messaging, or a per-child model
 choice.
+
+## Explicit v0.3 non-goals
+
+Yordam v0.3 provides no parallel children, executable skills or hooks,
+permission-bypass mode, or journal rewriting. Skills remain instruction-only
+context, children remain local and sequential, every effect remains subject to
+the ordinary permission policy, and compaction only appends evidence and
+projection events. The supported release targets remain macOS and Linux;
+Windows is not a v0.3 target.
 
 ## Session locations
 

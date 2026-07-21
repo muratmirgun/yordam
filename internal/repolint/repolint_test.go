@@ -173,6 +173,82 @@ fi`
 	}
 }
 
+func TestV030ProductDocumentationMatchesShippedSurface(t *testing.T) {
+	for path, required := range map[string][]string{
+		"README.md": {
+			`"contextWindow": 128000`,
+			`"autoCompact": true`,
+			`"compactReserveTokens": 8192`,
+			`"projectPolicy": "ask"`,
+			"`/compact` manually summarizes",
+			"`/skills` records an allow/deny decision",
+			"same provider and model",
+			"Only one child can be active",
+			"does not automatically retry an uncertain effect",
+			"## Explicit v0.3 non-goals",
+			"no parallel children, executable skills or hooks, permission-bypass mode, or journal rewriting",
+			"macOS and Linux",
+		},
+		"SECURITY.md": {
+			"`safe`, `ask`, and `auto` are permission modes, not sandboxes",
+			"trusted-shell acknowledgement",
+			"Project trust does not grant file, shell, provider, child, or permission authority",
+			"does not automatically retry an uncertain effect",
+			"Yordam has no permission-bypass mode",
+			"Skills are instruction-only; Yordam does not execute skills or load skill hooks",
+			"Compaction appends derived evidence and never deletes or rewrites the source journal",
+		},
+		"CHANGELOG.md": {
+			"## [0.3.0] - Unreleased",
+			"Context compaction",
+			"Filesystem skills",
+			"Sequential depth-one subagents",
+			"macOS and Linux",
+			"Uncertain effects are never retried automatically",
+		},
+		"docs/superpowers/specs/2026-07-19-yordam-v0.3-self-hosted-agent-runtime-design.md": {
+			"Status: implemented and release-gated",
+			"Implementation completed: 2026-07-21",
+			"TestV030SelfHostedRuntime",
+			"does not assert that v0.3.0 has been published",
+		},
+	} {
+		text := readRepositoryFile(t, path)
+		normalized := strings.Join(strings.Fields(text), " ")
+		for _, needle := range required {
+			if !strings.Contains(normalized, strings.Join(strings.Fields(needle), " ")) {
+				t.Errorf("%s missing shipped v0.3 contract %q", path, needle)
+			}
+		}
+	}
+
+	for _, path := range []string{"README.md", "SECURITY.md", "CHANGELOG.md"} {
+		text := strings.ToLower(strings.Join(strings.Fields(readRepositoryFile(t, path)), " "))
+		for _, unsupported := range []string{
+			"coming soon",
+			"planned for v0.3",
+			"will support parallel",
+			"supports parallel children",
+			"executes skill files",
+			"installs skill hooks",
+			"full access mode",
+			"automatically retries uncertain",
+			"yordam rewrites the source journal",
+		} {
+			if strings.Contains(text, unsupported) {
+				t.Errorf("%s contains future or unsupported v0.3 claim %q", path, unsupported)
+			}
+		}
+	}
+
+	design := readRepositoryFile(t, "docs/superpowers/specs/2026-07-19-yordam-v0.3-self-hosted-agent-runtime-design.md")
+	for _, stale := range []string{"Status: approved for implementation planning", "Production implementation begins from"} {
+		if strings.Contains(design, stale) {
+			t.Errorf("implemented design retains stale planning claim %q", stale)
+		}
+	}
+}
+
 func TestProductionCapabilityPackagesContainNoExecutableSkillOrHookLoader(t *testing.T) {
 	root := repositoryRoot(t)
 	for _, directory := range []string{

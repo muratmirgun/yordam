@@ -4,7 +4,7 @@
 - Worktree: `/Users/murat/oss/tui-yordam-v0.1/.worktrees/codex-v0.3-compaction`
 - Starting commit: `79cabb9`
 - Workflow: fresh implementer per task, task-scoped spec/quality review, final whole-branch review
-- Status: Self-hosting/release Task 5 complete; Task 6 ready for implementation
+- Status: Self-hosting/release Task 6 complete; Task 7 ready for implementation
 - Preflight conflicts: none; approved order is compaction, skills, sequential subagent, self-hosting/release
 
 ## Completed Tasks
@@ -39,6 +39,7 @@
 - Self-hosting/release Task 3: complete (named 13-case trust/hostile-skill/compaction/cancellation/crash/commit-unknown/retrust release matrix with exact top-level inventory guards; real process death and durable JSONL recovery are paired with the owning subagent reconciliation boundaries; no production defect was exposed; focused normal/race matrix, full tests, vet, and diff gates passed on Darwin/arm64).
 - Self-hosting/release Task 4: complete (exact compaction/skills/subagent/self-hosting/failure/Foundation cumulative umbrella with an AST-proven v0.2-to-v0.1 edge; narrow journal/storage/dispatch/testsupport/executable-loader architecture gates; default-fast and explicit `YORDAM_ACCEPTANCE=1` check paths; one race-discovered provider cancellation classification defect fixed separately in `a631c35`; repolint, focused architecture normal/race, exact umbrella, default/acceptance check scripts, vet, and diff gates passed on Darwin/arm64).
 - Self-hosting/release Task 5: complete (dedicated bounded `ubuntu-24.04`/`macos-15` cumulative acceptance matrix; exact-source release package guard and post-package v0.3 umbrella before verification/upload; provider-secret-free workflow contracts; preserved signed-tag, GoReleaser/Syft, four-target native smoke, checksum/SBOM, and publish dependencies; packaged semver/snapshot version plus full commit smoke validation; focused/full repolint, snapshot packaging, exact artifact inventory, native Darwin/arm64 smoke, vet, and diff gates passed).
+- Self-hosting/release Task 6: complete (production/config/help audit found no behavior gap; README, SECURITY, explicitly unpublished v0.3 CHANGELOG, and implemented design provenance synchronized to shipped compaction/skills/sequential-child behavior and non-goals; schema exact strict-decoder property sets retained and documented; generated template now emits explicit safe project trust policy and round-trips the complete v0.3 surface; focused/full config and repolint, forbidden-claim search, vet, and diff gates passed).
 
 ## Carried Dependencies
 
