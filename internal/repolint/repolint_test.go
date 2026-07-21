@@ -10,6 +10,152 @@ import (
 	"github.com/muratmirgun/yordam/internal/skills"
 )
 
+func TestV030AcceptanceCIJobContract(t *testing.T) {
+	workflow := readRepositoryFile(t, ".github/workflows/ci.yml")
+	job := workflowJob(t, workflow, "v030-acceptance")
+
+	for _, required := range []string{
+		"timeout-minutes: 75",
+		"os: [ubuntu-24.04, macos-15]",
+		"runs-on: ${{ matrix.os }}",
+		"uses: actions/checkout@v7",
+		"fetch-depth: 0",
+		"uses: actions/setup-go@v6",
+		"go-version-file: go.mod",
+		"go test -tags acceptance ./internal/acceptance -run TestV030SelfHostedRuntime -count=1 -v",
+		"-timeout 60m",
+	} {
+		if !strings.Contains(job, required) {
+			t.Errorf("v0.3 acceptance CI job missing %q", required)
+		}
+	}
+	if strings.Count(job, "go test -tags acceptance ./internal/acceptance -run TestV030SelfHostedRuntime -count=1 -v") != 1 {
+		t.Fatal("v0.3 acceptance CI job must run the cumulative umbrella exactly once")
+	}
+	for _, forbidden := range []string{"${{ secrets.", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "YORDAM_API_KEY", "PROFILE_KEY"} {
+		if strings.Contains(job, forbidden) {
+			t.Errorf("v0.3 acceptance CI job contains provider secret wiring %q", forbidden)
+		}
+	}
+}
+
+func TestV030ReleaseCandidateWorkflowContract(t *testing.T) {
+	workflow := readRepositoryFile(t, ".github/workflows/release.yml")
+	packageJob := workflowJob(t, workflow, "package")
+	for _, required := range []string{
+		"needs: verify",
+		"timeout-minutes: 120",
+		"uses: actions/checkout@v7",
+		"fetch-depth: 0",
+		"go-version-file: go.mod",
+		`test "$(git rev-parse HEAD)" = "$GITHUB_SHA"`,
+		"goreleaser release --snapshot --clean --skip=publish",
+		"goreleaser release --clean --skip=publish",
+		"go test -tags acceptance ./internal/acceptance -run TestV030SelfHostedRuntime -count=1 -v",
+		"-timeout 60m",
+		"archives=(dist/*.tar.gz)",
+		"sboms=(dist/*.spdx.json)",
+		"[[ ${#archives[@]} -eq 4 ]]",
+		"[[ ${#sboms[@]} -eq 4 ]]",
+		"[[ -f dist/checksums.txt ]]",
+		"uses: actions/upload-artifact@v4",
+	} {
+		if !strings.Contains(packageJob, required) {
+			t.Errorf("v0.3 release package job missing %q", required)
+		}
+	}
+	if strings.Count(packageJob, "go test -tags acceptance ./internal/acceptance -run TestV030SelfHostedRuntime -count=1 -v") != 1 {
+		t.Fatal("release package job must run the cumulative v0.3 umbrella exactly once")
+	}
+	packageIndex := strings.Index(packageJob, "goreleaser release --snapshot --clean --skip=publish")
+	acceptanceIndex := strings.Index(packageJob, "go test -tags acceptance ./internal/acceptance -run TestV030SelfHostedRuntime -count=1 -v")
+	verifyIndex := strings.Index(packageJob, "name: Verify packaged files")
+	uploadIndex := strings.Index(packageJob, "uses: actions/upload-artifact@v4")
+	if packageIndex < 0 || acceptanceIndex < packageIndex || verifyIndex < acceptanceIndex || uploadIndex < verifyIndex {
+		t.Fatal("release package job must package, run v0.3 acceptance, verify, then upload")
+	}
+	for _, forbidden := range []string{"${{ secrets.", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "YORDAM_API_KEY", "PROFILE_KEY"} {
+		if strings.Contains(packageJob, forbidden) {
+			t.Errorf("release package job contains provider secret wiring %q", forbidden)
+		}
+	}
+
+	smokeJob := workflowJob(t, workflow, "smoke")
+	for _, required := range []string{
+		"{runner: ubuntu-24.04, os: linux, arch: amd64}",
+		"{runner: ubuntu-24.04-arm, os: linux, arch: arm64}",
+		"{runner: macos-15-intel, os: darwin, arch: amd64}",
+		"{runner: macos-15, os: darwin, arch: arm64}",
+		`./scripts/smoke-release.sh "$archive" "$GITHUB_SHA"`,
+	} {
+		if !strings.Contains(smokeJob, required) {
+			t.Errorf("v0.3 release smoke job missing %q", required)
+		}
+	}
+	if strings.Count(smokeJob, "{runner:") != 4 {
+		t.Fatal("release smoke job must contain exactly four native targets")
+	}
+
+	publishJob := workflowJob(t, workflow, "publish")
+	for _, required := range []string{"needs: [verify, package, smoke]", "contents: write", "--verify-tag"} {
+		if !strings.Contains(publishJob, required) {
+			t.Errorf("release publish dependency or signing contract missing %q", required)
+		}
+	}
+}
+
+func TestReleaseSmokeRequiresPackagedVersionAndCommit(t *testing.T) {
+	script := readRepositoryFile(t, "scripts/smoke-release.sh")
+	for _, required := range []string{
+		"expected_commit=${2:?expected commit required}",
+		`^yordam_([^_]+)_(darwin|linux)_(amd64|arm64)\.tar\.gz$`,
+		`^[0-9]+\.[0-9]+\.[0-9]+$`,
+		`^0\.0\.0-SNAPSHOT-[0-9a-f]+$`,
+		`expected_output="yordam $expected_version ($expected_commit, `,
+		`[[ "$output" == "$expected_output" ]]`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("release smoke script missing %q", required)
+		}
+	}
+}
+
+func readRepositoryFile(t *testing.T, relative string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(repositoryRoot(t), filepath.FromSlash(relative)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func workflowJob(t *testing.T, workflow, name string) string {
+	t.Helper()
+	lines := strings.Split(workflow, "\n")
+	start := -1
+	prefix := "  " + name + ":"
+	for index, line := range lines {
+		if line == prefix {
+			if start >= 0 {
+				t.Fatalf("workflow contains duplicate %q job", name)
+			}
+			start = index
+		}
+	}
+	if start < 0 {
+		t.Fatalf("workflow missing %q job", name)
+	}
+	end := len(lines)
+	for index := start + 1; index < len(lines); index++ {
+		line := lines[index]
+		if strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && strings.HasSuffix(line, ":") {
+			end = index
+			break
+		}
+	}
+	return strings.Join(lines[start:end], "\n")
+}
+
 func TestCheckScriptKeepsV030AcceptanceOptIn(t *testing.T) {
 	raw, err := os.ReadFile("../../scripts/check.sh")
 	if err != nil {

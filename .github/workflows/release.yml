@@ -70,6 +70,7 @@ jobs:
   package:
     needs: verify
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
         with:
@@ -78,6 +79,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Verify exact source commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - name: Install pinned release tools
         run: |
           go install github.com/goreleaser/goreleaser/v2@v2.17.0
@@ -90,7 +93,7 @@ jobs:
             goreleaser release --clean --skip=publish
           fi
       - name: Run release-candidate acceptance
-        run: go test -tags acceptance ./internal/acceptance -run TestV010Acceptance -count=1 -v
+        run: go test -tags acceptance ./internal/acceptance -run TestV030SelfHostedRuntime -count=1 -v -timeout 60m
       - name: Verify packaged files
         run: |
           shopt -s nullglob
@@ -153,7 +156,7 @@ jobs:
           expected=$(awk -v name="$(basename "$archive")" '$2 == name {print $1}' dist/checksums.txt)
           actual=$(shasum -a 256 "$archive" | cut -d ' ' -f 1)
           [[ -n "$expected" && "$actual" == "$expected" ]]
-          ./scripts/smoke-release.sh "$archive"
+          ./scripts/smoke-release.sh "$archive" "$GITHUB_SHA"
 
   publish:
     needs: [verify, package, smoke]

@@ -61,7 +61,7 @@ func TestReleaseWorkflowEnforcesPreflightAndSignedTagPublish(t *testing.T) {
 		"github.com/goreleaser/goreleaser/v2@v2.17.0",
 		"github.com/anchore/syft/cmd/syft@v1.46.0",
 		"goreleaser release --snapshot --clean --skip=publish",
-		"go test -tags acceptance ./internal/acceptance -run TestV010Acceptance -count=1 -v",
+		"go test -tags acceptance ./internal/acceptance -run TestV030SelfHostedRuntime -count=1 -v",
 		"name: release-candidate",
 		"needs: [verify, package, smoke]",
 		"github.event_name == 'push'",
@@ -104,7 +104,7 @@ func TestReleaseWorkflowEnforcesPreflightAndSignedTagPublish(t *testing.T) {
 		t.Fatal("release checksum lookup must match the exact filename, not a substring")
 	}
 	packageIndex := strings.Index(text, "goreleaser release --snapshot --clean --skip=publish")
-	acceptanceIndex := strings.Index(text, "go test -tags acceptance ./internal/acceptance -run TestV010Acceptance -count=1 -v")
+	acceptanceIndex := strings.Index(text, "go test -tags acceptance ./internal/acceptance -run TestV030SelfHostedRuntime -count=1 -v")
 	if packageIndex < 0 || acceptanceIndex < packageIndex {
 		t.Fatal("release-candidate acceptance must run after snapshot packaging")
 	}
