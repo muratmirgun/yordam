@@ -109,19 +109,15 @@ func TestAdapterSendsCompleteToolHistoryBeforeLaterTurn(t *testing.T) {
 			t.Fatalf("messages[%d].role=%q want %q", index, captured[index].Role, role)
 		}
 	}
-	if captured[5].Content != "follow-up" || len(captured[2].ToolCalls) != 2 {
+	if captured[5].Content != "follow-up" {
 		t.Fatalf("messages=%#v", captured)
 	}
-	resultsBeforeLaterUser := map[string]int{}
-	for _, message := range captured[:5] {
-		if message.Role == "tool" {
-			resultsBeforeLaterUser[message.ToolCallID]++
-		}
+	toolCalls := captured[2].ToolCalls
+	if len(toolCalls) != 2 || toolCalls[0].ID != "call-a" || toolCalls[1].ID != "call-b" || toolCalls[0].ID == toolCalls[1].ID {
+		t.Fatalf("assistant tool calls=%#v want [call-a call-b]", toolCalls)
 	}
-	for _, call := range captured[2].ToolCalls {
-		if resultsBeforeLaterUser[call.ID] != 1 {
-			t.Fatalf("tool call %q has %d matching results before later user", call.ID, resultsBeforeLaterUser[call.ID])
-		}
+	if captured[3].ToolCallID != "call-a" || captured[4].ToolCallID != "call-b" {
+		t.Fatalf("tool result IDs=[%q %q] want [call-a call-b]", captured[3].ToolCallID, captured[4].ToolCallID)
 	}
 }
 
