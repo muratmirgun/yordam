@@ -36,9 +36,10 @@ type scriptedProvider struct {
 	URL      string
 	Requests []capturedProviderRequest
 
-	mu     sync.Mutex
-	steps  []providerStep
-	server *httptest.Server
+	mu           sync.Mutex
+	steps        []providerStep
+	server       *httptest.Server
+	firstFailure string
 }
 
 type providerWireRequest struct {
@@ -128,9 +129,14 @@ func (p *scriptedProvider) serveHTTP(response http.ResponseWriter, request *http
 	}
 	captured, err := validateProviderRequest(raw, stepIndex, p.steps[stepIndex])
 	if err != nil {
-		http.Error(response, fmt.Sprintf("provider step %d mismatch: %v", stepIndex, err), http.StatusBadRequest)
+		failure := fmt.Sprintf("provider step %d mismatch: %v", stepIndex, err)
+		if p.firstFailure == "" {
+			p.firstFailure = failure
+		}
+		http.Error(response, p.firstFailure, http.StatusBadRequest)
 		return
 	}
+	p.firstFailure = ""
 	p.Requests = append(p.Requests, captured)
 	response.Header().Set("Content-Type", "text/event-stream")
 	_, _ = io.WriteString(response, p.steps[stepIndex].SSE)
