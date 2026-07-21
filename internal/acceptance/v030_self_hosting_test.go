@@ -529,8 +529,21 @@ func assertSelfHostProviderTrace(t *testing.T, provider *scriptedProvider, attac
 	if counts["parent"] != 5 || counts["child"] != 5 || counts["compaction"] != 1 {
 		t.Fatalf("provider role counts=%v", counts)
 	}
-	if !strings.Contains(requests[7].Body, string(attachment.ReceiptEvidenceID)) || !strings.Contains(requests[7].Body, attachment.ReceiptDigest.Value) {
-		t.Fatal("parent continuation omitted exact attached child receipt")
+	var wire providerWireRequest
+	if err := json.Unmarshal([]byte(requests[7].Body), &wire); err != nil {
+		t.Fatal(err)
+	}
+	var continued protocol.SubagentReceiptV1
+	found := false
+	for _, message := range wire.Messages {
+		if message.Role == "tool" && message.ToolCallID == "delegate-readme" {
+			found = json.Unmarshal([]byte(message.Content), &continued) == nil
+			break
+		}
+	}
+	digest, err := canonicaljson.Digest(continued)
+	if err != nil || !found || digest != attachment.ReceiptDigest || continued.TerminalCursor != attachment.TerminalCursor || continued.Manifest.ChildSessionID != attachment.ChildSessionID {
+		t.Fatalf("parent continuation omitted exact attached child receipt: found=%t digest=%+v err=%v", found, digest, err)
 	}
 }
 
