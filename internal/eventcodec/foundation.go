@@ -27,6 +27,7 @@ func FoundationDescriptors() []Descriptor {
 		{protocol.EventTrustedExecutionAcknowledged, func() any { return new(protocol.TrustedExecutionAcknowledgedV1) }, true, "public", []string{"session", "permissions"}},
 		{protocol.EventUserMessage, func() any { return new(protocol.UserMessageV1) }, false, "sensitive", []string{"session", "context"}},
 		{protocol.EventAssistantMessage, func() any { return new(protocol.AssistantMessageV1) }, false, "sensitive", []string{"session", "context"}},
+		{protocol.EventToolMessage, func() any { return new(protocol.ToolMessageV1) }, false, "sensitive", []string{"session", "context", "activity"}},
 		{protocol.EventContextCompacted, func() any { return new(protocol.ContextCompactedV1) }, false, "sensitive", []string{"context", "evidence"}},
 		{protocol.EventFileChangePlanned, func() any { return new(protocol.FileChangePlannedV1) }, true, "sensitive", []string{"activity", "evidence"}},
 		{protocol.EventFileChanged, func() any { return new(protocol.FileChangedV1) }, true, "sensitive", []string{"activity", "evidence"}},
@@ -100,6 +101,10 @@ func FoundationDescriptors() []Descriptor {
 			},
 			ValidateEnvelope: func(envelope protocol.EventEnvelope, payload any) error {
 				switch kind {
+				case protocol.EventToolMessage:
+					if envelope.JournalKind != protocol.JournalSession || envelope.SessionID == "" || envelope.TurnID == "" || envelope.ActivityID == "" {
+						return fmt.Errorf("tool message requires session journal, session, turn, and activity IDs")
+					}
 				case protocol.EventContextCompacted:
 					return validateContextCompactionEnvelope(envelope, payload)
 				case protocol.EventProjectSkillTrustChanged:
@@ -212,6 +217,8 @@ func validateFoundationSemantic(kind string, payload any) error {
 				return err
 			}
 		}
+	case *protocol.ToolMessageV1:
+		return value.Validate()
 	case *protocol.ContextCompactedV1:
 		return value.Validate()
 	case *protocol.ProjectSkillTrustChangedV1:
@@ -891,7 +898,7 @@ func sessionOnlyKind(kind string) bool {
 	switch kind {
 	case protocol.EventSessionCreated, protocol.EventSessionForked, protocol.EventSessionTitleChanged, protocol.EventSessionLifecycleChanged,
 		protocol.EventModeChanged, protocol.EventModelChanged, protocol.EventTrustedExecutionAcknowledged,
-		protocol.EventUserMessage, protocol.EventAssistantMessage, protocol.EventContextCompacted,
+		protocol.EventUserMessage, protocol.EventAssistantMessage, protocol.EventToolMessage, protocol.EventContextCompacted,
 		protocol.EventFileChangePlanned, protocol.EventFileChanged,
 		protocol.EventTaskCreated, protocol.EventTaskStatusChanged,
 		protocol.EventOutcomeContractDeclared, protocol.EventOutcomeContractAmended, protocol.EventOutcomeCriterionAssessed, protocol.EventOutcomeFinalAssessed,

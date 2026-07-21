@@ -13,6 +13,29 @@ func protocolDigest(fill byte) protocol.Digest {
 	return protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat(string(fill), 64)}
 }
 
+func TestToolMessageValidate(t *testing.T) {
+	t.Parallel()
+	valid := protocol.ToolResultBlock{CallID: "call-1", Status: "succeeded", Text: "ok"}
+	tests := []struct {
+		name    string
+		value   protocol.ToolMessageV1
+		wantErr bool
+	}{
+		{name: "empty", value: protocol.ToolMessageV1{}, wantErr: true},
+		{name: "invalid", value: protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{Status: "failed"}}}, wantErr: true},
+		{name: "duplicate", value: protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{valid, valid}}, wantErr: true},
+		{name: "ordered", value: protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{valid, {CallID: "call-2", Status: "failed", Text: "no"}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.value.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestCompactionPublicDTOsExcludeBodies(t *testing.T) {
 	for _, value := range []any{protocol.ContextProjectionV1{Revision: "r", SummaryEvidenceID: "e"}, protocol.CompactionEventV1{Trigger: "manual", Stage: protocol.CompactionPreparing, SummaryEvidenceID: "e"}} {
 		raw, err := json.Marshal(value)

@@ -15,6 +15,7 @@ const (
 	EventTrustedExecutionAcknowledged   = "trusted_execution.acknowledged"
 	EventUserMessage                    = "user.message"
 	EventAssistantMessage               = "assistant.message"
+	EventToolMessage                    = "tool.message"
 	EventContextCompacted               = "context.compacted"
 	EventFileChangePlanned              = "file.change_planned"
 	EventFileChanged                    = "file.changed"
@@ -182,6 +183,30 @@ type UserMessageV1 struct {
 type AssistantMessageV1 struct {
 	Blocks      []ContentBlock `json:"blocks"`
 	ToolIntents []ToolUseBlock `json:"tool_intents,omitempty"`
+}
+
+type ToolMessageV1 struct {
+	Results []ToolResultBlock `json:"results"`
+}
+
+func (v ToolMessageV1) Validate() error {
+	if err := ValidateBounds(v); err != nil {
+		return fmt.Errorf("tool message bounds: %w", err)
+	}
+	if len(v.Results) == 0 {
+		return fmt.Errorf("tool message requires results")
+	}
+	seen := make(map[string]struct{}, len(v.Results))
+	for _, result := range v.Results {
+		if err := result.Validate(); err != nil {
+			return err
+		}
+		if _, duplicate := seen[result.CallID]; duplicate {
+			return fmt.Errorf("duplicate tool result %q", result.CallID)
+		}
+		seen[result.CallID] = struct{}{}
+	}
+	return nil
 }
 
 type ContextCompactedV1 struct {
