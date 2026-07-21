@@ -165,6 +165,15 @@ func TestRunTurnSubagentHappyPathCommitsParentHandoffAndAttachment(t *testing.T)
 	if !containsBatchKind(batches, protocol.EventEvidenceRecorded) {
 		t.Fatalf("receipt evidence missing: %v", batches)
 	}
+	attachmentResult := false
+	for _, appendRequest := range repo.appendRequests() {
+		if appendHasKinds(appendRequest, protocol.EventActivitySucceeded, protocol.EventToolMessage, protocol.EventSubagentResultAttached) {
+			attachmentResult = true
+		}
+	}
+	if !attachmentResult {
+		t.Fatalf("receipt attachment did not atomically persist tool.message: %v", batches)
+	}
 	var planned, evidence, terminal protocol.ActivityID
 	for _, appendRequest := range repo.appendRequests() {
 		for _, event := range appendRequest.Events {

@@ -607,7 +607,7 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 				}
 				return parentHead, changed, false, recoveredParentContinuationError(projection, initial, attempt, "reconstruct recovered parent continuation", rebuildErr)
 			}
-			resumed, resumeErr := s.resumeRecoveredParent(ctx, lease, parentRequest, initial, *attempt.Receipt)
+			resumed, resumeErr := s.resumeRecoveredParent(ctx, lease, parentRequest, initial)
 			if resumeErr != nil {
 				if !isRecoveredParentTerminalFailure(resumeErr) {
 					return parentHead, changed, false, resumeErr
@@ -629,7 +629,12 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 		if recoveryTurn.command.CommandID == "" || recoveryTurn.activeActivityID == "" {
 			continue
 		}
-		_, attachErr := s.attachSubagentReceipt(ctx, StartTurnRequest{Command: recoveryTurn.command, SessionID: protocol.SessionID(request.Storage.Journal.ID), Runtime: protocol.DeepCopy(request.Control.Runtime)}, &recoveryTurn, protocol.ToolUseBlock{CallID: string(attempt.AttemptID)}, attempt.ActivityID, *attempt.Receipt)
+		recoveryRequest := StartTurnRequest{Command: recoveryTurn.command, SessionID: protocol.SessionID(request.Storage.Journal.ID), ExpectedHead: parentHead, Runtime: protocol.DeepCopy(request.Control.Runtime)}
+		recoveredIntent, _, recoverIntentErr := s.recoverSubagentIntent(ctx, recoveryRequest, attempt)
+		if recoverIntentErr != nil {
+			return parentHead, changed, false, recoverIntentErr
+		}
+		_, attachErr := s.attachSubagentReceipt(ctx, recoveryRequest, &recoveryTurn, recoveredIntent, attempt.ActivityID, *attempt.Receipt)
 		if attachErr != nil {
 			return parentHead, changed, false, attachErr
 		}
@@ -642,7 +647,7 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 				}
 				return parentHead, changed, false, recoveredParentContinuationError(projection, initial, attempt, "reconstruct recovered parent continuation", rebuildErr)
 			}
-			resumed, resumeErr := s.resumeRecoveredParent(ctx, lease, parentRequest, initial, *attempt.Receipt)
+			resumed, resumeErr := s.resumeRecoveredParent(ctx, lease, parentRequest, initial)
 			if resumeErr != nil {
 				if !isRecoveredParentTerminalFailure(resumeErr) {
 					return parentHead, changed, false, resumeErr
@@ -798,26 +803,20 @@ func childInspectionCommitKnown(child journal.Inspection) bool {
 // exact canonical child receipt has been attached. The recovery lease remains
 // owned throughout; nested children use its Yield path and all new provider or
 // tool dispatches therefore receive fresh authorization.
-func (s *Service) resumeRecoveredParent(ctx context.Context, lease managedOperationLease, request StartTurnRequest, attempt receiptprojector.Attempt, receipt protocol.SubagentReceiptV1) (RunResult, error) {
+func (s *Service) resumeRecoveredParent(ctx context.Context, lease managedOperationLease, request StartTurnRequest, attempt receiptprojector.Attempt) (RunResult, error) {
 	if err := validateStartTurnRequest(request); err != nil {
 		return RunResult{}, terminalRecoveredParentFailure(err)
 	}
-	intent, providerAttempts, err := s.recoverSubagentIntent(ctx, request, attempt)
+	_, providerAttempts, err := s.recoverSubagentIntent(ctx, request, attempt)
 	if err != nil {
 		return RunResult{}, err
 	}
 	state := newTurnState(request)
 	state.taskID, state.turnID, state.contractID = attempt.ParentTaskID, attempt.ParentTurnID, protocol.OutcomeContractID(stableID("contract", string(request.Command.CommandID)))
 	state.accepted, state.taskRunning, state.subagentAttempts = true, true, 1
-	encoded, err := canonicaljson.Marshal(receipt)
-	if err != nil {
-		return RunResult{}, terminalRecoveredParentFailure(err)
-	}
-	resultBlock := protocol.ToolResultBlock{CallID: intent.CallID, Status: receipt.Status, JSON: encoded}
-	extra := []protocol.ModelMessage{{Role: "tool", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolResult, ToolResult: &resultBlock}}}}
 	completedTools := 1
 	for providerAttempt := providerAttempts; ; providerAttempt++ {
-		assistant, terminal, runErr := s.runProviderActivity(ctx, lease, request, &state, providerAttempt, extra)
+		assistant, terminal, runErr := s.runProviderActivity(ctx, lease, request, &state, providerAttempt)
 		if runErr != nil {
 			if errors.Is(runErr, ErrCommitUncertain) {
 				return RunResult{TaskID: state.taskID, TurnID: state.turnID, Cursor: state.head, Status: "uncertain"}, runErr
@@ -837,22 +836,15 @@ func (s *Service) resumeRecoveredParent(ctx context.Context, lease managedOperat
 		if completedTools+len(assistant.ToolIntents) > request.Runtime.Body.Limits.MaxToolCalls {
 			return RunResult{TaskID: state.taskID, TurnID: state.turnID, Cursor: state.head, Status: "uncertain"}, terminalRecoveredParentFailuref("tool call limit %d reached", request.Runtime.Body.Limits.MaxToolCalls)
 		}
-		results := make([]protocol.ContentBlock, 0, len(assistant.ToolIntents))
 		for _, next := range assistant.ToolIntents {
-			toolResult, toolErr := s.runToolIntent(ctx, lease, request, &state, next)
+			_, toolErr := s.runToolIntent(ctx, lease, request, &state, next)
 			if toolErr != nil {
 				if !errors.Is(toolErr, ErrCommitUncertain) {
 					toolErr = terminalRecoveredParentFailure(toolErr)
 				}
 				return RunResult{TaskID: state.taskID, TurnID: state.turnID, Cursor: state.head, Status: "uncertain"}, toolErr
 			}
-			copyResult := toolResult
-			results = append(results, protocol.ContentBlock{Kind: protocol.ContentToolResult, ToolResult: &copyResult})
 			completedTools++
-		}
-		extra = make([]protocol.ModelMessage, 0, len(results))
-		for _, result := range results {
-			extra = append(extra, protocol.ModelMessage{Role: "tool", Blocks: []protocol.ContentBlock{result}})
 		}
 	}
 }

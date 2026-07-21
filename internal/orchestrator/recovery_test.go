@@ -390,14 +390,22 @@ func TestSubagentRecoveryCreatesReservedChildOnceAndContinuesParent(t *testing.T
 	if continuation.request.ModelID != "model-a" || continuation.request.ProviderID != "provider-a" {
 		t.Fatalf("parent continuation model=%q/%q", continuation.request.ProviderID, continuation.request.ModelID)
 	}
-	if result, ok := findToolResult(continuation.request, intent.CallID); !ok || result.Status != "succeeded" || len(result.EvidenceIDs) != 0 {
-		// The recovery continuation reconstructs the receipt itself; unlike a
-		// live provider request it contains the canonical result without trusting
-		// an evidence ID from an interrupted process.
+	if result, ok := findToolResult(continuation.request, intent.CallID); !ok || result.Status != "succeeded" || len(result.EvidenceIDs) != 1 {
+		// Recovery persists the exact canonical receipt result together with the
+		// newly recorded parent evidence binding before provider continuation.
 		t.Fatalf("continuation result=%+v present=%v", result, ok)
 	}
 	if !containsBatchKind(flattenBatches(repository.appendRequests()), protocol.EventSubagentResultAttached) || !containsBatchKind(flattenBatches(repository.appendRequests()), protocol.EventTurnCompleted) {
 		t.Fatalf("recovery did not attach and terminalize parent: %v", flattenBatches(repository.appendRequests()))
+	}
+	recoveredAttachmentResult := false
+	for _, appendRequest := range repository.appendRequests() {
+		if appendHasKinds(appendRequest, protocol.EventActivitySucceeded, protocol.EventToolMessage, protocol.EventSubagentResultAttached) {
+			recoveredAttachmentResult = true
+		}
+	}
+	if !recoveredAttachmentResult {
+		t.Fatalf("recovered attachment did not atomically persist tool.message: %v", flattenBatches(repository.appendRequests()))
 	}
 	var attachment protocol.SubagentResultAttachedV1
 	attachmentCount := 0
@@ -429,7 +437,7 @@ func TestSubagentRecoveryCreatesReservedChildOnceAndContinuesParent(t *testing.T
 		"child.session.create",
 		"child.receipt.commit",
 		"evidence.put",
-		"append_session(activity.succeeded,evidence.recorded,evidence.linked,subagent_result_attached_v1)",
+		"append_session(tool.message,activity.succeeded,evidence.recorded,evidence.linked,subagent_result_attached_v1)",
 		"recovered-parent.provider.prepare",
 		"recovered-parent.provider.stream",
 	)

@@ -392,7 +392,7 @@ func TestDurableOrderingMutationPreviewCheckpointRevalidationExecutionAndContinu
 		"tool.revalidate", "append(authorization.requested)", "authorization.decide",
 		"append(authorization.decided,activity.authorized)", "append(authorization.decision_consumed,activity.started)",
 		"authorization.issue", "tool.execute", "evidence.put",
-		"append(activity.succeeded,evidence.recorded,evidence.linked)",
+		"append(tool.message,activity.succeeded,evidence.recorded,evidence.linked)",
 		"context.plan", "provider.negotiate", "provider.prepare",
 	}
 	if !containsContiguous(got, wantSequence) {
@@ -465,6 +465,266 @@ func TestSequentialToolContinuationsRetainEveryPriorResult(t *testing.T) {
 			t.Fatalf("request %d tool results=%v want=%v", requestIndex, resultIDs, want)
 		}
 	}
+}
+
+func TestToolResultSharesSuccessfulActivityTransaction(t *testing.T) {
+	log := &recordLog{}
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	repository := &recordingRepository{head: request.ExpectedHead}
+	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository,
+		TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log},
+		Provider: &toolThenFinalProvider{log: log}, Tools: evidencedObservationToolService{observationToolService{log: log}},
+		Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	terminal, result, ok := terminalToolResult(repository.appendRequests(), protocol.EventActivitySucceeded, "call-a")
+	if !ok {
+		t.Fatalf("successful tool terminal did not atomically persist tool.message: %v", repository.batchKinds())
+	}
+	if terminal.TransactionID == "" || result.CallID != "call-a" || result.Status != "succeeded" || !slices.Equal(result.EvidenceIDs, []protocol.EvidenceID{"evidence-a", "evidence-z"}) {
+		t.Fatalf("terminal=%+v result=%+v", terminal, result)
+	}
+}
+
+func TestToolResultTerminalPathsPersistConservativeStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		configure  func(*testing.T, *StartTurnRequest) (ToolService, AuthorizationService)
+		wantKind   string
+		wantStatus string
+		wantErr    bool
+	}{
+		{
+			name: "unknown tool", wantKind: protocol.EventActivityFailed, wantStatus: "failed",
+			configure: func(t *testing.T, request *StartTurnRequest) (ToolService, AuthorizationService) {
+				request.Runtime.Body.Tools = []protocol.ToolDescriptor{}
+				refreshRuntimeDigest(t, &request.Runtime)
+				return noToolService{}, &allowingAuthorization{log: &recordLog{}}
+			},
+		},
+		{
+			name: "resource drift", wantKind: protocol.EventActivityFailed, wantStatus: "failed",
+			configure: func(_ *testing.T, _ *StartTurnRequest) (ToolService, AuthorizationService) {
+				return driftingObservationToolService{observationToolService{log: &recordLog{}}}, &allowingAuthorization{log: &recordLog{}}
+			},
+		},
+		{
+			name: "execution error", wantKind: protocol.EventActivityUncertain, wantStatus: "uncertain",
+			configure: func(_ *testing.T, _ *StartTurnRequest) (ToolService, AuthorizationService) {
+				return failingObservationToolService{observationToolService{log: &recordLog{}}}, &allowingAuthorization{log: &recordLog{}}
+			},
+		},
+		{
+			name: "cancelled outcome", wantKind: protocol.EventActivityCancelled, wantStatus: "cancelled",
+			configure: func(_ *testing.T, _ *StartTurnRequest) (ToolService, AuthorizationService) {
+				return cancelledObservationToolService{observationToolService{log: &recordLog{}}}, &allowingAuthorization{log: &recordLog{}}
+			},
+		},
+		{
+			name: "authorization denial", wantKind: protocol.EventActivityDenied, wantStatus: "denied", wantErr: true,
+			configure: func(_ *testing.T, _ *StartTurnRequest) (ToolService, AuthorizationService) {
+				return observationToolService{log: &recordLog{}}, &toolDenyingAuthorization{allowingAuthorization: allowingAuthorization{log: &recordLog{}}}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := validStartTurnRequest()
+			request.Runtime = validRuntimeManifest(t, "observation")
+			tools, authorizer := test.configure(t, &request)
+			repository := &recordingRepository{head: request.ExpectedHead}
+			log := &recordLog{}
+			service, err := NewService(Dependencies{
+				Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository,
+				TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &toolThenFinalProvider{log: log},
+				Tools: tools, Authorization: authorizer, Evidence: recordingEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, runErr := service.RunTurn(context.Background(), request)
+			if (runErr != nil) != test.wantErr {
+				t.Fatalf("RunTurn error=%v wantErr=%v", runErr, test.wantErr)
+			}
+			_, result, ok := terminalToolResult(repository.appendRequests(), test.wantKind, "call-a")
+			if !ok || result.Status != test.wantStatus {
+				t.Fatalf("terminal result=%+v present=%v batches=%v", result, ok, repository.batchKinds())
+			}
+		})
+	}
+}
+
+func TestToolMessageExcludesProviderDenialAndSuccessfulMutationPreview(t *testing.T) {
+	t.Run("provider denial", func(t *testing.T) {
+		request := validStartTurnRequest()
+		request.Runtime = validRuntimeManifest(t, "observation")
+		repository := &recordingRepository{head: request.ExpectedHead}
+		log := &recordLog{}
+		service, err := NewService(Dependencies{
+			Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository,
+			TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &toolThenFinalProvider{log: log},
+			Tools: observationToolService{log: log}, Authorization: &denyingAuthorization{allowingAuthorization{log: log}}, Evidence: recordingEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.RunTurn(context.Background(), request); err == nil {
+			t.Fatal("provider denial unexpectedly succeeded")
+		}
+		for _, appendRequest := range repository.appendRequests() {
+			if appendHasKinds(appendRequest, protocol.EventActivityDenied, protocol.EventToolMessage) {
+				t.Fatalf("provider denial persisted a provider-visible tool result: %+v", appendRequest)
+			}
+		}
+	})
+
+	t.Run("mutation preview", func(t *testing.T) {
+		request := validStartTurnRequest()
+		request.Runtime = validRuntimeManifest(t, "mutation")
+		repository := &recordingRepository{head: request.ExpectedHead}
+		log := &recordLog{}
+		service, err := NewService(Dependencies{
+			Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository,
+			TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &toolThenFinalProvider{log: log},
+			Tools: mutationToolService{log: log}, Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log}, Recovery: recordingRecovery{log: log}, Verification: verification.NewService(time.Now),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.RunTurn(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		previewID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "preview", "call-a", "0"))
+		mutationID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "mutation", "call-a", "0"))
+		previewToolMessages, mutationToolMessages := 0, 0
+		for _, appendRequest := range repository.appendRequests() {
+			for _, event := range appendRequest.Events {
+				if event.Kind != protocol.EventToolMessage {
+					continue
+				}
+				if event.ActivityID == previewID {
+					previewToolMessages++
+				}
+				if event.ActivityID == mutationID {
+					mutationToolMessages++
+				}
+			}
+		}
+		if previewToolMessages != 0 || mutationToolMessages != 1 {
+			t.Fatalf("preview tool messages=%d mutation tool messages=%d batches=%v", previewToolMessages, mutationToolMessages, repository.batchKinds())
+		}
+	})
+}
+
+func TestLaterTurnRestartReconstructsToolResultFromJournal(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	repository := &recordingRepository{head: request.ExpectedHead}
+	firstLog := &recordLog{}
+	first, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository, TurnLeases: &recordingTurnLeaseManager{},
+		Context: contextplanner.NewPlanner(request.Runtime.Body.ToolCatalogRevision, nil), Providers: fakeProviderCatalog{log: firstLog}, Provider: &toolThenFinalProvider{log: firstLog},
+		Tools: observationToolService{log: firstLog}, Authorization: &allowingAuthorization{log: firstLog}, Evidence: recordingEvidence{log: firstLog}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.RunTurn(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+
+	later := request
+	later.Command.CommandID = "command-b"
+	later.Command.IdempotencyKey = "key-b"
+	later.Command.RequestDigest = repeatedDigest("9")
+	later.ExpectedHead = repository.head
+	later.Prompt = "use the durable result"
+	provider := &capturingProviderService{}
+	second, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository, TurnLeases: &recordingTurnLeaseManager{},
+		Context: contextplanner.NewPlanner(request.Runtime.Body.ToolCatalogRevision, nil), Providers: fakeProviderCatalog{log: &recordLog{}}, Provider: provider,
+		Tools: noToolService{}, Authorization: &allowingAuthorization{log: &recordLog{}}, Evidence: noEvidenceRecorder{}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.RunTurn(context.Background(), later); err != nil {
+		t.Fatal(err)
+	}
+	provider.mu.Lock()
+	requests := protocol.DeepCopy(provider.requests)
+	provider.mu.Unlock()
+	if len(requests) != 1 {
+		t.Fatalf("later provider requests=%d", len(requests))
+	}
+	result, ok := findToolResult(requests[0], "call-a")
+	if !ok || result.Status != "succeeded" {
+		t.Fatalf("later request did not reconstruct durable result: %#v", requests[0].Messages)
+	}
+	assistantFound := false
+	for _, message := range requests[0].Messages {
+		for _, block := range message.Blocks {
+			assistantFound = assistantFound || message.Role == "assistant" && block.ToolUse != nil && block.ToolUse.CallID == "call-a"
+		}
+	}
+	if !assistantFound {
+		t.Fatalf("later request did not reconstruct assistant tool call: %#v", requests[0].Messages)
+	}
+}
+
+func TestToolResultAppendBarrierBlocksProviderContinuation(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	base := &recordingRepository{head: request.ExpectedHead}
+	repository := &toolTerminalFailingRepository{recordingRepository: base}
+	log := &recordLog{}
+	provider := &toolThenFinalProvider{log: log}
+	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository, TurnLeases: &recordingTurnLeaseManager{},
+		Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: provider, Tools: observationToolService{log: log},
+		Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); err == nil {
+		t.Fatal("terminal append failure unexpectedly succeeded")
+	}
+	provider.mu.Lock()
+	prepareCount := len(provider.requests)
+	provider.mu.Unlock()
+	if prepareCount != 1 || provider.streams.Load() != 1 {
+		t.Fatalf("provider crossed failed result barrier: prepares=%d streams=%d", prepareCount, provider.streams.Load())
+	}
+}
+
+func terminalToolResult(requests []journal.AppendRequest, terminalKind, callID string) (journal.AppendRequest, protocol.ToolResultBlock, bool) {
+	for _, request := range requests {
+		if !appendHasKinds(request, terminalKind, protocol.EventToolMessage) {
+			continue
+		}
+		var messages []protocol.ToolMessageV1
+		for _, event := range request.Events {
+			if event.Kind != protocol.EventToolMessage {
+				continue
+			}
+			var message protocol.ToolMessageV1
+			if json.Unmarshal(event.Payload, &message) == nil {
+				messages = append(messages, message)
+			}
+		}
+		if len(messages) == 1 && len(messages[0].Results) == 1 && messages[0].Results[0].CallID == callID {
+			return request, messages[0].Results[0], true
+		}
+	}
+	return journal.AppendRequest{}, protocol.ToolResultBlock{}, false
 }
 
 func TestRunTurnEventsValidateFoundationRegistry(t *testing.T) {
@@ -551,7 +811,7 @@ func TestFileChangedEffectSharesTheUncertainTerminalTransactionAndIdentity(t *te
 		CallID: "edit-call", Subject: protocol.SubjectRef{Kind: "file", ID: "/workspace/target.txt"},
 		Before: repeatedDigest("a"), After: repeatedDigest("b"), EvidenceIDs: []protocol.EvidenceID{},
 	}
-	if err := service.appendActivityEvidence(context.Background(), request, &state, "edit-activity", "edit-terminal", "uncertain", nil, &change); err != nil {
+	if err := service.appendActivityEvidence(context.Background(), request, &state, "edit-activity", "edit-terminal", "uncertain", nil, nil, &change); err != nil {
 		t.Fatal(err)
 	}
 	requests := repository.appendRequests()
@@ -1028,6 +1288,15 @@ type recordingRepository struct {
 	requests []journal.AppendRequest
 }
 
+type toolTerminalFailingRepository struct{ *recordingRepository }
+
+func (r *toolTerminalFailingRepository) AppendBatch(ctx context.Context, request journal.AppendRequest) (journal.AppendResult, error) {
+	if appendHasKinds(request, protocol.EventToolMessage) {
+		return journal.AppendResult{}, errors.New("tool terminal append failed")
+	}
+	return r.recordingRepository.AppendBatch(ctx, request)
+}
+
 func (r *recordingRepository) Inspect(context.Context, protocol.JournalRef) (journal.Inspection, error) {
 	return journal.Inspection{Head: r.head, Writable: true}, nil
 }
@@ -1182,18 +1451,9 @@ func (l loggingOperationLease) Release() {
 
 type fakeContextPlanner struct{ log *recordLog }
 
-func (p fakeContextPlanner) Plan(_ context.Context, request contextplanner.Request) (protocol.ContextPlan, error) {
+func (p fakeContextPlanner) Plan(ctx context.Context, request contextplanner.Request) (protocol.ContextPlan, error) {
 	p.log.add("context.plan")
-	content := []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "inspect"}}
-	sourceDigest, _ := canonicaljson.Digest(content)
-	body := protocol.ContextPlanBody{
-		Sources:              []protocol.ContentSource{{ID: "prompt", Kind: "user_message", Scope: "turn", Provenance: "test", Digest: sourceDigest, Content: content}},
-		Excluded:             []protocol.ExcludedContentSource{},
-		EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueUnknown}, OutputReserve: 0,
-		ContextWindow: protocol.ValueInt64{State: protocol.ValueUnknown}, CompactionRevision: "none", ToolExposureRevision: "tools-a",
-	}
-	digest, _ := canonicaljson.Digest(body)
-	return protocol.ContextPlan{Body: body, Digest: digest}, nil
+	return contextplanner.NewPlanner("tools-a", nil).Plan(ctx, request)
 }
 
 type staticContextPlanner struct{ plan protocol.ContextPlan }
@@ -1372,6 +1632,17 @@ type allowingAuthorization struct {
 	dispatches atomic.Int64
 }
 
+type toolDenyingAuthorization struct{ allowingAuthorization }
+
+func (a *toolDenyingAuthorization) Decide(ctx context.Context, request protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error) {
+	decision, err := a.allowingAuthorization.Decide(ctx, request)
+	if request.Source.Source != "provider" {
+		decision.Action = "deny"
+		decision.Reason = "policy denied tool"
+	}
+	return decision, err
+}
+
 func (a *allowingAuthorization) Decide(_ context.Context, request protocol.AuthorizationRequest) (protocol.AuthorizationDecision, error) {
 	a.log.add("authorization.decide")
 	return protocol.AuthorizationDecision{
@@ -1407,6 +1678,38 @@ func (s mutationToolService) Plan(context.Context, tooling.PlanRequest) (tooling
 }
 
 type observationToolService struct{ log *recordLog }
+
+type evidencedObservationToolService struct{ observationToolService }
+
+func (s evidencedObservationToolService) Execute(_ context.Context, _ tooling.ActionHandle, _ authorization.CommittedToken) (protocol.ExecutionResult, error) {
+	s.log.add("tool.execute(call-a)")
+	return protocol.ExecutionResult{
+		Outcome:    protocol.ActivityOutcomeV1{Status: "succeeded"},
+		ToolResult: protocol.ToolResultBlock{CallID: "call-a", Status: "succeeded", Text: "ok"},
+		Evidence: []protocol.EvidenceCandidate{
+			{ID: "evidence-z", Kind: "tool_output", MediaType: "text/plain", Actor: protocol.ActorRef{ID: "read", Kind: protocol.ActorTool}, Subject: protocol.SubjectRef{Kind: "file", ID: "z.go"}, Content: []byte("z"), Limit: 1024},
+			{ID: "evidence-a", Kind: "tool_output", MediaType: "text/plain", Actor: protocol.ActorRef{ID: "read", Kind: protocol.ActorTool}, Subject: protocol.SubjectRef{Kind: "file", ID: "a.go"}, Content: []byte("a"), Limit: 1024},
+		},
+	}, nil
+}
+
+type driftingObservationToolService struct{ observationToolService }
+
+func (driftingObservationToolService) Revalidate(context.Context, tooling.ActionHandle) (protocol.ActionPlan, bool, error) {
+	return protocol.ActionPlan{}, true, nil
+}
+
+type failingObservationToolService struct{ observationToolService }
+
+func (failingObservationToolService) Execute(context.Context, tooling.ActionHandle, authorization.CommittedToken) (protocol.ExecutionResult, error) {
+	return protocol.ExecutionResult{}, errors.New("execution failed with sensitive detail")
+}
+
+type cancelledObservationToolService struct{ observationToolService }
+
+func (cancelledObservationToolService) Execute(context.Context, tooling.ActionHandle, authorization.CommittedToken) (protocol.ExecutionResult, error) {
+	return protocol.ExecutionResult{Outcome: protocol.ActivityOutcomeV1{Status: "cancelled"}, ToolResult: protocol.ToolResultBlock{CallID: "call-a", Status: "cancelled", Text: "cancelled"}}, nil
+}
 
 func (s observationToolService) Plan(_ context.Context, request tooling.PlanRequest) (tooling.ActionHandle, protocol.ActionPlan, error) {
 	s.log.add("tool.plan(" + request.CallID + ")")
