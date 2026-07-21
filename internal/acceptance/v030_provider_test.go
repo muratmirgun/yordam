@@ -191,8 +191,18 @@ func validateProviderRequest(raw []byte, stepIndex int, step providerStep) (capt
 	if !wire.Stream {
 		return capturedProviderRequest{}, fmt.Errorf("stream must be true")
 	}
-	if len(wire.Messages) < 2 || wire.Messages[0].Role != "system" || wire.Messages[1].Role != "user" {
-		return capturedProviderRequest{}, fmt.Errorf("message roles must start system,user")
+	firstUser := -1
+	for index, message := range wire.Messages {
+		if message.Role == "user" {
+			firstUser = index
+			break
+		}
+		if message.Role != "system" {
+			return capturedProviderRequest{}, fmt.Errorf("message %d before first user has role %q", index, message.Role)
+		}
+	}
+	if firstUser < 1 {
+		return capturedProviderRequest{}, fmt.Errorf("messages must start with one or more system sources followed by user")
 	}
 	roles, callIDs, err := validateProviderMessages(wire.Messages)
 	if err != nil {
