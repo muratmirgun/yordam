@@ -73,6 +73,20 @@ func TestRunTurnProviderLifecycleUsesDurableAuthorizationAndTerminalBarriers(t *
 	}
 }
 
+func TestCollectProviderStreamPreservesCancellationWhenProviderCloses(t *testing.T) {
+	service := &Service{}
+	for attempt := 0; attempt < 100; attempt++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		stream := make(chan protocol.ModelEvent)
+		cancel()
+		close(stream)
+		_, _, err := service.collectProviderStream(ctx, "generation", stream)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("attempt=%d error=%v want=%v", attempt, err, context.Canceled)
+		}
+	}
+}
+
 func TestAutomaticCompactionPolicyThresholds(t *testing.T) {
 	knownWindow := protocol.ValueInt64{State: protocol.ValueKnown, Value: 10_000, Provenance: "test-window"}
 	zero := protocol.ValueInt64{State: protocol.ValueKnown, Value: 0, Provenance: "test-reserve"}

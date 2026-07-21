@@ -1622,6 +1622,9 @@ func (s *Service) collectProviderStream(ctx context.Context, generation protocol
 		case event, ok := <-stream:
 			if !ok {
 				if terminal.TerminalReason == "" {
+					if err := ctx.Err(); err != nil {
+						return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+					}
 					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("provider stream closed without terminal")
 				}
 				if err := flushDelta(); err != nil {
