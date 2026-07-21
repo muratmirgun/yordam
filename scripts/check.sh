@@ -8,7 +8,8 @@ go vet ./...
 git diff --check
 
 # The real PTY self-hosting umbrella is a release gate, not part of the fast
-# edit loop. Opt in explicitly when validating a v0.3 release candidate.
+# edit loop. Opt in explicitly when validating a v0.3 release candidate. The
+# explicit bound matches CI and leaves the slower race variant below 60 minutes.
 if [[ "${YORDAM_ACCEPTANCE:-0}" == "1" ]]; then
-  go test -tags acceptance ./internal/acceptance -run '^TestV030SelfHostedRuntime$' -count=1 -v
+  go test -tags acceptance ./internal/acceptance -run '^TestV030SelfHostedRuntime$' -count=1 -v -timeout 60m
 fi

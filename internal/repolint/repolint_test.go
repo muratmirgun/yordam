@@ -163,7 +163,7 @@ func TestCheckScriptKeepsV030AcceptanceOptIn(t *testing.T) {
 	}
 	text := string(raw)
 	const acceptance = `if [[ "${YORDAM_ACCEPTANCE:-0}" == "1" ]]; then
-  go test -tags acceptance ./internal/acceptance -run '^TestV030SelfHostedRuntime$' -count=1 -v
+  go test -tags acceptance ./internal/acceptance -run '^TestV030SelfHostedRuntime$' -count=1 -v -timeout 60m
 fi`
 	if strings.Count(text, acceptance) != 1 {
 		t.Fatalf("check script must contain one exact opt-in v0.3 acceptance branch")
