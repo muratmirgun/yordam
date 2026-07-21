@@ -468,10 +468,10 @@ func (p recoveryProjection) InspectRecovery(ctx context.Context, ref protocol.Jo
 			case payload.Kind == "tool" && payload.Purpose == "tool preview":
 				plannedKinds[event.ActivityID] = "preview"
 			case payload.Kind == "tool":
-				if payload.Plan == nil || payload.Plan.Body.CallID == "" {
-					return orchestrator.RecoveryProjection{}, fmt.Errorf("provider-visible tool call binding is unresolved for activity %q", event.ActivityID)
+				plannedKinds[event.ActivityID] = "tool"
+				if payload.Plan != nil {
+					plannedCallIDs[event.ActivityID] = payload.Plan.Body.CallID
 				}
-				plannedKinds[event.ActivityID], plannedCallIDs[event.ActivityID] = "tool", payload.Plan.Body.CallID
 			default:
 				plannedKinds[event.ActivityID] = "other"
 			}
@@ -485,6 +485,9 @@ func (p recoveryProjection) InspectRecovery(ctx context.Context, ref protocol.Jo
 				return orchestrator.RecoveryProjection{}, fmt.Errorf("recovery activity %q has no durable plan binding", event.ActivityID)
 			}
 			if kind == "tool" {
+				if plannedCallIDs[event.ActivityID] == "" {
+					return orchestrator.RecoveryProjection{}, fmt.Errorf("provider-visible tool call binding is unresolved for activity %q", event.ActivityID)
+				}
 				if plannedCallIDs[event.ActivityID] != payload.CallID {
 					return orchestrator.RecoveryProjection{}, fmt.Errorf("provider-visible tool call binding changed for activity %q", event.ActivityID)
 				}

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -277,6 +278,7 @@ func recoverBootstrapSession(ctx context.Context, store *jsonl.Store, runtime Ru
 		return err
 	}
 	var observedTail protocol.Digest
+	cleanPrefix := false
 	for _, diagnostic := range inspection.Journal.Diagnostics {
 		if diagnostic.Code != "recovery.available" {
 			continue
@@ -291,7 +293,16 @@ func recoverBootstrapSession(ctx context.Context, store *jsonl.Store, runtime Ru
 		break
 	}
 	if observedTail.IsZero() {
-		return nil
+		projection, projectionErr := (recoveryProjection{Repository: store}).InspectRecovery(ctx, inspection.Journal.Journal, inspection.Journal.Head)
+		if projectionErr != nil {
+			return projectionErr
+		}
+		if projection.ActiveTurnID == "" {
+			return nil
+		}
+		emptyTail := sha256.Sum256(nil)
+		observedTail = protocol.Digest{Algorithm: protocol.DigestSHA256, Value: fmt.Sprintf("%x", emptyTail[:])}
+		cleanPrefix = true
 	}
 	// RecoverTurn owns the one recovery lane for this session. Its first session
 	// phase reconciles a waiting sequential-child handoff (child receipt before
@@ -314,7 +325,7 @@ func recoverBootstrapSession(ctx context.Context, store *jsonl.Store, runtime Ru
 	operationID := protocol.ControlOperationID(identity)
 	storage := journal.RecoveryRequest{
 		OperationID: operationID, Journal: inspection.Journal.Journal, ExpectedHead: inspection.Journal.Head,
-		ObservedTailDigest: observedTail, TransactionID: protocol.TransactionID(identity + "-storage"), RuntimeGenerationID: runtime.RuntimeGenerationID,
+		ObservedTailDigest: observedTail, CleanPrefix: cleanPrefix, TransactionID: protocol.TransactionID(identity + "-storage"), RuntimeGenerationID: runtime.RuntimeGenerationID,
 	}
 	descriptorDigest, err := canonicaljson.Digest(struct {
 		Name string `json:"name"`

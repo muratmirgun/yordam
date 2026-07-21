@@ -62,11 +62,22 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 		}
 	}
 	releaseHead := request.Storage.ExpectedHead
+	turnTerminal := projection.ActiveTurnID == ""
 	defer func() {
-		if turnLease != nil {
-			if releaseErr := turnLease.Release(context.WithoutCancel(ctx), releaseHead); releaseErr != nil {
-				runErr = errors.Join(runErr, releaseErr)
+		if turnLease == nil {
+			return
+		}
+		releaseCtx := context.WithoutCancel(ctx)
+		if runErr != nil && !turnTerminal {
+			if unresolved, ok := turnLease.(journal.UnresolvedTurnLease); ok {
+				if abandonErr := unresolved.Abandon(releaseCtx); abandonErr != nil {
+					runErr = errors.Join(runErr, abandonErr)
+				}
+				return
 			}
+		}
+		if releaseErr := turnLease.Release(releaseCtx, releaseHead); releaseErr != nil {
+			runErr = errors.Join(runErr, releaseErr)
 		}
 	}()
 
@@ -141,6 +152,7 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 	if err != nil {
 		return RecoveryControlResult{}, err
 	}
+	turnTerminal = projected.ActiveTurnID == ""
 	sessionHead := recoveryResult.Cursor
 	releaseHead = sessionHead
 	// A parent waiting on a sequential child has a durable cross-session
@@ -167,6 +179,7 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 		if err != nil {
 			return RecoveryControlResult{}, errors.Join(reconcileErr, err)
 		}
+		turnTerminal = true
 		barrierState := BarrierState{Journal: request.Storage.Journal, Cursor: sessionHead, CommandID: failedProjection.OriginalCommandID, ControlOperationID: request.Control.OperationID, TaskID: failedProjection.TaskID, TurnID: failedProjection.ActiveTurnID}
 		if err := s.cross(ctx, BarrierRecoveryTurnTerminalCommitted, barrierState); err != nil {
 			return RecoveryControlResult{}, errors.Join(reconcileErr, err)
@@ -179,6 +192,7 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 		if err != nil {
 			return RecoveryControlResult{}, err
 		}
+		turnTerminal = projected.ActiveTurnID == ""
 		if resumed && projected.ActiveTurnID != "" {
 			return RecoveryControlResult{}, fmt.Errorf("resumed parent remains active")
 		}
@@ -193,10 +207,11 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoveryControlReques
 		if projection.ActiveTurnID != "" && projected.ActiveTurnID != projection.ActiveTurnID {
 			return RecoveryControlResult{}, fmt.Errorf("active turn changed during recovery")
 		}
-		sessionHead, err = s.appendRecoverySessionTerminal(ctx, request, projected, recoveryResult.Cursor)
+		sessionHead, err = s.appendRecoverySessionTerminal(ctx, request, projected, sessionHead)
 		if err != nil {
 			return RecoveryControlResult{}, err
 		}
+		turnTerminal = true
 		barrierState := BarrierState{Journal: request.Storage.Journal, Cursor: sessionHead, CommandID: projected.OriginalCommandID, ControlOperationID: request.Control.OperationID, TaskID: projected.TaskID, TurnID: projected.ActiveTurnID}
 		if err := s.cross(ctx, BarrierRecoveryTurnTerminalCommitted, barrierState); err != nil {
 			return RecoveryControlResult{}, err
@@ -652,6 +667,12 @@ attemptLoop:
 			if repaired {
 				parentHead, parentRequest.ExpectedHead, changed = repairedHead, repairedHead, true
 			}
+			if attachedContinuationCommitted(parentEvents, initial) {
+				// The provider continuation already crossed its durable response
+				// boundary. Re-dispatching it would duplicate external egress; leave
+				// only the missing turn/task/command bookkeeping to generic recovery.
+				return parentHead, true, false, nil
+			}
 			resumed, resumeErr := s.resumeRecoveredParent(ctx, lease, parentRequest, initial)
 			if resumeErr != nil {
 				if !isRecoveredParentTerminalFailure(resumeErr) {
@@ -708,6 +729,34 @@ attemptLoop:
 	return parentHead, changed, false, nil
 }
 
+func attachedContinuationCommitted(parentEvents []protocol.EventRecord, attempt receiptprojector.Attempt) bool {
+	attached := false
+	for _, event := range parentEvents {
+		if event.Envelope.TurnID != attempt.ParentTurnID {
+			continue
+		}
+		if event.Envelope.Kind == protocol.EventSubagentResultAttached && event.Envelope.ActivityID == attempt.ActivityID {
+			var payload protocol.SubagentResultAttachedV1
+			if json.Unmarshal(event.Envelope.Payload, &payload) == nil && payload.AttemptID == attempt.AttemptID {
+				attached = true
+			}
+			continue
+		}
+		if attached {
+			switch event.Envelope.Kind {
+			case protocol.EventAssistantMessage, protocol.EventProviderAttemptTerminal:
+				return true
+			case protocol.EventActivityPlanned:
+				var payload protocol.ActivityPlannedV1
+				if json.Unmarshal(event.Envelope.Payload, &payload) == nil && payload.Kind == "provider" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (s *Service) ensureAttachedSubagentToolResult(ctx context.Context, request StartTurnRequest, parentEvents []protocol.EventRecord, attempt receiptprojector.Attempt) (protocol.CommittedCursor, bool, error) {
 	if attempt.State != receiptprojector.StateAttached || attempt.Receipt == nil || attempt.Attachment == nil {
 		return request.ExpectedHead, false, fmt.Errorf("attached subagent result repair lacks a verified attachment")
@@ -733,7 +782,7 @@ func (s *Service) ensureAttachedSubagentToolResult(ctx context.Context, request 
 	}
 	matches := 0
 	for _, event := range parentEvents {
-		if event.Envelope.Kind != protocol.EventToolMessage {
+		if event.Envelope.Kind != protocol.EventToolMessage || event.Envelope.TurnID != attempt.ParentTurnID {
 			continue
 		}
 		var message protocol.ToolMessageV1

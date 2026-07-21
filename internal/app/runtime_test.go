@@ -42,7 +42,7 @@ func TestNewUsesEmptyRedactorBindingWhenNoneIsSupplied(t *testing.T) {
 
 func TestProductionRecoveryProjectionRetainsExactProviderVisibleToolBinding(t *testing.T) {
 	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-recovery"}
-	head := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 9, TransactionID: "active-tail"}
+	head := protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 11, TransactionID: "active-tail"}
 	record := func(seq uint64, kind string, activityID protocol.ActivityID, payload any) protocol.EventRecord {
 		raw, err := canonicaljson.Marshal(payload)
 		if err != nil {
@@ -55,12 +55,17 @@ func TestProductionRecoveryProjectionRetainsExactProviderVisibleToolBinding(t *t
 		record(1, protocol.EventCommandAccepted, "", protocol.CommandAcceptedV1{CommandID: "command-a", RequestDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)}}),
 		record(2, protocol.EventTaskCreated, "", protocol.TaskCreatedV1{Goal: "recover", OutcomeContractID: "contract", ContractVersion: 1}),
 		record(3, protocol.EventTurnAccepted, "", protocol.TurnAcceptedV1{CommandID: "command-a", Goal: "recover", OutcomeContractID: "contract", ContractVersion: 1}),
-		record(4, protocol.EventActivityPlanned, toolActivity, protocol.ActivityPlannedV1{Kind: "tool", Purpose: "tool observation", Plan: &protocol.ActionPlan{Body: protocol.ActionPlanBody{CallID: "call-a"}}}),
-		record(5, protocol.EventActivityStarted, toolActivity, protocol.ActivityStartedV1{ActivityID: toolActivity, CallID: "call-a"}),
-		record(6, protocol.EventActivityPlanned, providerActivity, protocol.ActivityPlannedV1{Kind: "provider", Purpose: "continue task"}),
-		record(7, protocol.EventActivityStarted, providerActivity, protocol.ActivityStartedV1{ActivityID: providerActivity, CallID: "provider-call"}),
-		record(8, protocol.EventActivityPlanned, previewActivity, protocol.ActivityPlannedV1{Kind: "tool", Purpose: "tool preview", Plan: &protocol.ActionPlan{Body: protocol.ActionPlanBody{CallID: "call-a"}}}),
-		record(9, protocol.EventActivityStarted, previewActivity, protocol.ActivityStartedV1{ActivityID: previewActivity, CallID: "call-a"}),
+		// Unknown-tool and rejected-subagent paths intentionally write a terminal
+		// synthetic activity whose plan has no ActionPlan/CallID. Historical
+		// terminal activities must not poison a later production recovery scan.
+		record(4, protocol.EventActivityPlanned, "synthetic-terminal", protocol.ActivityPlannedV1{Kind: "tool", Purpose: "unknown tool"}),
+		record(5, protocol.EventActivityFailed, "synthetic-terminal", protocol.ActivityOutcomeV1{Status: "failed"}),
+		record(6, protocol.EventActivityPlanned, toolActivity, protocol.ActivityPlannedV1{Kind: "tool", Purpose: "tool observation", Plan: &protocol.ActionPlan{Body: protocol.ActionPlanBody{CallID: "call-a"}}}),
+		record(7, protocol.EventActivityStarted, toolActivity, protocol.ActivityStartedV1{ActivityID: toolActivity, CallID: "call-a"}),
+		record(8, protocol.EventActivityPlanned, providerActivity, protocol.ActivityPlannedV1{Kind: "provider", Purpose: "continue task"}),
+		record(9, protocol.EventActivityStarted, providerActivity, protocol.ActivityStartedV1{ActivityID: providerActivity, CallID: "provider-call"}),
+		record(10, protocol.EventActivityPlanned, previewActivity, protocol.ActivityPlannedV1{Kind: "tool", Purpose: "tool preview", Plan: &protocol.ActionPlan{Body: protocol.ActionPlanBody{CallID: "call-a"}}}),
+		record(11, protocol.EventActivityStarted, previewActivity, protocol.ActivityStartedV1{ActivityID: previewActivity, CallID: "call-a"}),
 	}
 	projection, err := (recoveryProjection{Repository: &inspectionOnlyRepository{inspection: journal.Inspection{Journal: ref, Head: head, Events: events}}}).InspectRecovery(context.Background(), ref, head)
 	if err != nil {
@@ -72,6 +77,103 @@ func TestProductionRecoveryProjectionRetainsExactProviderVisibleToolBinding(t *t
 	if !reflect.DeepEqual(projection.ProviderVisibleToolCalls, map[protocol.ActivityID]string{toolActivity: "call-a"}) {
 		t.Fatalf("provider-visible bindings=%v", projection.ProviderVisibleToolCalls)
 	}
+}
+
+func TestProductionBootstrapRecoversCleanUnresolvedToolTurn(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "bootstrap-recovery-key")
+	workspace, dataDir := t.TempDir(), t.TempDir()
+	configPath := writeRuntimeBootstrapConfig(t, config.Config{
+		ActiveProfile: "primary",
+		Profiles: map[string]config.Profile{"primary": {
+			BaseURL: "https://example.invalid/v1", APIKeyEnv: "PRIMARY_KEY", Models: []string{"model-a"}, DefaultModel: "model-a",
+		}},
+		MaxToolCalls: 32, ShellTimeoutSeconds: 1,
+	})
+	first, snapshot, err := Bootstrap(t.Context(), BootstrapOptions{ConfigPath: configPath, CWD: workspace, CLI: runtimeBootstrapCLI(dataDir)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := first.sessions.(*jsonl.Store)
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(snapshot.Session.ID)}
+	head, err := store.Head(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callID, activityID := "clean-call", protocol.ActivityID("clean-tool-activity")
+	digest := protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)}
+	body := protocol.ActionPlanBody{
+		CallID: callID, Tool: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "read"}, SourceRevision: "tools-a", DescriptorDigest: digest,
+		Action: "read", Purpose: "clean recovery regression", Resources: []protocol.ResourceTarget{{Kind: "path", CanonicalID: "README.md"}},
+		ExecutionLocus: "builtin", Effect: "observation", Boundary: "workspace", Reversibility: "not_applicable", VerificationCoverage: "full",
+		RequestedProfile: "restricted", EffectiveProfile: "restricted", RuntimeGenerationID: first.runtimeSet.RuntimeGenerationID,
+	}
+	planDigest, err := canonicaljson.Digest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := protocol.ActionPlan{Body: body, Digest: planDigest}
+	actor := protocol.ActorRef{ID: "bootstrap-regression", Kind: protocol.ActorUser}
+	events := []protocol.ProposedEvent{
+		{EventID: "clean-command", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventCommandAccepted, SessionID: protocol.SessionID(ref.ID), TaskID: "clean-task", TurnID: "clean-turn", Actor: &actor, RuntimeGenerationID: first.runtimeSet.RuntimeGenerationID, Payload: runtimeMustCanonical(t, protocol.CommandAcceptedV1{CommandID: "clean-command", RequestDigest: digest, IdempotencyKey: "clean-key"})},
+		{EventID: "clean-task", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventTaskCreated, SessionID: protocol.SessionID(ref.ID), TaskID: "clean-task", TurnID: "clean-turn", RuntimeGenerationID: first.runtimeSet.RuntimeGenerationID, Payload: runtimeMustCanonical(t, protocol.TaskCreatedV1{Goal: "recover clean unresolved tool", OutcomeContractID: "clean-contract", ContractVersion: 1})},
+		{EventID: "clean-turn", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventTurnAccepted, SessionID: protocol.SessionID(ref.ID), TaskID: "clean-task", TurnID: "clean-turn", RuntimeGenerationID: first.runtimeSet.RuntimeGenerationID, Payload: runtimeMustCanonical(t, protocol.TurnAcceptedV1{CommandID: "clean-command", Goal: "recover clean unresolved tool", OutcomeContractID: "clean-contract", ContractVersion: 1})},
+		{EventID: "clean-task-running", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventTaskStatusChanged, SessionID: protocol.SessionID(ref.ID), TaskID: "clean-task", TurnID: "clean-turn", RuntimeGenerationID: first.runtimeSet.RuntimeGenerationID, Payload: runtimeMustCanonical(t, protocol.TaskStatusChangedV1{From: string(protocol.TaskPending), To: string(protocol.TaskRunning), Reason: "compatibility contract frozen"})},
+		{EventID: "clean-turn-running", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventTurnStateChanged, SessionID: protocol.SessionID(ref.ID), TaskID: "clean-task", TurnID: "clean-turn", RuntimeGenerationID: first.runtimeSet.RuntimeGenerationID, Payload: runtimeMustCanonical(t, protocol.TurnStateChangedV1{From: string(protocol.TurnAccepted), To: string(protocol.TurnRunning), Reason: "compatibility contract frozen"})},
+		{EventID: "clean-assistant", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventAssistantMessage, SessionID: protocol.SessionID(ref.ID), TaskID: "clean-task", TurnID: "clean-turn", RuntimeGenerationID: first.runtimeSet.RuntimeGenerationID, Payload: runtimeMustCanonical(t, protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &protocol.ToolUseBlock{CallID: callID, Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}}}})},
+		{EventID: "clean-planned", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventActivityPlanned, SessionID: protocol.SessionID(ref.ID), TaskID: "clean-task", TurnID: "clean-turn", ActivityID: activityID, RuntimeGenerationID: first.runtimeSet.RuntimeGenerationID, Payload: runtimeMustCanonical(t, protocol.ActivityPlannedV1{Kind: "tool", Purpose: "tool observation", PurposeActor: protocol.ActorRef{ID: "orchestrator", Kind: protocol.ActorAgent}, Source: "builtin", RequestedProfile: "restricted", EffectiveProfile: "restricted", Plan: &plan})},
+		{EventID: "clean-authorized", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventActivityAuthorized, SessionID: protocol.SessionID(ref.ID), TaskID: "clean-task", TurnID: "clean-turn", ActivityID: activityID, RuntimeGenerationID: first.runtimeSet.RuntimeGenerationID, Payload: runtimeMustCanonical(t, protocol.ActivityAuthorizedV1{DecisionNonce: "clean-nonce", DecisionEventID: "clean-decision", PlanDigest: planDigest, RequestDigest: digest, DispatchDigest: digest})},
+		{EventID: "clean-started", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventActivityStarted, SessionID: protocol.SessionID(ref.ID), TaskID: "clean-task", TurnID: "clean-turn", ActivityID: activityID, RuntimeGenerationID: first.runtimeSet.RuntimeGenerationID, Payload: runtimeMustCanonical(t, protocol.ActivityStartedV1{DecisionNonce: "clean-nonce", DecisionEventID: "clean-decision", ActivityID: activityID, CallID: callID, PlanDigest: planDigest, RequestDigest: digest, DispatchDigest: digest, RuntimeGenerationID: first.runtimeSet.RuntimeGenerationID, DispatchState: "registered"})},
+	}
+	seeded, err := store.AppendBatch(t.Context(), journal.AppendRequest{
+		Journal: ref, ExpectedHead: head, TransactionID: "clean-unresolved-tail",
+		Compatibility: &journal.CompatibilityDeclaration{ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: head}, Events: events,
+	})
+	if err != nil || seeded.Status != journal.AppendCommitted {
+		t.Fatalf("seed clean unresolved turn=%+v err=%v", seeded, err)
+	}
+	inspection, err := store.InspectSession(t.Context(), protocol.SessionID(ref.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(inspection.Journal.Diagnostics, func(d protocol.Diagnostic) bool { return d.Code == "recovery.available" }) {
+		t.Fatalf("regression requires a clean committed prefix: %+v", inspection.Journal.Diagnostics)
+	}
+	first.runtimeSet.retireSecrets()
+
+	second, _, err := Bootstrap(t.Context(), BootstrapOptions{ConfigPath: configPath, CWD: workspace, CLI: cli.Options{Continue: true, Mode: domain.ModeAsk, DataDir: dataDir, MaxToolCalls: 32, ShellTimeout: time.Second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := second.sessions.(*jsonl.Store).Inspect(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := inspectionKinds(recovered.Events)
+	if !slices.Contains(kinds, protocol.EventToolMessage) || !slices.Contains(kinds, protocol.EventActivityUncertain) || !slices.Contains(kinds, protocol.EventTurnInterrupted) {
+		t.Fatalf("bootstrap skipped clean unresolved turn recovery: %v", kinds)
+	}
+}
+
+func writeRuntimeBootstrapConfig(t *testing.T, cfg config.Config) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.jsonc")
+	if err := config.SaveGlobal(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func runtimeBootstrapCLI(dataDir string) cli.Options {
+	return cli.Options{Mode: domain.ModeAsk, DataDir: dataDir, MaxToolCalls: 32, ShellTimeout: time.Second}
+}
+
+func runtimeMustCanonical(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	raw, err := canonicaljson.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 type inspectionOnlyRepository struct{ inspection journal.Inspection }

@@ -12,12 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	contextplanner "github.com/muratmirgun/yordam/internal/context"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/eventcodec"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/session/jsonl"
 	receiptprojector "github.com/muratmirgun/yordam/internal/subagent"
 	"github.com/muratmirgun/yordam/internal/tooling"
 	"github.com/muratmirgun/yordam/internal/verification"
@@ -98,6 +100,62 @@ func TestRecoveryAuthorizedControlTerminalizesCommittedSessionBeforeLeaseRelease
 	if got := repository.recoverCount(); got != 1 {
 		t.Fatalf("repository recovery calls after conflict=%d want=1", got)
 	}
+}
+
+func TestRecoveryFailureAbandonsProductionLeaseForSameProcessRetry(t *testing.T) {
+	store := jsonl.New(t.TempDir(), jsonl.Options{Encoder: recoveryRawPayloadEncoder{}})
+	workspace, err := jsonl.WorkspaceFromPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := store.Create(context.Background(), workspace, domain.ModeAsk, domain.ModelSelection{Profile: "provider-a", Model: "model-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(session.ID)}
+	head, err := store.Head(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := store.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: ref, ExpectedHead: head, TransactionID: "active-recovery-turn",
+		Compatibility: &journal.CompatibilityDeclaration{ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: head},
+		Events:        []protocol.ProposedEvent{{EventID: "active-recovery-turn", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventTurnAccepted, SessionID: protocol.SessionID(ref.ID), TurnID: "turn-original", Payload: mustCanonical(protocol.TurnAcceptedV1{CommandID: "command-original", Goal: "recover", OutcomeContractID: "contract", ContractVersion: 1})}},
+	})
+	if err != nil || active.Status != journal.AppendCommitted {
+		t.Fatalf("active append=%+v err=%v", active, err)
+	}
+
+	service, request, repository, _ := recoveryBarrierFixture(t, NoopBarrierProbe())
+	delete(repository.heads, repository.sessionRef)
+	repository.sessionRef = ref
+	repository.heads[ref], repository.recovered, repository.result.Cursor = active.Cursor, active.Cursor, active.Cursor
+	request.Storage.Journal, request.Storage.ExpectedHead = ref, active.Cursor
+	service.turnLeases = store
+	service.deps.Authorization = &dispatchFailureAuthorization{allowingAuthorization: allowingAuthorization{log: &recordLog{}}}
+
+	if _, err := service.RecoverTurn(context.Background(), request); err == nil || !strings.Contains(err.Error(), "forced recovery dispatch failure") {
+		t.Fatalf("first recovery error=%v", err)
+	}
+	request.Control.ExpectedHead = repository.heads[request.Control.Journal]
+	request.Control.Command.CommandID, request.Control.Command.IdempotencyKey, request.Control.Command.RequestDigest = "recovery-command-b", "recovery-key-b", repeatedDigest("8")
+	request.Control.OperationID, request.Control.TransactionID, request.Control.Event.EventID = "recovery-operation-b", "recovery-control-terminal-b", "recovery-event-b"
+	request.Storage.OperationID, request.Storage.TransactionID = request.Control.OperationID, "storage-recovery-b"
+	if _, err := service.RecoverTurn(context.Background(), request); err == nil || errors.Is(err, journal.ErrTurnLeaseHeld) || !strings.Contains(err.Error(), "forced recovery dispatch failure") {
+		t.Fatalf("same-process retry error=%v", err)
+	}
+}
+
+type dispatchFailureAuthorization struct{ allowingAuthorization }
+
+func (*dispatchFailureAuthorization) Dispatch(context.Context, authorization.CommittedToken, authorization.DispatchBinding, func(context.Context) error) error {
+	return errors.New("forced recovery dispatch failure")
+}
+
+type recoveryRawPayloadEncoder struct{}
+
+func (recoveryRawPayloadEncoder) EncodeProposed(event protocol.ProposedEvent) (json.RawMessage, error) {
+	return protocol.CloneRawMessage(event.Payload), nil
 }
 
 func TestRecoveryToolTerminalAtomicallyPersistsExactResultForNextProvider(t *testing.T) {
@@ -374,11 +432,18 @@ func TestSubagentRecoverAlreadyTerminalParentDoesNotResumeAttachedReceipt(t *tes
 
 func TestRecoveryRepairsLegacyAttachedSubagentResultBeforeProviderResume(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		newFormat bool
+		name                 string
+		newFormat            bool
+		currentConflict      bool
+		durableContinuation  bool
+		providerEvidenceOnly bool
 	}{
 		{name: "legacy attachment"},
 		{name: "new attachment", newFormat: true},
+		{name: "same-turn conflicting result", currentConflict: true},
+		{name: "durable continuation is not replayed", newFormat: true, durableContinuation: true},
+		{name: "durable legacy continuation repairs without replay", durableContinuation: true},
+		{name: "durable provider attempt is not replayed", newFormat: true, providerEvidenceOnly: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			continuationLog := &recordLog{}
@@ -394,6 +459,22 @@ func TestRecoveryRepairsLegacyAttachedSubagentResultBeforeProviderResume(t *test
 				t.Fatal(err)
 			}
 			activityID := protocol.ActivityID(stableID("activity", "command-original", "subagent", "delegate"))
+			// Call IDs are provider-local and may be reused by a later turn. A
+			// prior turn's result is outside this attachment exchange.
+			if !test.durableContinuation && !test.providerEvidenceOnly {
+				prior := []protocol.ProposedEvent{
+					{EventID: "prior-turn-tool-use", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventAssistantMessage, SessionID: "session-a", TaskID: "prior-task", TurnID: "prior-turn", RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &protocol.ToolUseBlock{CallID: "delegate", Alias: "read", Arguments: json.RawMessage(`{"path":"prior"}`)}}}})},
+					{EventID: "prior-turn-same-call", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventToolMessage, SessionID: "session-a", TaskID: "prior-task", TurnID: "prior-turn", ActivityID: "prior-activity", RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: "delegate", Status: "failed", Text: "prior exchange"}}})},
+				}
+				repository.events[request.Storage.Journal] = append(prior, repository.events[request.Storage.Journal]...)
+			}
+			if test.currentConflict {
+				repository.events[request.Storage.Journal] = append(repository.events[request.Storage.Journal], protocol.ProposedEvent{
+					EventID: "current-turn-conflict", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventToolMessage,
+					SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: "wrong-activity", RuntimeGenerationID: request.Control.Runtime.ID,
+					Payload: mustCanonical(protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: "delegate", Status: "failed", Text: "conflict"}}}),
+				})
+			}
 			if test.newFormat {
 				encoded, err := canonicaljson.Marshal(receipt)
 				if err != nil {
@@ -409,17 +490,40 @@ func TestRecoveryRepairsLegacyAttachedSubagentResultBeforeProviderResume(t *test
 				protocol.ProposedEvent{EventID: "legacy-activity-terminal", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventActivitySucceeded, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: activityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.ActivityOutcomeV1{Status: "succeeded"})},
 				protocol.ProposedEvent{EventID: "legacy-attachment", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentResultAttached, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", ActivityID: activityID, RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.SubagentResultAttachedV1{AttemptID: manifest.AttemptID, ChildSessionID: manifest.ChildSessionID, TerminalCursor: receipt.TerminalCursor, ReceiptDigest: digest, ReceiptEvidenceID: "receipt-evidence"})},
 			)
+			if test.durableContinuation || test.providerEvidenceOnly {
+				repository.events[request.Storage.Journal] = append(repository.events[request.Storage.Journal], protocol.ProposedEvent{EventID: "continued-provider-terminal", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventProviderAttemptTerminal, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.ProviderAttemptTerminalV1{Status: "completed"})})
+			}
+			if test.durableContinuation {
+				repository.events[request.Storage.Journal] = append(repository.events[request.Storage.Journal], protocol.ProposedEvent{EventID: "continued-assistant", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventAssistantMessage, SessionID: "session-a", TaskID: "task-original", TurnID: "turn-original", RuntimeGenerationID: request.Control.Runtime.ID, Payload: mustCanonical(protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "durable continuation"}}})})
+			}
 			recoveredHead := protocol.CommittedCursor{JournalKind: request.Storage.Journal.Kind, JournalID: request.Storage.Journal.ID, CommitSeq: uint64(len(repository.events[request.Storage.Journal])), TransactionID: "attached-parent-tail"}
 			repository.recovered, repository.result.Cursor, repository.heads[request.Storage.Journal] = recoveredHead, recoveredHead, recoveredHead
 			service.deps.Projection = terminalAwareRecoveryProjection{repository: repository, active: RecoveryProjection{ActiveTurnID: "turn-original", TaskID: "task-original", OriginalCommandID: "command-original", OriginalRequestDigest: repeatedDigest("5")}}
 
-			if _, err := service.RecoverTurn(context.Background(), request); err != nil {
+			if _, err := service.RecoverTurn(context.Background(), request); test.currentConflict {
+				if err == nil || !strings.Contains(err.Error(), "conflicts with verified receipt") {
+					t.Fatalf("conflict error=%v", err)
+				}
+				if continuation.request.ModelID != "" {
+					t.Fatalf("conflicting transcript resumed provider: %+v", continuation.request)
+				}
+				return
+			} else if err != nil {
 				t.Fatal(err)
+			}
+			if test.durableContinuation || test.providerEvidenceOnly {
+				if continuation.request.ModelID != "" {
+					t.Fatalf("durable continuation replayed provider: %+v", continuation.request)
+				}
+				if !slices.Contains(flattenAppendKinds(repository.appendRequests()), protocol.EventTurnInterrupted) {
+					t.Fatalf("missing terminal bookkeeping: %v", flattenBatches(repository.appendRequests()))
+				}
+				return
 			}
 			if continuation.request.ModelID == "" {
 				t.Fatal("attached parent did not resume provider")
 			}
-			result, ok := findToolResult(continuation.request, "delegate")
+			result, ok := findLastToolResult(continuation.request, "delegate")
 			if !ok || result.Status != receipt.Status || !reflect.DeepEqual(result.EvidenceIDs, []protocol.EvidenceID{"receipt-evidence"}) {
 				t.Fatalf("continued provider result=%+v present=%v", result, ok)
 			}
@@ -459,6 +563,19 @@ func TestRecoveryRepairsLegacyAttachedSubagentResultBeforeProviderResume(t *test
 			}
 		})
 	}
+}
+
+func findLastToolResult(request protocol.ModelRequest, callID string) (protocol.ToolResultBlock, bool) {
+	var found protocol.ToolResultBlock
+	ok := false
+	for _, message := range request.Messages {
+		for _, block := range message.Blocks {
+			if block.Kind == protocol.ContentToolResult && block.ToolResult != nil && block.ToolResult.CallID == callID {
+				found, ok = protocol.DeepCopy(*block.ToolResult), true
+			}
+		}
+	}
+	return found, ok
 }
 
 func TestRecoveryTerminalizesUncertainSubagentWithStructuredNonRetryableDiagnostic(t *testing.T) {

@@ -169,6 +169,7 @@ type RecoveryRequest struct {
 	Journal             protocol.JournalRef
 	ExpectedHead        protocol.CommittedCursor
 	ObservedTailDigest  protocol.Digest
+	CleanPrefix         bool
 	TransactionID       protocol.TransactionID
 	RuntimeGenerationID protocol.RuntimeGenerationID
 }

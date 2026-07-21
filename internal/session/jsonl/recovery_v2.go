@@ -146,6 +146,16 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 	if err != nil {
 		return journal.RecoveryResult{}, err
 	}
+	if request.CleanPrefix {
+		emptyTailDigest := digestBytes(nil)
+		if request.ObservedTailDigest != emptyTailDigest || scan.head != request.ExpectedHead || !scan.writable || recoveryEligible(scan) || scan.validPrefixSize != int64(len(activeRaw)) {
+			return journal.RecoveryResult{Status: "conflict", Cursor: scan.head}, nil
+		}
+		return journal.RecoveryResult{
+			Status: "recovered", Cursor: scan.head, QuarantineDigest: request.ObservedTailDigest,
+			Diagnostic: protocol.Diagnostic{Code: "recovery.clean_prefix", Message: "clean committed prefix admitted for active-turn recovery", Journal: request.Journal, AtSeq: scan.head.CommitSeq},
+		}, nil
+	}
 	if exists {
 		if err := validatePersistedRecoveryManifest(ctx, transaction, manifest, request, manifestName, operationHash, activeRaw); err != nil {
 			return journal.RecoveryResult{}, err
