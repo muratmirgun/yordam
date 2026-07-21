@@ -163,6 +163,9 @@ func groupContextSources(sources []protocol.ContentSource) ([]sourceGroup, error
 	groups := make([]sourceGroup, 0, len(sources))
 	for index := 0; index < len(sources); index++ {
 		source := sources[index]
+		if source.Kind == "tool_message" {
+			return nil, fmt.Errorf("tool source %q has no pending assistant tool call", source.ID)
+		}
 		group := sourceGroup{sources: []protocol.ContentSource{source}, tokens: estimateTokens(source.Content)}
 		callIDs := toolCallIDs(source.Content)
 		if source.Kind != "assistant_message" || len(callIDs) == 0 {

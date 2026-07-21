@@ -126,16 +126,18 @@ func TestSelectKeepsMultiResultToolExchangeAcrossBoundary(t *testing.T) {
 
 func TestSelectNormalizesToolResultWithoutBodies(t *testing.T) {
 	t.Parallel()
+	intent := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
 	events := []protocol.EventRecord{
-		selectionEvent(1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old"}),
+		selectionEvent(1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
 		selectionEvent(2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: "call-a", Status: "succeeded", Text: "secret body", JSON: json.RawMessage(`{"secret":true}`), EvidenceIDs: []protocol.EvidenceID{"evidence-a"}}}}),
-		selectionEvent(3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
-		selectionEvent(4, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
-		selectionEvent(5, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent three"}),
-		selectionEvent(6, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent four"}),
+		selectionEvent(3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old"}),
+		selectionEvent(4, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+		selectionEvent(5, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
+		selectionEvent(6, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent three"}),
+		selectionEvent(7, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent four"}),
 	}
 
-	selection, err := compaction.Select(events, selectionCursor(6), compaction.TriggerManual, 0)
+	selection, err := compaction.Select(events, selectionCursor(7), compaction.TriggerManual, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +149,170 @@ func TestSelectNormalizesToolResultWithoutBodies(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("normalized sources=%q missing=%q", joined, want)
 		}
+	}
+}
+
+func TestSelectKeepsToolExchangeAtomicAtByteLimitedFrom(t *testing.T) {
+	t.Parallel()
+	intent := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	events := []protocol.EventRecord{
+		selectionEvent(1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old one"}),
+		selectionEvent(2, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old two"}),
+		selectionEvent(3, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: strings.Repeat("large assistant ", 512)}, {Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+		selectionEvent(4, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: intent.CallID, Status: "succeeded", EvidenceIDs: []protocol.EvidenceID{"evidence-a"}}}}),
+		selectionEvent(5, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "compact only me"}),
+		selectionEvent(6, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+		selectionEvent(7, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
+		selectionEvent(8, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent three"}),
+		selectionEvent(9, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent four"}),
+	}
+
+	selection, err := compaction.Select(events, selectionCursor(9), compaction.TriggerManual, 5_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.From != selectionCursor(5) || selection.Through != selectionCursor(5) {
+		t.Fatalf("byte-limited range split tool exchange: from=%+v through=%+v summarized=%v", selection.From, selection.Through, selection.SummarizedEventIDs)
+	}
+}
+
+func TestSelectKeepsToolExchangeWhenCutoffFallsBetweenResultEvents(t *testing.T) {
+	t.Parallel()
+	first := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"a.go"}`)}
+	second := protocol.ToolUseBlock{CallID: "call-b", Alias: "read", Arguments: json.RawMessage(`{"path":"b.go"}`)}
+	events := []protocol.EventRecord{
+		selectionEvent(1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old one"}),
+		selectionEvent(2, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old two"}),
+		selectionEvent(3, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &first}, {Kind: protocol.ContentToolUse, ToolUse: &second}}}),
+		selectionEvent(4, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: first.CallID, Status: "succeeded"}}}),
+		selectionEvent(5, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: second.CallID, Status: "succeeded"}}}),
+		selectionEvent(6, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+		selectionEvent(7, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
+		selectionEvent(8, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent three"}),
+	}
+
+	selection, err := compaction.Select(events, selectionCursor(8), compaction.TriggerManual, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.Through != selectionCursor(2) {
+		t.Fatalf("cutoff split result events: through=%+v", selection.Through)
+	}
+}
+
+func TestSelectReturnsNothingWhenExchangeSafeCutoffPrecedesStart(t *testing.T) {
+	t.Parallel()
+	intent := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	events := []protocol.EventRecord{
+		selectionEvent(1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "compacted one"}),
+		selectionEvent(2, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "compacted two"}),
+		selectionEvent(3, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+		selectionEvent(4, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: intent.CallID, Status: "succeeded"}}}),
+		selectionEvent(5, protocol.EventContextCompacted, &protocol.ContextCompactedV1{From: selectionCursor(1), Through: selectionCursor(2), SummaryEvidenceID: "summary", Revision: "revision"}),
+		selectionEvent(6, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+		selectionEvent(7, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
+	}
+
+	_, err := compaction.Select(events, selectionCursor(7), compaction.TriggerManual, 0)
+	if !errors.Is(err, compaction.ErrNothingToCompact) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestSelectKeepsHistoricalTerminalToolExchangeAcrossBoundary(t *testing.T) {
+	t.Parallel()
+	intent := protocol.ToolUseBlock{CallID: "historical-call", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	events := []protocol.EventRecord{
+		selectionEvent(1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old one"}),
+		selectionEvent(2, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old two"}),
+		selectionTurnEvent(3, protocol.EventAssistantMessage, "turn-a", &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+		selectionTurnEvent(4, protocol.EventTurnCompleted, "turn-a", &protocol.TurnTerminalV1{Status: "completed", Reason: "historical"}),
+		selectionEvent(5, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+		selectionEvent(6, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
+		selectionEvent(7, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent three"}),
+	}
+
+	selection, err := compaction.Select(events, selectionCursor(7), compaction.TriggerManual, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.Through != selectionCursor(2) || !containsID(selection.RetainedEventIDs, "event-3") || !containsID(selection.RetainedEventIDs, "event-4") {
+		t.Fatalf("historical compatibility exchange split: selection=%+v", selection)
+	}
+}
+
+func TestSelectRejectsMalformedToolHistory(t *testing.T) {
+	t.Parallel()
+	intent := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	assistant := selectionEvent(1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}})
+	result := func(sequence uint64, callID string) protocol.EventRecord {
+		return selectionEvent(sequence, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: callID, Status: "succeeded"}}})
+	}
+	tests := []struct {
+		name   string
+		prefix []protocol.EventRecord
+	}{
+		{name: "standalone", prefix: []protocol.EventRecord{selectionEvent(1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old"}), result(2, "call-a")}},
+		{name: "unknown", prefix: []protocol.EventRecord{assistant, result(2, "call-b")}},
+		{name: "duplicate", prefix: []protocol.EventRecord{assistant, result(2, "call-a"), result(3, "call-a")}},
+		{name: "late", prefix: []protocol.EventRecord{selectionTurnEvent(1, protocol.EventAssistantMessage, "turn-a", &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}), selectionTurnEvent(2, protocol.EventTurnCompleted, "turn-a", &protocol.TurnTerminalV1{Status: "completed"}), selectionEvent(3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "next"}), result(4, "call-a")}},
+		{name: "duplicate legacy intent", prefix: []protocol.EventRecord{selectionEvent(1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{ToolIntents: []protocol.ToolUseBlock{intent, intent}}), result(2, "call-a")}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			events := append(protocol.DeepCopy(test.prefix),
+				selectionEvent(uint64(len(test.prefix)+1), protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+				selectionEvent(uint64(len(test.prefix)+2), protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
+				selectionEvent(uint64(len(test.prefix)+3), protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent three"}),
+				selectionEvent(uint64(len(test.prefix)+4), protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent four"}),
+			)
+			if _, err := compaction.Select(events, selectionCursor(uint64(len(events))), compaction.TriggerManual, 0); err == nil {
+				t.Fatalf("accepted malformed tool history: %#v", test.prefix)
+			}
+		})
+	}
+}
+
+func TestSelectDecodesAssistantAndToolMessagesAcrossProjectionForms(t *testing.T) {
+	t.Parallel()
+	intent := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	assistantValue := protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}
+	resultValue := protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: intent.CallID, Status: "succeeded", EvidenceIDs: []protocol.EvidenceID{"evidence-a"}}}}
+	tests := []struct {
+		name      string
+		assistant any
+		result    any
+	}{
+		{name: "pointer", assistant: &assistantValue, result: &resultValue},
+		{name: "value", assistant: assistantValue, result: resultValue},
+		{name: "raw", assistant: nil, result: nil},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assistant := selectionEvent(3, protocol.EventAssistantMessage, &assistantValue)
+			result := selectionEvent(4, protocol.EventToolMessage, &resultValue)
+			assistant.Decoded = test.assistant
+			result.Decoded = test.result
+			events := []protocol.EventRecord{
+				selectionEvent(1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old one"}),
+				selectionEvent(2, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old two"}),
+				assistant, result,
+				selectionEvent(5, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+				selectionEvent(6, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
+				selectionEvent(7, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent three"}),
+			}
+			selection, err := compaction.Select(events, selectionCursor(7), compaction.TriggerManual, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if selection.Through != selectionCursor(2) {
+				t.Fatalf("projection form split exchange: through=%+v", selection.Through)
+			}
+			joined := sourcesText(selection.Sources)
+			if strings.Contains(joined, "README.md") || !strings.Contains(joined, "call_id=call-a") || !strings.Contains(joined, "evidence_ids=evidence-a") {
+				t.Fatalf("normalized sources=%q", joined)
+			}
+		})
 	}
 }
 
@@ -441,6 +607,12 @@ func TestSelectReopenedTaskRestoresActiveRetentionAfterTerminal(t *testing.T) {
 
 func selectionEvent(sequence uint64, kind string, decoded any) protocol.EventRecord {
 	return selectionTaskEvent(sequence, "", kind, decoded)
+}
+
+func selectionTurnEvent(sequence uint64, kind string, turn protocol.TurnID, decoded any) protocol.EventRecord {
+	event := selectionEvent(sequence, kind, decoded)
+	event.Envelope.TurnID = turn
+	return event
 }
 
 func selectionTaskEvent(sequence uint64, task protocol.TaskID, kind string, decoded any) protocol.EventRecord {

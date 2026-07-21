@@ -455,6 +455,43 @@ func TestContextPlanBudgetIncludesWholeToolExchangeInSourceOrder(t *testing.T) {
 	}
 }
 
+func TestContextPlanRejectsMalformedGroupedToolHistory(t *testing.T) {
+	assistant := func(id, callID string) protocol.ContentSource {
+		intent := protocol.ToolUseBlock{CallID: callID, Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+		return transcriptSource(id, "assistant_message", []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}})
+	}
+	result := func(id, callID string) protocol.ContentSource {
+		value := protocol.ToolResultBlock{CallID: callID, Status: "succeeded", Text: "result"}
+		return transcriptSource(id, "tool_message", []protocol.ContentBlock{{Kind: protocol.ContentToolResult, ToolResult: &value}})
+	}
+	ordinary := transcriptSource("ordinary", "instruction", []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "ordinary"}})
+	tests := []struct {
+		name    string
+		sources []protocol.ContentSource
+	}{
+		{name: "standalone", sources: []protocol.ContentSource{result("standalone-result", "call-a")}},
+		{name: "unknown", sources: []protocol.ContentSource{assistant("assistant", "call-a"), result("unknown-result", "call-b")}},
+		{name: "duplicate", sources: []protocol.ContentSource{assistant("assistant", "call-a"), result("first-result", "call-a"), result("duplicate-result", "call-a")}},
+		{name: "late", sources: []protocol.ContentSource{assistant("assistant", "call-a"), result("first-result", "call-a"), ordinary, result("late-result", "call-a")}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := contextRequest(nil)
+			request.SystemInstructions = test.sources
+			if _, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), request); err == nil {
+				t.Fatalf("accepted malformed grouped tool history: %#v", test.sources)
+			}
+		})
+	}
+}
+
+func transcriptSource(id, kind string, blocks []protocol.ContentBlock) protocol.ContentSource {
+	return protocol.ContentSource{
+		ID: id, Kind: kind, Scope: "session", Provenance: "test", Content: blocks,
+		Digest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)},
+	}
+}
+
 func contextModel(window int64) protocol.ModelDescriptor {
 	return protocol.ModelDescriptor{
 		ProviderID: "openai", ModelID: "model", AdapterKind: "openai_compatible", DisplayName: "Model",

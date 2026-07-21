@@ -1,6 +1,7 @@
 package compaction
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,6 +47,10 @@ func Select(events []protocol.EventRecord, head protocol.CommittedCursor, trigge
 	if err != nil {
 		return Selection{}, err
 	}
+	exchanges, err := toolExchangeRanges(committed)
+	if err != nil {
+		return Selection{}, err
+	}
 	if len(committed) <= recentSuffixEvents {
 		return Selection{}, ErrNothingToCompact
 	}
@@ -53,8 +58,8 @@ func Select(events []protocol.EventRecord, head protocol.CommittedCursor, trigge
 	if priorThrough, ok := latestCompactionThrough(committed, head); ok {
 		start = priorThrough + 1
 	}
-	cutoff := len(committed) - recentSuffixEvents - 1
-	cutoff = exchangeSafeCutoff(committed, cutoff)
+	start = exchangeSafeStart(exchanges, start)
+	cutoff := exchangeSafeCutoff(exchanges, len(committed)-recentSuffixEvents-1)
 	if start > cutoff {
 		return Selection{}, ErrNothingToCompact
 	}
@@ -66,7 +71,7 @@ func Select(events []protocol.EventRecord, head protocol.CommittedCursor, trigge
 		}
 		sources = append(sources, source)
 	}
-	selection, err := boundedSelection(committed, sources, start, cutoff, trigger, manualInputBytes)
+	selection, err := boundedSelection(committed, sources, eventGroups(len(committed), exchanges), start, cutoff, trigger, manualInputBytes)
 	if err != nil {
 		return Selection{}, err
 	}
@@ -79,8 +84,7 @@ type toolExchangeRange struct {
 	result    int
 }
 
-func exchangeSafeCutoff(events []protocol.EventRecord, cutoff int) int {
-	ranges := toolExchangeRanges(events)
+func exchangeSafeCutoff(ranges []toolExchangeRange, cutoff int) int {
 	for {
 		adjusted := cutoff
 		for _, exchange := range ranges {
@@ -95,91 +99,231 @@ func exchangeSafeCutoff(events []protocol.EventRecord, cutoff int) int {
 	}
 }
 
-func toolExchangeRanges(events []protocol.EventRecord) []toolExchangeRange {
+func exchangeSafeStart(ranges []toolExchangeRange, start int) int {
+	for _, exchange := range ranges {
+		if exchange.assistant < start && start <= exchange.result {
+			start = exchange.result + 1
+		}
+	}
+	return start
+}
+
+func toolExchangeRanges(events []protocol.EventRecord) ([]toolExchangeRange, error) {
 	type pendingExchange struct {
 		assistant int
+		eventID   protocol.EventID
+		turnID    protocol.TurnID
+		sequence  uint64
+		ordered   []string
 		remaining map[string]struct{}
 	}
+	terminals := terminalTurnIndexes(events)
 	var pending *pendingExchange
 	ranges := make([]toolExchangeRange, 0)
+	flushPending := func() error {
+		if pending == nil {
+			return nil
+		}
+		terminal, ok := terminals[pending.turnID]
+		if !ok || events[terminal].Envelope.Seq <= pending.sequence {
+			for _, callID := range pending.ordered {
+				if _, unresolved := pending.remaining[callID]; unresolved {
+					return fmt.Errorf("assistant event %q has unresolved tool call %q", pending.eventID, callID)
+				}
+			}
+		}
+		ranges = append(ranges, toolExchangeRange{assistant: pending.assistant, result: terminal})
+		pending = nil
+		return nil
+	}
 	for index, record := range events {
-		if message, ok := assistantMessage(record); ok {
-			callIDs := assistantToolCallIDs(message)
+		switch record.Envelope.Kind {
+		case protocol.EventUserMessage:
+			if err := flushPending(); err != nil {
+				return nil, err
+			}
+		case protocol.EventAssistantMessage:
+			if err := flushPending(); err != nil {
+				return nil, err
+			}
+			message, ok := assistantMessage(record)
+			if !ok {
+				return nil, fmt.Errorf("assistant event %q is invalid", record.Envelope.EventID)
+			}
+			callIDs, err := assistantToolCallIDs(message)
+			if err != nil {
+				return nil, fmt.Errorf("assistant event %q: %w", record.Envelope.EventID, err)
+			}
 			if len(callIDs) > 0 {
 				remaining := make(map[string]struct{}, len(callIDs))
 				for _, callID := range callIDs {
 					remaining[callID] = struct{}{}
 				}
-				pending = &pendingExchange{assistant: index, remaining: remaining}
+				pending = &pendingExchange{assistant: index, eventID: record.Envelope.EventID, turnID: record.Envelope.TurnID, sequence: record.Envelope.Seq, ordered: callIDs, remaining: remaining}
 			}
-			continue
-		}
-		if record.Envelope.Kind != protocol.EventToolMessage || pending == nil {
-			continue
-		}
-		message, ok := toolMessage(record)
-		if !ok {
-			continue
-		}
-		for _, result := range message.Results {
-			delete(pending.remaining, result.CallID)
-		}
-		if len(pending.remaining) == 0 {
-			ranges = append(ranges, toolExchangeRange{assistant: pending.assistant, result: index})
-			pending = nil
+		case protocol.EventToolMessage:
+			message, ok := toolMessage(record)
+			if !ok {
+				return nil, fmt.Errorf("tool message event %q is invalid", record.Envelope.EventID)
+			}
+			if err := message.Validate(); err != nil {
+				return nil, fmt.Errorf("tool message event %q: %w", record.Envelope.EventID, err)
+			}
+			for _, result := range message.Results {
+				if pending == nil {
+					return nil, fmt.Errorf("tool result %q from source event %q is late", result.CallID, record.Envelope.EventID)
+				}
+				if _, expected := pending.remaining[result.CallID]; !expected {
+					if containsCallID(pending.ordered, result.CallID) {
+						return nil, fmt.Errorf("tool result %q from source event %q is duplicate", result.CallID, record.Envelope.EventID)
+					}
+					return nil, fmt.Errorf("tool result %q from source event %q is unknown", result.CallID, record.Envelope.EventID)
+				}
+				delete(pending.remaining, result.CallID)
+			}
+			if len(pending.remaining) == 0 {
+				ranges = append(ranges, toolExchangeRange{assistant: pending.assistant, result: index})
+				pending = nil
+			}
 		}
 	}
-	return ranges
+	if err := flushPending(); err != nil {
+		return nil, err
+	}
+	return mergeToolExchangeRanges(ranges), nil
 }
 
-func assistantToolCallIDs(message *protocol.AssistantMessageV1) []string {
-	if message == nil {
-		return nil
+func terminalTurnIndexes(events []protocol.EventRecord) map[protocol.TurnID]int {
+	terminals := make(map[protocol.TurnID]int)
+	for index, record := range events {
+		switch record.Envelope.Kind {
+		case protocol.EventTurnCompleted, protocol.EventTurnFailed, protocol.EventTurnInterrupted:
+			if record.Envelope.TurnID == "" {
+				continue
+			}
+			previous, ok := terminals[record.Envelope.TurnID]
+			if !ok || events[previous].Envelope.Seq < record.Envelope.Seq {
+				terminals[record.Envelope.TurnID] = index
+			}
+		}
 	}
-	seen := make(map[string]struct{})
+	return terminals
+}
+
+func assistantToolCallIDs(message *protocol.AssistantMessageV1) ([]string, error) {
+	if message == nil {
+		return nil, fmt.Errorf("assistant message is nil")
+	}
+	type occurrence struct {
+		intent protocol.ToolUseBlock
+		legacy bool
+	}
+	seen := make(map[string]occurrence)
 	callIDs := make([]string, 0, len(message.Blocks)+len(message.ToolIntents))
 	for _, block := range message.Blocks {
-		if block.Kind != protocol.ContentToolUse || block.ToolUse == nil || block.ToolUse.CallID == "" {
+		if block.Kind != protocol.ContentToolUse {
 			continue
+		}
+		if block.ToolUse == nil || block.ToolUse.Validate() != nil {
+			return nil, fmt.Errorf("invalid modern tool intent")
 		}
 		if _, duplicate := seen[block.ToolUse.CallID]; duplicate {
-			continue
+			return nil, fmt.Errorf("duplicate modern tool intent %q", block.ToolUse.CallID)
 		}
-		seen[block.ToolUse.CallID] = struct{}{}
+		seen[block.ToolUse.CallID] = occurrence{intent: protocol.DeepCopy(*block.ToolUse)}
 		callIDs = append(callIDs, block.ToolUse.CallID)
 	}
 	for _, intent := range message.ToolIntents {
-		if intent.CallID == "" {
+		if err := intent.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid legacy tool intent")
+		}
+		if existing, duplicate := seen[intent.CallID]; duplicate {
+			if existing.legacy {
+				return nil, fmt.Errorf("duplicate legacy tool intent %q", intent.CallID)
+			}
+			if existing.intent.Alias != intent.Alias || !bytes.Equal(existing.intent.Arguments, intent.Arguments) {
+				return nil, fmt.Errorf("conflicting tool intent %q", intent.CallID)
+			}
+			existing.legacy = true
+			seen[intent.CallID] = existing
 			continue
 		}
-		if _, duplicate := seen[intent.CallID]; duplicate {
-			continue
-		}
-		seen[intent.CallID] = struct{}{}
+		seen[intent.CallID] = occurrence{intent: protocol.DeepCopy(intent), legacy: true}
 		callIDs = append(callIDs, intent.CallID)
 	}
-	return callIDs
+	return callIDs, nil
 }
 
-func boundedSelection(events []protocol.EventRecord, sources []protocol.ContentSource, start, cutoff int, trigger Trigger, limit int) (Selection, error) {
+func containsCallID(callIDs []string, want string) bool {
+	for _, callID := range callIDs {
+		if callID == want {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeToolExchangeRanges(ranges []toolExchangeRange) []toolExchangeRange {
+	if len(ranges) < 2 {
+		return ranges
+	}
+	sort.SliceStable(ranges, func(i, j int) bool {
+		if ranges[i].assistant == ranges[j].assistant {
+			return ranges[i].result < ranges[j].result
+		}
+		return ranges[i].assistant < ranges[j].assistant
+	})
+	merged := make([]toolExchangeRange, 0, len(ranges))
+	for _, exchange := range ranges {
+		last := len(merged) - 1
+		if last >= 0 && exchange.assistant <= merged[last].result {
+			if exchange.result > merged[last].result {
+				merged[last].result = exchange.result
+			}
+			continue
+		}
+		merged = append(merged, exchange)
+	}
+	return merged
+}
+
+type eventGroup struct {
+	start int
+	end   int
+}
+
+func eventGroups(count int, exchanges []toolExchangeRange) []eventGroup {
+	groups := make([]eventGroup, count)
+	for index := range groups {
+		groups[index] = eventGroup{start: index, end: index}
+	}
+	for _, exchange := range exchanges {
+		group := eventGroup{start: exchange.assistant, end: exchange.result}
+		for index := group.start; index <= group.end; index++ {
+			groups[index] = group
+		}
+	}
+	return groups
+}
+
+func boundedSelection(events []protocol.EventRecord, sources []protocol.ContentSource, groups []eventGroup, start, cutoff int, trigger Trigger, limit int) (Selection, error) {
 	included := make(map[int]struct{}, len(events))
 	for index := cutoff + 1; index < len(events); index++ {
-		included[index] = struct{}{}
+		includeEventGroup(included, groups[index])
 	}
 	positions := make(map[protocol.EventID]int, len(events))
 	for index, record := range events {
 		positions[record.Envelope.EventID] = index
 	}
 	for _, record := range activeSafetyFacts(events) {
-		included[positions[record.Envelope.EventID]] = struct{}{}
+		includeEventGroup(included, groups[positions[record.Envelope.EventID]])
 	}
 	selectedStart := cutoff + 1
-	for index := cutoff; index >= start; index-- {
-		_, already := included[index]
-		if !already {
-			included[index] = struct{}{}
-		}
-		candidate, err := selectionFromIndexes(events, sources, included, index, cutoff, trigger, limit)
+	for index := cutoff; index >= start; {
+		group := groups[index]
+		required := eventGroupIncluded(included, group)
+		added := includeEventGroup(included, group)
+		candidate, err := selectionFromIndexes(events, sources, included, group.start, cutoff, trigger, limit)
 		if err != nil {
 			return Selection{}, err
 		}
@@ -188,20 +332,44 @@ func boundedSelection(events []protocol.EventRecord, sources []protocol.ContentS
 			return Selection{}, err
 		}
 		if len(input) > limit {
-			if !already {
-				delete(included, index)
+			if !required {
+				for _, addedIndex := range added {
+					delete(included, addedIndex)
+				}
 			}
-			if already || selectedStart > cutoff {
+			if required || selectedStart > cutoff {
 				return Selection{}, fmt.Errorf("required compaction safety facts exceed %d bytes", limit)
 			}
 			break
 		}
-		selectedStart = index
+		selectedStart = group.start
+		index = group.start - 1
 	}
 	if selectedStart > cutoff {
 		return Selection{}, ErrNothingToCompact
 	}
 	return selectionFromIndexes(events, sources, included, selectedStart, cutoff, trigger, limit)
+}
+
+func eventGroupIncluded(included map[int]struct{}, group eventGroup) bool {
+	for index := group.start; index <= group.end; index++ {
+		if _, ok := included[index]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func includeEventGroup(included map[int]struct{}, group eventGroup) []int {
+	added := make([]int, 0, group.end-group.start+1)
+	for index := group.start; index <= group.end; index++ {
+		if _, ok := included[index]; ok {
+			continue
+		}
+		included[index] = struct{}{}
+		added = append(added, index)
+	}
+	return added
 }
 
 func selectionFromIndexes(events []protocol.EventRecord, sources []protocol.ContentSource, included map[int]struct{}, start, cutoff int, trigger Trigger, limit int) (Selection, error) {
@@ -555,17 +723,27 @@ func normalizedEventText(record protocol.EventRecord) (string, error) {
 }
 
 func assistantMessage(record protocol.EventRecord) (*protocol.AssistantMessageV1, bool) {
+	if record.Envelope.Kind != protocol.EventAssistantMessage {
+		return nil, false
+	}
 	switch value := record.Decoded.(type) {
 	case *protocol.AssistantMessageV1:
 		return value, value != nil
 	case protocol.AssistantMessageV1:
 		return &value, true
 	default:
-		return nil, false
+		var decoded protocol.AssistantMessageV1
+		if len(record.Envelope.Payload) == 0 || json.Unmarshal(record.Envelope.Payload, &decoded) != nil {
+			return nil, false
+		}
+		return &decoded, true
 	}
 }
 
 func toolMessage(record protocol.EventRecord) (*protocol.ToolMessageV1, bool) {
+	if record.Envelope.Kind != protocol.EventToolMessage {
+		return nil, false
+	}
 	switch value := record.Decoded.(type) {
 	case *protocol.ToolMessageV1:
 		return value, value != nil
