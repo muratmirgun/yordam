@@ -11,6 +11,32 @@ import (
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
+func TestFoundationToolMessageDescriptorRoundTripAndEnvelope(t *testing.T) {
+	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: "call-1", Status: "succeeded", Text: "ok"}}}
+	event := protocol.EventEnvelope{
+		JournalKind: protocol.JournalSession, JournalID: "session", SessionID: "session",
+		TurnID: "turn", ActivityID: "activity", Kind: protocol.EventToolMessage,
+	}
+	record, err := registry.Decode(envelopeFor(t, event, payload))
+	if err != nil {
+		t.Fatalf("valid tool message rejected: %v", err)
+	}
+	if _, ok := record.Decoded.(*protocol.ToolMessageV1); !ok {
+		t.Fatalf("decoded payload type = %T, want *protocol.ToolMessageV1", record.Decoded)
+	}
+
+	event.JournalKind = protocol.JournalWorkspaceControl
+	event.JournalID = "workspace"
+	event.SessionID = ""
+	if _, err := registry.Decode(envelopeFor(t, event, payload)); err == nil {
+		t.Fatal("tool message outside a session journal accepted")
+	}
+}
+
 func TestFoundationSubagentDescriptorsBindSessionsAndTerminalCursor(t *testing.T) {
 	registry, err := eventcodec.New(eventcodec.FoundationDescriptors())
 	if err != nil {

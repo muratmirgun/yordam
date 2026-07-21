@@ -50,6 +50,77 @@ func TestAdapterNormalizesSuccessfulToolResultWithoutOutput(t *testing.T) {
 	}
 }
 
+func TestAdapterSendsCompleteToolHistoryBeforeLaterTurn(t *testing.T) {
+	type wireHistoryMessage struct {
+		Role       string `json:"role"`
+		Content    string `json:"content"`
+		ToolCallID string `json:"tool_call_id"`
+		ToolCalls  []struct {
+			ID string `json:"id"`
+		} `json:"tool_calls"`
+	}
+	var captured []wireHistoryMessage
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/chat/completions" {
+			t.Errorf("path=%q", request.URL.Path)
+		}
+		var payload struct {
+			Messages []wireHistoryMessage `json:"messages"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		captured = payload.Messages
+		response.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(response, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	adapter := NewAdapter(New(ClientOptions{HTTPClient: server.Client(), BaseURL: server.URL}))
+	stream, err := adapter.stream(context.Background(), protocol.ModelRequest{
+		RequestID: "request-history", ProviderID: "openai", ModelID: "model-a",
+		Messages: []protocol.ModelMessage{
+			{Role: "system", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "system"}}},
+			{Role: "user", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "inspect"}}},
+			{Role: "assistant", Blocks: []protocol.ContentBlock{
+				{Kind: protocol.ContentToolUse, ToolUse: &protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"a.go"}`)}},
+				{Kind: protocol.ContentToolUse, ToolUse: &protocol.ToolUseBlock{CallID: "call-b", Alias: "read", Arguments: json.RawMessage(`{"path":"b.go"}`)}},
+			}},
+			{Role: "tool", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolResult, ToolResult: &protocol.ToolResultBlock{CallID: "call-a", Status: "succeeded", Text: "a"}}}},
+			{Role: "tool", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolResult, ToolResult: &protocol.ToolResultBlock{CallID: "call-b", Status: "succeeded", Text: "b"}}}},
+			{Role: "user", Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "follow-up"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for event := range stream {
+		if event.Kind == protocol.ModelEventError {
+			t.Fatalf("stream error=%#v", event.Error)
+		}
+	}
+
+	if len(captured) != 6 {
+		t.Fatalf("messages=%#v", captured)
+	}
+	wantRoles := []string{"system", "user", "assistant", "tool", "tool", "user"}
+	for index, role := range wantRoles {
+		if captured[index].Role != role {
+			t.Fatalf("messages[%d].role=%q want %q", index, captured[index].Role, role)
+		}
+	}
+	if captured[5].Content != "follow-up" {
+		t.Fatalf("messages=%#v", captured)
+	}
+	toolCalls := captured[2].ToolCalls
+	if len(toolCalls) != 2 || toolCalls[0].ID != "call-a" || toolCalls[1].ID != "call-b" || toolCalls[0].ID == toolCalls[1].ID {
+		t.Fatalf("assistant tool calls=%#v want [call-a call-b]", toolCalls)
+	}
+	if captured[3].ToolCallID != "call-a" || captured[4].ToolCallID != "call-b" {
+		t.Fatalf("tool result IDs=[%q %q] want [call-a call-b]", captured[3].ToolCallID, captured[4].ToolCallID)
+	}
+}
+
 func TestRouterNormalizationIsEffectFree(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Error("normalization opened a network connection")

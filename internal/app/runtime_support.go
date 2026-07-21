@@ -432,8 +432,10 @@ func (p recoveryProjection) InspectRecovery(ctx context.Context, ref protocol.Jo
 	if inspection.Head != expected {
 		return orchestrator.RecoveryProjection{}, fmt.Errorf("recovery inspection head changed")
 	}
-	result := orchestrator.RecoveryProjection{UnmatchedNoEffect: make(map[protocol.ActivityID]bool)}
+	result := orchestrator.RecoveryProjection{ProviderVisibleToolCalls: make(map[protocol.ActivityID]string), UnmatchedNoEffect: make(map[protocol.ActivityID]bool)}
 	started := make(map[protocol.ActivityID]bool)
+	plannedKinds := make(map[protocol.ActivityID]string)
+	plannedCallIDs := make(map[protocol.ActivityID]string)
 	for _, record := range inspection.Events {
 		event := record.Envelope
 		switch event.Kind {
@@ -455,12 +457,49 @@ func (p recoveryProjection) InspectRecovery(ctx context.Context, ref protocol.Jo
 			if json.Unmarshal(event.Payload, &manifest) == nil && manifest.ChildSessionID == protocol.SessionID(ref.ID) {
 				result.ChildManifest = &manifest
 			}
+		case protocol.EventActivityPlanned:
+			var payload protocol.ActivityPlannedV1
+			if json.Unmarshal(event.Payload, &payload) != nil || event.ActivityID == "" || payload.Kind == "" {
+				return orchestrator.RecoveryProjection{}, fmt.Errorf("recovery activity plan binding is invalid for %q", event.ActivityID)
+			}
+			switch {
+			case payload.Kind == "provider":
+				plannedKinds[event.ActivityID] = "provider"
+			case payload.Kind == "tool" && payload.Purpose == "tool preview":
+				plannedKinds[event.ActivityID] = "preview"
+			case payload.Kind == "tool":
+				plannedKinds[event.ActivityID] = "tool"
+				if payload.Plan != nil {
+					plannedCallIDs[event.ActivityID] = payload.Plan.Body.CallID
+				}
+			default:
+				plannedKinds[event.ActivityID] = "other"
+			}
 		case protocol.EventActivityStarted:
+			var payload protocol.ActivityStartedV1
+			if json.Unmarshal(event.Payload, &payload) != nil || event.ActivityID == "" || payload.ActivityID != event.ActivityID || payload.CallID == "" {
+				return orchestrator.RecoveryProjection{}, fmt.Errorf("recovery activity start binding is invalid for %q", event.ActivityID)
+			}
+			kind, planned := plannedKinds[event.ActivityID]
+			if !planned {
+				return orchestrator.RecoveryProjection{}, fmt.Errorf("recovery activity %q has no durable plan binding", event.ActivityID)
+			}
+			if kind == "tool" {
+				if plannedCallIDs[event.ActivityID] == "" {
+					return orchestrator.RecoveryProjection{}, fmt.Errorf("provider-visible tool call binding is unresolved for activity %q", event.ActivityID)
+				}
+				if plannedCallIDs[event.ActivityID] != payload.CallID {
+					return orchestrator.RecoveryProjection{}, fmt.Errorf("provider-visible tool call binding changed for activity %q", event.ActivityID)
+				}
+				result.ProviderVisibleToolCalls[event.ActivityID] = payload.CallID
+			}
 			started[event.ActivityID] = true
 		case protocol.EventActivitySucceeded, protocol.EventActivityFailed, protocol.EventActivityDenied, protocol.EventActivityCancelled, protocol.EventActivityUncertain:
 			delete(started, event.ActivityID)
+			delete(result.ProviderVisibleToolCalls, event.ActivityID)
 		case protocol.EventActivityInterruptedNoEffect:
 			delete(started, event.ActivityID)
+			delete(result.ProviderVisibleToolCalls, event.ActivityID)
 			result.UnmatchedNoEffect[event.ActivityID] = true
 		}
 	}

@@ -129,6 +129,56 @@ func TestRecoveryAdmitsCompleteGeneratedTransactionBeforeManifestWrite(t *testin
 	}
 }
 
+func TestRecoveryResumeUsesFreshGenerationToAdmitPersistedTransaction(t *testing.T) {
+	root := t.TempDir()
+	setup, workspace, session := createTestSession(t, root)
+	eventsPath := filepath.Join(root, "workspaces", workspace.ID, "sessions", session.ID, "events.jsonl")
+	appendFile(t, eventsPath, []byte(`{"incomplete":`))
+	registry := secret.NewRegistry()
+	oldLease, err := registry.Acquire("generation-before-crash", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := recoveryRequestFromInspection(t, setup, session.ID, "operation-fresh-generation-resume", "txn-fresh-generation-resume")
+	request.RuntimeGenerationID = "generation-before-crash"
+	faultErr := errors.New("crash after persisted manifest")
+	faulting := jsonl.New(root, jsonl.Options{Encoder: passthroughEncoder{}, Secrets: registry, Fault: func(point jsonl.FaultPoint) error {
+		if point == jsonl.FaultQuarantineWrite {
+			return faultErr
+		}
+		return nil
+	}})
+	if _, err := faulting.RecoverSession(context.Background(), request); !errors.Is(err, faultErr) {
+		t.Fatalf("faulted recovery error=%v", err)
+	}
+	if err := oldLease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Retire("generation-before-crash"); err != nil {
+		t.Fatal(err)
+	}
+	newLease, err := registry.Acquire("generation-after-restart", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newLease.Close()
+
+	restartedRequest := request
+	restartedRequest.RuntimeGenerationID = "generation-after-restart"
+	restarted := jsonl.New(root, jsonl.Options{Encoder: passthroughEncoder{}, Secrets: registry})
+	result, err := restarted.RecoverSession(context.Background(), restartedRequest)
+	if err != nil || (result.Status != "recovered" && result.Status != "already_recovered") {
+		t.Fatalf("fresh-generation resume result=%+v err=%v", result, err)
+	}
+	raw, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"runtime_generation_id":"generation-before-crash"`)) || bytes.Contains(raw, []byte(`"runtime_generation_id":"generation-after-restart"`)) {
+		t.Fatalf("persisted transaction audit generation changed during resume: %s", raw)
+	}
+}
+
 func task5TreeSnapshot(t *testing.T, root string) map[string]string {
 	t.Helper()
 	snapshot := make(map[string]string)

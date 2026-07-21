@@ -285,6 +285,53 @@ func TestTurnLeaseReleaseRequiresTerminalEventInSuppliedTransaction(t *testing.T
 	}
 }
 
+func TestAbandonedNonterminalLeaseUnlocksRecoveryButGatesOrdinaryTurn(t *testing.T) {
+	root := t.TempDir()
+	_, _, session := createTestSession(t, root)
+	store := jsonl.New(root, jsonl.Options{Encoder: passthroughEncoder{}})
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(session.ID)}
+	initial, err := store.Head(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.AcquireTurnLease(context.Background(), protocol.SessionID(session.ID), "turn-unresolved", initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := canonicaljson.Marshal(protocol.TurnAcceptedV1{CommandID: "command-unresolved", Goal: "recover me", OutcomeContractID: "contract", ContractVersion: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := store.AppendBatch(context.Background(), journal.AppendRequest{
+		Journal: ref, ExpectedHead: initial, TransactionID: "txn-unresolved-accepted",
+		Compatibility: &journal.CompatibilityDeclaration{ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: initial},
+		Events:        []protocol.ProposedEvent{{EventID: "evt-unresolved-accepted", Time: time.Date(2026, 7, 18, 13, 2, 0, 0, time.UTC), PayloadVersion: 1, Kind: protocol.EventTurnAccepted, SessionID: protocol.SessionID(session.ID), TurnID: "turn-unresolved", Payload: payload}},
+	})
+	if err != nil || accepted.Status != journal.AppendCommitted {
+		t.Fatalf("accepted append=%+v err=%v", accepted, err)
+	}
+	type abandonable interface{ Abandon(context.Context) error }
+	abandoner, ok := lease.(abandonable)
+	if !ok {
+		t.Fatalf("production turn lease %T has no unresolved abandon path", lease)
+	}
+	if err := abandoner.Abandon(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireTurnLease(context.Background(), protocol.SessionID(session.ID), "turn-new", accepted.Cursor); !errors.Is(err, journal.ErrTurnRecoveryRequired) {
+		t.Fatalf("ordinary turn bypass error=%v", err)
+	}
+	recovery, err := store.AcquireTurnRecoveryLease(context.Background(), protocol.SessionID(session.ID), "turn-unresolved", accepted.Cursor)
+	if err != nil {
+		t.Fatalf("recovery lease acquisition=%v", err)
+	}
+	if recoveryAbandoner, ok := recovery.(abandonable); !ok {
+		t.Fatalf("recovery lease %T has no abandon path", recovery)
+	} else if err := recoveryAbandoner.Abandon(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWorkspaceControlRejectsPartialFinalMetadata(t *testing.T) {
 	root := t.TempDir()
 	store := jsonl.New(root, jsonl.Options{Encoder: passthroughEncoder{}})

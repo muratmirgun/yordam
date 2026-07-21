@@ -82,7 +82,7 @@ func (s *Store) RecoverSession(ctx context.Context, request journal.RecoveryRequ
 	if err != nil {
 		return journal.RecoveryResult{}, err
 	}
-	result, recoveryErr := s.recoverSessionLocked(ctx, request, guard)
+	result, recoveryErr := s.recoverSessionLocked(ctx, request, request.RuntimeGenerationID, guard)
 	return result, errors.Join(recoveryErr, guard.release())
 }
 
@@ -111,7 +111,7 @@ func validateRecoveryRequest(request journal.RecoveryRequest) error {
 	return nil
 }
 
-func (s *Store) recoverSessionLocked(ctx context.Context, request journal.RecoveryRequest, guard *journalMutationGuard) (result journal.RecoveryResult, resultErr error) {
+func (s *Store) recoverSessionLocked(ctx context.Context, request journal.RecoveryRequest, admissionGenerationID protocol.RuntimeGenerationID, guard *journalMutationGuard) (result journal.RecoveryResult, resultErr error) {
 	transaction, session, err := s.openJournal(ctx, request.Journal, os.O_RDONLY)
 	if err != nil {
 		return journal.RecoveryResult{}, err
@@ -134,7 +134,7 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 	if err != nil {
 		return journal.RecoveryResult{}, err
 	}
-	if exists && !reflect.DeepEqual(manifest.Request, request) {
+	if exists && !sameRecoveryStorageRequest(manifest.Request, request) {
 		return journal.RecoveryResult{Status: "conflict"}, nil
 	}
 
@@ -146,10 +146,23 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 	if err != nil {
 		return journal.RecoveryResult{}, err
 	}
+	if request.CleanPrefix {
+		emptyTailDigest := digestBytes(nil)
+		if request.ObservedTailDigest != emptyTailDigest || scan.head != request.ExpectedHead || !scan.writable || recoveryEligible(scan) || scan.validPrefixSize != int64(len(activeRaw)) {
+			return journal.RecoveryResult{Status: "conflict", Cursor: scan.head}, nil
+		}
+		return journal.RecoveryResult{
+			Status: "recovered", Cursor: scan.head, QuarantineDigest: request.ObservedTailDigest,
+			Diagnostic: protocol.Diagnostic{Code: "recovery.clean_prefix", Message: "clean committed prefix admitted for active-turn recovery", Journal: request.Journal, AtSeq: scan.head.CommitSeq},
+		}, nil
+	}
 	if exists {
 		if err := validatePersistedRecoveryManifest(ctx, transaction, manifest, request, manifestName, operationHash, activeRaw); err != nil {
 			return journal.RecoveryResult{}, err
 		}
+		// The manifest owns the already-admitted storage transaction. A restarted
+		// runtime authorizes the resume above, but must not rewrite its envelopes.
+		request = manifest.Request
 		if int64(len(activeRaw)) == manifest.Observation.SourceBytes && digestBytes(activeRaw) == manifest.SourceDigest && !recoveryEligible(scan) {
 			return journal.RecoveryResult{Status: "conflict", Cursor: scan.head}, nil
 		}
@@ -192,7 +205,7 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 				return journal.RecoveryResult{}, err
 			}
 			transactionOpen = false
-			return s.recoverSessionLocked(ctx, request, guard)
+			return s.recoverSessionLocked(ctx, request, admissionGenerationID, guard)
 		}
 	}
 	if !exists {
@@ -301,7 +314,7 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 	if diagnosticErr != nil {
 		return journal.RecoveryResult{}, diagnosticErr
 	}
-	appendResult, appendErr := s.commitRecoveryDiagnostic(ctx, request, manifest)
+	appendResult, appendErr := s.commitRecoveryDiagnostic(ctx, request, admissionGenerationID, manifest)
 	if appendErr != nil {
 		return journal.RecoveryResult{}, appendErr
 	}
@@ -311,7 +324,7 @@ func (s *Store) recoverSessionLocked(ctx context.Context, request journal.Recove
 	}, nil
 }
 
-func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.RecoveryRequest, manifest explicitRecoveryManifest) (journal.AppendResult, error) {
+func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.RecoveryRequest, admissionGenerationID protocol.RuntimeGenerationID, manifest explicitRecoveryManifest) (journal.AppendResult, error) {
 	var result journal.AppendResult
 	err := s.runRecoveryAction(FaultRecoveryDiagnosticCommit, func() error {
 		transaction, session, err := s.openJournal(ctx, request.Journal, os.O_RDWR|os.O_APPEND)
@@ -330,12 +343,20 @@ func (s *Store) commitRecoveryDiagnostic(ctx context.Context, request journal.Re
 		if buildErr != nil {
 			return errors.Join(buildErr, transaction.close())
 		}
-		admission, admissionErr := s.acquireAppendAdmission(deterministic.request)
-		if admissionErr != nil {
-			return errors.Join(admissionErr, transaction.close())
+		var admission *secret.Lease
+		if s.secrets != nil {
+			admission, err = s.secrets.AcquireExisting(admissionGenerationID)
+			if err != nil {
+				return errors.Join(fmt.Errorf("acquire recovery resume admission lease: %w", err), transaction.close())
+			}
+			if err := admission.Admit(deterministic.raw); err != nil {
+				return errors.Join(fmt.Errorf("admit persisted recovery transaction: %w", err), admission.Close(), transaction.close())
+			}
 		}
 		result, err = s.appendBatchLockedWithIdentity(ctx, transaction, session, deterministic.request, deterministic.identity, admission)
-		err = errors.Join(err, admission.Close())
+		if admission != nil {
+			err = errors.Join(err, admission.Close())
+		}
 		return errors.Join(err, transaction.close())
 	})
 	if err != nil {
@@ -663,7 +684,7 @@ func validatePersistedRecoveryManifest(
 	expectedCandidate := ".recovery-candidate-" + operationHash + ".jsonl"
 	expectedMetadata := ".recovery-metadata-" + operationHash + ".json"
 	expectedTemporary := strings.TrimSuffix(manifestName, ".json") + ".tmp"
-	if manifest.Version != recoveryManifestVersion || !reflect.DeepEqual(manifest.Request, request) ||
+	if manifest.Version != recoveryManifestVersion || !sameRecoveryStorageRequest(manifest.Request, request) ||
 		manifest.Observation.ObservedTailDigest != request.ObservedTailDigest ||
 		manifest.Observation.ValidPrefixBytes < 0 || manifest.Observation.SourceBytes <= manifest.Observation.ValidPrefixBytes ||
 		manifest.PrefixDigest.Validate() != nil || manifest.SourceDigest.Validate() != nil ||
@@ -711,6 +732,12 @@ func validatePersistedRecoveryManifest(
 		return fmt.Errorf("persisted recovery source identity mismatch")
 	}
 	return nil
+}
+
+func sameRecoveryStorageRequest(persisted, resumed journal.RecoveryRequest) bool {
+	persisted.RuntimeGenerationID = ""
+	resumed.RuntimeGenerationID = ""
+	return reflect.DeepEqual(persisted, resumed)
 }
 
 func safeRecoveryLeaf(name string) bool {

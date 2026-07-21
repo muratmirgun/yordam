@@ -73,6 +73,8 @@ func (s *Service) runSubagentIntent(ctx context.Context, lease managedOperationL
 		return protocol.ToolResultBlock{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
+	state.activeRequiresToolResult = false
+	state.activeToolCallID, state.activeProviderVisibleTool = intent.CallID, true
 	if _, err := s.authorizeActivity(ctx, lease, request, state, activityID, intent.CallID, label, authorizationRequest); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
@@ -120,6 +122,7 @@ func (s *Service) runSubagentIntent(ctx context.Context, lease managedOperationL
 		childCtx, cancel := context.WithDeadline(childParent, manifest.Deadline)
 		defer cancel()
 		var runErr error
+		state.activeDispatched = true
 		receipt, runErr = s.deps.Children.RunChild(childCtx, ChildRunRequest{Manifest: manifest, Call: call, Parent: protocol.DeepCopy(request)})
 		return runErr
 	})
@@ -200,6 +203,10 @@ func (s *Service) rejectSubagentIntent(ctx context.Context, request StartTurnReq
 }
 
 func (s *Service) attachSubagentReceipt(ctx context.Context, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock, activityID protocol.ActivityID, receipt protocol.SubagentReceiptV1) (protocol.ToolResultBlock, error) {
+	if state.activeActivityID == activityID {
+		state.activeRequiresToolResult = true
+		state.activeToolCallID, state.activeProviderVisibleTool = intent.CallID, true
+	}
 	encoded, err := canonicaljson.Marshal(receipt)
 	if err != nil {
 		return protocol.ToolResultBlock{}, err
@@ -228,10 +235,15 @@ func (s *Service) attachSubagentReceipt(ctx context.Context, request StartTurnRe
 	if err := record.Validate(); err != nil || record.Body.ID != candidate.ID || record.Body.SessionID != request.SessionID || record.Body.ProducingActivityID != candidate.ProducingActivityID || record.Body.Kind != candidate.Kind {
 		return protocol.ToolResultBlock{}, fmt.Errorf("subagent receipt evidence binding mismatch")
 	}
+	result, err := s.sanitizeToolResult(ctx, request.Runtime.ID, protocol.ToolResultBlock{CallID: intent.CallID, Status: receipt.Status, JSON: encoded, EvidenceIDs: []protocol.EvidenceID{record.Body.ID}})
+	if err != nil {
+		return protocol.ToolResultBlock{}, err
+	}
 	values := []struct {
 		kind    string
 		payload any
 	}{
+		{protocol.EventToolMessage, protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{protocol.DeepCopy(result)}}},
 		{protocol.EventActivitySucceeded, protocol.ActivityOutcomeV1{Status: "succeeded", OutputEvidenceIDs: []protocol.EvidenceID{record.Body.ID}}},
 		{protocol.EventEvidenceRecorded, protocol.EvidenceRecordedV1{Record: record}},
 		{protocol.EventEvidenceLinked, protocol.EvidenceLinkedV1{EvidenceID: record.Body.ID, Subject: candidate.Subject, Relation: "output"}},
@@ -244,11 +256,19 @@ func (s *Service) attachSubagentReceipt(ctx context.Context, request StartTurnRe
 	for index := range events {
 		events[index].ActivityID = candidate.ProducingActivityID
 	}
+	terminalHead := state.head
 	if err := s.append(ctx, state, "subagent-attachment-"+intent.CallID, events); err != nil {
+		if state.head != terminalHead && state.activeActivityID == activityID {
+			state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+			state.activeRequiresToolResult = false
+			state.activeToolCallID, state.activeProviderVisibleTool = "", false
+		}
 		return protocol.ToolResultBlock{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
-	return protocol.ToolResultBlock{CallID: intent.CallID, Status: receipt.Status, JSON: encoded, EvidenceIDs: []protocol.EvidenceID{record.Body.ID}}, nil
+	state.activeRequiresToolResult = false
+	state.activeToolCallID, state.activeProviderVisibleTool = "", false
+	return result, nil
 }
 
 // canonicalSubagentDescriptor is intentionally kept alongside the interception
