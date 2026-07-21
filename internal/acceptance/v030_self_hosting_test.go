@@ -85,7 +85,9 @@ func TestV030SelfHosting(t *testing.T) {
 	prefixes := captureSelfHostJournalPrefixes(t, checkout.DataDir)
 	compactOffset := session.OutputOffset()
 	session.Write(t, "/compact\r")
-	session.WaitForOrderedAfter(t, compactOffset, []string{"Compacting context: preparing", "Compacting context: summarizing", "Compacting context: persisting"}, 30*time.Second)
+	// The TUI rewrites the stage suffix in place, so only the first frame repeats
+	// the full label in the raw PTY byte stream. Assert the ordered visible suffixes.
+	session.WaitForOrderedAfter(t, compactOffset, []string{"Compacting context: preparing", "summarizing...", "persist"}, 30*time.Second)
 	session.WaitForAfter(t, compactOffset, "Latest compacted:", 30*time.Second)
 	session.WaitForQuiet(t, 300*time.Millisecond, 10*time.Second)
 
