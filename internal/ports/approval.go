@@ -8,8 +8,20 @@ import (
 )
 
 type PermissionPrompt struct {
-	SessionID string
-	Call      domain.PreparedToolRequest
+	SessionID           string
+	ParentSessionID     string
+	DelegationAttemptID string
+	Call                domain.PreparedToolRequest
+}
+
+// ChildPrompt preserves the child session's immutable delegation identity in
+// prompts presented through the parent application.  Call identity remains
+// child-local; the displayed correlation token is minted by the application.
+type ChildPrompt struct {
+	SessionID           string
+	ParentSessionID     string
+	DelegationAttemptID string
+	Call                domain.PreparedToolRequest
 }
 
 type PermissionApprover interface {

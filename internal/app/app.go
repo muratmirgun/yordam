@@ -106,7 +106,8 @@ type App struct {
 }
 
 type pendingPermission struct {
-	internalCallID  string
+	internalKey     string
+	child           bool
 	displayedCallID string
 	decision        chan domain.PermissionDecision
 	internalScope   string
@@ -128,6 +129,7 @@ type operationResult struct {
 	err             error
 	runtimeSet      RuntimeSet
 	throughProtocol bool
+	compactTerminal *Event
 }
 
 type operationKind string
@@ -253,6 +255,7 @@ func (a *App) Run(ctx context.Context) error {
 				}
 			}
 		case event := <-protocolEvents:
+			event = a.enrichSubagentStage(ctx, event)
 			if event.Kind != "" && !a.publish(ctx, event) {
 				if activeCancel != nil {
 					activeCancel()
@@ -289,7 +292,7 @@ func (a *App) Run(ctx context.Context) error {
 						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 						continue
 					}
-					_, subscription, err := activeSet.ApplicationService.SnapshotAndSubscribe(ctx, protocol.SnapshotRequest{
+					snapshot, subscription, err := activeSet.ApplicationService.SnapshotAndSubscribe(ctx, protocol.SnapshotRequest{
 						ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(a.session.ID), Consumer: "legacy_tui", QueueCapacity: 256,
 					})
 					if err != nil {
@@ -298,7 +301,20 @@ func (a *App) Run(ctx context.Context) error {
 						a.publish(ctx, Event{Kind: EventError, DraftID: command.DraftID, Err: err, Message: err.Error(), Draft: command.Prompt})
 						continue
 					}
-					go consumeLegacyProtocolEvents(ctx, subscription, activeSet.LegacyAdapter, protocolEvents)
+					contextState, contextErr := DurableContext(snapshot)
+					if contextErr != nil {
+						_ = subscription.Close()
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, Err: contextErr, Message: "invalid durable context", NonTerminal: true})
+						continue
+					}
+					if contextState != nil || snapshot.Durable.SelectedSession != nil {
+						a.publish(ctx, Event{Kind: EventState, Context: contextState, Durable: protocol.DeepCopy(&snapshot.Durable)})
+					}
+					// The operation result owns successful turn completion so it can
+					// clear activeOperation before publishing the sole terminal event.
+					go consumeLegacyProtocolEvents(ctx, subscription, activeSet.LegacyAdapter, protocolEvents, true, nil)
 					go func() {
 						result, executeErr := activeSet.ApplicationService.Execute(turnCtx, applicationCommand)
 						if executeErr == nil && result.Error != nil {
@@ -375,6 +391,62 @@ func (a *App) Run(ctx context.Context) error {
 				activeCancel = cancel
 				activeOperation = operationCompact
 				session, replay := a.session, a.replay
+				if activeSet.ApplicationService != nil && activeSet.LegacyAdapter != nil {
+					applicationCommand, err := activeSet.LegacyAdapter.Command(command)
+					if err != nil {
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error()})
+						continue
+					}
+					snapshot, subscription, err := activeSet.ApplicationService.SnapshotAndSubscribe(compactCtx, protocol.SnapshotRequest{
+						ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(a.session.ID), Consumer: "legacy_tui", QueueCapacity: 256,
+					})
+					if err != nil {
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, Err: err, Message: err.Error()})
+						continue
+					}
+					contextState, contextErr := DurableContext(snapshot)
+					if contextErr != nil {
+						_ = subscription.Close()
+						cancel()
+						activeCancel, activeOperation = nil, ""
+						a.publish(ctx, Event{Kind: EventError, Err: contextErr, Message: "invalid durable context", NonTerminal: true})
+						continue
+					}
+					if contextState != nil {
+						a.publish(ctx, Event{Kind: EventState, Context: contextState})
+					}
+					compactTerminals := make(chan Event, 1)
+					go consumeLegacyProtocolEvents(compactCtx, subscription, activeSet.LegacyAdapter, protocolEvents, true, compactTerminals)
+					go func() {
+						result, executeErr := activeSet.ApplicationService.Execute(compactCtx, applicationCommand)
+						awaitTerminal := executeErr == nil && result.Error == nil
+						var terminal *Event
+						if executeErr == nil && result.Error != nil {
+							terminal = serializableCompactionFailure(*result.Error)
+							executeErr = errors.New(result.Error.Message)
+						}
+						if awaitTerminal {
+							select {
+							case event, ok := <-compactTerminals:
+								if ok {
+									terminal = &event
+								} else {
+									terminal = &Event{Kind: EventCompactionFailed, Message: "context compaction lifecycle ended unexpectedly", Compaction: &protocol.CompactionEventV1{Trigger: "manual", Stage: protocol.CompactionFailed, Usage: unknownCompactionUsage(), Error: &protocol.PublicError{Code: "compaction_failed", Message: "context compaction lifecycle ended unexpectedly"}}}
+									executeErr = errors.New(terminal.Message)
+								}
+							case <-compactCtx.Done():
+							}
+						}
+						cancel()
+						_ = subscription.Close()
+						done <- operationResult{kind: operationCompact, err: executeErr, compactTerminal: terminal}
+					}()
+					continue
+				}
 				go func() {
 					var err error
 					if activeSet.CompactSession != nil {
@@ -399,6 +471,41 @@ func (a *App) Run(ctx context.Context) error {
 				activeOperation = operationReload
 				selection := a.session.Selection
 				go func() {
+					candidate, err := a.reloadRuntime(reloadCtx, selection)
+					done <- operationResult{kind: operationReload, err: err, runtimeSet: candidate}
+				}()
+			case CommandTrustSkillCatalog:
+				if activeOperation != "" {
+					a.publish(ctx, Event{Kind: EventRejected, Message: "an operation is already active"})
+					continue
+				}
+				if a.runtimeSet.LegacyAdapter == nil || a.runtimeSet.ApplicationService == nil || a.reloadRuntime == nil {
+					a.publish(ctx, Event{Kind: EventRejected, Message: "skill trust reload is not available"})
+					continue
+				}
+				reloadCtx, cancel := context.WithCancel(ctx)
+				activeCancel = cancel
+				activeOperation = operationReload
+				selection := a.session.Selection
+				activeSet := a.runtimeSet
+				go func() {
+					protocolCommand, err := activeSet.LegacyAdapter.Command(command)
+					if err == nil {
+						result, executeErr := activeSet.ApplicationService.Execute(reloadCtx, protocolCommand)
+						if executeErr != nil {
+							err = executeErr
+						} else if result.Status != "completed" {
+							if result.Error != nil {
+								err = fmt.Errorf("skill trust command failed: %s", result.Error.Message)
+							} else {
+								err = fmt.Errorf("skill trust command status %q", result.Status)
+							}
+						}
+					}
+					if err != nil {
+						done <- operationResult{kind: operationReload, err: err}
+						return
+					}
 					candidate, err := a.reloadRuntime(reloadCtx, selection)
 					done <- operationResult{kind: operationReload, err: err, runtimeSet: candidate}
 				}()
@@ -465,7 +572,10 @@ func (a *App) Run(ctx context.Context) error {
 			}
 			a.drainRuntimeEvents(ctx, runtimeEvents)
 			event := Event{Kind: EventTurnCompleted}
-			if result.err != nil {
+			if result.kind == operationCompact && result.compactTerminal != nil {
+				event = *result.compactTerminal
+			}
+			if result.err != nil && result.compactTerminal == nil {
 				event.Err = result.err
 				event.Message = result.err.Error()
 				if errors.Is(result.err, context.Canceled) || errors.Is(result.err, context.DeadlineExceeded) {
@@ -474,7 +584,7 @@ func (a *App) Run(ctx context.Context) error {
 					event.Kind = EventError
 				}
 			}
-			if a.sessions != nil && a.session.ID != "" && (result.kind == operationTurn || result.err == nil) {
+			if a.sessions != nil && a.session.ID != "" && (result.kind == operationTurn || result.err == nil || result.compactTerminal != nil) {
 				refreshed, err := a.inspectSession(ctx, a.session.ID)
 				if err != nil {
 					a.replayValid = false
@@ -489,9 +599,6 @@ func (a *App) Run(ctx context.Context) error {
 					event.Replay = refreshed
 					event.Session = a.session
 				}
-			}
-			if result.throughProtocol && result.err == nil {
-				event.Kind = ""
 			}
 			if event.Kind != "" && !a.publish(ctx, event) {
 				if !shutdownRequested {
@@ -510,6 +617,28 @@ func (a *App) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (a *App) enrichSubagentStage(ctx context.Context, event Event) Event {
+	if event.Kind != EventSubagentStage || a.runtimeSet.ApplicationService == nil || a.session.ID == "" {
+		return event
+	}
+	snapshot, err := a.runtimeSet.ApplicationService.Snapshot(ctx, protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(a.session.ID), Consumer: "legacy_subagent_stage", QueueCapacity: 1})
+	if err != nil {
+		return Event{Kind: EventError, Err: err, Message: "refresh durable subagent state", NonTerminal: true}
+	}
+	event.Durable = protocol.DeepCopy(&snapshot.Durable)
+	return event
+}
+
+func serializableCompactionFailure(public protocol.PublicError) *Event {
+	stage := protocol.CompactionFailed
+	if public.Code == "cancelled" || public.Code == "compaction_interrupted" {
+		stage = protocol.CompactionCancelled
+	} else if public.Code == "commit_uncertain" {
+		stage = protocol.CompactionUncertain
+	}
+	return &Event{Kind: EventCompactionFailed, Message: public.Message, Code: public.Code, Compaction: &protocol.CompactionEventV1{Trigger: "manual", Stage: stage, Usage: unknownCompactionUsage(), Error: protocol.DeepCopy(&public)}}
 }
 
 type sessionHeadReader interface {
@@ -629,12 +758,14 @@ func (a *App) completeReload(ctx context.Context, result operationResult) {
 		a.redactors.Replace(candidate.Redactor)
 	}
 	previous.retireSecrets()
+	skills := candidate.SkillSnapshot()
 	event := Event{
 		Kind:      EventReloadCompleted,
 		Applied:   true,
 		Message:   "configuration reloaded",
 		Models:    append([]domain.ModelSelection(nil), candidate.Models...),
 		Selection: selection,
+		Skills:    &skills,
 	}
 	if readyErr := candidate.Ready(selection); readyErr != nil {
 		event.Err = readyErr
@@ -732,6 +863,15 @@ func (a *App) applyModel(ctx context.Context, selection domain.ModelSelection) b
 }
 
 func (a *App) acknowledgeAutoShell(ctx context.Context, callID string, decision domain.PermissionDecision) bool {
+	if callID != "" && a.pendingChild(callID) {
+		switch a.resolvePermission(callID, decision) {
+		case permissionStale:
+			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q is stale", callID)})
+		case permissionInvalidScope:
+			return a.publish(ctx, Event{Kind: EventRejected, Message: fmt.Sprintf("permission call %q response is invalid", callID)})
+		}
+		return true
+	}
 	if a.session.Mode != domain.ModeAuto {
 		return a.publish(ctx, Event{Kind: EventRejected, Message: "trusted shell acknowledgement requires auto mode"})
 	}
@@ -761,6 +901,13 @@ func (a *App) acknowledgeAutoShell(ctx context.Context, callID string, decision 
 		}
 	}
 	return a.publish(ctx, a.settingEvent())
+}
+
+func (a *App) pendingChild(callID string) bool {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	pending := a.pending[callID]
+	return pending != nil && pending.child
 }
 
 func (a *App) commitSessionChange(ctx context.Context, kind string, payload any) error {
@@ -917,7 +1064,20 @@ func (a *App) openSession(ctx context.Context, sessionID string) bool {
 	if policy != nil {
 		a.policy = policy
 	}
-	return a.publish(ctx, a.stateEvent())
+	event := a.stateEvent()
+	if a.runtimeSet.ApplicationService != nil {
+		snapshot, snapshotErr := a.runtimeSet.ApplicationService.Snapshot(ctx, protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(a.session.ID), Consumer: "session_context", QueueCapacity: 1})
+		if snapshotErr != nil {
+			return a.publish(ctx, Event{Kind: EventError, Err: snapshotErr, Message: "refresh durable context", NonTerminal: true})
+		}
+		contextState, contextErr := DurableContext(snapshot)
+		if contextErr != nil {
+			return a.publish(ctx, Event{Kind: EventError, Err: contextErr, Message: "invalid durable context", NonTerminal: true})
+		}
+		event.Context = contextState
+		event.Durable = protocol.DeepCopy(&snapshot.Durable)
+	}
+	return a.publish(ctx, event)
 }
 
 func (a *App) modelConfigured(selection domain.ModelSelection) bool {
@@ -951,6 +1111,7 @@ func (a *App) settingEvent() Event {
 
 func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domain.PermissionDecision, error) {
 	internalCallID := prompt.Call.Request.CallID
+	internalKey := permissionPendingKey(prompt.SessionID, internalCallID)
 	var redactor secret.Redacting = secret.New()
 	if a.redactors != nil {
 		redactor = a.redactors.Snapshot()
@@ -964,7 +1125,7 @@ func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domai
 		return domain.PermissionDecision{}, sanitizeErr
 	}
 	a.pendingMu.Lock()
-	if _, exists := a.pendingInternal[internalCallID]; exists {
+	if _, exists := a.pendingInternal[internalKey]; exists {
 		a.pendingMu.Unlock()
 		return domain.PermissionDecision{}, errors.New("duplicate permission call is already pending")
 	}
@@ -980,14 +1141,15 @@ func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domai
 	}
 	published = permissionEventWithCallID(published, displayedCallID)
 	pending := &pendingPermission{
-		internalCallID:  internalCallID,
+		internalKey:     internalKey,
+		child:           prompt.ParentSessionID != "" || prompt.DelegationAttemptID != "",
 		displayedCallID: displayedCallID,
 		decision:        make(chan domain.PermissionDecision, 1),
 		internalScope:   permissionApprovalScope(prompt.Call),
 		displayedScope:  permissionApprovalScope(published.Permission.Call),
 	}
 	a.pending[displayedCallID] = pending
-	a.pendingInternal[internalCallID] = pending
+	a.pendingInternal[internalKey] = pending
 	a.pendingMu.Unlock()
 	defer a.removePending(pending)
 
@@ -1001,6 +1163,8 @@ func (a *App) Resolve(ctx context.Context, prompt ports.PermissionPrompt) (domai
 		return domain.PermissionDecision{}, ctx.Err()
 	}
 }
+
+func permissionPendingKey(sessionID, callID string) string { return sessionID + "\x00" + callID }
 
 func (a *App) newDisplayedPermissionCallID(redactor secret.Redacting) (string, error) {
 	for range 32 {
@@ -1070,7 +1234,7 @@ func (a *App) resolvePermission(callID string, decision domain.PermissionDecisio
 	select {
 	case pending.decision <- decision:
 		delete(a.pending, callID)
-		delete(a.pendingInternal, pending.internalCallID)
+		delete(a.pendingInternal, pending.internalKey)
 		return permissionResolved
 	default:
 		return permissionStale
@@ -1083,8 +1247,8 @@ func (a *App) removePending(pending *pendingPermission) {
 	if a.pending[pending.displayedCallID] == pending {
 		delete(a.pending, pending.displayedCallID)
 	}
-	if a.pendingInternal[pending.internalCallID] == pending {
-		delete(a.pendingInternal, pending.internalCallID)
+	if a.pendingInternal[pending.internalKey] == pending {
+		delete(a.pendingInternal, pending.internalKey)
 	}
 }
 
@@ -1176,11 +1340,17 @@ func legacyTerminalEvent(kind EventKind) bool {
 	}
 }
 
-func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription, adapter *LegacyAdapter, destination chan<- Event) {
+func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription, adapter *LegacyAdapter, destination chan<- Event, suppressTerminal bool, compactTerminals chan<- Event) {
 	defer subscription.Close()
+	if compactTerminals != nil {
+		defer close(compactTerminals)
+	}
 	for {
 		item, err := subscription.Next(ctx)
 		if err != nil {
+			if compactTerminals != nil {
+				return
+			}
 			if ctx.Err() == nil {
 				select {
 				case destination <- Event{Kind: EventError, Err: err, Message: err.Error()}:
@@ -1190,6 +1360,9 @@ func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription,
 			return
 		}
 		if item.Terminal != nil {
+			if compactTerminals != nil {
+				return
+			}
 			err := errors.New(item.Terminal.Message)
 			select {
 			case destination <- Event{Kind: EventError, Code: item.Terminal.Code, Err: err, Message: err.Error()}:
@@ -1208,6 +1381,9 @@ func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription,
 		}
 		event, err := adapter.Event(*item.Event)
 		if err != nil {
+			if compactTerminals != nil {
+				return
+			}
 			select {
 			case destination <- Event{Kind: EventError, Err: err, Message: err.Error()}:
 			case <-ctx.Done():
@@ -1216,6 +1392,28 @@ func consumeLegacyProtocolEvents(ctx context.Context, subscription Subscription,
 		}
 		if event.Kind == "" {
 			continue
+		}
+		if compactTerminals != nil && (event.Kind == EventCompactionCompleted || event.Kind == EventCompactionFailed) {
+			select {
+			case compactTerminals <- event:
+			case <-ctx.Done():
+			}
+			return
+		}
+		// Automatic compaction is nested inside an active turn. Its lifecycle
+		// terminal updates durable context but must not make the TUI idle before
+		// the owning turn result arrives.
+		if compactTerminals == nil && event.Compaction != nil && event.Compaction.Trigger == "automatic" && (event.Kind == EventCompactionCompleted || event.Kind == EventCompactionFailed) {
+			if event.Context != nil {
+				select {
+				case destination <- Event{Kind: EventState, Context: event.Context}:
+				case <-ctx.Done():
+				}
+			}
+			continue
+		}
+		if suppressTerminal && legacyTerminalEvent(event.Kind) {
+			return
 		}
 		select {
 		case destination <- event:

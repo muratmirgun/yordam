@@ -15,24 +15,31 @@ import (
 	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/cli"
+	"github.com/muratmirgun/yordam/internal/compaction"
 	"github.com/muratmirgun/yordam/internal/config"
 	contextplanner "github.com/muratmirgun/yordam/internal/context"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/evidence"
+	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/orchestrator"
+	"github.com/muratmirgun/yordam/internal/permission"
 	"github.com/muratmirgun/yordam/internal/ports"
+	"github.com/muratmirgun/yordam/internal/projection"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/provider"
 	"github.com/muratmirgun/yordam/internal/provider/openaicompat"
 	"github.com/muratmirgun/yordam/internal/recovery"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
+	"github.com/muratmirgun/yordam/internal/skills"
 	"github.com/muratmirgun/yordam/internal/tooling"
 	edittool "github.com/muratmirgun/yordam/internal/tools/edit"
 	"github.com/muratmirgun/yordam/internal/tools/output"
 	readtool "github.com/muratmirgun/yordam/internal/tools/read"
 	searchtool "github.com/muratmirgun/yordam/internal/tools/search"
 	shelltool "github.com/muratmirgun/yordam/internal/tools/shell"
+	skilltool "github.com/muratmirgun/yordam/internal/tools/skill"
+	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 	"github.com/muratmirgun/yordam/internal/verification"
 )
 
@@ -52,15 +59,45 @@ type RuntimeSet struct {
 	ProviderCatalog      provider.Catalog
 	ProviderService      *provider.Service
 	ToolService          *tooling.Service
+	Skills               skills.Catalog
+	WorkspaceID          protocol.WorkspaceID
+	ProjectSkillPolicy   config.ProjectSkillPolicy
 	AuthorizationService orchestrator.AuthorizationService
 	Broker               *Broker
 	ApplicationService   *ProtocolService
 	LegacyAdapter        *LegacyAdapter
+	ChildRuntime         *ChildRuntimeView
 	ConfigurationError   error
 	configPath           string
 	bindApprover         func(ports.PermissionApprover)
 	unchecked            bool
 	retire               func()
+}
+
+// ChildRuntimeView is the single immutable handoff surface for sequential
+// children. It is present only when the built-in subagent tool is enabled.
+type ChildRuntimeView struct {
+	Sessions            orchestrator.ChildSessionStore
+	Policies            *permission.SessionPolicyRegistry
+	Skills              skills.Catalog
+	Exposure            protocol.ToolExposure
+	Reconciler          *orchestrator.Service
+	RuntimeGenerationID protocol.RuntimeGenerationID
+	acquire             func() (func(), error)
+}
+
+func (v *ChildRuntimeView) Acquire() (func(), error) {
+	if v == nil || v.acquire == nil {
+		return nil, fmt.Errorf("child runtime is not configured")
+	}
+	return v.acquire()
+}
+
+func (v *ChildRuntimeView) SkillCatalogSnapshot() protocol.SkillCatalogSnapshot {
+	if v == nil || v.Skills == nil {
+		return protocol.SkillCatalogSnapshot{}
+	}
+	return protocol.DeepCopy(v.Skills.Snapshot())
 }
 
 var runtimeSecretGeneration atomic.Uint64
@@ -81,20 +118,84 @@ func (s RuntimeSet) Validate() error {
 	if err := canonicaljson.ValidateDigest(s.Manifest.Body, s.Manifest.Digest); err != nil {
 		return fmt.Errorf("runtime generation manifest: %w", err)
 	}
-	if len(s.Manifest.Body.Models) == 0 || s.Manifest.Body.Limits.MaxToolCalls < 1 || s.Manifest.Body.Limits.MaxToolCalls > 128 || s.Manifest.Body.Limits.ShellTimeoutNanos <= 0 || s.Manifest.Body.Limits.ApplicationQueueCapacity <= 0 {
+	limits := s.Manifest.Body.Limits
+	if len(s.Manifest.Body.Models) == 0 || limits.Validate() != nil {
 		return fmt.Errorf("runtime generation manifest limits or models are invalid")
+	}
+	reserve := limits.CompactReserveTokens
+	if err := reserve.Validate(); err != nil || (reserve.State != protocol.ValueKnown && reserve.State != protocol.ValueUnknown) || (reserve.State == protocol.ValueKnown && reserve.Value <= 0) {
+		return fmt.Errorf("runtime generation compact reserve is invalid")
+	}
+	if s.CompactSession == nil {
+		return fmt.Errorf("runtime compaction is not configured")
 	}
 	for _, model := range s.Manifest.Body.Models {
 		if err := model.Validate(); err != nil || model.RuntimeGenerationID != s.Manifest.ID {
 			return fmt.Errorf("runtime generation model is invalid")
 		}
 	}
+	subagentPresent := false
 	for _, descriptor := range s.Manifest.Body.Tools {
 		if err := descriptor.Body.Validate(); err != nil || canonicaljson.ValidateDigest(descriptor.Body, descriptor.DescriptorDigest) != nil {
 			return fmt.Errorf("runtime generation tool is invalid")
 		}
+		if descriptor.Body.Identity == (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: subagenttool.Kind}) {
+			if subagentPresent || !subagenttool.IsCanonicalDescriptor(descriptor) {
+				return fmt.Errorf("runtime subagent descriptor is not canonical")
+			}
+			subagentPresent = true
+		}
+	}
+	if subagentPresent != limits.Subagents.Enabled {
+		return fmt.Errorf("runtime subagent descriptor does not match configured limits")
+	}
+	if limits.Subagents.Enabled {
+		if s.ChildRuntime == nil || s.ChildRuntime.Sessions == nil || s.ChildRuntime.Policies == nil || s.ChildRuntime.Skills == nil || s.ChildRuntime.Reconciler == nil || s.ChildRuntime.RuntimeGenerationID != s.Manifest.ID || s.ChildRuntime.acquire == nil || s.ChildRuntime.Exposure.Validate() != nil {
+			return fmt.Errorf("runtime child composition is incomplete")
+		}
+		for _, tool := range s.ChildRuntime.Exposure.Tools {
+			if tool.Identity == (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: subagenttool.Kind}) {
+				return fmt.Errorf("runtime child exposure retains subagent")
+			}
+		}
+		childSnapshot := s.ChildRuntime.SkillCatalogSnapshot()
+		if childSnapshot.Revision != s.Manifest.Body.SkillCatalogRevision || !slices.EqualFunc(childSnapshot.Active, s.Manifest.Body.Skills, sameRuntimeSkillDescriptor) {
+			return fmt.Errorf("runtime child skill catalog is not frozen to parent")
+		}
+	} else if s.ChildRuntime != nil {
+		return fmt.Errorf("disabled runtime exposes child composition")
+	}
+	if s.Skills == nil {
+		return fmt.Errorf("runtime skill catalog is not configured")
+	}
+	if s.WorkspaceID == "" || (s.ProjectSkillPolicy != config.ProjectSkillsAsk && s.ProjectSkillPolicy != config.ProjectSkillsAllow && s.ProjectSkillPolicy != config.ProjectSkillsDeny) {
+		return fmt.Errorf("runtime skill snapshot binding is invalid")
+	}
+	snapshot := s.Skills.Snapshot()
+	if err := snapshot.Validate(); err != nil || snapshot.Revision != s.Manifest.Body.SkillCatalogRevision || !slices.EqualFunc(snapshot.Active, s.Manifest.Body.Skills, sameRuntimeSkillDescriptor) {
+		return fmt.Errorf("runtime skill catalog manifest binding is invalid")
+	}
+	for _, descriptor := range snapshot.Active {
+		if descriptor.State != protocol.SkillStateActive || descriptor.Identity.RuntimeGenerationID != s.Manifest.ID {
+			return fmt.Errorf("runtime active skill catalog generation binding is invalid")
+		}
+	}
+	for _, descriptor := range snapshot.Discovered {
+		if descriptor.Identity.RuntimeGenerationID != s.Manifest.ID {
+			return fmt.Errorf("runtime skill catalog generation binding is invalid")
+		}
 	}
 	return nil
+}
+
+func sameRuntimeSkillDescriptor(left, right protocol.SkillDescriptor) bool {
+	if left.Identity != right.Identity || left.Description != right.Description || left.State != right.State {
+		return false
+	}
+	if left.Shadows == nil || right.Shadows == nil {
+		return left.Shadows == nil && right.Shadows == nil
+	}
+	return *left.Shadows == *right.Shadows
 }
 
 type ReloadRuntime func(context.Context, domain.ModelSelection) (RuntimeSet, error)
@@ -142,12 +243,42 @@ func (s RuntimeSet) BindApprover(approver ports.PermissionApprover) {
 	}
 }
 
+// SkillCatalogSnapshot returns a deep-copied description of the catalog frozen
+// into this generation. Child handoffs must use this snapshot rather than
+// rescanning mutable filesystem input.
+func (s RuntimeSet) SkillCatalogSnapshot() protocol.SkillCatalogSnapshot {
+	if s.Skills == nil {
+		return protocol.SkillCatalogSnapshot{}
+	}
+	return protocol.DeepCopy(s.Skills.Snapshot())
+}
+
+// SkillSnapshot is the metadata-only, deep-copied catalog available to a
+// local client. It is a snapshot of this generation, never a filesystem scan.
+func (s RuntimeSet) SkillSnapshot() SkillSnapshot {
+	snapshot := NewSkillSnapshot(s.WorkspaceID, s.SkillCatalogSnapshot(), s.ProjectSkillPolicy)
+	if s.Redactor == nil {
+		return snapshot
+	}
+	for index := range snapshot.Active {
+		snapshot.Active[index].Description = s.Redactor.String(snapshot.Active[index].Description)
+	}
+	for index := range snapshot.Discovered {
+		snapshot.Discovered[index].Description = s.Redactor.String(snapshot.Discovered[index].Description)
+	}
+	for index := range snapshot.Diagnostics {
+		snapshot.Diagnostics[index].Message = s.Redactor.String(snapshot.Diagnostics[index].Message)
+	}
+	return snapshot
+}
+
 type runtimeBuilder struct {
 	configPath       string
 	cli              cli.Options
 	workspace        domain.Workspace
 	store            *jsonl.Store
 	policy           *policyBinding
+	policies         *permission.SessionPolicyRegistry
 	activeSession    *sessionBinding
 	runtimeEvents    chan<- agent.RuntimeEvent
 	httpClient       *http.Client
@@ -158,7 +289,28 @@ type runtimeBuilder struct {
 	workspaceControl protocol.JournalRef
 }
 
+// childSessionStore deliberately exposes only journal inspection to the
+// parent handoff API while the coordinator receives the full parent-session
+// inspector separately to inherit workspace/mode/model identity.
+type childSessionStore struct{ store *jsonl.Store }
+
+func (s childSessionStore) ReserveSessionID() (protocol.SessionID, error) {
+	return s.store.ReserveSessionID()
+}
+
+func (s childSessionStore) CreateWithIdentity(ctx context.Context, id protocol.SessionID, workspace domain.Workspace, mode domain.PermissionMode, selection domain.ModelSelection, lineage *journal.SessionLineage) (domain.Session, error) {
+	return s.store.CreateWithIdentity(ctx, id, workspace, mode, selection, lineage)
+}
+
+func (s childSessionStore) InspectSession(ctx context.Context, id protocol.SessionID) (journal.Inspection, error) {
+	inspection, err := s.store.InspectSession(ctx, id)
+	return inspection.Journal, err
+}
+
 func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection) (RuntimeSet, error) {
+	if err := cfg.Validate(); err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "configuration is invalid; edit the file and run /reload", err)
+	}
 	defaultProfile, defaultModel := "", ""
 	if slices.Contains(cfg.Models(), current) {
 		defaultProfile, defaultModel = current.Profile, current.Model
@@ -248,6 +400,42 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		Redact:           admission,
 		Admission:        admission,
 	}
+	workspaceControl := b.workspaceControl
+	if workspaceControl == (protocol.JournalRef{}) {
+		workspaceControl, err = b.store.EnsureWorkspaceControl(context.Background(), b.workspace)
+		if err != nil {
+			return RuntimeSet{}, configurationError(b.configPath, "initialize workspace control", err)
+		}
+	}
+	discovery, err := skills.Discover(context.Background(), skills.DiscoveryOptions{
+		Workspace:    b.workspace,
+		GlobalRoot:   filepath.Join(filepath.Dir(b.configPath), "skills"),
+		ProjectRoot:  filepath.Join(b.workspace.CanonicalPath, ".yordam", "skills"),
+		GenerationID: generationID,
+	})
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "discover skills", err)
+	}
+	projectDigest, err := skills.ProjectCatalogDigest(discovery.Candidates)
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "digest discovered project skills", err)
+	}
+	workspaceHead, err := b.store.Head(context.Background(), workspaceControl)
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "read workspace trust", err)
+	}
+	var trust *skills.TrustState
+	if workspaceHead != (protocol.CommittedCursor{}) {
+		trustProjection, projectErr := projection.New[skills.TrustProjection](b.store, skills.TrustProjector{}, nil).At(context.Background(), workspaceControl, workspaceHead)
+		if projectErr != nil {
+			return RuntimeSet{}, configurationError(b.configPath, "project skill trust", projectErr)
+		}
+		trust, _ = trustProjection.State.Resolve(protocol.WorkspaceID(b.workspace.ID), projectDigest)
+	}
+	skillCatalog, err := skills.Build(skills.BuildOptions{Discovery: discovery, Policy: cfg.Skills.ProjectPolicy, Trust: trust, Workspace: b.workspace, Generation: generationID})
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "build skill catalog", err)
+	}
 	runnerAdmission, err := admission.Derive()
 	if err != nil {
 		return RuntimeSet{}, configurationError(b.configPath, "bind runner secret admission", err)
@@ -266,6 +454,12 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 	toolItems := []ports.Tool{
 		readtool.New(readtool.Options{Workspace: b.workspace.CanonicalPath, Output: outputOptions}),
 		searchtool.New(searchtool.Options{Workspace: b.workspace.CanonicalPath, Output: outputOptions}),
+		skilltool.New(skillCatalog, outputOptions),
+	}
+	if cfg.Subagents.Enabled {
+		toolItems = append(toolItems, subagenttool.New())
+	}
+	toolItems = append(toolItems,
 		edittool.New(edittool.Options{Workspace: b.workspace.CanonicalPath, Output: outputOptions}),
 		shelltool.New(shelltool.Options{
 			Workspace:       b.workspace.CanonicalPath,
@@ -274,7 +468,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 			Output:          outputOptions,
 			Progress:        progress,
 		}),
-	}
+	)
 	toolCatalogRevision := "builtin-v1"
 	toolCatalog, err := tooling.NewCatalog(toolCatalogRevision, toolItems...)
 	if err != nil {
@@ -284,8 +478,22 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 	providerCatalogRevision := "configured-v1"
 	providerCatalog := provider.NewCatalog(providerCatalogRevision, models)
 	durableAuthorization := authorization.NewService(b.store)
+	policies := b.policies
+	if policies == nil {
+		policies = permission.NewSessionPolicyRegistry()
+		b.policies = policies
+	}
+	if b.policy == nil {
+		return RuntimeSet{}, configurationError(b.configPath, "build authorization", fmt.Errorf("session policy is required"))
+	}
+	b.policy.mu.RLock()
+	currentPolicy := b.policy.current
+	b.policy.mu.RUnlock()
+	if err := policies.RegisterParent(protocol.SessionID(b.activeSession.get()), currentPolicy); err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "register active session policy", err)
+	}
 	authorizer := &runtimeAuthorization{
-		Service: durableAuthorization, Policy: b.policy, Tools: toolCatalog,
+		Service: durableAuthorization, Registry: policies, Tools: toolCatalog,
 		Workspace: b.workspace, ActiveSession: b.activeSession,
 	}
 	providerService, err := provider.NewService(providerCatalog, []provider.Adapter{&openAIAdapterRouter{byProvider: routedAdapters}}, authorizer)
@@ -301,16 +509,23 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		}
 		toolDescriptors = append(toolDescriptors, descriptor)
 	}
+	instructions, err := newSkillInstructions(generationID, skillCatalog)
+	if err != nil {
+		return RuntimeSet{}, configurationError(b.configPath, "build skill instructions", err)
+	}
 	body := protocol.RuntimeGenerationBody{
 		ProviderCatalogRevision: providerCatalogRevision,
 		Models:                  protocol.DeepCopy(models),
 		ToolCatalogRevision:     toolCatalogRevision,
 		Tools:                   protocol.DeepCopy(toolDescriptors),
-		InstructionRevision:     "system-v1",
+		SkillCatalogRevision:    skillCatalog.Snapshot().Revision,
+		Skills:                  skillCatalog.Snapshot().Active,
+		InstructionRevision:     instructions.revision,
 		PolicyGeneration:        "compatibility-v1",
 		ExecutionProfiles:       []string{"network", "restricted", "unsandboxed"},
 		Limits: protocol.RuntimeLimits{
 			MaxToolCalls: effectiveMaxToolCalls(cfg, b.cli), ShellTimeoutNanos: int64(effectiveShellTimeout(cfg, b.cli)), ApplicationQueueCapacity: 64,
+			AutoCompact: cfg.Context.AutoCompact, CompactReserveTokens: runtimeCompactReserve(cfg), Subagents: runtimeSubagentLimits(cfg),
 		},
 	}
 	manifestDigest, err := canonicaljson.Digest(body)
@@ -321,15 +536,8 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 	if b.lane == nil {
 		b.lane = orchestrator.NewOperationLane()
 	}
-	workspaceControl := b.workspaceControl
-	if workspaceControl == (protocol.JournalRef{}) {
-		workspaceControl, err = b.store.EnsureWorkspaceControl(context.Background(), b.workspace)
-		if err != nil {
-			return RuntimeSet{}, configurationError(b.configPath, "initialize application broker", err)
-		}
-	}
 	broker, err := NewBroker(BrokerOptions{
-		Source: runtimeBrokerSource{Repository: b.store, Workspace: workspaceControl, Generation: generationID},
+		Source: runtimeBrokerSource{Repository: b.store, Sessions: b.store, Workspace: workspaceControl, Generation: generationID, Manifest: manifest, Skills: skillCatalog, Redactor: admission},
 		Epoch:  string(generationID), DefaultQueueCapacity: 64, MaxQueueCapacity: 1024,
 	})
 	if err != nil {
@@ -348,24 +556,6 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		_ = evidenceStore.Close()
 		return RuntimeSet{}, configurationError(b.configPath, "build recovery store", err)
 	}
-	approverBridge := &interactiveApproverBinding{}
-	publisher := b.publisher
-	if publisher == nil {
-		publisher = broker
-	}
-	service, err := orchestrator.NewService(orchestrator.Dependencies{
-		Lane: b.lane, Repository: b.store, TurnLeases: b.store,
-		Context: contextplanner.NewPlanner(toolCatalogRevision), Providers: providerCatalog, Provider: providerService,
-		Tools: toolService, Authorization: authorizer, Approver: approverBridge,
-		Evidence: evidenceStore, Recovery: recoveryRecorder{Tools: toolService, Store: recoveryStore},
-		Verification: verification.NewService(time.Now), Projection: recoveryProjection{Repository: b.store},
-		Publisher: publisher, Admission: generationAdmission{Registry: secretRegistry}, Instructions: staticInstructions{},
-	})
-	if err != nil {
-		_ = evidenceStore.Close()
-		_ = recoveryStore.Close()
-		return RuntimeSet{}, configurationError(b.configPath, "build turn orchestrator", err)
-	}
 	lifecycle := newRuntimeLifecycle(func() {
 		_ = evidenceStore.Close()
 		_ = recoveryStore.Close()
@@ -376,6 +566,60 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		}
 	})
 	retire = lifecycle.retire
+	approverBridge := &interactiveApproverBinding{}
+	approverBridge.setChildPrompts(policies)
+	publisher := b.publisher
+	if publisher == nil {
+		publisher = broker
+	}
+	childSessions := childSessionStore{store: b.store}
+	service, err := orchestrator.NewService(orchestrator.Dependencies{
+		Lane: b.lane, Repository: b.store, TurnLeases: b.store,
+		Context: contextplanner.NewPlanner(toolCatalogRevision, contextplanner.NewEvidenceSummaryResolver(evidenceStore)), Providers: providerCatalog, Provider: providerService,
+		Tools: toolService, Authorization: authorizer, Approver: approverBridge,
+		Evidence: evidenceStore, Recovery: recoveryRecorder{Tools: toolService, Store: recoveryStore},
+		Verification: verification.NewService(time.Now), Projection: recoveryProjection{Repository: b.store},
+		Publisher: publisher, Admission: generationAdmission{Registry: secretRegistry}, Instructions: instructions,
+		ChildSessions: childSessions, ParentSessions: b.store,
+	})
+	if err != nil {
+		lifecycle.retire()
+		return RuntimeSet{}, configurationError(b.configPath, "build turn orchestrator", err)
+	}
+	childRun := func(ctx context.Context, request orchestrator.StartTurnRequest) (orchestrator.RunResult, error) {
+		release, acquireErr := lifecycle.acquire()
+		if acquireErr != nil {
+			return orchestrator.RunResult{}, acquireErr
+		}
+		defer release()
+		return service.RunTurn(ctx, request)
+	}
+	childCoordinator, err := orchestrator.NewSequentialChildCoordinator(childSessions, b.store, childRun, policies)
+	if err != nil {
+		lifecycle.retire()
+		return RuntimeSet{}, configurationError(b.configPath, "build child coordinator", err)
+	}
+	service.SetChildCoordinator(childCoordinator)
+	compactSession := func(ctx context.Context, session domain.Session, _ domain.SessionReplay) error {
+		if session.ID == "" {
+			return fmt.Errorf("compaction requires a selected session")
+		}
+		ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(session.ID)}
+		head, err := b.store.Head(ctx, ref)
+		if err != nil {
+			return err
+		}
+		metadata, err := runtimeCompactionMetadata(protocol.SessionID(session.ID), head, manifest.ID)
+		if err != nil {
+			return err
+		}
+		_, err = service.RunCompaction(ctx, orchestrator.CompactRequest{
+			Command: metadata, WorkspaceID: protocol.WorkspaceID(b.workspace.ID), SessionID: protocol.SessionID(session.ID), ExpectedHead: head,
+			ProviderID: protocol.ProviderID(session.Selection.Profile), ModelID: protocol.ModelID(session.Selection.Model),
+			Runtime: protocol.DeepCopy(manifest), Trigger: compaction.TriggerManual,
+		})
+		return err
+	}
 	runner := &agent.OrchestratedRunner{
 		Orchestrator: service,
 		Prepare: func(_ context.Context, input agent.RunInput) (orchestrator.StartTurnRequest, error) {
@@ -383,7 +627,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 				return orchestrator.StartTurnRequest{}, fmt.Errorf("turn input has no committed command or session head")
 			}
 			return orchestrator.StartTurnRequest{
-				Command: input.Command, ExpectedHead: input.ExpectedHead,
+				Command: input.Command, WorkspaceID: protocol.WorkspaceID(b.workspace.ID), ExpectedHead: input.ExpectedHead,
 				ProviderID: protocol.ProviderID(input.Session.Selection.Profile), ModelID: protocol.ModelID(input.Session.Selection.Model),
 				Runtime: protocol.DeepCopy(manifest),
 			}, nil
@@ -399,7 +643,7 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 			}
 		},
 	}
-	dispatcher := runtimeCommandDispatcher{Orchestrator: service, Store: b.store, Manifest: protocol.DeepCopy(manifest), Workspace: workspaceControl}
+	dispatcher := runtimeCommandDispatcher{Orchestrator: service, Store: b.store, Manifest: protocol.DeepCopy(manifest), Workspace: workspaceControl, WorkspaceID: protocol.WorkspaceID(b.workspace.ID), Skills: skillCatalog, Acquire: lifecycle.acquire}
 	applicationService, err := NewProtocolService(ProtocolServiceOptions{
 		Orchestrator: service, Dispatcher: dispatcher, Broker: broker, WorkspaceControl: workspaceControl,
 	})
@@ -409,11 +653,21 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 	}
 	legacyAdapter := NewLegacyAdapter(LegacyAdapterOptions{
 		Actor: protocol.ActorRef{ID: "legacy-user", Kind: protocol.ActorUser}, SelectedSessionID: protocol.SessionID(b.activeSession.get()),
-		Cursor: runtimeCommandExpectation(b.store, workspaceControl, b.activeSession),
+		Cursor: runtimeCommandExpectation(b.store, workspaceControl, b.activeSession), RuntimeGenerationID: generationID,
 	})
+	var childRuntime *ChildRuntimeView
+	if cfg.Subagents.Enabled {
+		childExposure, exposureErr := toolCatalog.Without(subagenttool.Kind)
+		if exposureErr != nil {
+			lifecycle.retire()
+			return RuntimeSet{}, configurationError(b.configPath, "derive child tool exposure", exposureErr)
+		}
+		childRuntime = &ChildRuntimeView{Sessions: childSessions, Policies: policies, Skills: skillCatalog, Exposure: childExposure, Reconciler: service, RuntimeGenerationID: generationID, acquire: lifecycle.acquire}
+	}
 	succeeded = true
 	result := RuntimeSet{
 		Runtime:              runner,
+		CompactSession:       compactSession,
 		Models:               cfg.Models(),
 		DefaultSelection:     cfg.DefaultSelection(),
 		CredentialEnvs:       credentialEnvs,
@@ -427,10 +681,14 @@ func (b *runtimeBuilder) build(cfg config.Config, current domain.ModelSelection)
 		ProviderCatalog:      providerCatalog,
 		ProviderService:      providerService,
 		ToolService:          toolService,
+		Skills:               skillCatalog,
+		WorkspaceID:          protocol.WorkspaceID(b.workspace.ID),
+		ProjectSkillPolicy:   cfg.Skills.ProjectPolicy,
 		AuthorizationService: authorizer,
 		Broker:               broker,
 		ApplicationService:   applicationService,
 		LegacyAdapter:        legacyAdapter,
+		ChildRuntime:         childRuntime,
 		configPath:           b.configPath,
 		bindApprover: func(approver ports.PermissionApprover) {
 			approverBridge.set(approver)
@@ -475,7 +733,9 @@ func effectiveShellTimeout(cfg config.Config, options cli.Options) time.Duration
 
 func configurationError(path, message string, cause error) error {
 	if path != "" {
-		message = path + ": " + message
+		// Keep the recovery diagnostic on the first terminal line. Canonical paths
+		// can be long enough to hide parser failures in a bounded TUI viewport.
+		message += "\nconfig: " + path
 	}
 	return &domain.TypedError{Kind: domain.ErrorConfigurationInvalid, Message: message, Cause: cause}
 }

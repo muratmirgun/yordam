@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 	"github.com/muratmirgun/yordam/internal/workspace"
 )
@@ -81,6 +82,37 @@ func TestContextTooLargeShowsCompactAction(t *testing.T) {
 	for _, want := range []string{"context_too_large", "request exceeded context", "Run /compact"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("view missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestContextShowsCompactionHintWhenNoCompactionStateIsKnown(t *testing.T) {
+	panel := components.NewContext()
+
+	view := panel.View()
+	for _, want := range []string{"CONTEXT", "Auto compaction: unavailable", "/compact"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestContextCompactionLabelsAndPolicyReasons(t *testing.T) {
+	for _, reason := range []string{"disabled", "unknown_context_window", "unknown_generation", "invalid_budget", "below_threshold", "threshold_reached"} {
+		panel := components.NewContext()
+		panel.SetCompactionContext(protocol.ContextProjectionV1{AutoReason: reason, EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 100}, ContextWindow: protocol.ValueInt64{State: protocol.ValueKnown, Value: 1000}, ReserveTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 50}})
+		if !strings.Contains(panel.View(), "Auto compaction: "+reason) {
+			t.Fatalf("reason=%s view=%s", reason, panel.View())
+		}
+	}
+	for _, trigger := range []string{"manual", "automatic"} {
+		for _, stage := range []protocol.CompactionStage{protocol.CompactionPreparing, protocol.CompactionSummarizing, protocol.CompactionPersisting} {
+			panel := components.NewContext()
+			panel.SetCompactionContext(protocol.ContextProjectionV1{})
+			panel.SetCompactionProgress(protocol.CompactionEventV1{Trigger: trigger, Stage: stage})
+			if !strings.Contains(panel.View(), "Compaction ("+trigger+"): "+string(stage)) {
+				t.Fatal(panel.View())
+			}
 		}
 	}
 }

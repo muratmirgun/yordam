@@ -3,13 +3,18 @@ package tui_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
+	lipgloss "charm.land/lipgloss/v2"
+	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/tui"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 )
@@ -24,6 +29,7 @@ func TestSlashCommandTable(t *testing.T) {
 		{input: "/sessions", wantScreen: "sessions"},
 		{input: "/mode", wantScreen: "mode"},
 		{input: "/model", wantScreen: "model"},
+		{input: "/skills", wantScreen: "skills"},
 		{input: "/reload", wantCommand: app.CommandReloadConfig, wantScreen: "conversation"},
 		{input: "/compact", wantCommand: app.CommandCompact, wantScreen: "conversation"},
 		{input: "/help", wantScreen: "help"},
@@ -346,7 +352,7 @@ func TestStateModelsDistinguishesNilFromEmpty(t *testing.T) {
 func TestHelpListsReloadCommand(t *testing.T) {
 	model, _ := tui.NavigationModelForTest()
 	model = tui.SubmitForTest(model, "/help")
-	if view := model.View().Content; !strings.Contains(view, "/new /sessions /mode /model /reload /compact /help /quit") {
+	if view := model.View().Content; !strings.Contains(view, "/new /sessions /mode /model /skills /reload /compact /help /quit") {
 		t.Fatalf("help missing reload command:\n%s", view)
 	}
 }
@@ -550,6 +556,133 @@ func TestDurableStateEventUpdatesStatusAndProjectsOpenedSession(t *testing.T) {
 	blocks := model.ConversationBlocksForTest()
 	if len(blocks) != 2 || blocks[0].Content != "persisted user" || blocks[1].Content != "persisted assistant" {
 		t.Fatalf("projected blocks=%v", blocks)
+	}
+}
+
+func TestDurableSubagentSnapshotRendersCardAndNavigatesChildAndParent(t *testing.T) {
+	model, commands := tui.NavigationModelForTest()
+	card := protocol.SubagentCardV1{AttemptID: "attempt", ParentSessionID: "parent", ChildSessionID: "child", Task: "inspect recovery", State: protocol.SubagentStageRunning, Attempt: 1, StartedAt: time.Unix(1, 0).UTC(), Deadline: time.Unix(11, 0).UTC(), ElapsedNanos: int64(time.Second), MaxToolCalls: 4}
+	rawCard, _ := json.Marshal(card)
+	lineage := protocol.SubagentLineageV1{SessionID: "parent", Children: []protocol.SessionID{"child"}}
+	rawLineage, _ := json.Marshal(lineage)
+	durable := protocol.DurableProjection{Subagents: []protocol.ProjectionView{{ID: "attempt", Kind: "subagent", Status: "running", State: protocol.ValueKnown, Data: rawCard}}, Lineage: &protocol.ProjectionView{ID: "parent", Kind: "lineage", Status: "ready", State: protocol.ValueKnown, Data: rawLineage}}
+	parent := domain.Session{ID: "parent", Title: "Parent", Mode: domain.ModeAsk, Selection: domain.ModelSelection{Profile: "primary", Model: "model-a"}}
+	parentEvent := app.Event{Kind: app.EventState, Session: parent, Replay: domain.SessionReplay{Session: parent}, Durable: &durable}
+	model = tui.ApplyAppEventForTest(model, parentEvent)
+	if view := model.View().Content; !strings.Contains(view, "inspect recovery") || !strings.Contains(view, "child") {
+		t.Fatalf("child card absent:\n%s", view)
+	}
+	model = tui.PressForTest(model, "alt+enter")
+	got := tui.CommandsForTest(commands)
+	if len(got) != 1 || got[0].Kind != app.CommandOpenSession || got[0].SessionID != "child" {
+		t.Fatalf("open child commands=%+v", got)
+	}
+
+	childLineage := protocol.SubagentLineageV1{SessionID: "child", ParentSessionID: "parent", DelegationAttemptID: "attempt", Children: []protocol.SessionID{}}
+	rawChildLineage, _ := json.Marshal(childLineage)
+	childDurable := protocol.DurableProjection{Lineage: &protocol.ProjectionView{ID: "child", Kind: "lineage", Status: "ready", State: protocol.ValueKnown, Data: rawChildLineage}}
+	child := domain.Session{ID: "child", Title: "Child", Mode: domain.ModeAsk, Selection: parent.Selection}
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventState, Session: child, Replay: domain.SessionReplay{Session: child}, Durable: &childDurable})
+	if view := model.View().Content; !strings.Contains(view, "Parent: parent") {
+		t.Fatalf("parent backlink absent:\n%s", view)
+	}
+	model = tui.PressForTest(model, "alt+left")
+	got = tui.CommandsForTest(commands)
+	if len(got) != 1 || got[0].SessionID != "parent" {
+		t.Fatalf("return parent commands=%+v", got)
+	}
+
+	restarted, restartedCommands := tui.NavigationModelForTest()
+	restarted = tui.ApplyAppEventForTest(restarted, parentEvent)
+	if view := restarted.View().Content; !strings.Contains(view, "inspect recovery") || !strings.Contains(view, "child") {
+		t.Fatalf("restart did not reconstruct child card:\n%s", view)
+	}
+	restarted = tui.PressForTest(restarted, "alt+enter")
+	if got := tui.CommandsForTest(restartedCommands); len(got) != 1 || got[0].SessionID != "child" {
+		t.Fatalf("restart child navigation=%+v", got)
+	}
+}
+
+func TestRealModelBoundsSelectedChildCardWithHugeHistoryAndCardList(t *testing.T) {
+	model := tui.NewModel(tui.OptionsForTest())
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTextDelta, Runtime: agent.RuntimeEvent{Text: strings.Repeat("huge history line\n", 1000)}})
+	long := strings.Repeat("long-task-value-", 120)
+	views := make([]protocol.ProjectionView, 20)
+	for index := range views {
+		card := protocol.SubagentCardV1{
+			AttemptID: protocol.DelegationAttemptID(fmt.Sprintf("attempt-%02d", index+1)), ParentSessionID: "parent",
+			ChildSessionID: protocol.SessionID(fmt.Sprintf("123e4567-e89b-12d3-a456-%012d", index)), Task: long,
+			State: protocol.SubagentStageSucceeded, Attempt: index%protocol.MaxSubagentAttemptsPerTurn + 1,
+			StartedAt: time.Unix(1, 0).UTC(), Deadline: time.Unix(3, 0).UTC(), ElapsedNanos: int64(time.Second), ToolCalls: 1, MaxToolCalls: 4,
+		}
+		if index%2 == 0 {
+			card.ReceiptSummary = long
+			card.ChangedFiles = []string{"a-" + long, "b-" + long, "c-" + long}
+			card.CommandsAndTests = []string{"a-" + long, "b-" + long, "c-" + long}
+		}
+		raw, err := json.Marshal(card)
+		if err != nil {
+			t.Fatal(err)
+		}
+		views[index] = protocol.ProjectionView{ID: string(card.AttemptID), Kind: "subagent", Status: string(card.State), State: protocol.ValueKnown, Data: raw}
+	}
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventState, Durable: &protocol.DurableProjection{Subagents: views}})
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnCompleted})
+	for range 12 {
+		model = tui.PressForTest(model, "alt+]")
+	}
+	for _, width := range []int{40, 120} {
+		model = tui.UpdateForTest(model, tea.WindowSizeMsg{Width: width, Height: 24})
+		view := model.View()
+		rendered := view.Content
+		if lines := strings.Count(strings.TrimSuffix(rendered, "\n"), "\n") + 1; lines > 24 {
+			t.Fatalf("width %d terminal overflow: lines=%d height=24\n%s", width, lines, rendered)
+		}
+		if view.Cursor == nil || view.Cursor.Position.Y < 0 || view.Cursor.Position.Y >= 24 {
+			t.Fatalf("width %d composer cursor is not visible: %+v", width, view.Cursor)
+		}
+		start := strings.Index(rendered, "card 13/20")
+		endMarker := "Alt+[/Alt+] cards | Alt+Enter open"
+		end := strings.Index(rendered[start:], endMarker)
+		if start < 0 || end < 0 {
+			t.Fatalf("width %d selected card missing:\n%s", width, rendered)
+		}
+		end += start + len(endMarker)
+		cardView := rendered[start:end]
+		lines := strings.Split(cardView, "\n")
+		if len(lines) > 12 || strings.Contains(cardView, "attempt-12") || strings.Contains(cardView, "attempt-14") {
+			t.Fatalf("width %d unbounded/non-selected card view (%d lines):\n%s", width, len(lines), cardView)
+		}
+		for _, line := range lines {
+			if lipgloss.Width(line) > width {
+				t.Fatalf("width %d card line width=%d: %q", width, lipgloss.Width(line), line)
+			}
+		}
+		model = tui.PressForTest(model, "alt+]")
+		transition := model.View()
+		if lines := strings.Count(strings.TrimSuffix(transition.Content, "\n"), "\n") + 1; lines > 24 || transition.Cursor == nil || transition.Cursor.Position.Y >= 24 || !strings.Contains(transition.Content, "card 14/20") {
+			t.Fatalf("width %d card-height transition overflow/cursor loss: cursor=%+v\n%s", width, transition.Cursor, transition.Content)
+		}
+		model = tui.PressForTest(model, "alt+[")
+	}
+}
+
+func TestLiveSubagentStageUsesFreshDurableSnapshotAndEscCancelsParent(t *testing.T) {
+	model, commands := tui.NavigationModelForTest()
+	model = tui.SetTurnActiveForTest(model, true)
+	card := protocol.SubagentCardV1{AttemptID: "attempt", ParentSessionID: "parent", ChildSessionID: "child", Task: "child task", State: protocol.SubagentStageRunning, Attempt: 1, StartedAt: time.Unix(1, 0).UTC(), Deadline: time.Unix(11, 0).UTC(), ElapsedNanos: int64(time.Second), MaxToolCalls: 4}
+	raw, _ := json.Marshal(card)
+	durable := protocol.DurableProjection{Subagents: []protocol.ProjectionView{{ID: "attempt", Kind: "subagent", Status: "running", State: protocol.ValueKnown, Data: raw}}}
+	stage := protocol.SubagentStageV1{AttemptID: "attempt", ParentSessionID: "parent", ChildSessionID: "child", Stage: protocol.SubagentStageWaiting}
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventSubagentStage, Subagent: &stage, Durable: &durable})
+	view := model.View().Content
+	if !strings.Contains(view, "[running]") || strings.Contains(view, "[waiting]") {
+		t.Fatalf("transient stage overrode durable snapshot:\n%s", view)
+	}
+	model = tui.PressForTest(model, "esc")
+	got := tui.CommandsForTest(commands)
+	if len(got) != 1 || got[0].Kind != app.CommandCancelTurn || !model.CancelSentForTest() {
+		t.Fatalf("Esc did not cancel owning parent turn: commands=%+v", got)
 	}
 }
 

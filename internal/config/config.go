@@ -24,12 +24,39 @@ const (
 	reservedModelID            = "your-model-id"
 )
 
+var defaultSubagentConfig = SubagentConfig{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 16, TimeoutSeconds: 600}
+
 type Profile struct {
-	Name         string
-	BaseURL      string
-	APIKeyEnv    string
-	Models       []string
-	DefaultModel string
+	Name                string
+	BaseURL             string
+	APIKeyEnv           string
+	Models              []string
+	DefaultModel        string
+	ModelContextWindows map[string]int64
+}
+
+type ContextConfig struct {
+	AutoCompact          bool
+	CompactReserveTokens *int64
+}
+
+type ProjectSkillPolicy string
+
+const (
+	ProjectSkillsAsk   ProjectSkillPolicy = "ask"
+	ProjectSkillsAllow ProjectSkillPolicy = "allow"
+	ProjectSkillsDeny  ProjectSkillPolicy = "deny"
+)
+
+type SkillConfig struct {
+	ProjectPolicy ProjectSkillPolicy
+}
+
+type SubagentConfig struct {
+	Enabled        bool
+	MaxPerTurn     int
+	MaxToolCalls   int
+	TimeoutSeconds int
 }
 
 type Config struct {
@@ -37,6 +64,9 @@ type Config struct {
 	Profiles            map[string]Profile
 	MaxToolCalls        int
 	ShellTimeoutSeconds int
+	Context             ContextConfig
+	Skills              SkillConfig
+	Subagents           SubagentConfig
 	raw                 []byte
 	lookupEnv           func(string) (string, bool)
 }
@@ -64,10 +94,13 @@ type ResolvedProfile struct {
 }
 
 type document struct {
-	Schema   string                      `json:"$schema,omitempty"`
-	Model    string                      `json:"model"`
-	Provider map[string]documentProvider `json:"provider"`
-	Limits   documentLimits              `json:"limits,omitempty"`
+	Schema    string                      `json:"$schema,omitempty"`
+	Model     string                      `json:"model"`
+	Provider  map[string]documentProvider `json:"provider"`
+	Limits    documentLimits              `json:"limits,omitempty"`
+	Context   documentContext             `json:"context,omitempty"`
+	Skills    documentSkills              `json:"skills,omitempty"`
+	Subagents documentSubagents           `json:"subagents,omitempty"`
 }
 
 type documentProvider struct {
@@ -82,7 +115,8 @@ type documentProviderOptions struct {
 }
 
 type documentModel struct {
-	Name string `json:"name,omitempty"`
+	Name          string `json:"name,omitempty"`
+	ContextWindow *int64 `json:"contextWindow,omitempty"`
 }
 
 type documentLimits struct {
@@ -90,8 +124,24 @@ type documentLimits struct {
 	ShellTimeoutSeconds *int `json:"shellTimeoutSeconds,omitempty"`
 }
 
+type documentContext struct {
+	AutoCompact          *bool  `json:"autoCompact,omitempty"`
+	CompactReserveTokens *int64 `json:"compactReserveTokens,omitempty"`
+}
+
+type documentSkills struct {
+	ProjectPolicy *ProjectSkillPolicy `json:"projectPolicy,omitempty"`
+}
+
+type documentSubagents struct {
+	Enabled        *bool `json:"enabled,omitempty"`
+	MaxPerTurn     *int  `json:"maxPerTurn,omitempty"`
+	MaxToolCalls   *int  `json:"maxToolCalls,omitempty"`
+	TimeoutSeconds *int  `json:"timeoutSeconds,omitempty"`
+}
+
 func (d *document) UnmarshalJSON(data []byte) error {
-	fields, err := decodeExactObject(data, "$schema", "model", "provider", "limits")
+	fields, err := decodeExactObject(data, "$schema", "model", "provider", "limits", "context", "skills", "subagents")
 	if err != nil {
 		return err
 	}
@@ -105,7 +155,16 @@ func (d *document) UnmarshalJSON(data []byte) error {
 	if err := decodeField(fields, "provider", &d.Provider); err != nil {
 		return err
 	}
-	return decodeField(fields, "limits", &d.Limits)
+	if err := decodeField(fields, "limits", &d.Limits); err != nil {
+		return err
+	}
+	if err := decodeField(fields, "context", &d.Context); err != nil {
+		return err
+	}
+	if err := decodeField(fields, "skills", &d.Skills); err != nil {
+		return err
+	}
+	return decodeField(fields, "subagents", &d.Subagents)
 }
 
 func (d *documentProvider) UnmarshalJSON(data []byte) error {
@@ -136,12 +195,22 @@ func (d *documentProviderOptions) UnmarshalJSON(data []byte) error {
 }
 
 func (d *documentModel) UnmarshalJSON(data []byte) error {
-	fields, err := decodeExactObject(data, "name")
+	fields, err := decodeExactObject(data, "name", "contextWindow")
 	if err != nil {
 		return err
 	}
 	*d = documentModel{}
-	return decodeField(fields, "name", &d.Name)
+	if err := decodeField(fields, "name", &d.Name); err != nil {
+		return err
+	}
+	if _, ok := fields["contextWindow"]; ok {
+		var value int64
+		if err := decodeField(fields, "contextWindow", &value); err != nil {
+			return err
+		}
+		d.ContextWindow = &value
+	}
+	return nil
 }
 
 func (d *documentLimits) UnmarshalJSON(data []byte) error {
@@ -163,6 +232,82 @@ func (d *documentLimits) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		d.ShellTimeoutSeconds = &value
+	}
+	return nil
+}
+
+func (d *documentContext) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "autoCompact", "compactReserveTokens")
+	if err != nil {
+		return err
+	}
+	*d = documentContext{}
+	if _, ok := fields["autoCompact"]; ok {
+		var value bool
+		if err := decodeField(fields, "autoCompact", &value); err != nil {
+			return err
+		}
+		d.AutoCompact = &value
+	}
+	if _, ok := fields["compactReserveTokens"]; ok {
+		var value int64
+		if err := decodeField(fields, "compactReserveTokens", &value); err != nil {
+			return err
+		}
+		d.CompactReserveTokens = &value
+	}
+	return nil
+}
+
+func (d *documentSkills) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "projectPolicy")
+	if err != nil {
+		return err
+	}
+	*d = documentSkills{}
+	if _, ok := fields["projectPolicy"]; ok {
+		var value ProjectSkillPolicy
+		if err := decodeField(fields, "projectPolicy", &value); err != nil {
+			return err
+		}
+		d.ProjectPolicy = &value
+	}
+	return nil
+}
+
+func (d *documentSubagents) UnmarshalJSON(data []byte) error {
+	fields, err := decodeExactObject(data, "enabled", "maxPerTurn", "maxToolCalls", "timeoutSeconds")
+	if err != nil {
+		return err
+	}
+	*d = documentSubagents{}
+	if _, ok := fields["enabled"]; ok {
+		var value bool
+		if err := decodeField(fields, "enabled", &value); err != nil {
+			return err
+		}
+		d.Enabled = &value
+	}
+	if _, ok := fields["maxPerTurn"]; ok {
+		var value int
+		if err := decodeField(fields, "maxPerTurn", &value); err != nil {
+			return err
+		}
+		d.MaxPerTurn = &value
+	}
+	if _, ok := fields["maxToolCalls"]; ok {
+		var value int
+		if err := decodeField(fields, "maxToolCalls", &value); err != nil {
+			return err
+		}
+		d.MaxToolCalls = &value
+	}
+	if _, ok := fields["timeoutSeconds"]; ok {
+		var value int
+		if err := decodeField(fields, "timeoutSeconds", &value); err != nil {
+			return err
+		}
+		d.TimeoutSeconds = &value
 	}
 	return nil
 }
@@ -256,6 +401,9 @@ func normalizeDocument(decoded document) (Config, error) {
 		Profiles:            make(map[string]Profile, len(decoded.Provider)),
 		MaxToolCalls:        defaultMaxToolCalls,
 		ShellTimeoutSeconds: defaultShellTimeoutSeconds,
+		Context:             ContextConfig{AutoCompact: true},
+		Skills:              SkillConfig{ProjectPolicy: ProjectSkillsAsk},
+		Subagents:           defaultSubagentConfig,
 	}
 	if decoded.Limits.MaxToolCalls != nil {
 		cfg.MaxToolCalls = *decoded.Limits.MaxToolCalls
@@ -263,11 +411,31 @@ func normalizeDocument(decoded document) (Config, error) {
 	if decoded.Limits.ShellTimeoutSeconds != nil {
 		cfg.ShellTimeoutSeconds = *decoded.Limits.ShellTimeoutSeconds
 	}
+	if decoded.Context.AutoCompact != nil {
+		cfg.Context.AutoCompact = *decoded.Context.AutoCompact
+	}
+	cfg.Context.CompactReserveTokens = cloneInt64(decoded.Context.CompactReserveTokens)
+	if decoded.Skills.ProjectPolicy != nil {
+		cfg.Skills.ProjectPolicy = *decoded.Skills.ProjectPolicy
+	}
+	if decoded.Subagents.Enabled != nil {
+		cfg.Subagents.Enabled = *decoded.Subagents.Enabled
+	}
+	if decoded.Subagents.MaxPerTurn != nil {
+		cfg.Subagents.MaxPerTurn = *decoded.Subagents.MaxPerTurn
+	}
+	if decoded.Subagents.MaxToolCalls != nil {
+		cfg.Subagents.MaxToolCalls = *decoded.Subagents.MaxToolCalls
+	}
+	if decoded.Subagents.TimeoutSeconds != nil {
+		cfg.Subagents.TimeoutSeconds = *decoded.Subagents.TimeoutSeconds
+	}
 	for id, provider := range decoded.Provider {
 		if id == "" {
 			return Config{}, fmt.Errorf("provider ID is empty")
 		}
 		models := make([]string, 0, len(provider.Models))
+		var contextWindows map[string]int64
 		for model := range provider.Models {
 			if model == "" {
 				return Config{}, fmt.Errorf("provider %q model ID is empty", id)
@@ -276,6 +444,12 @@ func normalizeDocument(decoded document) (Config, error) {
 				return Config{}, fmt.Errorf("model ID %q is reserved", model)
 			}
 			models = append(models, model)
+			if window := provider.Models[model].ContextWindow; window != nil {
+				if contextWindows == nil {
+					contextWindows = make(map[string]int64)
+				}
+				contextWindows[model] = *window
+			}
 		}
 		sort.Strings(models)
 		defaultModel := ""
@@ -286,11 +460,12 @@ func normalizeDocument(decoded document) (Config, error) {
 			defaultModel = modelID
 		}
 		cfg.Profiles[id] = Profile{
-			Name:         provider.Name,
-			BaseURL:      provider.Options.BaseURL,
-			APIKeyEnv:    provider.Options.APIKeyEnv,
-			Models:       models,
-			DefaultModel: defaultModel,
+			Name:                provider.Name,
+			BaseURL:             provider.Options.BaseURL,
+			APIKeyEnv:           provider.Options.APIKeyEnv,
+			Models:              models,
+			DefaultModel:        defaultModel,
+			ModelContextWindows: contextWindows,
 		}
 	}
 	if err := cfg.Validate(); err != nil {
@@ -305,6 +480,21 @@ func (c Config) Validate() error {
 	}
 	if c.ShellTimeoutSeconds < 1 || c.ShellTimeoutSeconds > 1800 {
 		return fmt.Errorf("shellTimeoutSeconds must be 1..1800")
+	}
+	if c.Context.CompactReserveTokens != nil && *c.Context.CompactReserveTokens <= 0 {
+		return fmt.Errorf("compactReserveTokens must be positive")
+	}
+	if c.Skills.ProjectPolicy != ProjectSkillsAsk && c.Skills.ProjectPolicy != ProjectSkillsAllow && c.Skills.ProjectPolicy != ProjectSkillsDeny {
+		return fmt.Errorf("projectPolicy must be ask, allow, or deny")
+	}
+	if c.Subagents.MaxPerTurn < 1 || c.Subagents.MaxPerTurn > 4 {
+		return fmt.Errorf("maxPerTurn must be 1..4")
+	}
+	if c.Subagents.MaxToolCalls < 1 || c.Subagents.MaxToolCalls > 64 {
+		return fmt.Errorf("subagent maxToolCalls must be 1..64")
+	}
+	if c.Subagents.TimeoutSeconds < 1 || c.Subagents.TimeoutSeconds > 1800 {
+		return fmt.Errorf("subagent timeoutSeconds must be 1..1800")
 	}
 	profile, ok := c.Profiles[c.ActiveProfile]
 	if !ok {
@@ -334,8 +524,27 @@ func (c Config) Validate() error {
 				return fmt.Errorf("model ID %q is reserved", model)
 			}
 		}
+		for model, window := range configured.ModelContextWindows {
+			if !slices.Contains(configured.Models, model) {
+				return fmt.Errorf("provider %q model %q is not configured", name, model)
+			}
+			if window <= 0 {
+				return fmt.Errorf("provider %q model %q contextWindow must be positive", name, model)
+			}
+			if c.Context.CompactReserveTokens != nil && *c.Context.CompactReserveTokens >= window {
+				return fmt.Errorf("compactReserveTokens must be less than configured contextWindow")
+			}
+		}
 	}
 	return nil
+}
+
+func cloneInt64(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func (c Config) Resolve(opts ResolveOptions) (ResolvedProfile, error) {

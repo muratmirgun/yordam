@@ -16,6 +16,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/tools/read"
 	"github.com/muratmirgun/yordam/internal/tools/search"
 	"github.com/muratmirgun/yordam/internal/tools/shell"
+	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 )
 
 func TestCatalogAcceptsDynamicToolsRetainsBuiltinAliasOrderAndCopiesSchemas(t *testing.T) {
@@ -34,7 +35,7 @@ func TestCatalogAcceptsDynamicToolsRetainsBuiltinAliasOrderAndCopiesSchemas(t *t
 			t.Fatalf("real builtin %s has no explicit trusted classification wrapper", alias)
 		}
 	}
-	items := []ports.Tool{shellTool, catalogTool("inspect", schema), editTool, readTool, searchTool}
+	items := []ports.Tool{shellTool, catalogExternalTool("inspect", protocol.ToolIdentity{Source: "mcp", Authority: "example", Name: "inspect"}, trustedRemoteClassification()), editTool, catalogTool("skill", schema), readTool, searchTool}
 	catalog, err := NewCatalog("revision-1", items...)
 	if err != nil {
 		t.Fatal(err)
@@ -44,11 +45,11 @@ func TestCatalogAcceptsDynamicToolsRetainsBuiltinAliasOrderAndCopiesSchemas(t *t
 	for _, tool := range exposure.Tools {
 		aliases = append(aliases, tool.Alias)
 	}
-	want := []string{"read", "search", "edit", "shell", "inspect"}
+	want := []string{"read", "search", "skill", "edit", "shell", "inspect"}
 	if strings.Join(aliases, ",") != strings.Join(want, ",") {
 		t.Fatalf("aliases=%v", aliases)
 	}
-	for index, alias := range want[:4] {
+	for index, alias := range want[:2] {
 		identity := exposure.Aliases[index].Identity
 		if exposure.Tools[index].Alias != alias || identity != (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: alias}) {
 			t.Fatalf("binding[%d]=%#v", index, exposure.Aliases[index])
@@ -61,9 +62,96 @@ func TestCatalogAcceptsDynamicToolsRetainsBuiltinAliasOrderAndCopiesSchemas(t *t
 		t.Fatal("catalog exposure was mutable through returned values")
 	}
 	schema[0] = '['
-	if catalog.Expose().Tools[4].InputSchema[0] != '{' {
+	if catalog.Expose().Tools[2].InputSchema[0] != '{' {
 		t.Fatal("catalog retained caller-owned schema")
 	}
+}
+
+func TestCatalogWithoutSubagentDerivesChildExposureWithoutChangingOtherDescriptors(t *testing.T) {
+	workspace := t.TempDir()
+	artifacts := discardArtifacts{}
+	items := []ports.Tool{
+		read.New(read.Options{Workspace: workspace, Output: output.Options{SessionID: "s", Artifacts: artifacts}}),
+		search.New(search.Options{Workspace: workspace, Output: output.Options{SessionID: "s", Artifacts: artifacts}}),
+		subagenttool.New(),
+		edit.New(edit.Options{Workspace: workspace, Output: output.Options{SessionID: "s", Artifacts: artifacts}}),
+		shell.New(shell.Options{Workspace: workspace, ShellPath: "/bin/sh", Timeout: time.Second, Output: output.Options{SessionID: "s", Artifacts: artifacts}}),
+	}
+	catalog, err := NewCatalog("builtin-v1", items...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := catalog.Expose()
+	child, err := catalog.Without("subagent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.CatalogRevision == parent.CatalogRevision || !strings.HasPrefix(child.CatalogRevision, "derived:") {
+		t.Fatalf("parent revision=%q child revision=%q", parent.CatalogRevision, child.CatalogRevision)
+	}
+	for _, tool := range child.Tools {
+		if tool.Identity == (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "subagent"}) {
+			t.Fatalf("child exposure contains subagent: %#v", tool)
+		}
+	}
+	for _, binding := range child.Aliases {
+		parentDescriptor, ok := catalog.Descriptor(binding.Alias)
+		if !ok || binding.DescriptorDigest != parentDescriptor.DescriptorDigest {
+			t.Fatalf("binding=%#v parent=%#v", binding, parentDescriptor)
+		}
+	}
+	if _, err := catalog.Without("missing"); err == nil {
+		t.Fatal("unknown exclusion did not fail closed")
+	}
+	if _, err := catalog.Filter(ToolExposureFilter{AllowedAliases: []string{"read"}, Revision: "forged-child-revision"}); err == nil {
+		t.Fatal("arbitrary child revision was accepted")
+	}
+	asserted, err := catalog.Filter(ToolExposureFilter{AllowedAliases: []string{"read"}, Revision: childRevisionForAlias(t, catalog, "read")})
+	if err != nil || asserted.CatalogRevision == "" {
+		t.Fatalf("asserted exposure=%#v err=%v", asserted, err)
+	}
+	if _, err := catalog.ResolveExposure(child, "subagent"); err == nil {
+		t.Fatal("hidden subagent alias resolved for dispatch")
+	}
+	if resolved, err := catalog.ResolveExposure(child, "read"); err != nil || resolved.Body.Identity.Name != "read" {
+		t.Fatalf("read resolution=%#v err=%v", resolved, err)
+	}
+	reordered := protocol.DeepCopy(child)
+	reordered.Tools[0], reordered.Tools[1] = reordered.Tools[1], reordered.Tools[0]
+	if err := ValidateDerivedExposure(parent, reordered); err == nil {
+		t.Fatal("reordered provider-visible child tools were accepted")
+	}
+	if _, err := catalog.ResolveExposure(reordered, "read"); err == nil {
+		t.Fatal("reordered provider-visible child tools reached exposure resolution")
+	}
+	descriptor, ok := catalog.Descriptor("subagent")
+	if !ok {
+		t.Fatal("subagent descriptor not found")
+	}
+	if kind, ok := catalog.OrchestratedKind("subagent", descriptor); !ok || kind != "subagent" {
+		t.Fatalf("kind=%q ok=%t", kind, ok)
+	}
+	forged := protocol.DeepCopy(descriptor)
+	forged.DescriptorDigest = catalogDigest("f")
+	if kind, ok := catalog.OrchestratedKind("subagent", forged); ok || kind != "" {
+		t.Fatalf("forged descriptor kind=%q ok=%t", kind, ok)
+	}
+	if kind, ok := catalog.OrchestratedKind("read", descriptor); ok || kind != "" {
+		t.Fatalf("alias-only marker kind=%q ok=%t", kind, ok)
+	}
+}
+
+func childRevisionForAlias(t *testing.T, catalog *Catalog, alias string) string {
+	t.Helper()
+	exposure, err := catalog.Filter(ToolExposureFilter{AllowedAliases: []string{alias}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exposure.CatalogRevision
+}
+
+func catalogDigest(fill string) protocol.Digest {
+	return protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat(fill, 64)}
 }
 
 func TestCatalogRejectsAliasTrustSpoof(t *testing.T) {

@@ -55,6 +55,7 @@ const (
 	EventContextPlanRecorded            = "context.plan_recorded"
 	EventContextUsageRecorded           = "context.usage_recorded"
 	EventRuntimeGenerationActivated     = "runtime_generation.activated"
+	EventProjectSkillTrustChanged       = "project_skill_trust_changed_v1"
 	EventControlOperationPlanned        = "control_operation.planned"
 	EventControlOperationAuthorized     = "control_operation.authorized"
 	EventControlOperationStarted        = "control_operation.started"
@@ -67,6 +68,11 @@ const (
 	EventMigrationDiagnostic            = "migration.diagnostic"
 	EventRecoveryDiagnostic             = "recovery.diagnostic"
 	EventTransactionCommitted           = "transaction.committed"
+	EventSubagentRequested              = "subagent_requested_v1"
+	EventSubagentWaiting                = "subagent_waiting_v1"
+	EventSubagentResultAttached         = "subagent_result_attached_v1"
+	EventSubagentManifest               = "subagent_manifest_v1"
+	EventSubagentReceipt                = "subagent_receipt_v1"
 )
 
 type SessionCreatedV1 struct {
@@ -185,6 +191,13 @@ type ContextCompactedV1 struct {
 	Revision          string          `json:"revision"`
 }
 
+func (v ContextCompactedV1) Validate() error {
+	if v.From.Validate() != nil || v.Through.Validate() != nil || v.From.JournalKind != JournalSession || v.Through.JournalKind != JournalSession || v.From.JournalID != v.Through.JournalID || v.SummaryEvidenceID == "" || v.Revision == "" || v.From.CommitSeq > v.Through.CommitSeq {
+		return fmt.Errorf("invalid context compaction range")
+	}
+	return nil
+}
+
 type FileChangePlannedV1 struct {
 	Plan           ActionPlan `json:"plan"`
 	DiffEvidenceID EvidenceID `json:"diff_evidence_id,omitempty"`
@@ -274,14 +287,15 @@ type TurnTerminalV1 struct {
 }
 
 type ActivityPlannedV1 struct {
-	Kind             string       `json:"kind"`
-	Purpose          string       `json:"purpose"`
-	PurposeActor     ActorRef     `json:"purpose_actor"`
-	Source           string       `json:"source"`
-	Plan             *ActionPlan  `json:"plan,omitempty"`
-	InputEvidenceIDs []EvidenceID `json:"input_evidence_ids,omitempty"`
-	RequestedProfile string       `json:"requested_profile"`
-	EffectiveProfile string       `json:"effective_profile"`
+	Kind              string       `json:"kind"`
+	Purpose           string       `json:"purpose"`
+	PurposeActor      ActorRef     `json:"purpose_actor"`
+	Source            string       `json:"source"`
+	Plan              *ActionPlan  `json:"plan,omitempty"`
+	InputEvidenceIDs  []EvidenceID `json:"input_evidence_ids,omitempty"`
+	RequestedProfile  string       `json:"requested_profile"`
+	EffectiveProfile  string       `json:"effective_profile"`
+	CompactionTrigger string       `json:"compaction_trigger,omitempty"`
 }
 
 type ActivityAuthorizedV1 struct {
@@ -317,6 +331,8 @@ type ActivityOutcomeV1 struct {
 	ErrorCode         string       `json:"error_code,omitempty"`
 	OutputEvidenceIDs []EvidenceID `json:"output_evidence_ids,omitempty"`
 	UnknownEffects    []SubjectRef `json:"unknown_effects,omitempty"`
+	Usage             *ModelUsage  `json:"usage,omitempty"`
+	OutputBytes       int64        `json:"output_bytes,omitempty"`
 }
 
 type ProviderCapabilityDecidedV1 struct {

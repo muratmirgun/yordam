@@ -135,7 +135,7 @@ func (s *Service) Prepare(ctx context.Context, activityID protocol.ActivityID, c
 	if err != nil {
 		return ProviderHandle{}, err
 	}
-	boundDispatchDigest, err := dispatchDigest(requestDigest, contextPlanDigest, request.Plan.Digest, request.Plan.Body.Descriptor.RuntimeGenerationID)
+	boundDispatchDigest, err := DispatchDigest(requestDigest, contextPlanDigest, request.Plan.Digest, request.Plan.Body.Descriptor.RuntimeGenerationID)
 	if err != nil {
 		return ProviderHandle{}, err
 	}
@@ -186,7 +186,10 @@ func sameProviderHandle(left, right ProviderHandle) bool {
 	return left.id == right.id && left.activityID == right.activityID && left.callID == right.callID && left.planDigest == right.planDigest && left.runtimeGenerationID == right.runtimeGenerationID && left.requestDigest == right.requestDigest && left.contextPlanDigest == right.contextPlanDigest && left.dispatchDigest == right.dispatchDigest && left.prepared == right.prepared
 }
 
-func dispatchDigest(requestDigest, contextPlanDigest, providerPlanDigest protocol.Digest, runtimeGenerationID protocol.RuntimeGenerationID) (protocol.Digest, error) {
+// DispatchDigest is the canonical authorization binding shared by provider
+// preparation and orchestration. Any egress authorization must use this exact
+// shape or ProviderHandle.Stream will reject its committed token.
+func DispatchDigest(requestDigest, contextPlanDigest, providerPlanDigest protocol.Digest, runtimeGenerationID protocol.RuntimeGenerationID) (protocol.Digest, error) {
 	return canonicaljson.Digest(dispatchBinding{
 		RequestDigest: requestDigest, ContextPlanDigest: contextPlanDigest,
 		ProviderPlanDigest: providerPlanDigest, RuntimeGenerationID: runtimeGenerationID,

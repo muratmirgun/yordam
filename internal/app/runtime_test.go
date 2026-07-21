@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,13 +19,17 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/agent"
+	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/cli"
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/permission"
+	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/secret"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
+	"github.com/muratmirgun/yordam/internal/skills"
 	"github.com/muratmirgun/yordam/internal/testsupport/agentfixture"
 )
 
@@ -32,6 +38,34 @@ func TestNewUsesEmptyRedactorBindingWhenNoneIsSupplied(t *testing.T) {
 	if got := application.redactors.String("candidate-secret"); got != "candidate-secret" {
 		t.Fatalf("implicit binding inherited candidate secrets: %q", got)
 	}
+}
+
+func TestInteractiveApproverProjectsChildPromptLineage(t *testing.T) {
+	registry := permission.NewSessionPolicyRegistry()
+	if err := registry.RegisterChild("child", domain.ModeAsk); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.RegisterChildLineage("child", "parent", "attempt"); err != nil {
+		t.Fatal(err)
+	}
+	approver := &promptCapturingApprover{}
+	binding := &interactiveApproverBinding{}
+	binding.set(approver)
+	binding.setChildPrompts(registry)
+	_, err := binding.Approve(t.Context(), protocol.AuthorizationDecision{Request: protocol.AuthorizationRequest{SessionID: "child", CallID: "shell-call", Source: protocol.ToolIdentity{Name: "shell"}, Effect: "mutation", ExecutionLocus: "process", Boundary: "workspace"}, Scope: protocol.CanonicalAuthorizationScope{Resources: []protocol.ResourceTarget{{Kind: "directory", CanonicalID: "/workspace"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approver.prompt.SessionID != "child" || approver.prompt.ParentSessionID != "parent" || approver.prompt.DelegationAttemptID != "attempt" || approver.prompt.Call.Request.CallID != "shell-call" {
+		t.Fatalf("child prompt=%+v", approver.prompt)
+	}
+}
+
+type promptCapturingApprover struct{ prompt ports.PermissionPrompt }
+
+func (a *promptCapturingApprover) Resolve(_ context.Context, prompt ports.PermissionPrompt) (domain.PermissionDecision, error) {
+	a.prompt = prompt
+	return domain.PermissionDecision{Action: domain.PermissionAllow, Lifetime: domain.PermissionOnce, Scope: prompt.Call.CanonicalScope}, nil
 }
 
 func TestRuntimeSetReadinessClassifiesModelsAndCredentials(t *testing.T) {
@@ -56,12 +90,724 @@ func TestRuntimeSetReadinessClassifiesModelsAndCredentials(t *testing.T) {
 	}
 }
 
+func TestRuntimeModelDescriptorsContextWindowProvenance(t *testing.T) {
+	descriptors := runtimeModelDescriptors(config.Config{Profiles: map[string]config.Profile{
+		"primary": {
+			APIKeyEnv:           "PRIMARY_KEY",
+			Models:              []string{"configured", "unknown"},
+			ModelContextWindows: map[string]int64{"configured": 128000},
+		},
+	}}, "generation")
+	if len(descriptors) != 2 {
+		t.Fatalf("descriptors=%+v", descriptors)
+	}
+	for _, descriptor := range descriptors {
+		if descriptor.MaximumOutput.State != protocol.ValueUnknown {
+			t.Fatalf("maximum output=%+v", descriptor.MaximumOutput)
+		}
+		switch descriptor.ModelID {
+		case "configured":
+			if descriptor.ContextWindow != (protocol.ValueInt64{State: protocol.ValueKnown, Value: 128000, Provenance: "configured_claim"}) {
+				t.Fatalf("configured context window=%+v", descriptor.ContextWindow)
+			}
+		case "unknown":
+			if descriptor.ContextWindow != (protocol.ValueInt64{State: protocol.ValueUnknown}) {
+				t.Fatalf("unknown context window=%+v", descriptor.ContextWindow)
+			}
+		default:
+			t.Fatalf("unexpected model=%q", descriptor.ModelID)
+		}
+	}
+}
+
+func TestLoadBootstrapConfigCanonicalizesRelativeConfigPath(t *testing.T) {
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "config.jsonc")
+	if err := config.SaveGlobal(path, loadRuntimeConfig(t, "https://example.invalid/v1", 120)); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(directory)
+	_, canonical, err := loadBootstrapConfig(BootstrapOptions{ConfigPath: "config.jsonc"})
+	if err != nil || canonical != path {
+		t.Fatalf("canonical=%q path=%q err=%v", canonical, path, err)
+	}
+}
+
+func TestBootstrapReloadUsesCanonicalRelativeConfigSkillRoot(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "relative-config-key")
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "config.jsonc")
+	if err := config.SaveGlobal(path, loadRuntimeConfig(t, "https://example.invalid/v1", 120)); err != nil {
+		t.Fatal(err)
+	}
+	writeRuntimeSkill(t, filepath.Join(directory, "skills", "go-testing", "SKILL.md"), "Global skill.", "relative-root-body")
+	workspace := t.TempDir()
+	t.Chdir(directory)
+	application, snapshot, err := Bootstrap(t.Context(), BootstrapOptions{ConfigPath: "config.jsonc", CWD: workspace, CLI: cli.Options{Mode: domain.ModeAsk, DataDir: t.TempDir(), MaxToolCalls: 32, ShellTimeout: time.Second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer application.runtimeSet.retireSecrets()
+	if application.runtimeSet.configPath != path || application.reloadRuntime == nil {
+		t.Fatalf("runtime path=%q reload=%v", application.runtimeSet.configPath, application.reloadRuntime)
+	}
+	reloaded, err := application.reloadRuntime(t.Context(), snapshot.Session.Selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloaded.retireSecrets()
+	loaded, ok := reloaded.Skills.Load("go-testing")
+	if !ok || !strings.Contains(string(loaded.Content), "relative-root-body") {
+		t.Fatalf("loaded=%#v ok=%v", loaded, ok)
+	}
+}
+
+func TestRuntimeBrokerSnapshotReconstructsDurableCompactionContext(t *testing.T) {
+	builder := newRuntimeBuilderForTest(t, nil)
+	t.Setenv("PRIMARY_KEY", "primary-test-key")
+	if _, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{}); err != nil {
+		t.Fatal(err)
+	}
+	workspaceRef, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceSeed, err := canonicaljson.Marshal(protocol.ControlOperationTerminalV1{ControlOperationID: "seed", Status: "interrupted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seeded, err := builder.store.AppendBatch(t.Context(), journal.AppendRequest{Journal: workspaceRef, TransactionID: "seed", Events: []protocol.ProposedEvent{{EventID: "seed", Time: time.Unix(1, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventControlOperationInterrupted, Payload: workspaceSeed}}})
+	if err != nil || seeded.Status != journal.AppendCommitted {
+		t.Fatalf("seed=%+v err=%v", seeded, err)
+	}
+	workspaceHead, err := builder.store.Head(t.Context(), workspaceRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(builder.activeSession.get())}
+	head, err := builder.store.Head(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planBody := protocol.ContextPlanBody{Sources: []protocol.ContentSource{}, Excluded: []protocol.ExcludedContentSource{}, EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 900, Provenance: "estimator"}, OutputReserve: 100, ContextWindow: protocol.ValueInt64{State: protocol.ValueKnown, Value: 9000, Provenance: "configured_claim"}, CompactionRevision: "prior-r", ToolExposureRevision: "tools-r1"}
+	planDigest, err := canonicaljson.Digest(planBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPayload, err := canonicaljson.Marshal(protocol.ContextPlanRecordedV1{Plan: protocol.ContextPlan{Body: planBody, Digest: planDigest}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compactPayload, err := canonicaljson.Marshal(protocol.ContextCompactedV1{From: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: ref.ID, CommitSeq: 1, TransactionID: "ctx"}, Through: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: ref.ID, CommitSeq: 1, TransactionID: "ctx"}, SummaryEvidenceID: "evidence-1", Revision: "r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appended, err := builder.store.AppendBatch(t.Context(), journal.AppendRequest{Journal: ref, ExpectedHead: head, TransactionID: "context", Compatibility: &journal.CompatibilityDeclaration{ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: head}, Events: []protocol.ProposedEvent{
+		{EventID: "context-plan", Time: time.Unix(1, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventContextPlanRecorded, SessionID: protocol.SessionID(ref.ID), RuntimeGenerationID: "test-generation", Payload: planPayload},
+		{EventID: "context-compacted", Time: time.Unix(2, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventContextCompacted, SessionID: protocol.SessionID(ref.ID), Payload: compactPayload},
+	}})
+	if err != nil || appended.Status != journal.AppendCommitted {
+		t.Fatalf("append=%+v err=%v", appended, err)
+	}
+	durable, _, err := (runtimeBrokerSource{Repository: builder.store, Workspace: workspaceRef, Manifest: protocol.RuntimeGenerationManifest{ID: "test-generation", Body: protocol.RuntimeGenerationBody{Limits: protocol.RuntimeLimits{AutoCompact: true}}}}).Project(t.Context(), SnapshotVector{WorkspaceControl: workspaceHead, SelectedSession: &appended.Cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contextState protocol.ContextProjectionV1
+	if err := json.Unmarshal(durable.Context.Data, &contextState); err != nil {
+		t.Fatal(err)
+	}
+	if !contextState.AutoAvailable || contextState.AutoReason != "below_threshold" || contextState.EstimatedInputTokens.Value != 900 || contextState.ContextWindow.Value != 9000 || contextState.ReserveTokens.Value != 2048 || contextState.Revision != "r1" || contextState.SummaryEvidenceID != "evidence-1" || contextState.LatestRange == nil || contextState.LatestRange.Through.CommitSeq != 1 {
+		t.Fatalf("context=%+v", contextState)
+	}
+	if strings.Contains(string(durable.Context.Data), "provider-body-sentinel") || strings.Contains(string(durable.Context.Data), "summary-body-sentinel") {
+		t.Fatalf("context leaked content: %s", durable.Context.Data)
+	}
+}
+
+func TestRuntimeBrokerProjectsFrozenMetadataOnlySkillCatalog(t *testing.T) {
+	builder := newRuntimeBuilderForTest(t, nil)
+	workspaceRef, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := canonicaljson.Marshal(protocol.ControlOperationTerminalV1{ControlOperationID: "seed", Status: "interrupted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := builder.store.AppendBatch(t.Context(), journal.AppendRequest{Journal: workspaceRef, TransactionID: "seed", Events: []protocol.ProposedEvent{{EventID: "seed", Time: time.Unix(1, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventControlOperationInterrupted, Payload: payload}}}); err != nil {
+		t.Fatal(err)
+	}
+	head, err := builder.store.Head(t.Context(), workspaceRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("---\nname: go-testing\ndescription: Test Go.\n---\nmetadata-only-sentinel\n")
+	sum := sha256.Sum256(content)
+	catalog, err := skills.Build(skills.BuildOptions{Discovery: skills.Discovery{Candidates: []skills.Candidate{{Name: "go-testing", Description: "Test Go.", Content: content, Source: protocol.SkillSourceGlobal, CanonicalPath: "/skills/global/go-testing/SKILL.md", ContentDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hex.EncodeToString(sum[:])}}}}, Policy: config.ProjectSkillsAsk, Workspace: builder.workspace, Generation: "generation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable, _, err := (runtimeBrokerSource{Repository: builder.store, Workspace: workspaceRef, Skills: catalog}).Project(t.Context(), SnapshotVector{WorkspaceControl: head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(durable.Skills, catalog.Snapshot()) {
+		t.Fatalf("skills = %#v, want %#v", durable.Skills, catalog.Snapshot())
+	}
+	encoded, err := json.Marshal(durable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "metadata-only-sentinel") || strings.Contains(string(encoded), `"content"`) {
+		t.Fatalf("durable projection leaked skill content: %s", encoded)
+	}
+	copy := catalog.Snapshot()
+	copy.Active[0].Description = "changed"
+	if durable.Skills.Active[0].Description == "changed" {
+		t.Fatal("durable projection aliases catalog snapshot")
+	}
+	nilCatalog, _, err := (runtimeBrokerSource{Repository: builder.store, Workspace: workspaceRef}).Project(t.Context(), SnapshotVector{WorkspaceControl: head})
+	if err != nil || nilCatalog.Skills.Revision != "" {
+		t.Fatalf("nil catalog compatibility = %#v / %v", nilCatalog.Skills, err)
+	}
+}
+
+func TestRuntimeBrokerSnapshotExcludesParentAndChildCommitsAfterVectorCapture(t *testing.T) {
+	builder := newRuntimeBuilderForTest(t, nil)
+	workspaceRef, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspacePayload, err := canonicaljson.Marshal(protocol.ControlOperationTerminalV1{ControlOperationID: "seed", Status: "interrupted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, appendErr := builder.store.AppendBatch(t.Context(), journal.AppendRequest{Journal: workspaceRef, TransactionID: "snapshot-workspace-seed", Events: []protocol.ProposedEvent{{EventID: "snapshot-workspace-seed", Time: time.Unix(1, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventControlOperationInterrupted, Payload: workspacePayload}}}); appendErr != nil || result.Status != journal.AppendCommitted {
+		t.Fatalf("seed workspace result=%+v err=%v", result, appendErr)
+	}
+	parentID := protocol.SessionID(builder.activeSession.get())
+	parentRef := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(parentID)}
+	parentHead, err := builder.store.Head(t.Context(), parentRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childID, err := builder.store.ReserveSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := protocol.SubagentManifestV1{AttemptID: "snapshot-attempt-1", ParentSessionID: parentID, ParentCursor: parentHead, ChildSessionID: childID, ChildTaskID: "snapshot-child-task-1", ChildTurnID: "snapshot-child-turn-1", RuntimeGenerationID: "snapshot-generation", SkillCatalogRevision: "snapshot-skills", MaxToolCalls: 4, Deadline: time.Unix(100, 0).UTC()}
+	request := protocol.SubagentRequestedV1{Call: protocol.SubagentCallV1{Task: "first snapshot task"}, Manifest: manifest}
+	requestPayload, err := canonicaljson.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstParent, err := appendSnapshotFixtureEvent(t.Context(), builder.store, parentRef, parentHead, "snapshot-parent-request-1", protocol.ProposedEvent{EventID: "snapshot-parent-request-1", Time: time.Unix(10, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentRequested, SessionID: parentID, TaskID: "snapshot-parent-task", TurnID: "snapshot-parent-turn", RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: requestPayload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestDigest, err := canonicaljson.Digest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := builder.store.CreateWithIdentity(t.Context(), childID, builder.workspace, domain.ModeAsk, domain.ModelSelection{}, &journal.SessionLineage{Kind: journal.LineageSubagent, ParentSessionID: parentID, ParentCursor: manifest.ParentCursor, DelegationAttemptID: manifest.AttemptID, ManifestDigest: manifestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	childRef := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(childID)}
+	childHead, err := builder.store.Head(t.Context(), childRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPayload, err := canonicaljson.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstChild, err := appendSnapshotFixtureEvent(t.Context(), builder.store, childRef, childHead, "snapshot-child-manifest-1", protocol.ProposedEvent{EventID: "snapshot-child-manifest-1", Time: time.Unix(11, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentManifest, SessionID: childID, TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID, RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: manifestPayload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingChildID, err := builder.store.ReserveSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseSource := runtimeBrokerSource{Repository: builder.store, Sessions: builder.store, Workspace: workspaceRef, Generation: "snapshot-generation", Redactor: secret.New()}
+	source := &postCaptureRuntimeSource{runtimeBrokerSource: baseSource}
+	source.late = func() error {
+		secondManifest := manifest
+		secondManifest.AttemptID, secondManifest.ChildSessionID, secondManifest.ChildTaskID, secondManifest.ChildTurnID = "snapshot-attempt-2", missingChildID, "snapshot-child-task-2", "snapshot-child-turn-2"
+		secondManifest.ParentCursor = firstParent
+		secondPayload, marshalErr := canonicaljson.Marshal(protocol.SubagentRequestedV1{Call: protocol.SubagentCallV1{Task: "second snapshot task"}, Manifest: secondManifest})
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if _, appendErr := appendSnapshotFixtureEvent(t.Context(), builder.store, parentRef, firstParent, "snapshot-parent-request-2", protocol.ProposedEvent{EventID: "snapshot-parent-request-2", Time: time.Unix(12, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentRequested, SessionID: parentID, TaskID: "snapshot-parent-task", TurnID: "snapshot-parent-turn", RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: secondPayload}); appendErr != nil {
+			return appendErr
+		}
+		receiptCursor := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: childRef.ID, CommitSeq: firstChild.CommitSeq + 1, TransactionID: "snapshot-child-receipt-1"}
+		receipt := protocol.SubagentReceiptV1{Status: "succeeded", Summary: "late snapshot receipt", Manifest: manifest, TerminalCursor: receiptCursor, ChangedFiles: []string{}, CommandsAndTests: []string{}, Usage: unknownSubagentUsage(), EvidenceIDs: []protocol.EvidenceID{}, UnknownEffects: []protocol.ActivityID{}}
+		receiptPayload, marshalErr := canonicaljson.Marshal(receipt)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		_, appendErr := appendSnapshotFixtureEvent(t.Context(), builder.store, childRef, firstChild, "snapshot-child-receipt-1", protocol.ProposedEvent{EventID: "snapshot-child-receipt-1", Time: time.Unix(13, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentReceipt, SessionID: childID, TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID, RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: receiptPayload})
+		return appendErr
+	}
+	broker, err := NewBroker(BrokerOptions{Source: source, Epoch: "snapshot-epoch", DefaultQueueCapacity: 4, MaxQueueCapacity: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := broker.Snapshot(t.Context(), protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: parentID, Consumer: "snapshot-adversary", QueueCapacity: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCards := decodeSnapshotSubagentCards(t, first.Durable)
+	if len(firstCards) != 1 || firstCards[0].State != protocol.SubagentStageRunning || firstCards[0].ReceiptSummary != "" || first.Cursor.SelectedSession == nil || *first.Cursor.SelectedSession != firstParent || len(first.Cursor.RelatedSessions) != 1 || first.Cursor.RelatedSessions[0] != firstChild {
+		t.Fatalf("first snapshot cards=%+v cursor=%+v", firstCards, first.Cursor)
+	}
+	second, err := broker.Snapshot(t.Context(), protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: parentID, Consumer: "snapshot-adversary", QueueCapacity: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCards := decodeSnapshotSubagentCards(t, second.Durable)
+	if len(secondCards) != 2 || secondCards[0].State != protocol.SubagentStageSucceeded || secondCards[0].ReceiptSummary != "late snapshot receipt" || second.Cursor.SelectedSession == nil || second.Cursor.SelectedSession.CommitSeq <= first.Cursor.SelectedSession.CommitSeq || len(second.Cursor.RelatedSessions) != 1 || second.Cursor.RelatedSessions[0].CommitSeq <= first.Cursor.RelatedSessions[0].CommitSeq {
+		t.Fatalf("second snapshot cards=%+v cursor=%+v", secondCards, second.Cursor)
+	}
+}
+
+type postCaptureRuntimeSource struct {
+	runtimeBrokerSource
+	once atomic.Bool
+	late func() error
+}
+
+func (s *postCaptureRuntimeSource) RelatedSessionHeads(ctx context.Context, parent protocol.CommittedCursor) ([]protocol.CommittedCursor, error) {
+	result, err := s.runtimeBrokerSource.RelatedSessionHeads(ctx, parent)
+	if err == nil && s.once.CompareAndSwap(false, true) && s.late != nil {
+		err = s.late()
+	}
+	return result, err
+}
+
+func appendSnapshotFixtureEvent(ctx context.Context, store *jsonl.Store, ref protocol.JournalRef, expected protocol.CommittedCursor, transactionID protocol.TransactionID, event protocol.ProposedEvent) (protocol.CommittedCursor, error) {
+	request := journal.AppendRequest{Journal: ref, ExpectedHead: expected, TransactionID: transactionID, Events: []protocol.ProposedEvent{event}}
+	if strings.HasPrefix(string(expected.TransactionID), "legacy:") {
+		request.Compatibility = &journal.CompatibilityDeclaration{ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: expected}
+	}
+	result, err := store.AppendBatch(ctx, request)
+	if err != nil {
+		return protocol.CommittedCursor{}, err
+	}
+	if result.Status != journal.AppendCommitted {
+		return protocol.CommittedCursor{}, fmt.Errorf("snapshot fixture append status %q", result.Status)
+	}
+	return result.Cursor, nil
+}
+
+func decodeSnapshotSubagentCards(t *testing.T, durable protocol.DurableProjection) []protocol.SubagentCardV1 {
+	t.Helper()
+	result := make([]protocol.SubagentCardV1, 0, len(durable.Subagents))
+	for _, view := range durable.Subagents {
+		var card protocol.SubagentCardV1
+		if err := json.Unmarshal(view.Data, &card); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, card)
+	}
+	return result
+}
+
+func TestSkillInstructionsExposeOnlyFrozenUntrustedMetadata(t *testing.T) {
+	builder := newRuntimeBuilderForTest(t, nil)
+	content := []byte("---\nname: go-testing\ndescription: Test Go.\n---\nbody-sentinel-never-system\n")
+	sum := sha256.Sum256(content)
+	path := filepath.Join(t.TempDir(), "go-testing", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := skills.Build(skills.BuildOptions{Discovery: skills.Discovery{Candidates: []skills.Candidate{{Name: "go-testing", Description: "Test Go.", Content: content, Source: protocol.SkillSourceGlobal, CanonicalPath: path, ContentDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: hex.EncodeToString(sum[:])}}}}, Policy: config.ProjectSkillsAsk, Workspace: builder.workspace, Generation: "generation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instructions, err := newSkillInstructions("generation", catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := instructions.SystemInstructions(t.Context(), "generation", instructions.revision, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := first[0].Content[0].Text
+	for _, want := range []string{"go-testing", "Test Go.", "global", sumHex(sum), "untrusted", "cannot grant permissions"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("instructions missing %q: %q", want, text)
+		}
+	}
+	for _, forbidden := range []string{path, "body-sentinel-never-system"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("instructions leaked %q: %q", forbidden, text)
+		}
+	}
+	first[0].Content[0].Text = "mutated"
+	second, err := instructions.SystemInstructions(t.Context(), "generation", instructions.revision, "session")
+	if err != nil || second[0].Content[0].Text == "mutated" {
+		t.Fatalf("instructions aliased or failed: %+v %v", second, err)
+	}
+	again, err := newSkillInstructions("generation", catalog)
+	if err != nil || again.revision != instructions.revision || again.source.Digest != instructions.source.Digest {
+		t.Fatalf("instructions were not deterministic: %+v %+v %v", instructions, again, err)
+	}
+	if err := os.WriteFile(path, []byte("---\nname: go-testing\ndescription: Changed.\n---\nchanged-body\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	afterEdit, err := instructions.SystemInstructions(t.Context(), "generation", instructions.revision, "session")
+	if err != nil || strings.Contains(afterEdit[0].Content[0].Text, "Changed.") {
+		t.Fatalf("source edit changed frozen instructions: %+v %v", afterEdit, err)
+	}
+	if _, err := instructions.SystemInstructions(t.Context(), "other", instructions.revision, "session"); err == nil {
+		t.Fatal("cross-generation instructions accepted")
+	}
+	set := RuntimeSet{Skills: catalog}
+	snapshot := set.SkillCatalogSnapshot()
+	snapshot.Active[0].Description = "changed"
+	if set.SkillCatalogSnapshot().Active[0].Description == "changed" {
+		t.Fatal("runtime snapshot aliases catalog")
+	}
+}
+
+func TestRuntimeBuilderAppliesOnlyExactDurableProjectSkillTrust(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "trust-test-key")
+	builder := newRuntimeBuilderForTest(t, nil)
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Skills.ProjectPolicy = config.ProjectSkillsAsk
+	writeRuntimeSkill(t, filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md"), "Project skill.", "project-body")
+	first, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := first.Skills.Snapshot().Discovered[0].State; got != protocol.SkillStateAwaitingTrust {
+		t.Fatalf("before trust state=%q", got)
+	}
+	workspace, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := canonicaljson.Marshal(protocol.ProjectSkillTrustChangedV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: first.Skills.Snapshot().Digest, Decision: "allow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := builder.store.AppendBatch(t.Context(), journal.AppendRequest{Journal: workspace, TransactionID: "trust-allow", Events: []protocol.ProposedEvent{{EventID: "trust-allow", Time: time.Unix(2, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventProjectSkillTrustChanged, Payload: payload}}}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := second.Skills.Snapshot().Discovered[0].State; got != protocol.SkillStateActive {
+		t.Fatalf("after exact trust state=%q", got)
+	}
+	writeRuntimeSkill(t, filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md"), "Project skill.", "changed-project-body")
+	third, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := third.Skills.Snapshot().Discovered[0].State; got != protocol.SkillStateAwaitingTrust {
+		t.Fatalf("changed catalog state=%q", got)
+	}
+}
+
+func TestSkillTrustProtocolCommandRequiresExactWorkspaceCatalogAndIsIdempotent(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "trust-command-key")
+	builder := newRuntimeBuilderForTest(t, nil)
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Skills.ProjectPolicy = config.ProjectSkillsAsk
+	writeRuntimeSkill(t, filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md"), "Project skill.", "project-body")
+	set, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := builder.store.Head(t.Context(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionBefore, err := builder.store.InspectSession(t.Context(), protocol.SessionID(builder.activeSession.get()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := protocol.Command{ProtocolVersion: protocol.ApplicationProtocolVersion, CommandID: "trust-command", Actor: protocol.ActorRef{ID: "user", Kind: protocol.ActorUser}, IdempotencyKey: "trust-command", Kind: string(CommandTrustSkillCatalog), PayloadVersion: 1, Expected: &protocol.CommandExpectation{WorkspaceControl: &head}}
+	command.Payload, err = canonicaljson.Marshal(protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: set.Skills.Snapshot().Digest, Decision: "allow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.RequestDigest, err = CanonicalRequestDigest(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := set.ApplicationService.Execute(t.Context(), command)
+	if err != nil || first.Status != "completed" {
+		t.Fatalf("first=%+v public=%+v err=%v", first, first.Error, err)
+	}
+	second, err := set.ApplicationService.Execute(t.Context(), command)
+	if err != nil || !reflect.DeepEqual(first, second) {
+		t.Fatalf("replay first=%+v second=%+v err=%v", first, second, err)
+	}
+	inspection, err := builder.store.Inspect(t.Context(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorized, decided, trustAt := -1, -1, -1
+	for index, event := range inspection.Events {
+		if event.Envelope.Kind == protocol.EventAuthorizationRequested {
+			authorized = index
+		}
+		if event.Envelope.Kind == protocol.EventAuthorizationDecided {
+			decided = index
+		}
+		if event.Envelope.Kind == protocol.EventProjectSkillTrustChanged {
+			trustAt = index
+		}
+	}
+	if authorized < 0 || decided < 0 || trustAt < 0 || authorized >= decided || decided >= trustAt {
+		t.Fatalf("authorization/trust ordering invalid: %+v", inspection.Events)
+	}
+	makeTrustCommand := func(id string, expected protocol.CommittedCursor, payload protocol.SkillTrustCommandV1) protocol.Command {
+		result := protocol.Command{ProtocolVersion: protocol.ApplicationProtocolVersion, CommandID: protocol.CommandID(id), Actor: protocol.ActorRef{ID: "user", Kind: protocol.ActorUser}, IdempotencyKey: id, Kind: string(CommandTrustSkillCatalog), PayloadVersion: 1, Expected: &protocol.CommandExpectation{WorkspaceControl: &expected}}
+		result.Payload, _ = canonicaljson.Marshal(payload)
+		result.RequestDigest, _ = CanonicalRequestDigest(result)
+		return result
+	}
+	currentHead, err := builder.store.Head(t.Context(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, bad := range map[string]protocol.Command{
+		"stale":           makeTrustCommand("trust-stale", head, protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: set.Skills.Snapshot().Digest, Decision: "allow"}),
+		"wrong workspace": makeTrustCommand("trust-wrong-workspace", currentHead, protocol.SkillTrustCommandV1{WorkspaceID: "other-workspace", CatalogDigest: set.Skills.Snapshot().Digest, Decision: "allow"}),
+		"wrong digest":    makeTrustCommand("trust-wrong-digest", currentHead, protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("b", 64)}, Decision: "allow"}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			result, executeErr := set.ApplicationService.Execute(t.Context(), bad)
+			if executeErr != nil || result.Error == nil {
+				t.Fatalf("result=%+v err=%v", result, executeErr)
+			}
+		})
+	}
+	deny := makeTrustCommand("trust-deny", currentHead, protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: set.Skills.Snapshot().Digest, Decision: "deny"})
+	denied, err := set.ApplicationService.Execute(t.Context(), deny)
+	if err != nil || denied.Status != "completed" {
+		t.Fatalf("deny=%+v err=%v", denied, err)
+	}
+	inspection, err = builder.store.Inspect(t.Context(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lastTrust protocol.ProjectSkillTrustChangedV1
+	for _, event := range inspection.Events {
+		if event.Envelope.Kind == protocol.EventProjectSkillTrustChanged {
+			if err := json.Unmarshal(event.Envelope.Payload, &lastTrust); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if lastTrust.Decision != "deny" {
+		t.Fatalf("last trust=%+v", lastTrust)
+	}
+	sessionAfter, err := builder.store.InspectSession(t.Context(), protocol.SessionID(builder.activeSession.get()))
+	if err != nil || len(sessionAfter.Journal.Events) != len(sessionBefore.Journal.Events) {
+		t.Fatalf("skill trust mutated session permissions: before=%d after=%d err=%v", len(sessionBefore.Journal.Events), len(sessionAfter.Journal.Events), err)
+	}
+	changed := protocol.CloneCommand(command)
+	changed.Payload, _ = canonicaljson.Marshal(protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: set.Skills.Snapshot().Digest, Decision: "deny"})
+	changed.RequestDigest, _ = CanonicalRequestDigest(changed)
+	conflict, err := set.ApplicationService.Execute(t.Context(), changed)
+	if err != nil || conflict.Error == nil || conflict.Error.Code != codeIdempotencyConflict {
+		t.Fatalf("conflict=%+v err=%v", conflict, err)
+	}
+	withSession := makeTrustCommand("trust-with-session", currentHead, protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: set.Skills.Snapshot().Digest, Decision: "allow"})
+	withSession.Expected.SelectedSessionID = "session"
+	withSession.Expected.Session = &protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "session", CommitSeq: 1, TransactionID: "session"}
+	withSession.RequestDigest, _ = CanonicalRequestDigest(withSession)
+	invalid, err := set.ApplicationService.Execute(t.Context(), withSession)
+	if err != nil || invalid.Error == nil {
+		t.Fatalf("session expectation accepted: %+v err=%v", invalid, err)
+	}
+}
+
+func TestAppSkillTrustReloadActivatesCandidateAndReloadFailureRetainsOldGeneration(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "trust-reload-key")
+	builder := newRuntimeBuilderForTest(t, nil)
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Skills.ProjectPolicy = config.ProjectSkillsAsk
+	writeRuntimeSkill(t, filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md"), "Project skill.", "project-body")
+	first, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := builder.store.InspectSession(t.Context(), protocol.SessionID(builder.activeSession.get()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trust := protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: first.Skills.Snapshot().Digest, Decision: "allow"}
+	application := New(Options{RuntimeSet: first, ReloadRuntime: func(ctx context.Context, selection domain.ModelSelection) (RuntimeSet, error) {
+		return builder.build(cfg, selection)
+	}, Sessions: builder.store, Session: inspection.Session, Replay: LegacyReplayFromInspection(inspection), Workspace: builder.workspace, WorkspaceControl: workspace})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go application.Run(ctx)
+	application.Commands() <- Command{Kind: CommandTrustSkillCatalog, SkillTrust: trust}
+	var event Event
+	select {
+	case event = <-application.Events():
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out waiting for trust reload")
+	}
+	if event.Kind != EventReloadCompleted || !event.Applied {
+		t.Fatalf("trust reload event=%+v", event)
+	}
+	if application.runtimeSet.RuntimeGenerationID == first.RuntimeGenerationID || application.runtimeSet.Skills.Snapshot().Discovered[0].State != protocol.SkillStateActive {
+		t.Fatalf("trusted candidate was not activated: old=%q new=%q skills=%+v", first.RuntimeGenerationID, application.runtimeSet.RuntimeGenerationID, application.runtimeSet.Skills.Snapshot())
+	}
+
+	// A separately started app proves that durable acceptance precedes a failed
+	// candidate build: the old generation remains live while a future build sees
+	// the persisted trust decision.
+	writeRuntimeSkill(t, filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md"), "Project skill.", "changed-body")
+	old, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedTrust := protocol.SkillTrustCommandV1{WorkspaceID: protocol.WorkspaceID(builder.workspace.ID), CatalogDigest: old.Skills.Snapshot().Digest, Decision: "allow"}
+	failing := New(Options{RuntimeSet: old, ReloadRuntime: func(context.Context, domain.ModelSelection) (RuntimeSet, error) {
+		return RuntimeSet{}, errors.New("candidate build failed")
+	}, Sessions: builder.store, Session: inspection.Session, Replay: LegacyReplayFromInspection(inspection), Workspace: builder.workspace, WorkspaceControl: workspace})
+	failingCtx, stopFailing := context.WithCancel(t.Context())
+	defer stopFailing()
+	go failing.Run(failingCtx)
+	failing.Commands() <- Command{Kind: CommandTrustSkillCatalog, SkillTrust: changedTrust}
+	select {
+	case event = <-failing.Events():
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out waiting for failed trust reload")
+	}
+	if event.Kind != EventReloadCompleted || event.Applied || !strings.Contains(event.Message, "candidate build failed") || failing.runtimeSet.RuntimeGenerationID != old.RuntimeGenerationID {
+		t.Fatalf("failed trust reload=%+v old=%q active=%q", event, old.RuntimeGenerationID, failing.runtimeSet.RuntimeGenerationID)
+	}
+	future, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil || future.Skills.Snapshot().Discovered[0].State != protocol.SkillStateActive {
+		t.Fatalf("durable trust missing after failed reload: skills=%+v err=%v", future.Skills.Snapshot(), err)
+	}
+}
+
+func sumHex(sum [32]byte) string { return hex.EncodeToString(sum[:]) }
+
+func TestContextProjectionPolicyUsesImmutableGeneration(t *testing.T) {
+	plan := func(g protocol.RuntimeGenerationID, input, window, output int64) protocol.EventRecord {
+		return protocol.EventRecord{Envelope: protocol.EventEnvelope{RuntimeGenerationID: g}, Decoded: &protocol.ContextPlanRecordedV1{Plan: protocol.ContextPlan{Body: protocol.ContextPlanBody{EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: input, Provenance: "e"}, ContextWindow: protocol.ValueInt64{State: protocol.ValueKnown, Value: window, Provenance: "w"}, OutputReserve: output, CompactionRevision: "r"}}}}
+	}
+	manifest := func(auto bool, reserve int64) protocol.RuntimeGenerationManifest {
+		limits := protocol.RuntimeLimits{AutoCompact: auto}
+		if reserve > 0 {
+			limits.CompactReserveTokens = protocol.ValueInt64{State: protocol.ValueKnown, Value: reserve, Provenance: "c"}
+		}
+		return protocol.RuntimeGenerationManifest{Body: protocol.RuntimeGenerationBody{Limits: limits}}
+	}
+	for _, tc := range []struct {
+		name                  string
+		m                     protocol.RuntimeGenerationManifest
+		input, window, output int64
+		reason                string
+	}{{"disabled", manifest(false, 0), 1, 9000, 1, "disabled"}, {"below", manifest(true, 0), 1, 9000, 1, "below_threshold"}, {"threshold", manifest(true, 0), 6952, 9000, 0, "threshold_reached"}, {"invalid", manifest(true, 9000), 1, 9000, 1, "invalid_budget"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.m.ID = "A"
+			p := contextProjectionProjector{generations: map[protocol.RuntimeGenerationID]protocol.RuntimeGenerationManifest{"A": tc.m}}
+			got, err := p.Apply(p.Zero(protocol.JournalRef{}), plan("A", tc.input, tc.window, tc.output))
+			if err != nil || got.AutoReason != tc.reason {
+				t.Fatalf("%+v %v", got, err)
+			}
+		})
+	}
+	p := contextProjectionProjector{generations: map[protocol.RuntimeGenerationID]protocol.RuntimeGenerationManifest{"A": manifest(false, 0)}, bootstrap: protocol.RuntimeGenerationManifest{ID: "B", Body: manifest(true, 0).Body}}
+	got, _ := p.Apply(p.Zero(protocol.JournalRef{}), plan("A", 1, 9000, 1))
+	if got.AutoReason != "disabled" {
+		t.Fatalf("old generation=%+v", got)
+	}
+	got, _ = p.Apply(p.Zero(protocol.JournalRef{}), plan("missing", 1, 9000, 1))
+	if got.AutoReason != "unknown_generation" || got.ReserveTokens.State != protocol.ValueUnknown {
+		t.Fatalf("missing=%+v", got)
+	}
+	known := manifest(true, 0)
+	known.ID = "A"
+	projector := contextProjectionProjector{generations: map[protocol.RuntimeGenerationID]protocol.RuntimeGenerationManifest{"A": known}}
+	got, _ = projector.Apply(projector.Zero(protocol.JournalRef{}), plan("A", 1, 9000, 1))
+	if !got.AutoAvailable || got.ReserveTokens.Value != 2048 || got.ReserveTokens.Provenance != "compaction_policy" {
+		t.Fatalf("default=%+v", got)
+	}
+	explicit := manifest(true, 3333)
+	explicit.ID = "A"
+	projector.generations["A"] = explicit
+	got, _ = projector.Apply(projector.Zero(protocol.JournalRef{}), plan("A", 1, 9000, 1))
+	if !got.AutoAvailable || got.ReserveTokens.Value != 3333 || got.ReserveTokens.Provenance != "compaction_policy" {
+		t.Fatalf("explicit=%+v", got)
+	}
+	unknown := plan("A", 1, 9000, 1)
+	unknown.Decoded.(*protocol.ContextPlanRecordedV1).Plan.Body.ContextWindow = protocol.ValueInt64{State: protocol.ValueUnknown}
+	got, _ = projector.Apply(projector.Zero(protocol.JournalRef{}), unknown)
+	if got.AutoAvailable || got.AutoReason != "unknown_context_window" || got.ReserveTokens.State != protocol.ValueUnknown {
+		t.Fatalf("unknown=%+v", got)
+	}
+	fallback := contextProjectionProjector{bootstrap: protocol.RuntimeGenerationManifest{ID: "B", Body: manifest(true, 0).Body}}
+	got, _ = fallback.Apply(fallback.Zero(protocol.JournalRef{}), plan("B", 1, 9000, 1))
+	if !got.AutoAvailable {
+		t.Fatalf("fallback=%+v", got)
+	}
+	state, _ := projector.Apply(projector.Zero(protocol.JournalRef{}), plan("A", 1, 9000, 1))
+	compact := &protocol.ContextCompactedV1{From: protocol.CommittedCursor{JournalID: "s", CommitSeq: 1}, Through: protocol.CommittedCursor{JournalID: "s", CommitSeq: 2}, SummaryEvidenceID: "e", Revision: "r2"}
+	state, _ = projector.Apply(state, protocol.EventRecord{Decoded: compact})
+	if state.Revision != "r2" || state.SummaryEvidenceID != "e" || state.LatestRange == nil || state.LatestRange.Through.CommitSeq != 2 {
+		t.Fatalf("sequential=%+v", state)
+	}
+}
+
 func TestRuntimeSetReadyReturnsConfigurationErrorBeforeCompatibilityBypass(t *testing.T) {
 	configuration := configurationError("/home/user/.config/yordam/config.jsonc", "configuration is invalid; edit the file and run /reload", nil)
 	set := RuntimeSet{ConfigurationError: configuration, unchecked: true}
 
 	if got := set.Ready(domain.ModelSelection{}); !errors.Is(got, configuration) {
 		t.Fatalf("Ready() error = %v, want configuration error %v", got, configuration)
+	}
+}
+
+func TestConfigurationErrorPrioritizesRecoveryDiagnosticBeforeCanonicalPath(t *testing.T) {
+	path := "/private/var/folders/wn/np4wy_7x0bq4d5v1b7yb15r40000gn/T/" + strings.Repeat("very-long-config-parent/", 5) + ".config/yordam/config.jsonc"
+	cause := errors.New("invalid JSONC at line 2, column 11")
+	err := configurationError(path, "configuration is invalid (invalid JSONC at line 2, column 11); edit the file and run /reload", cause)
+
+	var typed *domain.TypedError
+	if !errors.As(err, &typed) {
+		t.Fatalf("configuration error type=%T", err)
+	}
+	if !strings.HasPrefix(typed.Message, "configuration is invalid (invalid JSONC at line 2, column 11); edit the file and run /reload") {
+		t.Fatalf("recovery diagnostic was not prioritized: %q", typed.Message)
+	}
+	if !strings.Contains(typed.Message, "\nconfig: "+path) || !errors.Is(typed, cause) {
+		t.Fatalf("configuration error lost its canonical path or cause: %+v", typed)
 	}
 }
 
@@ -101,8 +847,131 @@ func TestRuntimeBuilderBindsProvidersToolsLimitsAndCredentials(t *testing.T) {
 	if _, ok := set.Runtime.(*agent.OrchestratedRunner); !ok || set.Manifest.Body.Limits.MaxToolCalls != 7 || set.Manifest.Body.Limits.ShellTimeoutNanos != int64(time.Second) {
 		t.Fatalf("runtime=%T limits=%+v", set.Runtime, set.Manifest.Body.Limits)
 	}
-	if len(set.ProviderCatalog.List()) != 3 || len(set.Manifest.Body.Tools) != 4 {
+	if len(set.ProviderCatalog.List()) != 3 || len(set.Manifest.Body.Tools) != 6 {
 		t.Fatalf("provider models=%d tool descriptors=%d", len(set.ProviderCatalog.List()), len(set.Manifest.Body.Tools))
+	}
+	if err := set.Validate(); err != nil {
+		t.Fatalf("enabled runtime did not validate: %v", err)
+	}
+}
+
+func TestRuntimeBuilderBindsCatalogSkillsToConfigAndWorkspaceRoots(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "skill-test-key")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	builder := newRuntimeBuilderForTest(t, nil)
+	configDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder.configPath = filepath.Join(configDir, "config.jsonc")
+	globalPath := filepath.Join(configDir, "skills", "go-testing", "SKILL.md")
+	projectPath := filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md")
+	writeRuntimeSkill(t, globalPath, "Global skill.", "global-generation-body")
+	writeRuntimeSkill(t, projectPath, "Project skill.", "project-generation-body")
+
+	for _, test := range []struct {
+		policy     config.ProjectSkillPolicy
+		wantSource protocol.SkillSource
+		wantBody   string
+	}{
+		{config.ProjectSkillsAllow, protocol.SkillSourceProject, "project-generation-body"},
+		{config.ProjectSkillsAsk, protocol.SkillSourceGlobal, "global-generation-body"},
+		{config.ProjectSkillsDeny, protocol.SkillSourceGlobal, "global-generation-body"},
+	} {
+		t.Run(string(test.policy), func(t *testing.T) {
+			candidate := cfg
+			candidate.Skills.ProjectPolicy = test.policy
+			set, err := builder.build(candidate, domain.ModelSelection{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot := set.Skills.Snapshot()
+			loaded, ok := set.Skills.Load("go-testing")
+			if !ok || loaded.Identity.Source != test.wantSource || !strings.Contains(string(loaded.Content), test.wantBody) || len(snapshot.Active) != 1 || !slices.EqualFunc(snapshot.Active, set.Manifest.Body.Skills, sameRuntimeSkillDescriptor) || set.Manifest.Body.SkillCatalogRevision != snapshot.Revision {
+				t.Fatalf("snapshot=%#v loaded=%#v manifest=%#v", snapshot, loaded, set.Manifest.Body)
+			}
+			for _, descriptor := range snapshot.Discovered {
+				if descriptor.Identity.RuntimeGenerationID != set.RuntimeGenerationID {
+					t.Fatalf("generation=%q descriptor=%#v", set.RuntimeGenerationID, descriptor)
+				}
+			}
+			aliases := make([]string, 0, len(set.Manifest.Body.Tools))
+			for _, descriptor := range set.Manifest.Body.Tools {
+				aliases = append(aliases, descriptor.Body.Identity.Name)
+			}
+			if !slices.Equal(aliases, []string{"read", "search", "skill", "subagent", "edit", "shell"}) {
+				t.Fatalf("tool order=%v", aliases)
+			}
+			writeRuntimeSkill(t, projectPath, "Project skill.", "changed-after-build")
+			frozen, _ := set.Skills.Load("go-testing")
+			if !strings.Contains(string(frozen.Content), test.wantBody) {
+				t.Fatalf("built catalog mutated by source edit: %q", frozen.Content)
+			}
+		})
+	}
+}
+
+func TestRuntimeSetChildSkillCatalogHandoffIsFrozenAndExact(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "child-handoff-skill-key")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Skills.ProjectPolicy = config.ProjectSkillsAllow
+	builder := newRuntimeBuilderForTest(t, nil)
+	configDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder.configPath = filepath.Join(configDir, "config.jsonc")
+	globalPath := filepath.Join(configDir, "skills", "go-testing", "SKILL.md")
+	projectPath := filepath.Join(builder.workspace.CanonicalPath, ".yordam", "skills", "go-testing", "SKILL.md")
+	writeRuntimeSkill(t, globalPath, "Global parent metadata.", "global-parent-body")
+	writeRuntimeSkill(t, projectPath, "Project parent metadata.", "project-parent-body")
+
+	parent, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.retireSecrets()
+	parentCatalog := parent.SkillCatalogSnapshot()
+	parentLoaded, ok := parent.Skills.Load("go-testing")
+	if !ok || parentLoaded.Identity.Source != protocol.SkillSourceProject || !strings.Contains(string(parentLoaded.Content), "project-parent-body") {
+		t.Fatalf("parent admitted catalog=%+v loaded=%+v", parentCatalog, parentLoaded)
+	}
+
+	writeRuntimeSkill(t, projectPath, "Project child metadata.", "project-child-body")
+
+	// This is the production child-handoff seam. It must not discover or build
+	// from the mutable filesystem after the parent generation was captured.
+	childCatalog := parent.SkillCatalogSnapshot()
+	childLoaded, ok := parent.Skills.Load("go-testing")
+	if !ok {
+		t.Fatal("child handoff lost the admitted skill")
+	}
+	if childCatalog.Revision != parentCatalog.Revision || childCatalog.Digest != parentCatalog.Digest || !reflect.DeepEqual(childCatalog.Active, parentCatalog.Active) || !reflect.DeepEqual(childCatalog.Discovered, parentCatalog.Discovered) || !reflect.DeepEqual(childCatalog.Diagnostics, parentCatalog.Diagnostics) || !reflect.DeepEqual(childCatalog, parentCatalog) {
+		t.Fatalf("child catalog is not the exact frozen parent catalog:\nparent=%+v\nchild=%+v", parentCatalog, childCatalog)
+	}
+	if childLoaded.Identity.ContentDigest != parentLoaded.Identity.ContentDigest || childLoaded.Identity.RuntimeGenerationID != parentLoaded.Identity.RuntimeGenerationID || !reflect.DeepEqual(childLoaded, parentLoaded) || !strings.Contains(string(childLoaded.Content), "project-parent-body") || strings.Contains(string(childLoaded.Content), "project-child-body") {
+		t.Fatalf("child loaded skill is not the frozen parent body:\nparent=%+v\nchild=%+v", parentLoaded, childLoaded)
+	}
+
+	fresh, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.retireSecrets()
+	freshCatalog := fresh.SkillCatalogSnapshot()
+	freshLoaded, ok := fresh.Skills.Load("go-testing")
+	if !ok || reflect.DeepEqual(freshCatalog, parentCatalog) || freshLoaded.Identity.ContentDigest == parentLoaded.Identity.ContentDigest || !strings.Contains(string(freshLoaded.Content), "project-child-body") {
+		t.Fatalf("fresh runtime did not observe mutated project skill:\ncatalog=%+v\nloaded=%+v", freshCatalog, freshLoaded)
+	}
+}
+
+func writeRuntimeSkill(t *testing.T, path, description, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("---\nname: go-testing\ndescription: "+description+"\n---\n"+body+"\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -144,6 +1013,61 @@ func TestRuntimeGenerationManifestIsImmutableAcrossCandidateBuilds(t *testing.T)
 	}
 }
 
+func TestRuntimeReloadKeepsCapturedGenerationDependenciesImmutable(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "generation-a")
+	builder := newRuntimeBuilderForTest(t, nil)
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	first, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAdapter := first.LegacyAdapter
+	oldCompact, err := oldAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A candidate receives fresh generation-scoped services while the captured
+	// generation-A adapter remains an immutable compatibility closure.
+	t.Setenv("PRIMARY_KEY", "generation-b")
+	cfg.Context.AutoCompact = false
+	second, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.retireSecrets()
+	if first.RuntimeGenerationID == second.RuntimeGenerationID || first.ProviderService == second.ProviderService || first.ToolService == second.ToolService || first.Orchestrator == second.Orchestrator || first.Broker == second.Broker || first.LegacyAdapter == second.LegacyAdapter || first.AuthorizationService == second.AuthorizationService {
+		t.Fatalf("candidate reused generation-bound dependencies: first=%+v second=%+v", first, second)
+	}
+
+	workspaceControl, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := cfg.DefaultSelection()
+	application := New(Options{
+		RuntimeSet: first, Sessions: builder.store, Workspace: builder.workspace, WorkspaceControl: workspaceControl,
+		Session:     domain.Session{ID: builder.activeSession.get(), Workspace: builder.workspace, Selection: selection},
+		Replay:      domain.SessionReplay{Session: domain.Session{ID: builder.activeSession.get(), Workspace: builder.workspace, Selection: selection}},
+		EventBuffer: 1,
+	})
+	application.completeReload(t.Context(), operationResult{kind: operationReload, runtimeSet: second})
+	if application.runtimeSet.RuntimeGenerationID != second.RuntimeGenerationID || application.runtimeSet.ProviderService != second.ProviderService || application.runtimeSet.AuthorizationService != second.AuthorizationService {
+		t.Fatalf("reload did not activate candidate generation: active=%+v candidate=%+v", application.runtimeSet, second)
+	}
+	oldAfter, err := oldAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCompact, err := second.LegacyAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldAfter.CommandID != oldCompact.CommandID || newCompact.CommandID == oldCompact.CommandID {
+		t.Fatalf("compact identity was not generation-bound: old=%s old_after=%s new=%s", oldCompact.CommandID, oldAfter.CommandID, newCompact.CommandID)
+	}
+}
+
 func TestRuntimeCompositionUsesOnlyOrchestratedRunner(t *testing.T) {
 	t.Setenv("PRIMARY_KEY", "primary-secret")
 	builder := newRuntimeBuilderForTest(t, nil)
@@ -154,8 +1078,310 @@ func TestRuntimeCompositionUsesOnlyOrchestratedRunner(t *testing.T) {
 	if _, ok := set.Runtime.(*agent.OrchestratedRunner); !ok {
 		t.Fatalf("production runtime=%T, want *agent.OrchestratedRunner", set.Runtime)
 	}
-	if set.Orchestrator == nil || set.ProviderCatalog == nil || set.ProviderService == nil || set.ToolService == nil || set.AuthorizationService == nil || set.Broker == nil || set.ApplicationService == nil || set.LegacyAdapter == nil {
+	if set.Orchestrator == nil || set.ProviderCatalog == nil || set.ProviderService == nil || set.ToolService == nil || set.AuthorizationService == nil || set.Broker == nil || set.ApplicationService == nil || set.LegacyAdapter == nil || set.CompactSession == nil {
 		t.Fatalf("foundation composition is incomplete: %+v", set)
+	}
+}
+
+func TestRuntimeBuilderProjectsCompactionPolicyIntoImmutableManifest(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	reserve := int64(8_192)
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Context.AutoCompact = false
+	cfg.Context.CompactReserveTokens = &reserve
+
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := set.Manifest.Body.Limits
+	if limits.AutoCompact || limits.CompactReserveTokens.State != protocol.ValueKnown || limits.CompactReserveTokens.Value != reserve || limits.CompactReserveTokens.Provenance != "configured" {
+		t.Fatalf("compaction limits=%+v", limits)
+	}
+	if err := set.Validate(); err != nil {
+		t.Fatalf("valid runtime rejected: %v", err)
+	}
+
+	cfg.Context.CompactReserveTokens = nil
+	defaultBuilder := newRuntimeBuilderForTest(t, nil)
+	defaulted, err := defaultBuilder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := defaulted.Manifest.Body.Limits.CompactReserveTokens; got != (protocol.ValueInt64{State: protocol.ValueUnknown}) {
+		t.Fatalf("default reserve=%+v want unknown", got)
+	}
+}
+
+func TestRuntimeBuilderBindsSubagentLimitsIntoManifestDigest(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Subagents = config.SubagentConfig{Enabled: false, MaxPerTurn: 3, MaxToolCalls: 12, TimeoutSeconds: 300}
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := protocol.SubagentLimits{Enabled: false, MaxPerTurn: 3, MaxToolCalls: 12, TimeoutNanos: int64(300 * time.Second)}
+	if got := set.Manifest.Body.Limits.Subagents; got != want {
+		t.Fatalf("subagent limits=%+v want=%+v", got, want)
+	}
+	if err := set.Validate(); err != nil {
+		t.Fatalf("disabled runtime did not validate: %v", err)
+	}
+	for _, descriptor := range set.Manifest.Body.Tools {
+		if descriptor.Body.Identity == (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "subagent"}) {
+			t.Fatalf("disabled runtime exposed subagent: %#v", descriptor)
+		}
+	}
+	canonical, err := canonicaljson.Digest(set.Manifest.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.Manifest.Digest != canonical {
+		t.Fatalf("manifest digest=%+v want=%+v", set.Manifest.Digest, canonical)
+	}
+
+	unchangedBody := protocol.DeepCopy(set.Manifest.Body)
+	changedBody := protocol.DeepCopy(set.Manifest.Body)
+	changedBody.Limits.Subagents.Enabled = true
+	unchangedDigest, err := canonicaljson.Digest(unchangedBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedDigest, err := canonicaljson.Digest(changedBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchangedDigest == changedDigest {
+		t.Fatal("subagent configuration did not affect manifest digest")
+	}
+}
+
+func TestRuntimeBuilderComposesCompleteImmutableChildRuntimeOnlyWhenEnabled(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "child-runtime-secret")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	builder := newRuntimeBuilderForTest(t, nil)
+	enabled, err := builder.build(cfg, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enabled.ChildRuntime == nil || enabled.ChildRuntime.Sessions == nil || enabled.ChildRuntime.Policies == nil || enabled.ChildRuntime.Skills == nil || enabled.ChildRuntime.Reconciler == nil || enabled.ChildRuntime.RuntimeGenerationID != enabled.RuntimeGenerationID || enabled.ChildRuntime.SkillCatalogSnapshot().Revision != enabled.Manifest.Body.SkillCatalogRevision {
+		t.Fatalf("enabled child composition=%+v", enabled.ChildRuntime)
+	}
+	dispatcher, ok := enabled.ApplicationService.dispatcher.(runtimeCommandDispatcher)
+	if !ok || dispatcher.Acquire == nil {
+		t.Fatalf("production parent dispatcher has no runtime lease: %T", enabled.ApplicationService.dispatcher)
+	}
+	for _, tool := range enabled.ChildRuntime.Exposure.Tools {
+		if tool.Identity.Name == "subagent" {
+			t.Fatalf("child exposure retained subagent: %+v", tool)
+		}
+	}
+
+	parentRelease, err := enabled.Runtime.(*agent.OrchestratedRunner).Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	childRelease, err := enabled.ChildRuntime.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabled.retireSecrets()
+	parentRelease()
+	if _, err := enabled.Admission.Derive(); err != nil {
+		t.Fatalf("retirement ignored active child lease: %v", err)
+	}
+	childRelease()
+	if _, err := enabled.ChildRuntime.Acquire(); err == nil {
+		t.Fatal("retired child runtime accepted a future lease")
+	}
+
+	disabledConfig := cfg
+	disabledConfig.Subagents.Enabled = false
+	disabledBuilder := newRuntimeBuilderForTest(t, nil)
+	disabled, err := disabledBuilder.build(disabledConfig, domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disabled.retireSecrets()
+	if disabled.ChildRuntime != nil {
+		t.Fatalf("disabled runtime composed child dependencies: %+v", disabled.ChildRuntime)
+	}
+}
+
+func TestRuntimeSetRejectsInvalidSubagentLimits(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	for name, mutate := range map[string]func(*protocol.SubagentLimits){
+		"max per turn":   func(limits *protocol.SubagentLimits) { limits.MaxPerTurn = 0 },
+		"max tool calls": func(limits *protocol.SubagentLimits) { limits.MaxToolCalls = 65 },
+		"one nanosecond": func(limits *protocol.SubagentLimits) { limits.TimeoutNanos = 1 },
+		"above maximum":  func(limits *protocol.SubagentLimits) { limits.TimeoutNanos = int64(1800*time.Second) + 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			builder := newRuntimeBuilderForTest(t, nil)
+			set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(&set.Manifest.Body.Limits.Subagents)
+			set.Manifest.Digest, err = canonicaljson.Digest(set.Manifest.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := set.Validate(); err == nil {
+				t.Fatal("canonically redigested invalid subagent limits accepted")
+			}
+		})
+	}
+}
+
+func TestRuntimeBuilderRejectsOverflowingSubagentTimeout(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	cfg := loadRuntimeConfig(t, "https://example.invalid/v1", 120)
+	cfg.Subagents.TimeoutSeconds = int(1 + 1<<55)
+	builder := newRuntimeBuilderForTest(t, nil)
+	_, err := builder.build(cfg, domain.ModelSelection{})
+	if err == nil {
+		t.Fatal("builder accepted overflowing subagent timeout")
+	}
+}
+
+func TestProductionCompactProtocolCommandUsesRuntimeCompactionService(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := set.LegacyAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := set.ApplicationService.Execute(t.Context(), command)
+	if err != nil || result.Error == nil || result.Error.Code == codeUnsupportedCommand {
+		t.Fatalf("compact result=%+v err=%v, want a serializable compaction service failure rather than dispatcher rejection", result, err)
+	}
+}
+
+func TestProductionCompactProtocolRejectsStaleCursorBeforeProviderEgress(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+	defer server.Close()
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, server.Client())
+	set, err := builder.build(loadRuntimeConfig(t, server.URL+"/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := set.LegacyAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := *command.Expected.Session
+	stale.CommitSeq++
+	stale.TransactionID = "stale-cursor"
+	command.Expected.Session = &stale
+	command.RequestDigest, err = CanonicalRequestDigest(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := set.ApplicationService.Execute(t.Context(), command)
+	if err != nil || result.Error == nil || result.Error.Code != "stale_cursor" || requests.Load() != 0 {
+		t.Fatalf("result=%+v requests=%d err=%v", result, requests.Load(), err)
+	}
+}
+
+func TestProductionCompactProtocolRequiresIdleSessionWithoutProviderEgress(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+	defer server.Close()
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, server.Client())
+	set, err := builder.build(loadRuntimeConfig(t, server.URL+"/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(builder.activeSession.get())}
+	head, err := builder.store.Head(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := canonicaljson.Marshal(protocol.TurnAcceptedV1{CommandID: "active-command", Goal: "active", OutcomeContractID: "active-contract", ContractVersion: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appended, err := builder.store.AppendBatch(t.Context(), journal.AppendRequest{
+		Journal: ref, ExpectedHead: head, TransactionID: "active-turn",
+		Compatibility: &journal.CompatibilityDeclaration{ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: head},
+		Events:        []protocol.ProposedEvent{{EventID: "active-turn-accepted", Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventTurnAccepted, SessionID: protocol.SessionID(ref.ID), TurnID: "active-turn", Payload: payload}},
+	})
+	if err != nil || appended.Status != journal.AppendCommitted {
+		t.Fatalf("append=%+v err=%v", appended, err)
+	}
+	command, err := set.LegacyAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := set.ApplicationService.Execute(t.Context(), command)
+	if err != nil || result.Error == nil || result.Error.Code != "session_not_idle" || result.Error.Retryable || requests.Load() != 0 {
+		t.Fatalf("result=%+v requests=%d err=%v", result, requests.Load(), err)
+	}
+}
+
+func TestProductionCompactProtocolSerializesCancelledContext(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := set.LegacyAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	result, err := set.ApplicationService.Execute(ctx, command)
+	if err != nil || result.Error == nil || result.Error.Code != "cancelled" || result.Error.Retryable || strings.Contains(result.Error.Message, "context canceled") {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestProductionLegacyCompactNeverReportsMissingConfiguration(t *testing.T) {
+	t.Setenv("PRIMARY_KEY", "primary-secret")
+	builder := newRuntimeBuilderForTest(t, nil)
+	set, err := builder.build(loadRuntimeConfig(t, "https://example.invalid/v1", 120), domain.ModelSelection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := builder.store.InspectSession(t.Context(), protocol.SessionID(builder.activeSession.get()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay := LegacyReplayFromInspection(inspection)
+	application := New(Options{RuntimeSet: set, Sessions: builder.store, Session: replay.Session, Replay: replay, Workspace: builder.workspace})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go application.Run(ctx)
+	application.Commands() <- Command{Kind: CommandCompact}
+	var event Event
+	for range 8 {
+		select {
+		case event = <-application.Events():
+			if event.Kind == EventError || event.Kind == EventTurnCompleted || event.Kind == EventTurnInterrupted {
+				goto terminal
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for compact result")
+		}
+	}
+	t.Fatal("compact did not produce a terminal event")
+terminal:
+	if strings.Contains(event.Message, "compaction is not configured") {
+		t.Fatalf("valid production runtime rejected compact as unconfigured: %+v", event)
 	}
 }
 
@@ -163,7 +1389,8 @@ func TestProductionLegacyCommandUsesApplicationProtocolAndRealCursorProjection(t
 	var providerRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		response.Header().Set("Content-Type", "text/event-stream")
-		if providerRequests.Add(1) == 1 {
+		switch providerRequests.Add(1) {
+		case 1:
 			arguments := `{"path":"protocol-evidence.txt","create":true,"new_content":"committed evidence\n"}`
 			fmt.Fprintf(response, "data: {\"id\":\"request-production-tool\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"edit-production\",\"function\":{\"name\":\"edit\",\"arguments\":%q}}]}}]}\n\n", arguments)
 			fmt.Fprintln(response, `data: {"id":"request-production-tool","choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
@@ -171,8 +1398,11 @@ func TestProductionLegacyCommandUsesApplicationProtocolAndRealCursorProjection(t
 			fmt.Fprintln(response, "data: [DONE]")
 			fmt.Fprintln(response)
 			return
+		case 2:
+			fmt.Fprintln(response, `data: {"id":"request-production","choices":[{"delta":{"content":"protocol reply"},"finish_reason":"stop"}]}`)
+		default:
+			fmt.Fprintln(response, `data: {"id":"request-production-compact","choices":[{"delta":{"content":"{\"goal\":\"compact\",\"constraints\":[],\"decisions\":[],\"files\":[],\"commands_and_tests\":[],\"unresolved\":[],\"children\":[],\"skills\":[],\"unknown_effects\":[]}"},"finish_reason":"stop"}]}`)
 		}
-		fmt.Fprintln(response, `data: {"id":"request-production","choices":[{"delta":{"content":"protocol reply"},"finish_reason":"stop"}]}`)
 		fmt.Fprintln(response)
 		fmt.Fprintln(response, "data: [DONE]")
 		fmt.Fprintln(response)
@@ -287,6 +1517,44 @@ completed:
 	if !strings.Contains(string(current.Durable.Workspace.Data), `"consumed":`) || strings.Contains(string(current.Durable.Workspace.Data), `"consumed":{}`) {
 		t.Fatalf("current durable projection has no committed control authorization state: %s", current.Durable.Workspace.Data)
 	}
+	_, compactionSubscription, err := application.runtimeSet.ApplicationService.SnapshotAndSubscribe(t.Context(), protocol.SnapshotRequest{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(bootstrapSnapshot.Session.ID), Consumer: "compaction-protocol", QueueCapacity: 128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer compactionSubscription.Close()
+	compactCommand, err := application.runtimeSet.LegacyAdapter.Command(Command{Kind: CommandCompact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerBeforeCompact := providerRequests.Load()
+	firstCompact, err := application.runtimeSet.ApplicationService.Execute(t.Context(), compactCommand)
+	if err != nil || firstCompact.Status != "completed" {
+		t.Fatalf("first compact=%+v err=%v", firstCompact, err)
+	}
+	secondCompact, err := application.runtimeSet.ApplicationService.Execute(t.Context(), compactCommand)
+	if err != nil || !reflect.DeepEqual(secondCompact, firstCompact) || providerRequests.Load() != providerBeforeCompact+1 {
+		t.Fatalf("replayed compact=%+v first=%+v calls=%d before=%d err=%v", secondCompact, firstCompact, providerRequests.Load(), providerBeforeCompact, err)
+	}
+	streamCtx, streamCancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer streamCancel()
+	sawProgress, sawCompletion := false, false
+	for !sawProgress || !sawCompletion {
+		item, nextErr := compactionSubscription.Next(streamCtx)
+		if nextErr != nil {
+			t.Fatalf("compaction subscription progress=%t completion=%t err=%v", sawProgress, sawCompletion, nextErr)
+		}
+		if item.Event == nil {
+			continue
+		}
+		switch item.Event.Kind {
+		case protocol.EventActivityStarted:
+			sawProgress = true
+		case protocol.EventCommandCompleted:
+			sawCompletion = true
+		}
+	}
 	oldDurable, _, err := (runtimeBrokerSource{Repository: store, Workspace: application.workspaceControl, Generation: application.runtimeSet.RuntimeGenerationID}).Project(t.Context(), SnapshotVector{
 		WorkspaceControl: initial.Cursor.WorkspaceControl, SelectedSession: initial.Cursor.SelectedSession,
 	})
@@ -325,15 +1593,225 @@ completed:
 	if !reflect.DeepEqual(current.Durable, headless.Durable) || !reflect.DeepEqual(tuiSemantic, legacySemantic) {
 		t.Fatalf("consumer equivalence tui=%v legacy=%v headless=%+v current=%+v", tuiSemantic, legacySemantic, headless.Durable, current.Durable)
 	}
+	compactedInspection, err := store.InspectSession(t.Context(), protocol.SessionID(bootstrapSnapshot.Session.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(inspectionKinds(compactedInspection.Journal.Events), protocol.EventContextCompacted) {
+		t.Fatalf("legacy compact missed canonical compaction event: %v", inspectionKinds(compactedInspection.Journal.Events))
+	}
 	application.Commands() <- Command{Kind: CommandShutdown}
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
 }
 
+func TestAppRunCancelledProductionCompactPublishesOneInterruptedTerminal(t *testing.T) {
+	var blockCompaction atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		if blockCompaction.Load() {
+			<-request.Context().Done()
+			return
+		}
+		fmt.Fprintf(response, "data: {\"id\":\"cancelled-compact\",\"choices\":[{\"delta\":{\"content\":%q},\"finish_reason\":\"stop\"}]}\n\n", "ordinary turn reply")
+		fmt.Fprintln(response, "data: [DONE]")
+		fmt.Fprintln(response)
+	}))
+	defer server.Close()
+	t.Setenv("PRIMARY_KEY", "production-cancel-key")
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.jsonc")
+	configBody := fmt.Sprintf(`{"model":"primary/model-a","provider":{"primary":{"options":{"baseURL":%q,"apiKeyEnv":"PRIMARY_KEY"},"models":{"model-a":{}}}}}`, server.URL)
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	application, _, err := Bootstrap(t.Context(), BootstrapOptions{
+		ConfigPath: configPath, CWD: root, HTTPClient: server.Client(),
+		CLI: cli.Options{Mode: domain.ModeAsk, DataDir: filepath.Join(root, "data"), MaxToolCalls: 32, ShellTimeout: time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- application.Run(ctx) }()
+
+	awaitTurn := func(prompt string) {
+		t.Helper()
+		application.Commands() <- Command{Kind: CommandStartTurn, Prompt: prompt}
+		accepted := false
+		for {
+			select {
+			case event := <-application.Events():
+				switch event.Kind {
+				case EventError, EventTurnInterrupted, EventCompactionCompleted, EventCompactionFailed:
+					t.Fatalf("turn %q unexpected event=%+v", prompt, event)
+				case EventTurnAccepted:
+					accepted = true
+				case EventTurnCompleted:
+					if !accepted {
+						t.Fatalf("turn %q completed before acceptance", prompt)
+					}
+					return
+				}
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for turn %q: %v", prompt, ctx.Err())
+			}
+		}
+	}
+
+	// Build the durable history required for manual compaction, then make only
+	// the compact provider stream wait for cancellation.
+	awaitTurn("one")
+	awaitTurn("two")
+	blockCompaction.Store(true)
+	application.Commands() <- Command{Kind: CommandCompact}
+	cancelled, terminals := false, 0
+	for terminals == 0 {
+		select {
+		case event := <-application.Events():
+			switch event.Kind {
+			case EventError:
+				t.Fatalf("cancelled compact emitted generic error: %+v", event)
+			case EventCompactionStarted:
+				if event.Compaction != nil && event.Compaction.Trigger == "manual" && !cancelled {
+					cancelled = true
+					application.Commands() <- Command{Kind: CommandCancelTurn}
+				}
+			case EventCompactionCompleted:
+				t.Fatalf("cancelled compact completed: %+v", event)
+			case EventCompactionFailed:
+				terminals++
+				if !cancelled || event.Code != "compaction_interrupted" || event.Compaction == nil || event.Compaction.Stage != protocol.CompactionCancelled || event.Compaction.Error == nil || event.Compaction.Error.Code != "compaction_interrupted" {
+					t.Fatalf("cancelled compact terminal=%+v cancelled=%t", event, cancelled)
+				}
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for cancelled compact terminal: %v", ctx.Err())
+		}
+	}
+	blockCompaction.Store(false)
+	// A subsequent command proves the lane is clear and also catches a delayed
+	// duplicate compaction terminal before the next turn can complete.
+	awaitTurn("after cancelled compact")
+	application.Commands() <- Command{Kind: CommandShutdown}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out shutting down: %v", ctx.Err())
+	}
+}
+
+func TestAppRunCompactProtocolSubscriptionDoesNotLeakTerminalEvents(t *testing.T) {
+	var providerCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		content := "ordinary turn reply"
+		if providerCalls.Add(1) > 2 {
+			content = `{"goal":"compact","constraints":[],"decisions":[],"files":[],"commands_and_tests":[],"unresolved":[],"children":[],"skills":[],"unknown_effects":[]}`
+		}
+		fmt.Fprintf(response, "data: {\"id\":\"app-run-%d\",\"choices\":[{\"delta\":{\"content\":%q},\"finish_reason\":\"stop\"}]}\n\n", providerCalls.Load(), content)
+		fmt.Fprintln(response, "data: [DONE]")
+		fmt.Fprintln(response)
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.jsonc")
+	configBody := fmt.Sprintf(`{"model":"primary/model-a","provider":{"primary":{"options":{"baseURL":%q,"apiKeyEnv":"PRIMARY_KEY"},"models":{"model-a":{}}}}}`, server.URL)
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PRIMARY_KEY", "app-run-key")
+	application, _, err := Bootstrap(t.Context(), BootstrapOptions{
+		ConfigPath: configPath, CWD: root, HTTPClient: server.Client(),
+		CLI: cli.Options{Mode: domain.ModeAsk, DataDir: filepath.Join(root, "data"), MaxToolCalls: 32, ShellTimeout: time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This is deliberately one deadline for the entire sequence. Under -race
+	// the provider and journal operations can be individually slow without
+	// indicating a protocol failure; the required condition is that every
+	// operation reaches its terminal event and the immediately following turn
+	// can proceed without receiving a leaked terminal from its predecessor.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- application.Run(ctx) }()
+
+	awaitTerminal := func(command Command, requireAccepted bool) {
+		t.Helper()
+		application.Commands() <- command
+		accepted, terminals, contextState := false, 0, false
+		for terminals == 0 {
+			select {
+			case event := <-application.Events():
+				if event.Kind == EventState && event.Context != nil {
+					contextState = true
+				}
+				if event.Kind == EventTurnAccepted {
+					accepted = true
+				}
+				terminal := event.Kind == EventTurnCompleted || event.Kind == EventTurnInterrupted || event.Kind == EventError
+				if command.Kind == CommandCompact {
+					terminal = terminal || event.Kind == EventCompactionCompleted || event.Kind == EventCompactionFailed
+				}
+				if terminal {
+					terminals++
+					if command.Kind == CommandCompact && event.Kind != EventCompactionCompleted {
+						t.Fatalf("command %s terminal=%+v", command.Kind, event)
+					}
+					if command.Kind != CommandCompact && event.Kind != EventTurnCompleted {
+						t.Fatalf("command %s terminal=%+v", command.Kind, event)
+					}
+				}
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for %s terminal: %v", command.Kind, ctx.Err())
+			}
+		}
+		if requireAccepted && !accepted {
+			t.Fatalf("%s terminal arrived before its accepted event", command.Kind)
+		}
+		if !contextState {
+			t.Fatalf("%s did not receive durable context state before terminal", command.Kind)
+		}
+	}
+
+	// Two completed turns create a sufficiently rich durable history for the
+	// first compact; the intervening turn makes the second compact meaningful.
+	awaitTerminal(Command{Kind: CommandStartTurn, Prompt: "one"}, true)
+	awaitTerminal(Command{Kind: CommandStartTurn, Prompt: "two"}, true)
+	awaitTerminal(Command{Kind: CommandCompact}, false)
+	awaitTerminal(Command{Kind: CommandStartTurn, Prompt: "after first compact"}, true)
+	awaitTerminal(Command{Kind: CommandCompact}, false)
+	awaitTerminal(Command{Kind: CommandStartTurn, Prompt: "after second compact"}, true)
+
+	application.Commands() <- Command{Kind: CommandShutdown}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("app shutdown: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out shutting down app: %v", ctx.Err())
+	}
+}
+
 func legacyConsumerSemantic(event Event) []string {
 	switch event.Kind {
 	case EventState:
+		// A full durable snapshot is bootstrap metadata, not an event in the
+		// legacy durable stream. Context-plan events deliberately have no policy
+		// reason and remain part of the equivalence sequence below.
+		if event.Context != nil && event.Context.AutoReason != "" {
+			return nil
+		}
 		return []string{"state"}
 	case EventTurnAccepted:
 		return []string{"turn.accepted"}
@@ -352,6 +1830,14 @@ func inspectionKinds(events []protocol.EventRecord) []string {
 		kinds = append(kinds, event.Envelope.Kind)
 	}
 	return kinds
+}
+
+func inspectionSequenceRefs(events []protocol.EventRecord) []string {
+	values := make([]string, 0, len(events))
+	for _, event := range events {
+		values = append(values, fmt.Sprintf("%d/%s", event.Envelope.Seq, event.Envelope.TransactionID))
+	}
+	return values
 }
 
 func countString(values []string, target string) int {
@@ -586,7 +2072,7 @@ func newRuntimeBuilderForTest(t *testing.T, client *http.Client) runtimeBuilder 
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := jsonl.New(t.TempDir(), jsonl.Options{})
+	store := jsonl.New(t.TempDir(), jsonl.Options{Sanitize: func(value any) (json.RawMessage, error) { return json.Marshal(value) }})
 	session, err := store.Create(t.Context(), workspace, domain.ModeAsk, domain.ModelSelection{})
 	if err != nil {
 		t.Fatal(err)

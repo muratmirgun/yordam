@@ -5,19 +5,34 @@ import (
 	"strings"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
 type Sessions struct {
-	items  []domain.SessionSummary
-	filter string
-	cursor int
+	items     []domain.SessionSummary
+	filter    string
+	cursor    int
+	relations map[string]string
 }
 
 func NewSessions(items []domain.SessionSummary) Sessions {
 	items = append([]domain.SessionSummary(nil), items...)
 	sortSessions(items)
-	return Sessions{items: items}
+	return Sessions{items: items, relations: make(map[string]string)}
 }
+
+func (s *Sessions) SetLineage(lineage protocol.SubagentLineageV1) {
+	s.relations = make(map[string]string)
+	if lineage.ParentSessionID != "" {
+		s.relations[string(lineage.SessionID)] = "child of " + string(lineage.ParentSessionID)
+		s.relations[string(lineage.ParentSessionID)] = "parent of " + string(lineage.SessionID)
+	}
+	for _, child := range lineage.Children {
+		s.relations[string(child)] = "child of " + string(lineage.SessionID)
+	}
+}
+
+func (s Sessions) Relation(sessionID string) string { return s.relations[sessionID] }
 
 func (s *Sessions) Upsert(summary domain.SessionSummary) {
 	for index := range s.items {

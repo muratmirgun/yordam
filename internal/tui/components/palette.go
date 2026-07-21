@@ -25,6 +25,7 @@ func NewPalette() Palette {
 		{Name: "/sessions", Description: "Open a session", Screen: "sessions"},
 		{Name: "/mode", Description: "Choose safe, ask, or auto", Screen: "mode"},
 		{Name: "/model", Description: "Choose a configured model", Screen: "model"},
+		{Name: "/skills", Description: "Inspect frozen skill catalog", Screen: "skills"},
 		{Name: "/reload", Description: "Reload ~/.config/yordam/config.jsonc", Command: app.CommandReloadConfig},
 		{Name: "/compact", Description: "Compact older context", Command: app.CommandCompact},
 		{Name: "/help", Description: "Show commands and keybindings", Screen: "help"},

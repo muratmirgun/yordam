@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/muratmirgun/yordam/internal/secret"
 )
@@ -29,5 +30,45 @@ func TestSecretDiagnosticFormattingRedactsConfiguredSentinel(t *testing.T) {
 	}
 	if !strings.Contains(formatted, "ordinary terminal output") || !strings.Contains(formatted, "[REDACTED]") {
 		t.Fatal("secret-bearing PTY diagnostic discarded useful redacted output")
+	}
+}
+
+func TestCurrentScreenExcludesReplacedTerminalHistory(t *testing.T) {
+	emulator, stop := newPTYEmulator(12, 3)
+	session := &Session{emulator: emulator}
+	t.Cleanup(stop)
+	writer := lockedWriter{session: session}
+	if _, err := writer.Write([]byte("PERMISSION")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("\r\x1b[2KREADY")); err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(session.Output(), "PERMISSION") {
+		t.Fatal("raw PTY history did not retain replaced content")
+	}
+	if screen := session.CurrentScreen(); strings.Contains(screen, "PERMISSION") || !strings.Contains(screen, "READY") {
+		t.Fatalf("current screen=%q", screen)
+	}
+}
+
+func TestCurrentScreenEmulatorDoesNotBlockOnTerminalQueries(t *testing.T) {
+	emulator, stop := newPTYEmulator(12, 3)
+	session := &Session{emulator: emulator}
+	t.Cleanup(stop)
+	done := make(chan error, 1)
+	go func() {
+		_, err := (lockedWriter{session: session}).Write([]byte("\x1b[c"))
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal query blocked PTY output capture")
 	}
 }

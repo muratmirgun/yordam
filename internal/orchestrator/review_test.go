@@ -696,6 +696,53 @@ type redactingStream struct{ stream *secret.Stream }
 func (s redactingStream) Write(value string) (string, error) { return s.stream.Write(value), nil }
 func (s redactingStream) Close() (string, error)             { return s.stream.Close(), nil }
 
+func TestSkillResultPresentationIsSanitizedAndTransientOnly(t *testing.T) {
+	publisher := &capturingTransientPublisher{}
+	service := &Service{
+		deps:      Dependencies{Admission: newRedactingAdmission("presentation-secret")},
+		publisher: publisher,
+	}
+	request := StartTurnRequest{SessionID: "session-1", Runtime: validRuntimeManifest(t, "observation")}
+	state := &turnState{turnID: "turn-1"}
+	plan := protocol.ActionPlan{Body: protocol.ActionPlanBody{Tool: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "skill"}}}
+	execution := protocol.ExecutionResult{
+		ToolResult:   protocol.ToolResultBlock{CallID: "skill-call", Status: "succeeded", Text: "durable-secret"},
+		Presentation: protocol.ToolResultPresentation{Content: "presentation-secret", DurationNanos: int64(time.Second), Truncated: true},
+	}
+	if err := service.publishToolPresentation(context.Background(), request, state, "activity-1", plan, execution); err != nil {
+		t.Fatal(err)
+	}
+	if publisher.committed != 0 || len(publisher.transient) != 1 {
+		t.Fatalf("publishes=%+v", publisher)
+	}
+	event := publisher.transient[0]
+	if event.Kind != protocol.EventToolResultAvailable || event.Correlation.ActivityID != "activity-1" {
+		t.Fatalf("event=%+v", event)
+	}
+	var available protocol.ToolResultAvailableV1
+	if err := json.Unmarshal(event.Payload, &available); err != nil {
+		t.Fatal(err)
+	}
+	if available.Content == "presentation-secret" || strings.Contains(available.Content, "presentation-secret") || available.Content == "" || available.DurationNanos != int64(time.Second) || !available.Truncated {
+		t.Fatalf("unsanitized or incomplete presentation: %+v", available)
+	}
+}
+
+type capturingTransientPublisher struct {
+	committed int
+	transient []protocol.ApplicationEvent
+}
+
+func (p *capturingTransientPublisher) PublishCommitted(context.Context, protocol.JournalRef, protocol.CommittedCursor, []protocol.EventEnvelope) error {
+	p.committed++
+	return nil
+}
+
+func (p *capturingTransientPublisher) PublishTransient(event protocol.ApplicationEvent) error {
+	p.transient = append(p.transient, protocol.DeepCopy(event))
+	return nil
+}
+
 type splitSecretProvider struct{}
 
 func (splitSecretProvider) Prepare(context.Context, protocol.ActivityID, string, protocol.ModelRequest, protocol.Digest) (provider.ProviderHandle, error) {

@@ -9,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 )
 
@@ -49,8 +50,29 @@ func (model Model) updateMessage(message tea.Msg) Model {
 }
 
 func (model Model) handleAppEvent(event app.Event) Model {
+	if event.Context != nil {
+		model.context.SetCompactionContext(*event.Context)
+	}
 	switch event.Kind {
+	case app.EventCompactionStarted, app.EventCompactionProgress:
+		if event.Compaction != nil {
+			model.context.SetCompactionProgress(*event.Compaction)
+		}
+		model = model.setTurnActive(true)
+		model = model.setTurnProgress(progressWaiting)
+	case app.EventCompactionCompleted, app.EventCompactionFailed:
+		if event.Compaction != nil {
+			model.context.SetCompactionProgress(*event.Compaction)
+		}
+		model = model.setTurnActive(false)
+		if event.Compaction != nil && event.Compaction.Error != nil {
+			model.conversation.Append(components.BlockError, event.Compaction.Error.Message)
+		}
+		model.context.ClearCompactionProgress()
 	case app.EventState:
+		if event.Runtime.Kind == "" {
+			model.context.ClearCompactionProgress()
+		}
 		if event.Runtime.Kind != "" {
 			model = model.setTurnActive(true)
 			model = model.setTurnProgress(progressWaiting)
@@ -61,6 +83,7 @@ func (model Model) handleAppEvent(event app.Event) Model {
 			model = model.replaceModels(event.Models, event.Selection)
 		}
 	case app.EventTurnAccepted:
+		model.context.ClearCompactionProgress()
 		if model.matchesPendingDraft(event) {
 			draft := event.Draft
 			if draft == "" {
@@ -71,6 +94,10 @@ func (model Model) handleAppEvent(event app.Event) Model {
 		}
 	case app.EventReloadCompleted:
 		model = model.setTurnActive(false)
+		if event.Applied && event.Skills != nil {
+			model.skillSnapshot = event.Skills.Clone()
+			model = model.refreshSkillsStaleness()
+		}
 		if event.Applied {
 			model = model.replaceModels(event.Models, event.Selection)
 			if event.Message != "" {
@@ -97,13 +124,18 @@ func (model Model) handleAppEvent(event app.Event) Model {
 		model = model.setTurnActive(true)
 		model = model.setTurnProgress(progressTool)
 		if progress := event.Runtime.Progress; progress != nil {
-			model.conversation.ReplaceToolOutput(progress.CallID, "shell", progress.Text, progress.Truncated)
+			name := skillCardName(event.Runtime.Skill)
+			if name == "" {
+				name = "shell"
+			}
+			model.conversation.ReplaceToolOutput(progress.CallID, name, progress.Text, progress.Truncated)
 		}
 	case app.EventToolCompleted:
 		model = model.setTurnActive(true)
 		model = model.setTurnProgress(progressWaiting)
 		if result := event.Runtime.Result; result != nil {
-			model.conversation.CompleteTool(result.CallID, "", toolStatus(result.Status), result.Content, result.Duration, result.Truncated)
+			name := skillCardName(event.Runtime.Skill)
+			model.conversation.CompleteTool(result.CallID, name, toolStatus(result.Status), result.Content, result.Duration, result.Truncated)
 			if result.FileChange != nil {
 				model.context.ShowDiff(result.FileChange.Path, result.FileChange.Diff)
 				model = model.openContext()
@@ -113,12 +145,24 @@ func (model Model) handleAppEvent(event app.Event) Model {
 				model = model.openContext()
 			}
 		}
+	case app.EventSubagentStage:
+		if event.Subagent != nil {
+			model.childCards.ApplyStage(*event.Subagent)
+			if event.Subagent.Stage == protocol.SubagentStageRequested || event.Subagent.Stage == protocol.SubagentStageWaiting || event.Subagent.Stage == protocol.SubagentStageRunning {
+				model = model.setTurnActive(true)
+				model = model.setTurnProgress(progressWaiting)
+			}
+		}
+		if event.Durable != nil {
+			model = model.applyDurableSubagents(*event.Durable)
+		}
 	case app.EventPermissionRequested:
 		if event.Permission != nil {
-			warning := model.effectiveMode == domain.ModeAuto && event.Permission.Call.Request.Name == "shell"
+			childPrompt := event.Permission.ParentSessionID != "" || event.Permission.DelegationAttemptID != ""
+			warning := !childPrompt && model.effectiveMode == domain.ModeAuto && event.Permission.Call.Request.Name == "shell"
 			commands := model.commands
 			callID := event.Permission.Call.Request.CallID
-			model.permission = components.NewPermission(event.Permission.Call, func(decision domain.PermissionDecision) {
+			model.permission = components.NewPermissionPrompt(*event.Permission, func(decision domain.PermissionDecision) {
 				if commands == nil {
 					return
 				}
@@ -177,6 +221,17 @@ func (model Model) handleAppEvent(event app.Event) Model {
 		}
 	}
 	return model
+}
+
+func skillCardName(provenance *domain.SkillProvenance) string {
+	if provenance == nil || provenance.Validate() != nil {
+		return ""
+	}
+	digest := provenance.Digest.Value
+	if len(digest) > 7 {
+		digest = digest[:7]
+	}
+	return "skill " + provenance.Name + " [" + string(provenance.Source) + " " + provenance.Digest.Algorithm + ":" + digest + "]"
 }
 
 func (model Model) applyTerminalReplay(event app.Event) Model {
@@ -270,6 +325,8 @@ func (model Model) routeSubmission(submitted string) Model {
 	case "/help":
 		model.screen = ScreenHelp
 		model.focusedComponent = focusModal
+	case "/skills":
+		model = model.openSkills()
 	case "/quit":
 		if model.turnActive {
 			model.modal = ModalConfirmExit
@@ -281,6 +338,34 @@ func (model Model) routeSubmission(submitted string) Model {
 		model.conversation.Append(components.BlockNotice, "unknown command: "+command)
 	}
 	return model
+}
+
+func (model Model) openSkills() Model {
+	model.displayedSkills = model.skillSnapshot.Clone()
+	model.skills = components.NewSkills(skillScreenOptions(model.displayedSkills, false, model.turnActive))
+	model.screen = ScreenSkills
+	model.focusedComponent = focusModal
+	return model
+}
+
+func (model Model) refreshSkillsStaleness() Model {
+	if model.screen != ScreenSkills {
+		return model
+	}
+	stale := model.displayedSkills.WorkspaceID != model.skillSnapshot.WorkspaceID ||
+		model.displayedSkills.CatalogDigest != model.skillSnapshot.CatalogDigest ||
+		model.displayedSkills.ProjectPolicy != model.skillSnapshot.ProjectPolicy
+	if !stale {
+		// Trust decisions are catalog-digest-bound. A successful reload after a
+		// decision therefore keeps the same digest but changes visible states.
+		model.displayedSkills = model.skillSnapshot.Clone()
+	}
+	model.skills = components.NewSkills(skillScreenOptions(model.displayedSkills, stale, model.turnActive))
+	return model
+}
+
+func skillScreenOptions(snapshot app.SkillSnapshot, stale, active bool) components.SkillScreenOptions {
+	return components.SkillScreenOptions{Snapshot: snapshot.Clone(), Stale: stale, OperationActive: active}
 }
 
 func (model Model) matchesPendingDraft(event app.Event) bool {
@@ -343,6 +428,9 @@ func (model Model) replaceModels(models []domain.ModelSelection, selection domai
 }
 
 func (model Model) applyDurableState(event app.Event) Model {
+	if event.Durable != nil {
+		model = model.applyDurableSubagents(*event.Durable)
+	}
 	if event.Mode != "" {
 		model.effectiveMode = event.Mode
 		switch event.Mode {
@@ -381,6 +469,29 @@ func (model Model) applyDurableState(event app.Event) Model {
 	model.focusedComponent = focusComposer
 	model = model.replaceConversation(event.Replay)
 	return model
+}
+
+func (model Model) applyDurableSubagents(durable protocol.DurableProjection) Model {
+	cards := make([]protocol.SubagentCardV1, 0, len(durable.Subagents))
+	for _, view := range durable.Subagents {
+		if view.State != protocol.ValueKnown || view.Kind != "subagent" {
+			continue
+		}
+		var card protocol.SubagentCardV1
+		if json.Unmarshal(view.Data, &card) == nil && card.Validate() == nil {
+			cards = append(cards, card)
+		}
+	}
+	model.childCards.Set(cards)
+	model.lineage = protocol.SubagentLineageV1{}
+	if durable.Lineage != nil && durable.Lineage.State == protocol.ValueKnown {
+		var lineage protocol.SubagentLineageV1
+		if json.Unmarshal(durable.Lineage.Data, &lineage) == nil {
+			model.lineage = lineage
+			model.sessions.SetLineage(lineage)
+		}
+	}
+	return model.resizeComponents()
 }
 
 func (model Model) replaceConversation(replay domain.SessionReplay) Model {
@@ -443,6 +554,7 @@ func projectConversation(replay domain.SessionReplay) components.Conversation {
 func (model Model) setTurnActive(active bool) Model {
 	model.turnActive = active
 	model.composer.SetActiveTurn(active)
+	model.skills.SetOperationActive(active)
 	if !active {
 		model = model.setTurnProgress(progressIdle)
 	}
@@ -470,6 +582,11 @@ func (model Model) resizeComponents() Model {
 	}
 	model.composer.SetWidth(max(1, streamWidth))
 	conversationHeight := max(1, model.height-3-model.composer.Height())
+	if model.layout() != LayoutContextOnly {
+		if cards := model.childCards.View(max(1, streamWidth)); cards != "" {
+			conversationHeight = max(1, conversationHeight-renderedLineCount(cards)-2)
+		}
+	}
 	if model.turnProgress != progressIdle {
 		conversationHeight = max(1, conversationHeight-1)
 	}

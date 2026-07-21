@@ -13,6 +13,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/permission"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/secret"
 )
@@ -860,6 +861,69 @@ func TestAppPermissionBrokerSeparatesConcurrentCallIDsWithSameRedactedValue(t *t
 		case <-time.After(time.Second):
 			t.Fatal("redacted call ID collision stranded Resolve")
 		}
+	}
+}
+
+func TestAppChildPermissionPromptsRouteSameChildCallIDByDisplayedCorrelation(t *testing.T) {
+	application := app.New(app.Options{EventBuffer: 4})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go application.Run(ctx)
+	prompts := []ports.PermissionPrompt{
+		{SessionID: "child-one", ParentSessionID: "parent", DelegationAttemptID: "attempt-one", Call: domain.PreparedToolRequest{Request: domain.ToolRequest{CallID: "shell-1", Name: "shell"}, CanonicalScope: "/workspace/one"}},
+		{SessionID: "child-two", ParentSessionID: "parent", DelegationAttemptID: "attempt-two", Call: domain.PreparedToolRequest{Request: domain.ToolRequest{CallID: "shell-1", Name: "shell"}, CanonicalScope: "/workspace/two"}},
+	}
+	results := []chan permissionResult{make(chan permissionResult, 1), make(chan permissionResult, 1)}
+	for index := range prompts {
+		index := index
+		go func() {
+			decision, err := application.Resolve(ctx, prompts[index])
+			results[index] <- permissionResult{decision: decision, err: err}
+		}()
+	}
+	seen := map[string]ports.PermissionPrompt{}
+	for range prompts {
+		event := receiveEvent(t, application.Events())
+		if event.Kind != app.EventPermissionRequested || event.Permission == nil || event.Permission.ParentSessionID != "parent" || event.Permission.DelegationAttemptID == "" {
+			t.Fatalf("child prompt lost lineage: %+v", event)
+		}
+		seen[event.Permission.SessionID] = *event.Permission
+	}
+	for sessionID, prompt := range seen {
+		action := domain.PermissionDeny
+		if sessionID == "child-two" {
+			action = domain.PermissionAllow
+		}
+		application.Commands() <- app.Command{Kind: app.CommandResolvePermission, CallID: prompt.Call.Request.CallID, Decision: domain.PermissionDecision{Action: action, Lifetime: domain.PermissionOnce, Scope: prompt.Call.CanonicalScope}}
+	}
+	for index := range results {
+		result := <-results[index]
+		if result.err != nil || result.decision.Action != map[int]domain.PermissionAction{0: domain.PermissionDeny, 1: domain.PermissionAllow}[index] {
+			t.Fatalf("child %d resolved incorrectly: %+v", index, result)
+		}
+	}
+}
+
+func TestAppChildShellAcknowledgementCommandDoesNotMutateParentAutoPolicy(t *testing.T) {
+	parent := permission.NewSession(domain.ModeAuto)
+	application := app.New(app.Options{Session: domain.Session{ID: "parent", Mode: domain.ModeAuto}, Policy: parent, EventBuffer: 2})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go application.Run(ctx)
+	prompt := ports.PermissionPrompt{SessionID: "child", ParentSessionID: "parent", DelegationAttemptID: "attempt", Call: domain.PreparedToolRequest{Request: domain.ToolRequest{CallID: "shell", Name: "shell"}, Mutation: domain.MutationProcess, CanonicalScope: "/workspace\x00go test", InsideWorkspace: true}}
+	result := make(chan permissionResult, 1)
+	go func() {
+		decision, err := application.Resolve(ctx, prompt)
+		result <- permissionResult{decision: decision, err: err}
+	}()
+	event := receiveEvent(t, application.Events())
+	application.Commands() <- app.Command{Kind: app.CommandAcknowledgeAutoShell, CallID: event.Permission.Call.Request.CallID, Decision: domain.PermissionDecision{Action: domain.PermissionAllow, Lifetime: domain.PermissionSession, Scope: event.Permission.Call.CanonicalScope}}
+	if got := <-result; got.err != nil || got.decision.Action != domain.PermissionAllow {
+		t.Fatalf("child resolution=%+v", got)
+	}
+	parentShell := parent.Evaluate(context.Background(), ports.PermissionContext{}, domain.PreparedToolRequest{Request: domain.ToolRequest{Name: "shell"}, Mutation: domain.MutationProcess, CanonicalScope: "/workspace\x00echo parent", InsideWorkspace: true})
+	if parentShell.Action != domain.PermissionAsk {
+		t.Fatalf("child acknowledgement mutated parent: %+v", parentShell)
 	}
 }
 

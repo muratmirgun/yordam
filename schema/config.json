@@ -19,7 +19,19 @@
       "propertyNames": {"minLength": 1},
       "additionalProperties": {"$ref": "#/$defs/provider"}
     },
-    "limits": {"$ref": "#/$defs/limits"}
+    "limits": {"$ref": "#/$defs/limits"},
+    "context": {
+      "$ref": "#/$defs/context",
+      "description": "Context compaction policy."
+    },
+    "skills": {
+      "$ref": "#/$defs/skills",
+      "description": "Filesystem skill trust policy."
+    },
+    "subagents": {
+      "$ref": "#/$defs/subagents",
+      "description": "Sequential depth-one child limits."
+    }
   },
   "$defs": {
     "provider": {
@@ -54,7 +66,14 @@
     "model": {
       "type": "object",
       "additionalProperties": false,
-      "properties": {"name": {"type": "string"}}
+      "properties": {
+        "name": {"type": "string"},
+        "contextWindow": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Known model context window in tokens; omit when unknown."
+        }
+      }
     },
     "limits": {
       "type": "object",
@@ -62,6 +81,66 @@
       "properties": {
         "maxToolCalls": {"type": "integer", "minimum": 1, "maximum": 128, "default": 32},
         "shellTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 1800, "default": 120}
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "autoCompact": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow automatic compaction when the selected model has a known context window."
+        },
+        "compactReserveTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional explicit compaction reserve; it must be smaller than every configured context window."
+        }
+      }
+    },
+    "skills": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "projectPolicy": {
+          "type": "string",
+          "enum": ["ask", "allow", "deny"],
+          "default": "ask",
+          "description": "Project skill activation policy; trust never grants tool or permission authority."
+        }
+      }
+    },
+    "subagents": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Expose sequential delegation to parent turns."
+        },
+        "maxPerTurn": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4,
+          "default": 4,
+          "description": "Maximum child attempts in one parent turn."
+        },
+        "maxToolCalls": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 16,
+          "description": "Maximum completed tool calls in one child attempt."
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1800,
+          "default": 600,
+          "description": "Wall-time limit for one child attempt."
+        }
       }
     }
   }

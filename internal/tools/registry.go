@@ -16,10 +16,12 @@ type Registry struct {
 }
 
 var builtInRank = map[string]int{
-	"read":   0,
-	"search": 1,
-	"edit":   2,
-	"shell":  3,
+	"read":     0,
+	"search":   1,
+	"skill":    2,
+	"subagent": 3,
+	"edit":     4,
+	"shell":    5,
 }
 
 const BuiltinSourceRevision = "builtin-v1"
@@ -47,6 +49,18 @@ func ReadClassification() domain.ToolClassification {
 }
 
 func SearchClassification() domain.ToolClassification { return ReadClassification() }
+
+// SkillClassification is observation-only but its resource is a frozen logical
+// catalog entry rather than a filesystem path. Permission validation binds all
+// identity attributes before it treats that entry as workspace-scoped.
+func SkillClassification() domain.ToolClassification { return ReadClassification() }
+
+// SubagentClassification describes trusted runtime orchestration only. It
+// does not authorize any child provider or tool effect, each of which is
+// separately planned and authorized in the child turn.
+func SubagentClassification() domain.ToolClassification {
+	return domain.ToolClassification{Effect: "orchestration", Mutation: "orchestration", ExecutionLoci: []string{"orchestrator"}, Boundary: "runtime", Reversibility: "not_applicable", VerificationCoverage: "full", Idempotency: "conditional", Retry: "never_after_dispatch", RequestedProfile: "configured", EffectiveProfile: "configured"}
+}
 
 func EditClassification() domain.ToolClassification {
 	return domain.ToolClassification{Effect: "mutation", Mutation: "file", ExecutionLoci: []string{"builtin"}, Boundary: "workspace", Reversibility: "preimage", VerificationCoverage: "preimage_and_postimage", Idempotency: "conditional", Retry: "never_after_dispatch", RequestedProfile: "restricted", EffectiveProfile: "restricted"}

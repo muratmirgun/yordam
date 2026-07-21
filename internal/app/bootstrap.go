@@ -42,6 +42,9 @@ type Snapshot struct {
 	Sessions           []domain.SessionSummary
 	Models             []domain.ModelSelection
 	ConfigurationError error
+	Context            *protocol.ContextProjectionV1
+	Skills             SkillSnapshot
+	Durable            *protocol.DurableProjection
 }
 
 func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapshot, err error) {
@@ -116,12 +119,18 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 	runtimeEvents := make(chan agent.RuntimeEvent, 64)
 	activeSession := &sessionBinding{id: session.ID}
 	policy := newPolicyBinding(permission.Restore(replay))
+	policies := permission.NewSessionPolicyRegistry()
+	if err := policies.RegisterParent(protocol.SessionID(session.ID), policy.current); err != nil {
+		return nil, Snapshot{}, err
+	}
+	policy.registry = policies
 	builder := runtimeBuilder{
 		configPath:       configPath,
 		cli:              options.CLI,
 		workspace:        workspace,
 		store:            store,
 		policy:           policy,
+		policies:         policies,
 		activeSession:    activeSession,
 		runtimeEvents:    runtimeEvents,
 		httpClient:       options.HTTPClient,
@@ -233,6 +242,19 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 		}
 	}
 
+	var contextState *protocol.ContextProjectionV1
+	var durableState *protocol.DurableProjection
+	if runtimeSet.ApplicationService != nil {
+		durable, snapErr := runtimeSet.ApplicationService.Snapshot(ctx, protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: protocol.SessionID(session.ID), Consumer: "bootstrap_context", QueueCapacity: 1})
+		if snapErr != nil {
+			return nil, Snapshot{}, fmt.Errorf("snapshot durable context: %w", snapErr)
+		}
+		contextState, snapErr = DurableContext(durable)
+		if snapErr != nil {
+			return nil, Snapshot{}, fmt.Errorf("decode durable context: %w", snapErr)
+		}
+		durableState = protocol.DeepCopy(&durable.Durable)
+	}
 	return application, Snapshot{
 		Workspace:          workspace,
 		Session:            session,
@@ -240,6 +262,9 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (_ *App, _ Snapsho
 		Sessions:           sessions,
 		Models:             append([]domain.ModelSelection(nil), runtimeSet.Models...),
 		ConfigurationError: configErr,
+		Context:            contextState,
+		Skills:             runtimeSet.SkillSnapshot(),
+		Durable:            durableState,
 	}, nil
 }
 
@@ -268,6 +293,11 @@ func recoverBootstrapSession(ctx context.Context, store *jsonl.Store, runtime Ru
 	if observedTail.IsZero() {
 		return nil
 	}
+	// RecoverTurn owns the one recovery lane for this session. Its first session
+	// phase reconciles a waiting sequential-child handoff (child receipt before
+	// parent attachment) before it falls back to generic turn terminalization.
+	// Keeping bootstrap at this single entry point prevents a second startup
+	// worker from racing provider, process, or approval cancellation cleanup.
 	controlHead, err := store.Head(ctx, workspaceControl)
 	if err != nil {
 		return err
@@ -336,11 +366,41 @@ func recoverBootstrapSession(ctx context.Context, store *jsonl.Store, runtime Ru
 }
 
 func loadBootstrapConfig(options BootstrapOptions) (config.Config, string, error) {
-	cfg, err := config.Load(config.LoadOptions{ConfigPath: options.ConfigPath})
+	configPath, err := canonicalConfigPath(options.ConfigPath)
 	if err != nil {
-		return config.Config{}, options.ConfigPath, configurationError(options.ConfigPath, fmt.Sprintf("configuration is invalid (%v); edit the file and run /reload", err), err)
+		return config.Config{}, options.ConfigPath, configurationError(options.ConfigPath, fmt.Sprintf("configuration path is invalid (%v)", err), err)
 	}
-	return cfg, options.ConfigPath, nil
+	cfg, err := config.Load(config.LoadOptions{ConfigPath: configPath})
+	if err != nil {
+		return config.Config{}, configPath, configurationError(configPath, fmt.Sprintf("configuration is invalid (%v); edit the file and run /reload", err), err)
+	}
+	return cfg, configPath, nil
+}
+
+// canonicalConfigPath freezes a stable on-disk configuration identity before
+// the runtime derives the adjacent global skills directory. Resolving this
+// once prevents a relative path or symlink from changing the skill root on a
+// later reload.
+func canonicalConfigPath(path string) (string, error) {
+	if path == "" {
+		var err error
+		path, err = config.DefaultConfigPath()
+		if err != nil {
+			return "", err
+		}
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Clean(abs))
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(resolved) || filepath.Clean(resolved) != resolved {
+		return "", fmt.Errorf("non-canonical config path")
+	}
+	return resolved, nil
 }
 
 func appendBootstrapSelection(ctx context.Context, runtime RuntimeSet, store sessionStore, session *domain.Session, replay *domain.SessionReplay, selection domain.ModelSelection) error {
@@ -476,8 +536,9 @@ func zeroBytes(value []byte) {
 }
 
 type policyBinding struct {
-	mu      sync.RWMutex
-	current *permission.SessionPolicy
+	mu       sync.RWMutex
+	current  *permission.SessionPolicy
+	registry *permission.SessionPolicyRegistry
 }
 
 type sessionBinding struct {
@@ -540,6 +601,9 @@ func (p *policyBinding) GrantSession(tool, scope string) {
 func (p *policyBinding) restore(replay domain.SessionReplay) MutablePolicy {
 	p.mu.Lock()
 	p.current = permission.Restore(replay)
+	if p.registry != nil {
+		_ = p.registry.RegisterParent(protocol.SessionID(replay.Session.ID), p.current)
+	}
 	p.mu.Unlock()
 	return p
 }

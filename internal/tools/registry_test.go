@@ -15,16 +15,17 @@ import (
 func TestRegistryDescriptorsAreStable(t *testing.T) {
 	readTool := registryTool("read")
 	searchTool := registryTool("search")
+	skillTool := registryTool("skill")
 	editTool := registryTool("edit")
 	shellTool := registryTool("shell")
-	registry := tools.NewRegistry(shellTool, editTool, readTool, searchTool)
+	registry := tools.NewRegistry(shellTool, editTool, skillTool, readTool, searchTool)
 
 	descriptors := registry.Descriptors()
 	names := make([]string, 0, len(descriptors))
 	for _, descriptor := range descriptors {
 		names = append(names, descriptor.Name)
 	}
-	if !slices.Equal(names, []string{"read", "search", "edit", "shell"}) {
+	if !slices.Equal(names, []string{"read", "search", "skill", "edit", "shell"}) {
 		t.Fatalf("names=%v", names)
 	}
 
@@ -33,7 +34,7 @@ func TestRegistryDescriptorsAreStable(t *testing.T) {
 		t.Fatalf("registry descriptor mutated through returned slice: %q", got)
 	}
 	for name, want := range map[string]ports.Tool{
-		"read": readTool, "search": searchTool, "edit": editTool, "shell": shellTool,
+		"read": readTool, "search": searchTool, "skill": skillTool, "edit": editTool, "shell": shellTool,
 	} {
 		got, ok := registry.Lookup(name)
 		if !ok || got != want {
@@ -45,19 +46,31 @@ func TestRegistryDescriptorsAreStable(t *testing.T) {
 	}
 }
 
+func TestRegistryOrdersSubagentAfterSkillBeforeEdit(t *testing.T) {
+	registry := tools.NewRegistry(registryTool("shell"), registryTool("edit"), registryTool("subagent"), registryTool("skill"), registryTool("read"), registryTool("search"))
+	names := make([]string, 0, len(registry.Descriptors()))
+	for _, descriptor := range registry.Descriptors() {
+		names = append(names, descriptor.Name)
+	}
+	if !slices.Equal(names, []string{"read", "search", "skill", "subagent", "edit", "shell"}) {
+		t.Fatalf("names=%v", names)
+	}
+}
+
 func TestRegistryAcceptsArbitraryToolsAndRejectsDuplicateAliases(t *testing.T) {
 	readTool := registryTool("read")
 	searchTool := registryTool("search")
+	skillTool := registryTool("skill")
 	editTool := registryTool("edit")
 	shellTool := registryTool("shell")
 
-	registry := tools.NewRegistry(shellTool, registryTool("inspect"), editTool, readTool, searchTool)
+	registry := tools.NewRegistry(shellTool, registryTool("inspect"), editTool, skillTool, readTool, searchTool)
 	got := registry.Descriptors()
 	names := make([]string, 0, len(got))
 	for _, descriptor := range got {
 		names = append(names, descriptor.Name)
 	}
-	if !slices.Equal(names, []string{"read", "search", "edit", "shell", "inspect"}) {
+	if !slices.Equal(names, []string{"read", "search", "skill", "edit", "shell", "inspect"}) {
 		t.Fatalf("names=%v", names)
 	}
 	assertPanicsWith(t, "duplicate tool read", func() {

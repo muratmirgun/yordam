@@ -8,6 +8,8 @@ import (
 
 	contextplanner "github.com/muratmirgun/yordam/internal/context"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/tooling"
+	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 )
 
 func TestContextPlanRecordsProvenanceBudgetAndDigest(t *testing.T) {
@@ -17,7 +19,7 @@ func TestContextPlanRecordsProvenanceBudgetAndDigest(t *testing.T) {
 		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
 		SystemInstructions: []protocol.ContentSource{system}, Model: model, OutputReserve: 56,
 	}
-	planner := contextplanner.NewPlanner("tools-r1")
+	planner := contextplanner.NewPlanner("tools-r1", nil)
 	plan, err := planner.Plan(stdcontext.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -41,6 +43,58 @@ func TestContextPlanRecordsProvenanceBudgetAndDigest(t *testing.T) {
 	}
 }
 
+func TestChildPlannerBindsDerivedExposureAndRejectsCanonicalSubagent(t *testing.T) {
+	parentExposure := protocol.ToolExposure{
+		CatalogRevision: "parent-tools", Tools: []protocol.ExposedTool{{Alias: "read", Identity: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "read"}, Description: "Read", InputSchema: []byte(`{"type":"object"}`)}},
+		Aliases: []protocol.ToolAliasBinding{{Alias: "read", Identity: protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "read"}, SourceRevision: "builtin-v1", DescriptorDigest: contextDigest("a")}},
+	}
+	childExposure := protocol.ToolExposure{
+		CatalogRevision: "forged-child-revision", Tools: protocol.DeepCopy(parentExposure.Tools),
+		Aliases: protocol.DeepCopy(parentExposure.Aliases),
+	}
+	if _, err := contextplanner.NewChildPlanner(parentExposure, childExposure, nil); err == nil {
+		t.Fatal("child planner accepted forged child exposure revision")
+	}
+	derived, err := tooling.DerivedExposureRevision(parentExposure, childExposure.Tools, childExposure.Aliases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childExposure.CatalogRevision = derived
+	planner, err := contextplanner.NewChildPlanner(parentExposure, childExposure, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planner.Plan(stdcontext.Background(), contextplanner.Request{Session: "child", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1, Model: contextModel(1024), OutputReserve: 64})
+	if err != nil || plan.Body.ToolExposureRevision != childExposure.CatalogRevision {
+		t.Fatalf("plan=%#v err=%v", plan, err)
+	}
+	blocked := protocol.DeepCopy(childExposure)
+	descriptor := subagenttool.BuiltinDescriptor()
+	parentExposure.Tools = append(parentExposure.Tools, protocol.ExposedTool{Alias: "subagent", Identity: descriptor.Body.Identity, Description: descriptor.Body.Description, InputSchema: descriptor.Body.InputSchema})
+	parentExposure.Aliases = append(parentExposure.Aliases, protocol.ToolAliasBinding{Alias: "subagent", Identity: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest})
+	blocked.Tools = append(blocked.Tools, protocol.ExposedTool{Alias: "renamed", Identity: descriptor.Body.Identity, Description: descriptor.Body.Description, InputSchema: descriptor.Body.InputSchema})
+	blocked.Aliases = append(blocked.Aliases, protocol.ToolAliasBinding{Alias: "renamed", Identity: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest})
+	blocked.CatalogRevision, err = tooling.DerivedExposureRevision(parentExposure, blocked.Tools, blocked.Aliases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := contextplanner.NewChildPlanner(parentExposure, blocked, nil); err == nil {
+		t.Fatal("child planner accepted canonical subagent exposure")
+	}
+	parent, err := contextplanner.NewPlannerForExposure(blocked, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentPlan, err := parent.Plan(stdcontext.Background(), contextplanner.Request{Session: "parent", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1, Model: contextModel(1024), OutputReserve: 64})
+	if err != nil || parentPlan.Body.ToolExposureRevision != blocked.CatalogRevision {
+		t.Fatalf("parent plan=%#v err=%v", parentPlan, err)
+	}
+}
+
+func contextDigest(fill string) protocol.Digest {
+	return protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat(fill, 64)}
+}
+
 func TestContextPlanAdaptsEventTranscriptAndLegacyCompaction(t *testing.T) {
 	events := []protocol.EventRecord{
 		contextEvent("event-old", 1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old"}),
@@ -52,7 +106,7 @@ func TestContextPlanAdaptsEventTranscriptAndLegacyCompaction(t *testing.T) {
 		contextEvent("event-new", 3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "new"}),
 		contextEvent("event-assistant", 4, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "answer"}}}),
 	}
-	plan, err := contextplanner.NewPlanner("tools-r1").Plan(stdcontext.Background(), contextplanner.Request{
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
 		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
 		Events: events, Model: contextModel(1024), OutputReserve: 64,
 	})
@@ -67,9 +121,58 @@ func TestContextPlanAdaptsEventTranscriptAndLegacyCompaction(t *testing.T) {
 	}
 }
 
+func TestContextPlanDoesNotDuplicateDualEncodedToolIntents(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "load-skill", Alias: "skill", Arguments: json.RawMessage(`{"name":"go-development"}`)}
+	event := contextEvent("assistant-tool", 2, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{
+		Blocks:      []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}},
+		ToolIntents: []protocol.ToolUseBlock{intent},
+	})
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
+		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
+		Events: []protocol.EventRecord{event}, Model: contextModel(1024), OutputReserve: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Body.Sources) != 1 || len(plan.Body.Sources[0].Content) != 1 || plan.Body.Sources[0].Content[0].Kind != protocol.ContentToolUse || plan.Body.Sources[0].Content[0].ToolUse == nil || plan.Body.Sources[0].Content[0].ToolUse.CallID != intent.CallID {
+		t.Fatalf("dual-encoded tool intent was not projected exactly once: %+v", plan.Body.Sources)
+	}
+}
+
+func TestContextPlanKeepsLegacyToolIntentsOnly(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "legacy-call", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	event := contextEvent("legacy-assistant-tool", 2, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{ToolIntents: []protocol.ToolUseBlock{intent}})
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
+		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
+		Events: []protocol.EventRecord{event}, Model: contextModel(1024), OutputReserve: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Body.Sources) != 1 || len(plan.Body.Sources[0].Content) != 1 || plan.Body.Sources[0].Content[0].ToolUse == nil || plan.Body.Sources[0].Content[0].ToolUse.CallID != intent.CallID || plan.Body.Sources[0].Content[0].ToolUse.Alias != intent.Alias || string(plan.Body.Sources[0].Content[0].ToolUse.Arguments) != string(intent.Arguments) {
+		t.Fatalf("legacy tool intent was not preserved exactly once: %+v", plan.Body.Sources)
+	}
+}
+
+func TestContextPlanRejectsConflictingDualEncodedToolIntent(t *testing.T) {
+	modern := protocol.ToolUseBlock{CallID: "same-call", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	conflict := protocol.ToolUseBlock{CallID: "same-call", Alias: "read", Arguments: json.RawMessage(`{"path":"SECURITY.md"}`)}
+	event := contextEvent("conflicting-assistant-tool", 2, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{
+		Blocks:      []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &modern}},
+		ToolIntents: []protocol.ToolUseBlock{conflict},
+	})
+	_, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
+		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
+		Events: []protocol.EventRecord{event}, Model: contextModel(1024), OutputReserve: 64,
+	})
+	if err == nil || !strings.Contains(err.Error(), "conflicting tool intent") {
+		t.Fatalf("conflicting dual encoding error=%v", err)
+	}
+}
+
 func TestContextPlanDecodesEventPayloadWhenProjectionIsUnavailable(t *testing.T) {
 	record := protocol.EventRecord{Envelope: protocol.EventEnvelope{EventID: "event-raw", Seq: 1, Kind: protocol.EventUserMessage, Payload: json.RawMessage(`{"content":"from raw"}`)}}
-	plan, err := contextplanner.NewPlanner("tools-r1").Plan(stdcontext.Background(), contextplanner.Request{
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
 		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
 		Events: []protocol.EventRecord{record}, Model: contextModel(1024), OutputReserve: 64,
 	})
@@ -81,20 +184,20 @@ func TestContextPlanDecodesEventPayloadWhenProjectionIsUnavailable(t *testing.T)
 	}
 }
 
-func TestContextPlanRecordsNativeCompactionRevisionWithoutDroppingUnavailableSummary(t *testing.T) {
+func TestContextPlanFailsClosedForMalformedNativeCompaction(t *testing.T) {
 	events := []protocol.EventRecord{
 		contextEvent("event-old", 1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old"}),
 		contextEvent("event-compact", 2, protocol.EventContextCompacted, &protocol.ContextCompactedV1{Revision: "compact-r2", SummaryEvidenceID: "summary-evidence"}),
 		contextEvent("event-new", 3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "new"}),
 	}
-	plan, err := contextplanner.NewPlanner("tools-r1").Plan(stdcontext.Background(), contextplanner.Request{
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
 		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
 		Events: events, Model: contextModel(1024), OutputReserve: 64,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Body.CompactionRevision != "compact-r2" || len(plan.Body.Sources) != 2 || plan.Body.Sources[0].Content[0].Text != "old" || plan.Body.Sources[1].Content[0].Text != "new" {
+	if plan.Body.CompactionRevision != "none" || len(plan.Body.Sources) != 2 || plan.Body.Sources[0].Content[0].Text != "old" || plan.Body.Sources[1].Content[0].Text != "new" {
 		t.Fatalf("plan=%#v", plan)
 	}
 }
@@ -115,7 +218,7 @@ func TestContextPlanIgnoresMalformedLaterLegacyCompaction(t *testing.T) {
 		},
 		contextEvent("event-latest", 5, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "latest"}),
 	}
-	plan, err := contextplanner.NewPlanner("tools-r1").Plan(stdcontext.Background(), contextplanner.Request{
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
 		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
 		Events: events, Model: contextModel(1024), OutputReserve: 64,
 	})
@@ -137,7 +240,7 @@ func TestContextPlanExcludesSourcesBeyondKnownBudget(t *testing.T) {
 		SystemInstructions: []protocol.ContentSource{source(t, "first", strings.Repeat("a", 16), "configured"), source(t, "second", strings.Repeat("b", 20), "configured")},
 		Model:              contextModel(12), OutputReserve: 6,
 	}
-	plan, err := contextplanner.NewPlanner("tools-r1").Plan(stdcontext.Background(), request)
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}

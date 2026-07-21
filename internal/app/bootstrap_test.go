@@ -18,6 +18,7 @@ import (
 	"github.com/muratmirgun/yordam/internal/cli"
 	"github.com/muratmirgun/yordam/internal/config"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
 func TestBootstrapComposesCanonicalRedactedRuntime(t *testing.T) {
@@ -77,6 +78,7 @@ func TestBootstrapComposesCanonicalRedactedRuntime(t *testing.T) {
 		},
 		MaxToolCalls:        32,
 		ShellTimeoutSeconds: 120,
+		Skills:              config.SkillConfig{ProjectPolicy: config.ProjectSkillsAsk},
 	}
 	application, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
 		ConfigPath: writeBootstrapConfig(t, cfg),
@@ -104,6 +106,9 @@ func TestBootstrapComposesCanonicalRedactedRuntime(t *testing.T) {
 	}
 	if snapshot.Session.ID == "" || snapshot.Session.Mode != domain.ModeAsk || snapshot.Session.Selection != (domain.ModelSelection{Profile: "primary", Model: "model-a"}) {
 		t.Fatalf("session=%+v", snapshot.Session)
+	}
+	if snapshot.Context == nil || snapshot.Context.AutoReason != "unknown_context_window" || snapshot.Context.EstimatedInputTokens.State != protocol.ValueUnknown || snapshot.Context.ContextWindow.State != protocol.ValueUnknown || snapshot.Context.ReserveTokens.State != protocol.ValueUnknown {
+		t.Fatalf("bootstrap durable context=%+v", snapshot.Context)
 	}
 	wantModels := []domain.ModelSelection{
 		{Profile: "primary", Model: "model-a"},
@@ -135,7 +140,7 @@ func TestBootstrapComposesCanonicalRedactedRuntime(t *testing.T) {
 		t.Fatalf("visible output was not redacted: %q", visible.String())
 	}
 	request := <-requests
-	if request.authorization != "Bearer "+processKey || !slices.Equal(request.tools, []string{"read", "search", "edit", "shell"}) {
+	if request.authorization != "Bearer "+processKey || !slices.Equal(request.tools, []string{"read", "search", "skill", "subagent", "edit", "shell"}) {
 		t.Fatalf("provider request=%+v", request)
 	}
 	application.Commands() <- app.Command{Kind: app.CommandShutdown}
@@ -313,7 +318,7 @@ func TestBootstrapPersistsExplicitOverridesWhenContinuing(t *testing.T) {
 	cfg := config.Config{ActiveProfile: "primary", Profiles: map[string]config.Profile{
 		"primary":   {BaseURL: server.URL, APIKeyEnv: "PRIMARY_KEY", Models: []string{"m1"}, DefaultModel: "m1"},
 		"secondary": {BaseURL: server.URL, APIKeyEnv: "SECONDARY_KEY", Models: []string{"m2"}, DefaultModel: "m2"},
-	}, MaxToolCalls: 32, ShellTimeoutSeconds: 120}
+	}, MaxToolCalls: 32, ShellTimeoutSeconds: 120, Skills: config.SkillConfig{ProjectPolicy: config.ProjectSkillsAsk}}
 	configPath := writeBootstrapConfig(t, cfg)
 	_, first, err := app.Bootstrap(t.Context(), app.BootstrapOptions{ConfigPath: configPath, CLI: bootstrapCLI(dataDir), CWD: workspace, HTTPClient: server.Client()})
 	if err != nil {
@@ -359,7 +364,7 @@ func TestBootstrapKeepsCredentialsBoundToNamedProfiles(t *testing.T) {
 	cfg := config.Config{ActiveProfile: "primary", Profiles: map[string]config.Profile{
 		"primary":   {BaseURL: primary.URL, APIKeyEnv: "PRIMARY_KEY", Models: []string{"m1"}, DefaultModel: "m1"},
 		"secondary": {BaseURL: secondary.URL, APIKeyEnv: "SECONDARY_KEY", Models: []string{"m2"}, DefaultModel: "m2"},
-	}, MaxToolCalls: 32, ShellTimeoutSeconds: 120}
+	}, MaxToolCalls: 32, ShellTimeoutSeconds: 120, Skills: config.SkillConfig{ProjectPolicy: config.ProjectSkillsAsk}}
 	application, snapshot, err := app.Bootstrap(t.Context(), app.BootstrapOptions{
 		ConfigPath: writeBootstrapConfig(t, cfg),
 		CLI:        cli.Options{Mode: domain.ModeAsk, Profile: "primary", Model: "m1", DataDir: t.TempDir(), MaxToolCalls: 32, ShellTimeout: time.Second},
@@ -420,7 +425,7 @@ func TestBootstrapAppliesEnvironmentAndBaseURLOverridesToResumedSelection(t *tes
 	cfg := config.Config{ActiveProfile: "primary", Profiles: map[string]config.Profile{
 		"primary":   {BaseURL: primary.URL, APIKeyEnv: "PRIMARY_KEY", Models: []string{"m1"}, DefaultModel: "m1"},
 		"secondary": {BaseURL: secondary.URL, APIKeyEnv: "SECONDARY_KEY", Models: []string{"m2"}, DefaultModel: "m2"},
-	}, MaxToolCalls: 32, ShellTimeoutSeconds: 120}
+	}, MaxToolCalls: 32, ShellTimeoutSeconds: 120, Skills: config.SkillConfig{ProjectPolicy: config.ProjectSkillsAsk}}
 	configPath := writeBootstrapConfig(t, cfg)
 	create := bootstrapCLI(dataDir)
 	create.Profile, create.Model = "secondary", "m2"
@@ -563,6 +568,7 @@ func bootstrapConfig(baseURL string) config.Config {
 		},
 		MaxToolCalls:        32,
 		ShellTimeoutSeconds: 120,
+		Skills:              config.SkillConfig{ProjectPolicy: config.ProjectSkillsAsk},
 	}
 }
 

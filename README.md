@@ -64,9 +64,25 @@ The generated JSONC template is intentionally incomplete. Replace both `your-mod
         "apiKeyEnv": "OPENAI_API_KEY"
       },
       "models": {
-        "your-model-id": {"name": "Your model"}
+        "your-model-id": {
+          "name": "Your model",
+          "contextWindow": 128000
+        }
       }
     }
+  },
+  "context": {
+    "autoCompact": true,
+    "compactReserveTokens": 8192
+  },
+  "skills": {
+    "projectPolicy": "ask"
+  },
+  "subagents": {
+    "enabled": true,
+    "maxPerTurn": 4,
+    "maxToolCalls": 16,
+    "timeoutSeconds": 600
   },
   "limits": {
     "maxToolCalls": 32,
@@ -85,6 +101,16 @@ yordam
 ```
 
 `/reload` validates and applies file changes without replacing the current session or its data. If `apiKeyEnv` names a variable that was missing when Yordam started, the edited configuration is loaded but requests remain blocked with restart guidance. Export the variable and restart Yordam; a running process cannot inherit later changes from another shell.
+
+`contextWindow` is optional and must be positive. `context.autoCompact` defaults
+to `true`, but automatic compaction is available only for a model with a known
+window. Omit `compactReserveTokens` to use ten percent of that window with a
+2,048-token minimum; an explicit positive reserve must be smaller than every
+configured window. `skills.projectPolicy` defaults to `ask` and accepts `ask`,
+`allow`, or `deny`. Sequential subagents default to enabled: `maxPerTurn` is
+`1..4` (default `4`), child `maxToolCalls` is `1..64` (default `16`), and
+`timeoutSeconds` is `1..1800` (default `600`). Unknown fields and `null` values
+are rejected by the strict decoder.
 
 ## Usage
 
@@ -122,6 +148,7 @@ Each run creates a session by default. Common startup options are:
 | `/mode` | Choose `safe`, `ask`, or `auto`. |
 | `/model` | Choose a configured profile and model. |
 | `/reload` | Validate and apply `~/.config/yordam/config.jsonc`. |
+| `/skills` | Inspect frozen skill metadata and decide a project catalog when policy is `ask`. |
 | `/compact` | Compact older conversation context. |
 | `/help` | Show commands and keybindings. |
 | `/quit` | Exit, confirming first if a turn is active. |
@@ -133,6 +160,88 @@ Each run creates a session by default. Common startup options are:
 | `Esc` | Close the current surface or cancel an active turn. |
 | `Ctrl+C` | Exit, confirming first if a turn is active. |
 | `y` / `s` / `n` | At a permission prompt, allow once, allow for the exact session scope, or deny. |
+
+## Context compaction
+
+`/compact` manually summarizes an older, stable portion of an idle session. The
+original journal is immutable: compaction writes a durable range event and
+separate summary evidence, while the recent uncompacted suffix remains in the
+next provider context. Repeating an accepted command replays its durable result
+instead of making another summary request.
+
+When enabled by the selected model's known context window, automatic compaction
+runs only after the configured reserve threshold is reached. It is unavailable
+when automatic compaction is disabled or the context window is unknown. A
+provider `context too large` response opens the `/compact` action; it is not
+silently retried as a normal turn.
+
+Summary evidence is a derived aid for rebuilding context, not a replacement for
+the original journal evidence. If compaction is cancelled, its final durable
+state reports cancellation. If the journal cannot prove whether a final commit
+was recorded, Yordam reports an uncertain outcome rather than guessing.
+
+## Filesystem skills
+
+Global skills live at `~/.config/yordam/skills/<name>/SKILL.md`; project skills
+live at `.yordam/skills/<name>/SKILL.md` below the canonical workspace. Names
+use lowercase ASCII letters, digits, and single hyphens. Each file is UTF-8
+Markdown with exactly `name` and `description` frontmatter fields, a nonempty
+body, and a 128 KiB limit. Symlinked roots, directories, and files are rejected.
+
+Global skills are active user-managed input. Project `skills.projectPolicy` is
+`ask` by default, with `allow` and `deny` alternatives. Under `ask`, `/skills`
+records an allow/deny decision bound to the exact canonical workspace and project
+catalog digest; an edit makes trust stale. A trusted project skill shadows a
+same-name global skill, while `/skills` displays both.
+
+Provider context initially receives metadata only. Full content is available
+only when the model explicitly calls the read-only `skill` tool with an active
+canonical name; it accepts no path and is not a file reader. Reload validates a
+new generation, so changed files activate only after a successful reload or
+startup. Parent-to-child
+handoff uses that frozen catalog snapshot, never child filesystem discovery.
+Skill text is untrusted context: it cannot install hooks or URLs, execute code,
+change policy, reveal credentials, or bypass normal permission approval.
+
+## Sequential subagents
+
+When `subagents.enabled` is true, the model can delegate one bounded objective
+to a sequential child turn. The defaults allow four attempts in one parent
+turn, sixteen child tool calls per attempt, and a 600-second deadline. Only one
+child can be active for a parent turn, and delegation has depth one: a child does
+not receive the `subagent` tool and cannot create another child.
+
+The child uses the same provider and model as its parent and receives the exact
+frozen skill catalog from the parent runtime generation. The parent's current
+permission mode is a ceiling, but mutable session grants and the parent's
+trusted-shell acknowledgement are not inherited. Child edits and shell calls
+therefore pass through the child's own normal permission decisions; a child
+shell command can still require a visible approval even when the parent has
+acknowledged shell use in `auto` mode.
+
+Parent execution waits while the child owns the operation lane. A durable child
+receipt is committed before it is attached to the parent and supplied as the
+exact tool result for parent continuation. Receipts derive changed files,
+commands, tests, evidence IDs, and uncertain effects from committed child
+events. Assistant prose is only a bounded summary.
+The receipt does not verify the parent task. Cancellation propagates to an
+active child. Restart recovery attaches an
+already committed receipt or conservatively reports an uncertain effect; it
+does not silently repeat an ambiguous mutation. Yordam does not automatically
+retry an uncertain effect.
+
+This release does not provide concurrent child execution, worktree isolation,
+network-hosted agent transport, free-form child messaging, or a per-child model
+choice.
+
+## Explicit v0.3 non-goals
+
+Yordam v0.3 provides no parallel children, executable skills or hooks,
+permission-bypass mode, or journal rewriting. Skills remain instruction-only
+context, children remain local and sequential, every effect remains subject to
+the ordinary permission policy, and compaction only appends evidence and
+projection events. The supported release targets remain macOS and Linux;
+Windows is not a v0.3 target.
 
 ## Session locations
 

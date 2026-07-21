@@ -18,6 +18,7 @@ type RuntimeEvent struct {
 	Text     string
 	Progress *domain.ToolProgress
 	Result   *domain.ToolResult
+	Skill    *domain.SkillProvenance
 }
 
 type Sink func(RuntimeEvent)

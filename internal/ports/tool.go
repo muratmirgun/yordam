@@ -44,6 +44,14 @@ type Tool interface {
 	Prepare(context.Context, domain.ToolRequest) (PreparedTool, error)
 }
 
+// OrchestratedTool marks a built-in whose execution is owned by the turn
+// orchestrator rather than the ordinary tool dispatcher. Callers must bind the
+// marker to the canonical descriptor identity and digest before intercepting.
+type OrchestratedTool interface {
+	Tool
+	OrchestratedKind() string
+}
+
 type ToolRegistry interface {
 	Descriptors() []domain.ToolDescriptor
 	Lookup(name string) (Tool, bool)

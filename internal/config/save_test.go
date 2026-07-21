@@ -38,6 +38,11 @@ func TestEnsureGlobalCreatesSecureEnvironmentOnlyTemplate(t *testing.T) {
 		`"baseURL": "https://api.openai.com/v1"`,
 		`"apiKeyEnv": "OPENAI_API_KEY"`,
 		`// Format: provider/model`,
+		`// Project skills may come from the repository and need your trust.`,
+		`// Supported values: ask, allow, deny.`,
+		`"projectPolicy": "ask"`,
+		`// Enable sequential subagents for bounded delegated work.`,
+		`// maxPerTurn, maxToolCalls, and timeoutSeconds remain enforced when disabled.`,
 	} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("template missing %q:\n%s", want, raw)
@@ -45,6 +50,53 @@ func TestEnsureGlobalCreatesSecureEnvironmentOnlyTemplate(t *testing.T) {
 	}
 	if strings.Contains(string(raw), `"apiKey"`) || strings.Contains(string(raw), "actual-secret") {
 		t.Fatal("template persisted a literal API key")
+	}
+	if strings.Contains(string(raw), `"projectPolicy": "allow"`) {
+		t.Fatal("template implicitly enables project skills")
+	}
+}
+
+func TestGeneratedTemplateCoversV030StrictDecoderSurface(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path, _, err := config.EnsureGlobal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`// "contextWindow": 128000`,
+		`"autoCompact": true`,
+		`// "compactReserveTokens": 8192`,
+		`"projectPolicy": "ask"`,
+		`"enabled": true`,
+		`"maxPerTurn": 4`,
+		`"maxToolCalls": 16`,
+		`"timeoutSeconds": 600`,
+	} {
+		if strings.Count(string(raw), required) != 1 {
+			t.Errorf("generated template must contain exactly one %q", required)
+		}
+	}
+
+	configured := strings.ReplaceAll(string(raw), "your-model-id", "model-a")
+	configured = strings.Replace(configured, `// "contextWindow": 128000`, `"contextWindow": 128000`, 1)
+	configured = strings.Replace(configured, `// "compactReserveTokens": 8192`, `"compactReserveTokens": 8192`, 1)
+	if err := os.WriteFile(path, []byte(configured), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(config.LoadOptions{ConfigPath: path})
+	if err != nil {
+		t.Fatalf("generated v0.3 template does not pass strict decoder after placeholders are configured: %v", err)
+	}
+	if loaded.Profiles["openai"].ModelContextWindows["model-a"] != 128000 ||
+		!loaded.Context.AutoCompact || loaded.Context.CompactReserveTokens == nil || *loaded.Context.CompactReserveTokens != 8192 ||
+		loaded.Skills.ProjectPolicy != config.ProjectSkillsAsk ||
+		loaded.Subagents != (config.SubagentConfig{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 16, TimeoutSeconds: 600}) {
+		t.Fatalf("generated v0.3 template decoded incompletely: %+v", loaded)
 	}
 }
 
@@ -80,12 +132,45 @@ func TestSaveGlobalWritesStrictJSONAndRoundTrips(t *testing.T) {
 	}
 	if loaded.DefaultSelection() != (domain.ModelSelection{Profile: "primary", Model: "model-a"}) ||
 		!slices.Equal(loaded.Models(), []domain.ModelSelection{{Profile: "primary", Model: "model-a"}, {Profile: "primary", Model: "model-b"}}) ||
-		loaded.MaxToolCalls != 64 || loaded.ShellTimeoutSeconds != 300 {
+		loaded.MaxToolCalls != 64 || loaded.ShellTimeoutSeconds != 300 || loaded.Subagents != (config.SubagentConfig{Enabled: true, MaxPerTurn: 3, MaxToolCalls: 12, TimeoutSeconds: 300}) || !loaded.Context.AutoCompact || loaded.Context.CompactReserveTokens == nil || *loaded.Context.CompactReserveTokens != 8192 || loaded.Profiles["primary"].ModelContextWindows["model-a"] != 128000 {
 		t.Fatalf("round-tripped config=%+v models=%v", loaded, loaded.Models())
 	}
 	resolved, err := loaded.Resolve(config.ResolveOptions{})
 	if err != nil || resolved.APIKey != "actual-secret" {
 		t.Fatalf("round-tripped resolved=%+v err=%v", resolved, err)
+	}
+}
+
+func TestSaveGlobalDefaultsOmittedProjectPolicyToAsk(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.jsonc")
+	cfg := savedConfig()
+	cfg.Skills.ProjectPolicy = ""
+	if err := config.SaveGlobal(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(config.LoadOptions{ConfigPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Skills.ProjectPolicy != config.ProjectSkillsAsk {
+		t.Fatalf("project policy=%q want ask", loaded.Skills.ProjectPolicy)
+	}
+}
+
+func TestSaveGlobalDefaultsOmittedSubagentConfiguration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.jsonc")
+	cfg := savedConfig()
+	cfg.Subagents = config.SubagentConfig{}
+	if err := config.SaveGlobal(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(config.LoadOptions{ConfigPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := config.SubagentConfig{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 16, TimeoutSeconds: 600}
+	if loaded.Subagents != want {
+		t.Fatalf("subagents=%+v want=%+v", loaded.Subagents, want)
 	}
 }
 
@@ -196,19 +281,24 @@ func TestEnsureGlobalNeverOverwritesExistingFile(t *testing.T) {
 }
 
 func savedConfig() config.Config {
+	reserve := int64(8192)
 	return config.Config{
 		ActiveProfile: "primary",
 		Profiles: map[string]config.Profile{
 			"primary": {
-				Name:         "Primary",
-				BaseURL:      "https://llm.example/v1",
-				APIKeyEnv:    "PRIMARY_KEY",
-				Models:       []string{"model-b", "model-a"},
-				DefaultModel: "model-a",
+				Name:                "Primary",
+				BaseURL:             "https://llm.example/v1",
+				APIKeyEnv:           "PRIMARY_KEY",
+				Models:              []string{"model-b", "model-a"},
+				DefaultModel:        "model-a",
+				ModelContextWindows: map[string]int64{"model-a": 128000},
 			},
 		},
 		MaxToolCalls:        64,
 		ShellTimeoutSeconds: 300,
+		Subagents:           config.SubagentConfig{Enabled: true, MaxPerTurn: 3, MaxToolCalls: 12, TimeoutSeconds: 300},
+		Context:             config.ContextConfig{AutoCompact: true, CompactReserveTokens: &reserve},
+		Skills:              config.SkillConfig{ProjectPolicy: config.ProjectSkillsAsk},
 	}
 }
 

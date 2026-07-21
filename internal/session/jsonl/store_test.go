@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/journal"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/session/jsonl"
 	"github.com/oklog/ulid/v2"
 )
@@ -44,6 +47,14 @@ func TestWorkspaceFromPathUsesFullSHA256OfCanonicalPath(t *testing.T) {
 	}
 	if workspace.ID != wantID {
 		t.Fatalf("workspace ID=%q want full SHA-256 %q", workspace.ID, wantID)
+	}
+}
+
+func TestInspectMissingSessionReturnsTypedNotFound(t *testing.T) {
+	store := jsonl.New(t.TempDir(), jsonl.Options{})
+	_, err := store.InspectSession(context.Background(), protocol.SessionID(ulid.Make().String()))
+	if !errors.Is(err, journal.ErrSessionNotFound) {
+		t.Fatalf("InspectSession error=%v, want typed session-not-found", err)
 	}
 }
 
@@ -149,6 +160,185 @@ func TestCreateAppendAndList(t *testing.T) {
 		if got := info.Mode().Perm(); got != check.want {
 			t.Fatalf("permissions for %q=%#o want %#o", check.path, got, check.want)
 		}
+	}
+}
+
+func TestReservedSessionIDCreationIsIdempotentAndRejectsCollision(t *testing.T) {
+	root := t.TempDir()
+	store := jsonl.New(root, jsonl.Options{
+		Clock:   func() time.Time { return time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC) },
+		Entropy: strings.NewReader(strings.Repeat("a", 1024)),
+	})
+	workspace, err := jsonl.WorkspaceFromPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := store.ReserveSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "workspaces")); !os.IsNotExist(err) {
+		t.Fatalf("reservation wrote storage: %v", err)
+	}
+	first, err := store.CreateWithIdentity(t.Context(), id, workspace, domain.ModeAsk, domain.ModelSelection{Profile: "p", Model: "m"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.CreateWithIdentity(t.Context(), id, workspace, domain.ModeAsk, domain.ModelSelection{Profile: "p", Model: "m"}, nil)
+	if err != nil {
+		t.Fatalf("idempotent creation failed: %v", err)
+	}
+	if first != second {
+		t.Fatalf("idempotent sessions differ: first=%+v second=%+v", first, second)
+	}
+	if _, err := store.CreateWithIdentity(t.Context(), id, workspace, domain.ModeAuto, domain.ModelSelection{Profile: "p", Model: "m"}, nil); err == nil || !strings.Contains(err.Error(), "identity collision") {
+		t.Fatalf("different content collision err=%v", err)
+	}
+}
+
+func TestSeparateStoresConcurrentIdentityCreationIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	workspace, err := jsonl.WorkspaceFromPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := func() time.Time { return time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC) }
+	issuer := jsonl.New(root, jsonl.Options{Clock: clock, Entropy: strings.NewReader(strings.Repeat("a", 1024))})
+	id, err := issuer.ReserveSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stores := []*jsonl.Store{
+		jsonl.New(root, jsonl.Options{Clock: clock, Entropy: strings.NewReader(strings.Repeat("b", 1024))}),
+		jsonl.New(root, jsonl.Options{Clock: clock, Entropy: strings.NewReader(strings.Repeat("c", 1024))}),
+	}
+	type result struct {
+		session domain.Session
+		err     error
+	}
+	results := make(chan result, len(stores))
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	for _, store := range stores {
+		group.Add(1)
+		go func(store *jsonl.Store) {
+			defer group.Done()
+			<-start
+			session, err := store.CreateWithIdentity(t.Context(), id, workspace, domain.ModeAsk, domain.ModelSelection{Profile: "p", Model: "m"}, nil)
+			results <- result{session: session, err: err}
+		}(store)
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	var first domain.Session
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if first.ID == "" {
+			first = result.session
+		} else if result.session != first {
+			t.Fatalf("matching identity creation differed: first=%+v got=%+v", first, result.session)
+		}
+	}
+	if first.ID != string(id) {
+		t.Fatalf("created ID=%q want %q", first.ID, id)
+	}
+}
+
+func TestSeparateStoresConcurrentIdentityCollisionCannotOverwrite(t *testing.T) {
+	root := t.TempDir()
+	workspace, err := jsonl.WorkspaceFromPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := func() time.Time { return time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC) }
+	issuer := jsonl.New(root, jsonl.Options{Clock: clock, Entropy: strings.NewReader(strings.Repeat("d", 1024))})
+	id, err := issuer.ReserveSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		mode    domain.PermissionMode
+		session domain.Session
+		err     error
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	for index, mode := range []domain.PermissionMode{domain.ModeAsk, domain.ModeAuto} {
+		store := jsonl.New(root, jsonl.Options{Clock: clock, Entropy: strings.NewReader(strings.Repeat(string(rune('e'+index)), 1024))})
+		group.Add(1)
+		go func(store *jsonl.Store, mode domain.PermissionMode) {
+			defer group.Done()
+			<-start
+			session, err := store.CreateWithIdentity(t.Context(), id, workspace, mode, domain.ModelSelection{Profile: "p", Model: "m"}, nil)
+			results <- result{mode: mode, session: session, err: err}
+		}(store, mode)
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	var winner result
+	failures := 0
+	for result := range results {
+		if result.err == nil {
+			winner = result
+			continue
+		}
+		if !strings.Contains(result.err.Error(), "identity collision") {
+			t.Fatalf("unexpected concurrent create error: %v", result.err)
+		}
+		failures++
+	}
+	if winner.session.ID != string(id) || failures != 1 {
+		t.Fatalf("winner=%+v failures=%d", winner, failures)
+	}
+	matching, err := issuer.CreateWithIdentity(t.Context(), id, workspace, winner.mode, domain.ModelSelection{Profile: "p", Model: "m"}, nil)
+	if err != nil || matching != winner.session {
+		t.Fatalf("winning session was not preserved: got=%+v err=%v want=%+v", matching, err, winner.session)
+	}
+}
+
+func TestIdentityCreationRetriesAfterAbandonedStaging(t *testing.T) {
+	root := t.TempDir()
+	store := jsonl.New(root, jsonl.Options{
+		Clock:   func() time.Time { return time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC) },
+		Entropy: strings.NewReader(strings.Repeat("g", 2048)),
+	})
+	workspace, err := jsonl.WorkspaceFromPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(t.Context(), workspace, domain.ModeAsk, domain.ModelSelection{Profile: "p", Model: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	id, err := store.ReserveSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := ".yordam-create-" + string(id) + "-" + strings.Repeat("a", 32) + ".tmp"
+	stagingPath := filepath.Join(root, "workspaces", workspace.ID, "sessions", staging)
+	if err := os.Mkdir(stagingPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingPath, "partial"), []byte("interrupted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.CreateWithIdentity(t.Context(), id, workspace, domain.ModeAsk, domain.ModelSelection{Profile: "p", Model: "m"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.ID != string(id) {
+		t.Fatalf("created ID=%q want %q", created.ID, id)
+	}
+	if _, err := os.Lstat(stagingPath); !os.IsNotExist(err) {
+		t.Fatalf("abandoned staging directory remains: %v", err)
+	}
+	retry, err := store.CreateWithIdentity(t.Context(), id, workspace, domain.ModeAsk, domain.ModelSelection{Profile: "p", Model: "m"}, nil)
+	if err != nil || retry != created {
+		t.Fatalf("retry got=%+v err=%v want=%+v", retry, err, created)
 	}
 }
 

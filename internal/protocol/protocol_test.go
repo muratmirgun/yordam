@@ -13,6 +13,21 @@ func protocolDigest(fill byte) protocol.Digest {
 	return protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat(string(fill), 64)}
 }
 
+func TestCompactionPublicDTOsExcludeBodies(t *testing.T) {
+	for _, value := range []any{protocol.ContextProjectionV1{Revision: "r", SummaryEvidenceID: "e"}, protocol.CompactionEventV1{Trigger: "manual", Stage: protocol.CompactionPreparing, SummaryEvidenceID: "e"}} {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(raw)
+		for _, forbidden := range []string{`"summary"`, `"body"`, `"provider"`, `"prompt"`, `"native_error"`, `"cause"`} {
+			if strings.Contains(text, forbidden) {
+				t.Fatalf("%s contains %s", text, forbidden)
+			}
+		}
+	}
+}
+
 func validModelDescriptor() protocol.ModelDescriptor {
 	return protocol.ModelDescriptor{
 		ProviderID: "provider", ModelID: "model", AdapterKind: "openai_compatible", DisplayName: "Model",

@@ -521,6 +521,66 @@ func TestAppOpenSessionPersistsFallbackForRemovedModel(t *testing.T) {
 	_ = receiveEvent(t, application.Events())
 }
 
+func TestAppOpenSessionRefreshesDurableContextFromNonSubscribingSnapshot(t *testing.T) {
+	first := testSession()
+	second := first
+	second.Session.ID = "second"
+	store := newStateStore(first)
+	store.loads[second.Session.ID] = second
+
+	source := newBrokerSource()
+	firstRef := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(first.Session.ID)}
+	secondRef := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(second.Session.ID)}
+	source.ensure(firstRef)
+	source.ensure(secondRef)
+	firstRange := protocol.CompactionRange{From: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: firstRef.ID, CommitSeq: 3, TransactionID: "first-a"}, Through: protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: firstRef.ID, CommitSeq: 7, TransactionID: "first-b"}}
+	source.contexts[firstRef.ID] = protocol.ContextProjectionV1{
+		AutoAvailable: true, AutoReason: "below_threshold",
+		EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueKnown, Value: 70, Provenance: "estimate"},
+		ContextWindow:        protocol.ValueInt64{State: protocol.ValueKnown, Value: 100, Provenance: "configured"},
+		OutputReserve:        20,
+		ReserveTokens:        protocol.ValueInt64{State: protocol.ValueKnown, Value: 10, Provenance: "policy"},
+		LatestRange:          &firstRange, Revision: "first-revision", SummaryEvidenceID: "first-evidence",
+	}
+	source.contexts[secondRef.ID] = protocol.ContextProjectionV1{
+		AutoAvailable: false, AutoReason: "unknown_context_window",
+		EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueUnknown},
+		ContextWindow:        protocol.ValueInt64{State: protocol.ValueUnknown},
+		ReserveTokens:        protocol.ValueInt64{State: protocol.ValueUnknown},
+	}
+	broker := mustBroker(t, source, nil)
+	backend := &memoryCommandBackend{head: source.initialSession, results: make(map[protocol.CommandID]protocol.CommandResult), digests: make(map[protocol.CommandID]protocol.Digest)}
+	service, err := app.NewProtocolService(app.ProtocolServiceOptions{Orchestrator: backend, Dispatcher: backend, Broker: broker, WorkspaceControl: source.workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := stateRuntimeSet(nil, nil, first.Session.Selection)
+	set.ApplicationService = service
+	application := app.New(app.Options{RuntimeSet: set, Sessions: store, Session: first.Session, Replay: first, Workspace: first.Session.Workspace})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- application.Run(ctx) }()
+
+	open := func(sessionID string) app.Event {
+		t.Helper()
+		application.Commands() <- app.Command{Kind: app.CommandOpenSession, SessionID: sessionID}
+		return receiveEvent(t, application.Events())
+	}
+	openedSecond := open(second.Session.ID)
+	if openedSecond.Kind != app.EventState || openedSecond.Session.ID != second.Session.ID || openedSecond.Context == nil || openedSecond.Context.AutoAvailable || openedSecond.Context.AutoReason != "unknown_context_window" || openedSecond.Context.EstimatedInputTokens.State != protocol.ValueUnknown || openedSecond.Context.ContextWindow.State != protocol.ValueUnknown || openedSecond.Context.ReserveTokens.State != protocol.ValueUnknown || openedSecond.Context.OutputReserve != 0 || openedSecond.Context.LatestRange != nil || openedSecond.Context.Revision != "" || openedSecond.Context.SummaryEvidenceID != "" {
+		t.Fatalf("second context=%+v event=%+v", openedSecond.Context, openedSecond)
+	}
+	openedFirst := open(first.Session.ID)
+	if openedFirst.Kind != app.EventState || openedFirst.Session.ID != first.Session.ID || openedFirst.Context == nil || !openedFirst.Context.AutoAvailable || openedFirst.Context.AutoReason != "below_threshold" || openedFirst.Context.EstimatedInputTokens.Value != 70 || openedFirst.Context.ContextWindow.Value != 100 || openedFirst.Context.ReserveTokens.Value != 10 || openedFirst.Context.OutputReserve != 20 || openedFirst.Context.LatestRange == nil || openedFirst.Context.LatestRange.Through.CommitSeq != 7 || openedFirst.Context.Revision != "first-revision" || openedFirst.Context.SummaryEvidenceID != "first-evidence" {
+		t.Fatalf("first context=%+v event=%+v", openedFirst.Context, openedFirst)
+	}
+	application.Commands() <- app.Command{Kind: app.CommandShutdown}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAppOpenSessionPreservesCurrentWhenFallbackPersistenceFails(t *testing.T) {
 	current := testSession()
 	store := newStateStore(current)

@@ -51,3 +51,15 @@ func TestApplicationDTOValidationRejectsInvalidCorrelationAndBounds(t *testing.T
 		t.Fatal("control-operation event without operation ID was accepted")
 	}
 }
+
+func TestSkillTrustCommandV1AcceptsOnlyExactDurableDecisions(t *testing.T) {
+	digest := protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)}
+	for _, decision := range []string{"allow", "deny"} {
+		if err := (protocol.SkillTrustCommandV1{WorkspaceID: "workspace-1", CatalogDigest: digest, Decision: decision}).Validate(); err != nil {
+			t.Fatalf("decision %q: %v", decision, err)
+		}
+	}
+	if err := (protocol.SkillTrustCommandV1{WorkspaceID: "workspace-1", CatalogDigest: digest, Decision: "always"}).Validate(); err == nil {
+		t.Fatal("unsupported trust decision accepted")
+	}
+}

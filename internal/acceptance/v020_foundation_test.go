@@ -15,6 +15,7 @@ func TestV020Foundation(t *testing.T) {
 		{"evidence_and_lineage", acceptFoundationEvidence},
 		{"catalog_and_authorization", acceptFoundationCatalogAuthorization},
 		{"application_protocol", acceptFoundationApplicationProtocol},
+		{"filesystem_skill_contract", acceptFoundationSkills},
 		{"orchestration_boundaries", acceptFoundationArchitecture},
 		{"v010_regression", func(t *testing.T) { TestV010Acceptance(t) }},
 	}

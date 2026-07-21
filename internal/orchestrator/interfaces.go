@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 
 	"github.com/muratmirgun/yordam/internal/authorization"
+	"github.com/muratmirgun/yordam/internal/compaction"
 	contextplanner "github.com/muratmirgun/yordam/internal/context"
+	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/provider"
@@ -22,12 +24,35 @@ type CommandMetadata struct {
 
 type StartTurnRequest struct {
 	Command      CommandMetadata
+	WorkspaceID  protocol.WorkspaceID
 	SessionID    protocol.SessionID
 	ExpectedHead protocol.CommittedCursor
 	Prompt       string
 	ProviderID   protocol.ProviderID
 	ModelID      protocol.ModelID
 	Runtime      protocol.RuntimeGenerationManifest
+
+	child *childTurnConfig
+}
+
+type CompactRequest struct {
+	Command      CommandMetadata
+	WorkspaceID  protocol.WorkspaceID
+	SessionID    protocol.SessionID
+	ExpectedHead protocol.CommittedCursor
+	ProviderID   protocol.ProviderID
+	ModelID      protocol.ModelID
+	Runtime      protocol.RuntimeGenerationManifest
+	Trigger      compaction.Trigger
+}
+
+type CompactResult struct {
+	Cursor          protocol.CommittedCursor
+	SummaryEvidence protocol.EvidenceRecord
+	From            protocol.CommittedCursor
+	Through         protocol.CommittedCursor
+	Revision        string
+	Usage           protocol.ModelUsage
 }
 
 type RunResult struct {
@@ -93,6 +118,10 @@ type PureCommandCompletion struct {
 
 type ApplicationEventPublisher interface {
 	PublishCommitted(context.Context, protocol.JournalRef, protocol.CommittedCursor, []protocol.EventEnvelope) error
+}
+
+type TransientApplicationEventPublisher interface {
+	PublishTransient(protocol.ApplicationEvent) error
 }
 
 type StreamingSanitizer interface {
@@ -175,6 +204,24 @@ type RecoveryProjection struct {
 	OriginalRequestDigest protocol.Digest
 	StartedActivities     []protocol.ActivityID
 	UnmatchedNoEffect     map[protocol.ActivityID]bool
+	ChildManifest         *protocol.SubagentManifestV1
+	// SubagentRecoveryDiagnostic is populated only when reconciliation cannot
+	// prove a waiting parent/child boundary.  It is recorded with the parent
+	// terminal transaction rather than silently degrading to a generic recovery
+	// interruption.
+	SubagentRecoveryDiagnostic *SubagentRecoveryDiagnostic
+}
+
+// SubagentRecoveryDiagnostic is the public, durable shape for a failed-closed
+// sequential-child reconciliation.  The receipt digest/cursor are optional:
+// an ambiguous child may not have reached a terminal receipt.
+type SubagentRecoveryDiagnostic struct {
+	AttemptID      protocol.DelegationAttemptID `json:"attempt_id"`
+	ChildSessionID protocol.SessionID           `json:"child_session_id"`
+	ChildStatus    string                       `json:"child_status"`
+	TerminalCursor protocol.CommittedCursor     `json:"terminal_cursor,omitempty"`
+	ReceiptDigest  protocol.Digest              `json:"receipt_digest,omitempty"`
+	Reason         string                       `json:"reason"`
 }
 
 type ProjectionService interface {
@@ -185,23 +232,64 @@ type EffectStartProbe interface {
 	ProvesNoEffect(context.Context, protocol.ActivityID) (bool, error)
 }
 
+// ChildSessionStore reserves the identity which is bound into the durable
+// parent request before any child session can be published.
+type ChildSessionStore interface {
+	ReserveSessionID() (protocol.SessionID, error)
+	CreateWithIdentity(context.Context, protocol.SessionID, domain.Workspace, domain.PermissionMode, domain.ModelSelection, *journal.SessionLineage) (domain.Session, error)
+	InspectSession(context.Context, protocol.SessionID) (journal.Inspection, error)
+}
+
+// ParentSessionInspector supplies the immutable session identity inherited by
+// a child. It is deliberately separate from ChildSessionStore because the
+// latter exposes only journal inspection to the parent handoff path.
+type ParentSessionInspector interface {
+	InspectSession(context.Context, protocol.SessionID) (journal.SessionInspection, error)
+}
+
+// ChildCoordinator owns the child-side session creation and turn execution.
+// It receives the exact frozen parent request and the pre-reserved identity;
+// implementations must never mint or substitute a child identity.
+type ChildCoordinator interface {
+	RunChild(context.Context, ChildRunRequest) (protocol.SubagentReceiptV1, error)
+}
+
+// ChildPolicyRegistry creates an isolated policy entry before the child turn
+// can issue any authorization request. Implementations must not clone grants.
+type ChildPolicyRegistry interface {
+	RegisterChild(protocol.SessionID, domain.PermissionMode) error
+}
+
+type ChildPromptRegistry interface {
+	RegisterChildLineage(protocol.SessionID, protocol.SessionID, protocol.DelegationAttemptID) error
+}
+
+type ChildRunRequest struct {
+	Manifest protocol.SubagentManifestV1
+	Call     protocol.SubagentCallV1
+	Parent   StartTurnRequest
+}
+
 type Dependencies struct {
-	Lane          OperationLane
-	Repository    journal.Repository
-	TurnLeases    journal.TurnLeaseManager
-	Context       ContextPlanner
-	Providers     ProviderCatalog
-	Provider      ProviderService
-	Tools         ToolService
-	Authorization AuthorizationService
-	Approver      InteractiveApprover
-	Evidence      EvidenceRecorder
-	Recovery      RecoveryRecorder
-	Verification  VerificationService
-	Projection    ProjectionService
-	EffectProbe   EffectStartProbe
-	Publisher     ApplicationEventPublisher
-	BarrierProbe  BarrierProbe
-	Admission     AdmissionService
-	Instructions  InstructionService
+	Lane           OperationLane
+	Repository     journal.Repository
+	TurnLeases     journal.TurnLeaseManager
+	Context        ContextPlanner
+	Providers      ProviderCatalog
+	Provider       ProviderService
+	Tools          ToolService
+	Authorization  AuthorizationService
+	Approver       InteractiveApprover
+	Evidence       EvidenceRecorder
+	Recovery       RecoveryRecorder
+	Verification   VerificationService
+	Projection     ProjectionService
+	EffectProbe    EffectStartProbe
+	Publisher      ApplicationEventPublisher
+	BarrierProbe   BarrierProbe
+	Admission      AdmissionService
+	Instructions   InstructionService
+	ChildSessions  ChildSessionStore
+	ParentSessions ParentSessionInspector
+	Children       ChildCoordinator
 }

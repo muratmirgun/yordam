@@ -210,10 +210,20 @@ type ActionPlan struct {
 	Digest Digest         `json:"digest"`
 }
 
+// ToolResultPresentation is transient UI material. It is never added to a
+// journal event; durable tool results remain bounded model protocol blocks.
+type ToolResultPresentation struct {
+	Content       string `json:"content"`
+	DurationNanos int64  `json:"duration_nanos"`
+	Truncated     bool   `json:"truncated"`
+}
+
 type ExecutionResult struct {
-	Outcome    ActivityOutcomeV1   `json:"outcome"`
-	ToolResult ToolResultBlock     `json:"tool_result"`
-	Evidence   []EvidenceCandidate `json:"evidence"`
+	Outcome      ActivityOutcomeV1      `json:"outcome"`
+	ToolResult   ToolResultBlock        `json:"tool_result"`
+	Presentation ToolResultPresentation `json:"presentation"`
+	Evidence     []EvidenceCandidate    `json:"evidence"`
+	FileChange   *FileChangedV1         `json:"file_change,omitempty"`
 }
 
 func validateJSONObject(raw json.RawMessage, label string) error {

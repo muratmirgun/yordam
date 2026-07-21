@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -51,6 +52,169 @@ func TestSnapshotAndSubscribeHasNoCommitGap(t *testing.T) {
 	if err != nil || item.Event == nil || item.Event.StreamEventID != "event-during-snapshot" {
 		t.Fatalf("item=%+v err=%v snapshot=%+v", item, err, result.snapshot)
 	}
+}
+
+func TestSnapshotCapturesRelatedHeadsBeforeProjectionAndReplaysExactVector(t *testing.T) {
+	base := newBrokerSource()
+	child := protocol.JournalRef{Kind: protocol.JournalSession, ID: "child-1"}
+	base.ensure(child)
+	source := &adversarialRelatedBrokerSource{brokerSource: base, child: child}
+	broker := mustBroker(t, source, nil)
+
+	first, err := broker.Snapshot(t.Context(), snapshotRequest(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Cursor.SelectedSession == nil || first.Cursor.SelectedSession.CommitSeq != base.initialSession.CommitSeq || len(first.Cursor.RelatedSessions) != 1 || first.Cursor.RelatedSessions[0].CommitSeq != 1 {
+		t.Fatalf("first cursor=%+v", first.Cursor)
+	}
+	var projected app.SnapshotVector
+	if err := json.Unmarshal(first.Durable.Workspace.Data, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if projected.SelectedSession == nil || *projected.SelectedSession != *first.Cursor.SelectedSession || len(projected.RelatedSessions) != 1 || projected.RelatedSessions[0] != first.Cursor.RelatedSessions[0] {
+		t.Fatalf("projection vector=%+v cursor=%+v", projected, first.Cursor)
+	}
+
+	second, err := broker.Snapshot(t.Context(), snapshotRequest(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Cursor.SelectedSession == nil || second.Cursor.SelectedSession.CommitSeq <= first.Cursor.SelectedSession.CommitSeq || len(second.Cursor.RelatedSessions) != 1 || second.Cursor.RelatedSessions[0].CommitSeq <= first.Cursor.RelatedSessions[0].CommitSeq {
+		t.Fatalf("second cursor=%+v first=%+v", second.Cursor, first.Cursor)
+	}
+}
+
+func TestSubscriptionUpdatesPreserveCapturedRelatedSessionCursors(t *testing.T) {
+	base := newBrokerSource()
+	child := protocol.JournalRef{Kind: protocol.JournalSession, ID: "child-1"}
+	base.ensure(child)
+	source := &stableRelatedBrokerSource{brokerSource: base, child: child}
+	broker := mustBroker(t, source, nil)
+	snapshot, subscription, err := broker.SnapshotAndSubscribe(t.Context(), snapshotRequest(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Cursor.RelatedSessions) != 1 {
+		t.Fatalf("snapshot cursor=%+v", snapshot.Cursor)
+	}
+	events, cursor := source.commit(source.session, "parent-after-related-snapshot", time.Unix(7, 0).UTC())
+	if err := broker.PublishCommitted(t.Context(), source.session, cursor, events); err != nil {
+		t.Fatal(err)
+	}
+	item, err := subscription.Next(t.Context())
+	if err != nil || item.Event == nil || len(item.Event.Cursor.RelatedSessions) != 1 || item.Event.Cursor.RelatedSessions[0] != snapshot.Cursor.RelatedSessions[0] {
+		t.Fatalf("item=%+v err=%v snapshot=%+v", item, err, snapshot.Cursor)
+	}
+	item.Event.Cursor.RelatedSessions[0].CommitSeq++
+	if snapshot.Cursor.RelatedSessions[0].CommitSeq == item.Event.Cursor.RelatedSessions[0].CommitSeq {
+		t.Fatal("subscription event related cursors alias snapshot cursor")
+	}
+}
+
+func TestMaximumServerDerivedRelatedWindowDeliversValidEventCursor(t *testing.T) {
+	base := newBrokerSource()
+	source := &maximumRelatedBrokerSource{brokerSource: base}
+	broker := mustBroker(t, source, nil)
+	snapshot, subscription, err := broker.SnapshotAndSubscribe(t.Context(), snapshotRequest(8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Cursor.RelatedSessions) != protocol.MaxCollectionMembers {
+		t.Fatalf("related cursors=%d", len(snapshot.Cursor.RelatedSessions))
+	}
+	events, cursor := source.commit(source.session, "parent-at-max-related-window", time.Unix(8, 0).UTC())
+	if err := broker.PublishCommitted(t.Context(), source.session, cursor, events); err != nil {
+		t.Fatal(err)
+	}
+	item, err := subscription.Next(t.Context())
+	if err != nil || item.Event == nil || item.Terminal != nil || len(item.Event.Cursor.RelatedSessions) != protocol.MaxCollectionMembers {
+		t.Fatalf("item=%+v err=%v", item, err)
+	}
+}
+
+type maximumRelatedBrokerSource struct{ *brokerSource }
+
+func (s *maximumRelatedBrokerSource) RelatedSessionHeads(context.Context, protocol.CommittedCursor) ([]protocol.CommittedCursor, error) {
+	result := make([]protocol.CommittedCursor, protocol.MaxCollectionMembers)
+	for index := range result {
+		ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(fmt.Sprintf("child-%05d", index))}
+		result[index] = committedCursor(ref, 1, "head")
+	}
+	return result, nil
+}
+
+func TestSubscribeNeverEchoesClientSuppliedRelatedSessionCursors(t *testing.T) {
+	source := newBrokerSource()
+	broker := mustBroker(t, source, nil)
+	foreign := committedCursor(protocol.JournalRef{Kind: protocol.JournalSession, ID: "nonexistent-child"}, 9999, "client-future")
+	subscription, err := broker.Subscribe(t.Context(), protocol.SubscriptionRequest{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: "session-1",
+		After:    protocol.ApplicationCursor{WorkspaceControl: source.initialWorkspace, SelectedSession: ptrCursor(source.initialSession), RelatedSessions: []protocol.CommittedCursor{foreign}, Stream: protocol.StreamCursor{Epoch: broker.Epoch()}},
+		Consumer: "adversarial-client", QueueCapacity: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.PublishTransient(protocol.ApplicationEvent{Correlation: protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: "session-1", SessionID: "session-1"}, Kind: app.ApplicationEventNotice, PayloadVersion: 1, Payload: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	item, err := subscription.Next(t.Context())
+	if err != nil || item.Event == nil {
+		t.Fatalf("item=%+v err=%v", item, err)
+	}
+	if len(item.Event.Cursor.RelatedSessions) != 0 {
+		t.Fatalf("outgoing cursor echoed client provenance: %+v", item.Event.Cursor.RelatedSessions)
+	}
+}
+
+func TestSubscribeEpochGapNeverEchoesClientSuppliedRelatedSessionCursors(t *testing.T) {
+	source := newBrokerSource()
+	broker := mustBroker(t, source, nil)
+	foreign := committedCursor(protocol.JournalRef{Kind: protocol.JournalSession, ID: "nonexistent-child"}, 9999, "client-future")
+	subscription, err := broker.Subscribe(t.Context(), protocol.SubscriptionRequest{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: "session-1",
+		After:    protocol.ApplicationCursor{WorkspaceControl: source.initialWorkspace, SelectedSession: ptrCursor(source.initialSession), RelatedSessions: []protocol.CommittedCursor{foreign}, Stream: protocol.StreamCursor{Epoch: "stale-client-epoch"}},
+		Consumer: "adversarial-client", QueueCapacity: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := subscription.Next(t.Context())
+	if err != nil || item.Terminal == nil {
+		t.Fatalf("item=%+v err=%v", item, err)
+	}
+	if len(item.Terminal.ResumeAfter.RelatedSessions) != 0 {
+		t.Fatalf("terminal echoed client provenance: %+v", item.Terminal.ResumeAfter.RelatedSessions)
+	}
+}
+
+type stableRelatedBrokerSource struct {
+	*brokerSource
+	child protocol.JournalRef
+}
+
+func (s *stableRelatedBrokerSource) RelatedSessionHeads(context.Context, protocol.CommittedCursor) ([]protocol.CommittedCursor, error) {
+	head, err := s.Head(context.Background(), s.child)
+	return []protocol.CommittedCursor{head}, err
+}
+
+type adversarialRelatedBrokerSource struct {
+	*brokerSource
+	child protocol.JournalRef
+	once  sync.Once
+}
+
+func (s *adversarialRelatedBrokerSource) RelatedSessionHeads(context.Context, protocol.CommittedCursor) ([]protocol.CommittedCursor, error) {
+	head, err := s.Head(context.Background(), s.child)
+	if err != nil {
+		return nil, err
+	}
+	s.once.Do(func() {
+		s.commit(s.session, "parent-request-after-vector", time.Unix(5, 0).UTC())
+		s.commit(s.child, "child-receipt-after-vector", time.Unix(6, 0).UTC())
+	})
+	return []protocol.CommittedCursor{head}, nil
 }
 
 func TestSubscriptionCatchUpMergesByTimestampThenEventID(t *testing.T) {
@@ -243,6 +407,7 @@ type brokerSource struct {
 	initialSession   protocol.CommittedCursor
 	heads            map[protocol.JournalRef]protocol.CommittedCursor
 	records          map[protocol.JournalRef][]protocol.EventRecord
+	contexts         map[protocol.JournalID]protocol.ContextProjectionV1
 	pauseEntered     chan struct{}
 	pauseRelease     chan struct{}
 	durable          chan struct{}
@@ -251,7 +416,7 @@ type brokerSource struct {
 func newBrokerSource() *brokerSource {
 	workspace := protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "workspace-1"}
 	session := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-1"}
-	s := &brokerSource{workspace: workspace, session: session, heads: make(map[protocol.JournalRef]protocol.CommittedCursor), records: make(map[protocol.JournalRef][]protocol.EventRecord), durable: make(chan struct{}, 32)}
+	s := &brokerSource{workspace: workspace, session: session, heads: make(map[protocol.JournalRef]protocol.CommittedCursor), records: make(map[protocol.JournalRef][]protocol.EventRecord), contexts: make(map[protocol.JournalID]protocol.ContextProjectionV1), durable: make(chan struct{}, 32)}
 	s.initialWorkspace = committedCursor(workspace, 1, "workspace-initial")
 	s.initialSession = committedCursor(session, 1, "session-initial")
 	s.heads[workspace], s.heads[session] = s.initialWorkspace, s.initialSession
@@ -284,7 +449,17 @@ func (s *brokerSource) Project(_ context.Context, vector app.SnapshotVector) (pr
 		<-s.pauseRelease
 	}
 	data, _ := json.Marshal(vector)
-	return protocol.DurableProjection{Workspace: protocol.ProjectionView{ID: string(s.workspace.ID), Kind: "workspace", Status: "ready", State: protocol.ValueKnown, Data: data}}, protocol.RuntimeProjection{}, nil
+	durable := protocol.DurableProjection{Workspace: protocol.ProjectionView{ID: string(s.workspace.ID), Kind: "workspace", Status: "ready", State: protocol.ValueKnown, Data: data}}
+	if vector.SelectedSession != nil {
+		if state, ok := s.contexts[vector.SelectedSession.JournalID]; ok {
+			contextData, err := json.Marshal(protocol.DeepCopy(state))
+			if err != nil {
+				return protocol.DurableProjection{}, protocol.RuntimeProjection{}, err
+			}
+			durable.Context = protocol.ProjectionView{ID: string(vector.SelectedSession.JournalID), Kind: "context", Status: "ready", State: protocol.ValueKnown, Data: contextData}
+		}
+	}
+	return durable, protocol.RuntimeProjection{}, nil
 }
 func (s *brokerSource) pauseSnapshot() (<-chan struct{}, chan struct{}) {
 	s.pauseEntered, s.pauseRelease = make(chan struct{}), make(chan struct{})

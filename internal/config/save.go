@@ -31,10 +31,34 @@ var defaultTemplate = []byte(`{
       },
       "models": {
         "your-model-id": {
-          "name": "Your model"
+          "name": "Your model",
+          // Set only when you know this model's context window.
+          // "contextWindow": 128000
         }
       }
     }
+  },
+
+  "context": {
+    // Automatically compact a session before its configured model window is exceeded.
+    "autoCompact": true,
+    // Optional tokens to reserve for compaction output.
+    // "compactReserveTokens": 8192
+  },
+
+  "skills": {
+    // Project skills may come from the repository and need your trust.
+    // Supported values: ask, allow, deny.
+    "projectPolicy": "ask"
+  },
+
+  "subagents": {
+    // Enable sequential subagents for bounded delegated work.
+    "enabled": true,
+    // maxPerTurn, maxToolCalls, and timeoutSeconds remain enforced when disabled.
+    "maxPerTurn": 4,
+    "maxToolCalls": 16,
+    "timeoutSeconds": 600
   },
 
   "limits": {
@@ -113,6 +137,14 @@ func ensureGlobal(
 func SaveGlobal(path string, cfg Config) (err error) {
 	saveMu.Lock()
 	defer saveMu.Unlock()
+	// Programmatic callers commonly omit the optional policy. Persist the same
+	// safe default that the document loader applies to an omitted field.
+	if cfg.Skills.ProjectPolicy == "" {
+		cfg.Skills.ProjectPolicy = ProjectSkillsAsk
+	}
+	if cfg.Subagents == (SubagentConfig{}) {
+		cfg.Subagents = defaultSubagentConfig
+	}
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -175,13 +207,22 @@ func marshalConfig(cfg Config) ([]byte, error) {
 			MaxToolCalls:        &cfg.MaxToolCalls,
 			ShellTimeoutSeconds: &cfg.ShellTimeoutSeconds,
 		},
+		Context: documentContext{
+			AutoCompact:          boolPointer(cfg.Context.AutoCompact),
+			CompactReserveTokens: cloneInt64(cfg.Context.CompactReserveTokens),
+		},
+		Skills: documentSkills{ProjectPolicy: projectSkillPolicyPointer(cfg.Skills.ProjectPolicy)},
+		Subagents: documentSubagents{
+			Enabled: boolPointer(cfg.Subagents.Enabled), MaxPerTurn: intPointer(cfg.Subagents.MaxPerTurn),
+			MaxToolCalls: intPointer(cfg.Subagents.MaxToolCalls), TimeoutSeconds: intPointer(cfg.Subagents.TimeoutSeconds),
+		},
 	}
 	for name, profile := range cfg.Profiles {
 		models := make(map[string]documentModel, len(profile.Models))
 		ordered := append([]string(nil), profile.Models...)
 		sort.Strings(ordered)
 		for _, model := range ordered {
-			models[model] = documentModel{}
+			models[model] = documentModel{ContextWindow: cloneInt64FromMap(profile.ModelContextWindows, model)}
 		}
 		doc.Provider[name] = documentProvider{
 			Name: profile.Name,
@@ -194,6 +235,20 @@ func marshalConfig(cfg Config) ([]byte, error) {
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	return append(raw, '\n'), err
+}
+
+func boolPointer(value bool) *bool { return &value }
+
+func intPointer(value int) *int { return &value }
+
+func projectSkillPolicyPointer(value ProjectSkillPolicy) *ProjectSkillPolicy { return &value }
+
+func cloneInt64FromMap(values map[string]int64, key string) *int64 {
+	value, ok := values[key]
+	if !ok {
+		return nil
+	}
+	return cloneInt64(&value)
 }
 
 func cleanupConfigTemporaries(directory string) error {

@@ -20,6 +20,8 @@ import (
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/recovery"
 	"github.com/muratmirgun/yordam/internal/tooling"
+	toolset "github.com/muratmirgun/yordam/internal/tools"
+	edittool "github.com/muratmirgun/yordam/internal/tools/edit"
 	"github.com/muratmirgun/yordam/internal/verification"
 )
 
@@ -54,6 +56,13 @@ type Service struct {
 	probe      BarrierProbe
 }
 
+// SetChildCoordinator is used only while wiring an immutable runtime before it
+// is exposed to callers. Keeping the coordinator injected preserves small test
+// seams while production uses SequentialChildCoordinator.
+func (s *Service) SetChildCoordinator(coordinator ChildCoordinator) {
+	s.deps.Children = coordinator
+}
+
 func NewService(dependencies Dependencies) (*Service, error) {
 	if dependencies.Repository == nil {
 		return nil, fmt.Errorf("journal repository is required")
@@ -83,7 +92,7 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 		return RunResult{}, err
 	}
 	request.Prompt = admittedPrompt
-	lease, err := s.lane.Acquire(ctx, OperationClaim{Kind: OperationTurn, SessionID: request.SessionID})
+	lease, err := acquireManagedOperationLease(ctx, s.lane, OperationClaim{Kind: OperationTurn, SessionID: request.SessionID})
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -119,6 +128,18 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 		result = terminalResult
 	}()
 
+	if request.child != nil {
+		manifestEvents, manifestErr := s.turnEvents(state, request.Runtime.ID, "subagent-manifest", []struct {
+			kind    string
+			payload any
+		}{{protocol.EventSubagentManifest, request.child.manifest}})
+		if manifestErr != nil {
+			return RunResult{}, manifestErr
+		}
+		if manifestErr = s.append(ctx, &state, "subagent-manifest", manifestEvents); manifestErr != nil {
+			return RunResult{}, manifestErr
+		}
+	}
 	initial, err := s.initialTurnEvents(request, state)
 	if err != nil {
 		return RunResult{}, err
@@ -157,7 +178,7 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 	completedTools := 0
 	zeroByteRetries := 0
 	for attempt := 0; ; attempt++ {
-		assistant, terminal, err := s.runProviderActivity(ctx, request, &state, attempt, extraMessages)
+		assistant, terminal, err := s.runProviderActivity(ctx, lease, request, &state, attempt, extraMessages)
 		if err != nil {
 			var proved ProvenZeroByteProviderError
 			if errors.As(err, &proved) && proved.Retryable() && proved.ZeroBytesSent() && zeroByteRetries == 0 && state.activeActivityID != "" {
@@ -173,23 +194,35 @@ func (s *Service) RunTurn(ctx context.Context, request StartTurnRequest) (result
 		if len(assistant.ToolIntents) == 0 {
 			return s.completeTurn(ctx, request, &state, assistant, terminal)
 		}
-		if completedTools+len(assistant.ToolIntents) > request.Runtime.Body.Limits.MaxToolCalls {
-			return RunResult{}, fmt.Errorf("tool call limit %d reached", request.Runtime.Body.Limits.MaxToolCalls)
+		maxTools := request.Runtime.Body.Limits.MaxToolCalls
+		if request.child != nil {
+			maxTools = request.child.manifest.MaxToolCalls
+		}
+		if completedTools+len(assistant.ToolIntents) > maxTools {
+			return RunResult{}, fmt.Errorf("tool call limit %d reached", maxTools)
 		}
 		if s.deps.Tools == nil || s.deps.Evidence == nil || s.deps.Recovery == nil {
 			return RunResult{}, fmt.Errorf("tool orchestration dependencies are incomplete")
 		}
 		results := make([]protocol.ContentBlock, 0, len(assistant.ToolIntents))
 		for _, intent := range assistant.ToolIntents {
-			result, runErr := s.runToolIntent(ctx, request, &state, intent)
+			result, runErr := s.runToolIntent(ctx, lease, request, &state, intent)
 			if runErr != nil {
 				return RunResult{}, runErr
+			}
+			// A cancelled tool may still return a durable uncertain/no-effect
+			// result after its detached terminal write. Do not mistake that receipt
+			// for authority to start another provider activity.
+			if err := ctx.Err(); err != nil {
+				return RunResult{}, err
 			}
 			resultCopy := result
 			results = append(results, protocol.ContentBlock{Kind: protocol.ContentToolResult, ToolResult: &resultCopy})
 			completedTools++
 		}
-		extraMessages = make([]protocol.ModelMessage, 0, len(results))
+		// Tool-result messages are not independent durable transcript events;
+		// retain every result from this turn so later provider continuations can
+		// still resolve all earlier committed assistant tool calls.
 		for _, result := range results {
 			extraMessages = append(extraMessages, protocol.ModelMessage{Role: "tool", Blocks: []protocol.ContentBlock{result}})
 		}
@@ -203,16 +236,12 @@ func commandResultCursor(result protocol.CommandResult) protocol.CommittedCursor
 	return result.Cursor.WorkspaceControl
 }
 
-func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequest, state *turnState, attempt int, extra []protocol.ModelMessage) (protocol.AssistantMessageV1, protocol.ProviderAttemptTerminalV1, error) {
+func (s *Service) runProviderActivity(ctx context.Context, lease managedOperationLease, request StartTurnRequest, state *turnState, attempt int, extra []protocol.ModelMessage) (protocol.AssistantMessageV1, protocol.ProviderAttemptTerminalV1, error) {
 	model, ok := selectedRuntimeModel(request)
 	if !ok {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("selected model %q/%q is not in runtime generation %q", request.ProviderID, request.ModelID, request.Runtime.ID)
 	}
 	requirements := []protocol.CapabilityRequirement{}
-	history, err := s.readFullHistory(ctx, state.ref)
-	if err != nil {
-		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
-	}
 	instructions, err := s.deps.Instructions.SystemInstructions(ctx, request.Runtime.ID, request.Runtime.Body.InstructionRevision, request.SessionID)
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
@@ -234,15 +263,40 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("system instruction source: %w", err)
 		}
 	}
-	contextPlan, err := s.deps.Context.Plan(ctx, contextplanner.Request{
-		Session: request.SessionID, TaskID: state.taskID, OutcomeContractID: state.contractID, OutcomeContractVersion: 2,
-		Events: history, SystemInstructions: instructions, Model: model,
-	})
-	if err != nil {
-		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+	var contextPlan protocol.ContextPlan
+	for rebuild := 0; ; rebuild++ {
+		history, historyErr := s.readFullHistory(ctx, state.ref)
+		if historyErr != nil {
+			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, historyErr
+		}
+		contextPlan, err = s.deps.Context.Plan(ctx, contextplanner.Request{
+			Session: request.SessionID, TaskID: state.taskID, OutcomeContractID: state.contractID, OutcomeContractVersion: 2,
+			Events: history, SystemInstructions: instructions, Model: model,
+		})
+		if err != nil {
+			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+		}
+		if rebuild != 0 {
+			break
+		}
+		decision, policyErr := automaticCompactionDecision(contextPlan, request.Runtime.Body.Limits)
+		if policyErr != nil {
+			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, policyErr
+		}
+		if !decision.ShouldCompact {
+			break
+		}
+		compacted, compactErr := s.compactWithinTurn(ctx, lease, request, state, state.head, history)
+		if compactErr != nil {
+			return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, compactErr
+		}
+		if !compacted {
+			break
+		}
 	}
 	state.contextPlanDigest = contextPlan.Digest
-	plan, err := s.deps.Providers.Negotiate(model.ProviderID, model.ModelID, requirements, request.Runtime.Body.ToolCatalogRevision)
+	exposure := effectiveToolExposure(request)
+	plan, err := s.deps.Providers.Negotiate(model.ProviderID, model.ModelID, requirements, exposure.CatalogRevision)
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
@@ -251,7 +305,7 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 	modelRequest := protocol.ModelRequest{
 		RequestID:  stableID("provider-request", string(request.Command.CommandID), fmt.Sprint(attempt)),
 		ProviderID: model.ProviderID, ModelID: model.ModelID, Messages: messages,
-		Tools: toolExposure(request.Runtime), Requirements: requirements, Plan: plan,
+		Tools: exposure, Requirements: requirements, Plan: plan,
 	}
 	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "provider", fmt.Sprint(attempt)))
 	callID := stableID("provider-call", string(request.Command.CommandID), fmt.Sprint(attempt))
@@ -285,7 +339,7 @@ func (s *Service) runProviderActivity(ctx context.Context, request StartTurnRequ
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
-	token, err := s.authorizeActivity(ctx, request, state, activityID, callID, label, authorizationRequest)
+	token, err := s.authorizeActivity(ctx, lease, request, state, activityID, callID, label, authorizationRequest)
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
@@ -365,7 +419,7 @@ func (s *Service) readFullHistory(ctx context.Context, ref protocol.JournalRef) 
 	}
 }
 
-func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock) (protocol.ToolResultBlock, error) {
+func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock) (protocol.ToolResultBlock, error) {
 	descriptor, ok := toolDescriptor(request.Runtime, intent.Alias)
 	if !ok {
 		if err := s.appendSyntheticToolFailure(ctx, request, state, intent, nil, "unknown tool"); err != nil {
@@ -373,9 +427,12 @@ func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, s
 		}
 		return protocol.ToolResultBlock{CallID: intent.CallID, Status: "failed", Text: "unknown tool"}, nil
 	}
+	if canonicalSubagentDescriptor(descriptor) {
+		return s.runSubagentIntent(ctx, lease, request, state, intent)
+	}
 	mutating := descriptor.Body.Effect != "observation"
 	if !mutating {
-		return s.runObservationIntent(ctx, request, state, intent)
+		return s.runObservationIntent(ctx, lease, request, state, intent)
 	}
 	for round := 0; round < 3; round++ {
 		previewActivityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "preview", intent.CallID, fmt.Sprint(round)))
@@ -417,7 +474,7 @@ func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, s
 		if err := s.cross(ctx, BarrierActionPlanCommitted, barrierState); err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
-		previewToken, err := s.authorizeActivity(ctx, request, state, previewActivityID, intent.CallID, previewLabel, previewAuthorization)
+		previewToken, err := s.authorizeActivity(ctx, lease, request, state, previewActivityID, intent.CallID, previewLabel, previewAuthorization)
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
@@ -515,7 +572,7 @@ func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, s
 		if err := s.append(ctx, state, mutationLabel+"-authorization", events); err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
-		token, err := s.authorizeActivity(ctx, request, state, mutationActivityID, intent.CallID, mutationLabel, mutationAuthorization)
+		token, err := s.authorizeActivity(ctx, lease, request, state, mutationActivityID, intent.CallID, mutationLabel, mutationAuthorization)
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
@@ -550,11 +607,15 @@ func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, s
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
+		fileChange, err := structuredFileChangedEffect(mutationPlan, execution, records)
+		if err != nil {
+			return protocol.ToolResultBlock{}, err
+		}
 		status := execution.Outcome.Status
 		if status == "" {
 			status = "failed"
 		}
-		if err := s.appendActivityEvidence(ctx, request, state, mutationActivityID, mutationLabel+"-terminal", status, records); err != nil {
+		if err := s.appendActivityEvidence(ctx, request, state, mutationActivityID, mutationLabel+"-terminal", status, records, fileChange); err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
 		execution.ToolResult.EvidenceIDs = evidenceIDs(records)
@@ -563,7 +624,7 @@ func (s *Service) runToolIntent(ctx context.Context, request StartTurnRequest, s
 	return protocol.ToolResultBlock{CallID: intent.CallID, Status: "failed", Text: "resource drift did not stabilize"}, nil
 }
 
-func (s *Service) runObservationIntent(ctx context.Context, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock) (protocol.ToolResultBlock, error) {
+func (s *Service) runObservationIntent(ctx context.Context, lease managedOperationLease, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock) (protocol.ToolResultBlock, error) {
 	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "tool", intent.CallID))
 	planRequest := tooling.PlanRequest{TurnID: state.turnID, ActivityID: activityID, CallID: intent.CallID, Alias: intent.Alias, Arguments: protocol.DeepCopy(intent.Arguments), RuntimeGenerationID: request.Runtime.ID}
 	handle, plan, err := s.deps.Tools.Plan(ctx, planRequest)
@@ -609,7 +670,7 @@ func (s *Service) runObservationIntent(ctx context.Context, request StartTurnReq
 	if err := s.cross(ctx, BarrierActionPlanCommitted, barrierState); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
-	token, err := s.authorizeActivity(ctx, request, state, activityID, intent.CallID, label, authRequest)
+	token, err := s.authorizeActivity(ctx, lease, request, state, activityID, intent.CallID, label, authRequest)
 	if err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
@@ -634,6 +695,9 @@ func (s *Service) runObservationIntent(ctx context.Context, request StartTurnReq
 	if err := s.probe.After(ctx, BarrierEffectDispatch, barrierState); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
+	if err := s.publishToolPresentation(ctx, request, state, activityID, plan, execution); err != nil {
+		return protocol.ToolResultBlock{}, err
+	}
 	records, err := s.recordEvidence(ctx, request, activityID, plan, execution.Evidence)
 	if err != nil {
 		return protocol.ToolResultBlock{}, err
@@ -643,6 +707,29 @@ func (s *Service) runObservationIntent(ctx context.Context, request StartTurnReq
 	}
 	execution.ToolResult.EvidenceIDs = evidenceIDs(records)
 	return s.sanitizeToolResult(ctx, request.Runtime.ID, execution.ToolResult)
+}
+
+func (s *Service) publishToolPresentation(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, plan protocol.ActionPlan, execution protocol.ExecutionResult) error {
+	if plan.Body.Tool != (protocol.ToolIdentity{Source: "builtin", Authority: "yordam", Name: "skill"}) {
+		return nil
+	}
+	publisher, ok := s.publisher.(TransientApplicationEventPublisher)
+	if !ok {
+		return nil
+	}
+	content, err := s.deps.Admission.SanitizeText(ctx, request.Runtime.ID, execution.Presentation.Content)
+	if err != nil {
+		return err
+	}
+	available := protocol.ToolResultAvailableV1{ActivityID: activityID, CallID: execution.ToolResult.CallID, Status: execution.ToolResult.Status, Content: content, DurationNanos: execution.Presentation.DurationNanos, Truncated: execution.Presentation.Truncated}
+	if err := available.Validate(); err != nil {
+		return err
+	}
+	payload, err := canonicaljson.Marshal(available)
+	if err != nil {
+		return err
+	}
+	return publisher.PublishTransient(protocol.ApplicationEvent{Correlation: protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), SessionID: request.SessionID, TurnID: state.turnID, ActivityID: activityID}, Time: time.Now().UTC(), Kind: protocol.EventToolResultAvailable, PayloadVersion: 1, Payload: payload})
 }
 
 func (s *Service) sanitizeToolResult(ctx context.Context, generation protocol.RuntimeGenerationID, result protocol.ToolResultBlock) (protocol.ToolResultBlock, error) {
@@ -685,7 +772,7 @@ func (s *Service) recordEvidence(ctx context.Context, request StartTurnRequest, 
 		if candidate.ID == "" {
 			candidate.ID = protocol.EvidenceID(stableID("evidence", string(request.Command.CommandID), string(activityID), fmt.Sprint(index)))
 		}
-		candidate.WorkspaceID = protocol.WorkspaceID(request.SessionID)
+		candidate.WorkspaceID = effectiveWorkspaceID(request.WorkspaceID, request.SessionID)
 		candidate.SessionID = request.SessionID
 		candidate.ProducingActivityID = activityID
 		if candidate.Actor.Validate() != nil {
@@ -746,7 +833,7 @@ func (s *Service) recordEvidence(ctx context.Context, request StartTurnRequest, 
 	return records, nil
 }
 
-func (s *Service) appendActivityEvidence(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, label, status string, records []protocol.EvidenceRecord) error {
+func (s *Service) appendActivityEvidence(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, label, status string, records []protocol.EvidenceRecord, fileChanges ...*protocol.FileChangedV1) error {
 	kind := map[string]string{
 		"succeeded": protocol.EventActivitySucceeded, "failed": protocol.EventActivityFailed,
 		"denied": protocol.EventActivityDenied, "cancelled": protocol.EventActivityCancelled,
@@ -758,7 +845,15 @@ func (s *Service) appendActivityEvidence(ctx context.Context, request StartTurnR
 	values := make([]struct {
 		kind    string
 		payload any
-	}, 0, 1+len(records)*2)
+	}, 0, 1+len(records)*2+len(fileChanges))
+	for _, fileChange := range fileChanges {
+		if fileChange != nil {
+			values = append(values, struct {
+				kind    string
+				payload any
+			}{protocol.EventFileChanged, *fileChange})
+		}
+	}
 	values = append(values, struct {
 		kind    string
 		payload any
@@ -792,6 +887,37 @@ func (s *Service) appendActivityEvidence(ctx context.Context, request StartTurnR
 	barrierState := state.barrierState()
 	barrierState.ActivityID = activityID
 	return s.cross(ctx, BarrierActionTerminalCommitted, barrierState)
+}
+
+func structuredFileChangedEffect(plan protocol.ActionPlan, execution protocol.ExecutionResult, records []protocol.EvidenceRecord) (*protocol.FileChangedV1, error) {
+	if execution.FileChange == nil {
+		return nil, nil
+	}
+	expectedDescriptor := edittool.BuiltinDescriptor()
+	expectedClassification := toolset.EditClassification()
+	if plan.Body.Tool != expectedDescriptor.Body.Identity || plan.Body.SourceRevision != expectedDescriptor.Body.SourceRevision || plan.Body.DescriptorDigest != expectedDescriptor.DescriptorDigest ||
+		plan.Body.Action != "edit" || plan.Body.Purpose != "mutate" || plan.Body.Effect != expectedClassification.Effect || plan.Body.ExecutionLocus != expectedClassification.ExecutionLoci[0] ||
+		plan.Body.Reversibility != expectedClassification.Reversibility || plan.Body.VerificationCoverage != expectedClassification.VerificationCoverage || plan.Body.RequestedProfile != expectedClassification.RequestedProfile || plan.Body.EffectiveProfile != expectedClassification.EffectiveProfile ||
+		plan.Body.Boundary != expectedClassification.Boundary {
+		return nil, fmt.Errorf("structured file change requires the canonical edit tool")
+	}
+	if err := canonicaljson.ValidateDigest(plan.Body, plan.Digest); err != nil {
+		return nil, fmt.Errorf("structured file change plan digest: %w", err)
+	}
+	change := protocol.DeepCopy(*execution.FileChange)
+	if change.CallID == "" || change.CallID != plan.Body.CallID || change.Subject.Kind != "file" || change.Subject.ID == "" || change.Subject.Validate() != nil || change.Before.Validate() != nil || change.After.Validate() != nil || len(plan.Body.Resources) != 1 {
+		return nil, fmt.Errorf("structured file change is incomplete or unbound")
+	}
+	resource := plan.Body.Resources[0]
+	create := len(resource.Attributes) == 1 && resource.Attributes[0] == (protocol.ResourceAttribute{Name: "create", Value: "true"})
+	const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if resource.Kind != "file" || resource.CanonicalID != change.Subject.ID ||
+		create && (resource.Digest != "" || resource.ParentID == "" || change.Before.Value != emptySHA256) ||
+		!create && (len(resource.Attributes) != 0 || resource.ParentID != "" || resource.Digest != change.Before.Value) {
+		return nil, fmt.Errorf("structured file change does not match the authorized resource")
+	}
+	change.EvidenceIDs = evidenceIDs(records)
+	return &change, nil
 }
 
 func (s *Service) prepareCheckpoint(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, label string, preview tooling.PreviewResult, plan protocol.ActionPlan, evidence []protocol.EvidenceRecord) (protocol.CheckpointBody, error) {
@@ -833,7 +959,7 @@ func (s *Service) prepareCheckpoint(ctx context.Context, request StartTurnReques
 		} else if putErr != nil {
 			return protocol.CheckpointBody{}, s.failCheckpoint(ctx, request, state, activityID, label, plan.Digest, putErr)
 		} else {
-			if err := validateRecoveryMaterialMetadata(material, protocol.WorkspaceID(request.SessionID), activityID, body, plan); err != nil {
+			if err := validateRecoveryMaterialMetadata(material, effectiveWorkspaceID(request.WorkspaceID, request.SessionID), activityID, body, plan); err != nil {
 				return protocol.CheckpointBody{}, s.failCheckpoint(ctx, request, state, activityID, label, plan.Digest, fmt.Errorf("recovery material binding mismatch"))
 			}
 			body.Coverage[0].RecoveryMaterialID = material.ID
@@ -924,7 +1050,7 @@ func (s *Service) abandonDriftRound(ctx context.Context, request StartTurnReques
 	return nil
 }
 
-func (s *Service) authorizeActivity(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, callID, label string, authorizationRequest protocol.AuthorizationRequest) (authorization.CommittedToken, error) {
+func (s *Service) authorizeActivity(ctx context.Context, lease managedOperationLease, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, callID, label string, authorizationRequest protocol.AuthorizationRequest) (authorization.CommittedToken, error) {
 	decision, err := s.deps.Authorization.Decide(ctx, authorizationRequest)
 	if err != nil {
 		return authorization.CommittedToken{}, err
@@ -933,9 +1059,12 @@ func (s *Service) authorizeActivity(ctx context.Context, request StartTurnReques
 		if s.deps.Approver == nil {
 			return authorization.CommittedToken{}, fmt.Errorf("interactive approver is required")
 		}
-		response, approveErr := s.deps.Approver.Approve(ctx, decision)
+		response, approveErr := s.awaitInteractiveApproval(ctx, lease, decision)
 		if approveErr != nil {
 			return authorization.CommittedToken{}, approveErr
+		}
+		if err := s.reconcileInteractiveApprovalJournal(ctx, request, state); err != nil {
+			return authorization.CommittedToken{}, err
 		}
 		decision, err = s.deps.Authorization.ResolveInteractive(ctx, authorizationRequest, decision, response)
 		if err != nil {
@@ -1031,7 +1160,43 @@ func (s *Service) authorizeActivity(ctx context.Context, request StartTurnReques
 	})
 }
 
-func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, state *turnState, assistant protocol.AssistantMessageV1, _ protocol.ProviderAttemptTerminalV1) (RunResult, error) {
+func (s *Service) awaitInteractiveApproval(ctx context.Context, lease managedOperationLease, decision protocol.AuthorizationDecision) (protocol.ApprovalResponse, error) {
+	if lease == nil {
+		return protocol.ApprovalResponse{}, fmt.Errorf("interactive approval requires an operation lease")
+	}
+	var response protocol.ApprovalResponse
+	err := lease.Yield(ctx, func(yielded context.Context) error {
+		var approveErr error
+		response, approveErr = s.deps.Approver.Approve(yielded, decision)
+		return approveErr
+	})
+	return response, err
+}
+
+func (s *Service) reconcileInteractiveApprovalJournal(ctx context.Context, request StartTurnRequest, state *turnState) error {
+	page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: state.ref, After: state.head, Limit: 3})
+	if err != nil {
+		return fmt.Errorf("read interactive approval journal suffix: %w", err)
+	}
+	if page.Head == state.head {
+		return nil
+	}
+	if page.More || page.Cursor != page.Head || len(page.Events) != 1 || page.Head.CommitSeq != state.head.CommitSeq+2 {
+		return fmt.Errorf("interactive approval journal drift b=%d c=%d h=%d n=%d more=%t", state.head.CommitSeq, page.Cursor.CommitSeq, page.Head.CommitSeq, len(page.Events), page.More)
+	}
+	event := page.Events[0].Envelope
+	if event.Kind != protocol.EventTrustedExecutionAcknowledged || event.SessionID != request.SessionID || event.RuntimeGenerationID != request.Runtime.ID || event.Actor == nil || *event.Actor != request.Command.Actor || event.Seq != state.head.CommitSeq+1 || event.TransactionID != page.Head.TransactionID {
+		return fmt.Errorf("interactive approval journal suffix has invalid trusted-shell provenance: kind=%q session=%q generation=%q actor=%+v seq=%d transaction=%q", event.Kind, event.SessionID, event.RuntimeGenerationID, event.Actor, event.Seq, event.TransactionID)
+	}
+	var acknowledged protocol.TrustedExecutionAcknowledgedV1
+	if err := json.Unmarshal(event.Payload, &acknowledged); err != nil || !acknowledged.Enabled || acknowledged.Profile != "unsandboxed" {
+		return fmt.Errorf("interactive approval journal suffix has invalid trusted-shell payload")
+	}
+	state.head = page.Head
+	return nil
+}
+
+func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, state *turnState, assistant protocol.AssistantMessageV1, terminal protocol.ProviderAttemptTerminalV1) (RunResult, error) {
 	verificationActivityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "verification"))
 	assessment, err := s.deps.Verification.Assess(ctx, verification.Request{
 		TaskID: state.taskID, OutcomeContractID: state.contractID, ContractVersion: 2,
@@ -1066,7 +1231,11 @@ func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, st
 	}
 
 	finalTransactionID := protocol.TransactionID(stableID("transaction", string(state.command.CommandID), "turn-terminal"))
-	finalCursor := protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + 4, TransactionID: finalTransactionID}
+	terminalEventCount := uint64(3)
+	if request.child != nil {
+		terminalEventCount++
+	}
+	finalCursor := protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + terminalEventCount + 1, TransactionID: finalTransactionID}
 	commandPayload, err := canonicaljson.Marshal(struct {
 		TaskID protocol.TaskID `json:"task_id"`
 		TurnID protocol.TurnID `json:"turn_id"`
@@ -1090,6 +1259,16 @@ func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, st
 		{protocol.EventTurnCompleted, protocol.TurnTerminalV1{Status: "completed", Reason: "provider completed"}},
 		{protocol.EventTaskStatusChanged, protocol.TaskStatusChangedV1{From: string(protocol.TaskRunning), To: string(protocol.TaskCompleted), Reason: "legacy turn terminal"}},
 		{protocol.EventCommandCompleted, protocol.CommandCompletedV1{CommandID: request.Command.CommandID, RequestDigest: request.Command.RequestDigest, Status: "completed", Result: rawResult}},
+	}
+	if request.child != nil {
+		receipt, receiptErr := s.projectChildReceipt(ctx, state, request.child.manifest, "succeeded", assistantSummary(assistant), protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + terminalEventCount, TransactionID: finalTransactionID}, terminal.Usage, nil)
+		if receiptErr != nil {
+			return RunResult{}, receiptErr
+		}
+		terminalEvents = append(terminalEvents, struct {
+			kind    string
+			payload any
+		}{protocol.EventSubagentReceipt, receipt})
 	}
 	events, err = s.turnEvents(*state, request.Runtime.ID, "turn-terminal", terminalEvents)
 	if err != nil {
@@ -1126,8 +1305,14 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 		turnKind, turnStatus = protocol.EventTurnInterrupted, "interrupted"
 		commandStatus, taskTo = "interrupted", string(protocol.TaskCancelled)
 		reason, code = "turn orchestration interrupted", "turn_interrupted"
-	} else if !state.taskRunning {
-		taskTo = string(protocol.TaskCancelled)
+	} else {
+		var providerFailure *providerFailureError
+		if errors.As(cause, &providerFailure) && providerFailure.code == "context_too_large" {
+			reason, code = "provider context is too large; compact or reduce the request", "context_too_large"
+		}
+		if !state.taskRunning {
+			taskTo = string(protocol.TaskCancelled)
+		}
 	}
 	activityStatus := "failed"
 	if denied != nil {
@@ -1141,6 +1326,9 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 	}
 	eventCount := 3
 	if state.activeActivityID != "" {
+		eventCount++
+	}
+	if request.child != nil {
 		eventCount++
 	}
 	transactionID := protocol.TransactionID(stableID("transaction", string(request.Command.CommandID), "turn-failure-terminal"))
@@ -1185,7 +1373,7 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 	if state.taskRunning {
 		from = string(protocol.TaskRunning)
 	}
-	turnEvents, err := s.turnEvents(*state, request.Runtime.ID, "turn-failure-terminal", []struct {
+	terminalValues := []struct {
 		kind    string
 		payload any
 	}{
@@ -1195,7 +1383,43 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 			CommandID: request.Command.CommandID, RequestDigest: request.Command.RequestDigest,
 			Status: commandStatus, Result: rawResult, Error: publicError,
 		}},
-	})
+	}
+	if request.child != nil {
+		receiptStatus := "failed"
+		unknownEffects := []protocol.ActivityID{}
+		if activityStatus == "uncertain" {
+			receiptStatus = "uncertain"
+			if state.activeActivityID != "" {
+				unknownEffects = append(unknownEffects, state.activeActivityID)
+			}
+		} else if turnStatus == "interrupted" {
+			receiptStatus = "cancelled"
+		}
+		receipt, receiptErr := s.projectChildReceipt(ctx, state, request.child.manifest, receiptStatus, reason, protocol.CommittedCursor{JournalKind: state.ref.Kind, JournalID: state.ref.ID, CommitSeq: state.head.CommitSeq + uint64(eventCount), TransactionID: transactionID}, unknownUsage(), publicError)
+		if receiptErr != nil {
+			return RunResult{}, receiptErr
+		}
+		if len(unknownEffects) != 0 {
+			receipt.Status = "uncertain"
+			seen := make(map[protocol.ActivityID]struct{}, len(receipt.UnknownEffects)+len(unknownEffects))
+			for _, activityID := range receipt.UnknownEffects {
+				seen[activityID] = struct{}{}
+			}
+			for _, activityID := range unknownEffects {
+				seen[activityID] = struct{}{}
+			}
+			receipt.UnknownEffects = receipt.UnknownEffects[:0]
+			for activityID := range seen {
+				receipt.UnknownEffects = append(receipt.UnknownEffects, activityID)
+			}
+			sort.Slice(receipt.UnknownEffects, func(i, j int) bool { return receipt.UnknownEffects[i] < receipt.UnknownEffects[j] })
+		}
+		terminalValues = append(terminalValues, struct {
+			kind    string
+			payload any
+		}{protocol.EventSubagentReceipt, receipt})
+	}
+	turnEvents, err := s.turnEvents(*state, request.Runtime.ID, "turn-failure-terminal", terminalValues)
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -1232,6 +1456,13 @@ func toolExposure(manifest protocol.RuntimeGenerationManifest) protocol.ToolExpo
 		exposure.Aliases = append(exposure.Aliases, protocol.ToolAliasBinding{Alias: alias, Identity: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest})
 	}
 	return exposure
+}
+
+func effectiveToolExposure(request StartTurnRequest) protocol.ToolExposure {
+	if request.child != nil {
+		return protocol.DeepCopy(request.child.exposure)
+	}
+	return toolExposure(request.Runtime)
 }
 
 func providerAuthorizationRequest(request StartTurnRequest, state *turnState, activityID protocol.ActivityID, callID string, modelRequest protocol.ModelRequest, contextPlanDigest protocol.Digest) (protocol.AuthorizationRequest, error) {
@@ -1391,6 +1622,9 @@ func (s *Service) collectProviderStream(ctx context.Context, generation protocol
 		case event, ok := <-stream:
 			if !ok {
 				if terminal.TerminalReason == "" {
+					if err := ctx.Err(); err != nil {
+						return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
+					}
 					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("provider stream closed without terminal")
 				}
 				if err := flushDelta(); err != nil {
@@ -1487,7 +1721,7 @@ func (s *Service) collectProviderStream(ctx context.Context, generation protocol
 				if sanitizeErr != nil {
 					return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, sanitizeErr
 				}
-				return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, fmt.Errorf("provider error %s: %s", code, messageText)
+				return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, &providerFailureError{code: code, message: messageText}
 			}
 		}
 	}
@@ -1585,6 +1819,10 @@ type turnState struct {
 	activeActivityID  protocol.ActivityID
 	activeStarted     bool
 	activeDispatched  bool
+	compactedSources  map[protocol.Digest]struct{}
+	subagentAttempts  int
+	subagentDepth     int
+	activeSubagent    bool
 }
 
 type authorizationDeniedError struct{ reason string }
@@ -1596,14 +1834,29 @@ func (e *authorizationDeniedError) Error() string {
 	return "authorization denied: " + e.reason
 }
 
+type providerFailureError struct {
+	code    string
+	message string
+}
+
+func (e *providerFailureError) Error() string {
+	return fmt.Sprintf("provider error %s: %s", e.code, e.message)
+}
+
 func newTurnState(request StartTurnRequest) turnState {
-	return turnState{
+	state := turnState{
 		ref:  protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(request.SessionID)},
 		head: request.ExpectedHead, command: request.Command,
-		taskID:     protocol.TaskID(stableID("task", string(request.Command.CommandID))),
-		turnID:     protocol.TurnID(stableID("turn", string(request.Command.CommandID))),
-		contractID: protocol.OutcomeContractID(stableID("contract", string(request.Command.CommandID))),
+		taskID:           protocol.TaskID(stableID("task", string(request.Command.CommandID))),
+		turnID:           protocol.TurnID(stableID("turn", string(request.Command.CommandID))),
+		contractID:       protocol.OutcomeContractID(stableID("contract", string(request.Command.CommandID))),
+		compactedSources: make(map[protocol.Digest]struct{}),
 	}
+	if request.child != nil {
+		state.taskID, state.turnID = request.child.manifest.ChildTaskID, request.child.manifest.ChildTurnID
+		state.subagentDepth = 1
+	}
+	return state
 }
 
 func (s *Service) initialTurnEvents(request StartTurnRequest, state turnState) ([]protocol.ProposedEvent, error) {
@@ -1689,10 +1942,19 @@ func eventID(commandID protocol.CommandID, label string, index int, kind string)
 }
 
 func (s *Service) append(ctx context.Context, state *turnState, label string, events []protocol.ProposedEvent) error {
-	if err := validateProposedEvents(events, state.ref); err != nil {
+	transactionID := protocol.TransactionID(stableID("transaction", string(state.command.CommandID), label))
+	validate := validateProposedEvents
+	for _, event := range events {
+		if event.Kind == protocol.EventContextCompacted || event.Kind == protocol.EventSubagentRequested || event.Kind == protocol.EventSubagentReceipt {
+			validate = func(events []protocol.ProposedEvent, ref protocol.JournalRef) error {
+				return validateProposedEventsAt(events, ref, state.head.CommitSeq+1, transactionID)
+			}
+			break
+		}
+	}
+	if err := validate(events, state.ref); err != nil {
 		return err
 	}
-	transactionID := protocol.TransactionID(stableID("transaction", string(state.command.CommandID), label))
 	result, err := s.appendBatch(ctx, journal.AppendRequest{
 		Journal: state.ref, ExpectedHead: state.head, TransactionID: transactionID, Events: events,
 	})
@@ -2505,6 +2767,11 @@ func validateControlRequest(request ControlRequest, recovery bool) error {
 		if err := validateProposedEvent(request.Event, request.Journal); err != nil {
 			return err
 		}
+		if request.Event.Kind == protocol.EventProjectSkillTrustChanged {
+			if err := validateProjectSkillTrustControl(request); err != nil {
+				return err
+			}
+		}
 	}
 	wantEvent := map[OperationKind]string{
 		OperationControl:          protocol.EventMigrationDiagnostic,
@@ -2512,8 +2779,24 @@ func validateControlRequest(request ControlRequest, recovery bool) error {
 		OperationRecovery:         protocol.EventRecoveryDiagnostic,
 		OperationReloadActivation: protocol.EventRuntimeGenerationActivated,
 	}[request.Kind]
-	if !settingControl && request.Event.Kind != wantEvent {
+	if !settingControl && request.Event.Kind != wantEvent && !(request.Kind == OperationControl && request.Event.Kind == protocol.EventProjectSkillTrustChanged) {
 		return fmt.Errorf("control kind %q requires event %q", request.Kind, wantEvent)
+	}
+	return nil
+}
+
+func validateProjectSkillTrustControl(request ControlRequest) error {
+	var trust protocol.ProjectSkillTrustChangedV1
+	if err := json.Unmarshal(request.Event.Payload, &trust); err != nil || trust.Validate() != nil || protocol.JournalID(trust.WorkspaceID) != request.Journal.ID {
+		return fmt.Errorf("project skill trust event binding is invalid")
+	}
+	body := request.Plan.Body
+	if body.Tool != (protocol.ToolIdentity{Source: "runtime", Authority: "yordam", Name: "skill-trust"}) || body.Action != "runtime.skill.trust" || body.Boundary != "workspace_control" || len(body.Resources) != 1 {
+		return fmt.Errorf("project skill trust action plan is invalid")
+	}
+	resource := body.Resources[0]
+	if resource.Kind != "skill_catalog" || resource.CanonicalID != string(trust.WorkspaceID) || resource.Digest != trust.CatalogDigest.Algorithm+":"+trust.CatalogDigest.Value || len(resource.Attributes) != 1 || resource.Attributes[0] != (protocol.ResourceAttribute{Name: "decision", Value: trust.Decision}) {
+		return fmt.Errorf("project skill trust target binding is invalid")
 	}
 	return nil
 }
@@ -2645,6 +2928,15 @@ func validateStartTurnRequest(request StartTurnRequest) error {
 		return fmt.Errorf("selected model %q/%q is not in runtime generation", request.ProviderID, request.ModelID)
 	}
 	return nil
+}
+
+func effectiveWorkspaceID(workspaceID protocol.WorkspaceID, sessionID protocol.SessionID) protocol.WorkspaceID {
+	if workspaceID != "" {
+		return workspaceID
+	}
+	// Legacy/internal callers created before workspace provenance was carried on
+	// orchestration requests remain replayable; production builders always bind it.
+	return protocol.WorkspaceID(sessionID)
 }
 
 func selectedRuntimeModel(request StartTurnRequest) (protocol.ModelDescriptor, bool) {

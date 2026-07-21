@@ -2,6 +2,8 @@ package permission_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -12,6 +14,8 @@ import (
 	"github.com/muratmirgun/yordam/internal/permission"
 	"github.com/muratmirgun/yordam/internal/ports"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	skilltool "github.com/muratmirgun/yordam/internal/tools/skill"
+	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 )
 
 func TestAuthorizationPolicyPrecedenceCrossProduct(t *testing.T) {
@@ -51,6 +55,87 @@ func TestAuthorizationPolicyPrecedenceCrossProduct(t *testing.T) {
 			}
 			if got.Action != test.want {
 				t.Fatalf("action=%s want=%s result=%#v", got.Action, test.want, got)
+			}
+		})
+	}
+}
+
+func TestPermissionAllowsOnlyCanonicalTrustedSubagentOrchestration(t *testing.T) {
+	descriptor := subagenttool.BuiltinDescriptor()
+	request := structuredRequest("subagent", descriptor.Body.Identity)
+	request.SourceRevision = descriptor.Body.SourceRevision
+	request.DescriptorDigest = descriptor.DescriptorDigest
+	request.Effect = descriptor.Body.Effect
+	request.ExecutionLocus = descriptor.Body.ExecutionLoci[0]
+	request.RequestedProfile = "configured"
+	request.EffectiveProfile = "configured"
+	request.Boundary = "runtime"
+	request.Reversibility = "not_applicable"
+	request.VerificationCoverage = "full"
+	request.Resources = nil
+	input := ports.EvaluationInput{Permission: ports.PermissionContext{SessionID: string(request.SessionID), Mode: domain.ModeSafe, Workspace: "/workspace"}, Request: request, Descriptor: descriptor}
+	decision, err := permission.NewSession(domain.ModeSafe).EvaluateAuthorization(context.Background(), input)
+	if err != nil || decision.Action != string(domain.PermissionAllow) {
+		t.Fatalf("decision=%#v err=%v", decision, err)
+	}
+	for name, mutate := range map[string]func(*ports.EvaluationInput){
+		"alias action": func(in *ports.EvaluationInput) { in.Request.Action = "other" },
+		"source":       func(in *ports.EvaluationInput) { in.Request.Source.Name = "other" },
+		"digest":       func(in *ports.EvaluationInput) { in.Request.DescriptorDigest = permissionDigest("0") },
+		"descriptor":   func(in *ports.EvaluationInput) { in.Descriptor.Body.Description = "forged" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			forged := protocol.DeepCopy(input)
+			mutate(&forged)
+			got, evaluateErr := permission.NewSession(domain.ModeSafe).EvaluateAuthorization(context.Background(), forged)
+			if evaluateErr != nil || got.Action != string(domain.PermissionDeny) {
+				t.Fatalf("decision=%#v err=%v", got, evaluateErr)
+			}
+		})
+	}
+}
+
+func TestPermissionAllowsOnlyExactCatalogBoundSkillResource(t *testing.T) {
+	descriptor := skilltool.BuiltinDescriptor()
+	request := structuredRequest("skill", descriptor.Body.Identity)
+	request.SourceRevision, request.DescriptorDigest = descriptor.Body.SourceRevision, descriptor.DescriptorDigest
+	request.Effect, request.ExecutionLocus, request.RequestedProfile, request.EffectiveProfile = "observation", "builtin", "restricted", "restricted"
+	request.Boundary, request.Reversibility, request.VerificationCoverage = "workspace", "not_applicable", "full"
+	request.Resources = []protocol.ResourceTarget{{Kind: "skill", CanonicalID: "go-testing", Digest: "sha256:" + strings.Repeat("a", 64), Attributes: []protocol.ResourceAttribute{{Name: "runtime_generation", Value: "generation-1"}, {Name: "source", Value: "global"}, {Name: "workspace_id", Value: ""}}}}
+	base := ports.EvaluationInput{Permission: ports.PermissionContext{SessionID: "session-1", Mode: domain.ModeAsk, Workspace: "/workspace"}, Request: request, Descriptor: descriptor}
+	for _, mode := range []domain.PermissionMode{domain.ModeSafe, domain.ModeAsk, domain.ModeAuto} {
+		input := protocol.DeepCopy(base)
+		input.Permission.Mode = mode
+		decision, err := permission.NewSession(mode).EvaluateAuthorization(context.Background(), input)
+		if err != nil || decision.Action != string(domain.PermissionAllow) {
+			t.Fatalf("mode=%s decision=%#v err=%v", mode, decision, err)
+		}
+	}
+	project := protocol.DeepCopy(base)
+	workspaceSum := sha256.Sum256([]byte(project.Permission.Workspace))
+	project.Request.Resources[0].Attributes[1].Value = "project"
+	project.Request.Resources[0].Attributes[2].Value = hex.EncodeToString(workspaceSum[:])
+	if decision, err := permission.NewSession(domain.ModeSafe).EvaluateAuthorization(context.Background(), project); err != nil || decision.Action != string(domain.PermissionAllow) {
+		t.Fatalf("project decision=%#v err=%v", decision, err)
+	}
+	for name, mutate := range map[string]func(*ports.EvaluationInput){
+		"parent":       func(in *ports.EvaluationInput) { in.Request.Resources[0].ParentID = "forged" },
+		"upper digest": func(in *ports.EvaluationInput) { in.Request.Resources[0].Digest = "sha256:" + strings.Repeat("A", 64) },
+		"source":       func(in *ports.EvaluationInput) { in.Request.Resources[0].Attributes[1].Value = "project" },
+		"workspace":    func(in *ports.EvaluationInput) { in.Request.Resources[0].Attributes[2].Value = "workspace" },
+		"generation":   func(in *ports.EvaluationInput) { in.Request.Resources[0].Attributes[0].Value = "other" },
+		"name":         func(in *ports.EvaluationInput) { in.Request.Resources[0].CanonicalID = "../go-testing" },
+		"mixed": func(in *ports.EvaluationInput) {
+			in.Request.Resources = append(in.Request.Resources, protocol.ResourceTarget{Kind: "file", CanonicalID: "/workspace/a"})
+		},
+		"descriptor": func(in *ports.EvaluationInput) { in.Descriptor.Body.Description = "forged" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := protocol.DeepCopy(base)
+			mutate(&input)
+			decision, err := permission.NewSession(domain.ModeAsk).EvaluateAuthorization(context.Background(), input)
+			if err == nil && decision.Action != string(domain.PermissionAsk) {
+				t.Fatalf("decision=%#v err=%v", decision, err)
 			}
 		})
 	}
@@ -340,14 +425,17 @@ func TestPermissionMatrix(t *testing.T) {
 		want     domain.PermissionAction
 	}{
 		{"safe read inside", domain.ModeSafe, "read", domain.MutationReadOnly, true, domain.PermissionAllow},
+		{"safe skill inside", domain.ModeSafe, "skill", domain.MutationReadOnly, true, domain.PermissionAllow},
 		{"safe read outside", domain.ModeSafe, "read", domain.MutationReadOnly, false, domain.PermissionDeny},
 		{"safe edit", domain.ModeSafe, "edit", domain.MutationFile, true, domain.PermissionDeny},
 		{"safe shell", domain.ModeSafe, "shell", domain.MutationProcess, true, domain.PermissionDeny},
 		{"ask read inside", domain.ModeAsk, "read", domain.MutationReadOnly, true, domain.PermissionAllow},
+		{"ask skill inside", domain.ModeAsk, "skill", domain.MutationReadOnly, true, domain.PermissionAllow},
 		{"ask read outside", domain.ModeAsk, "read", domain.MutationReadOnly, false, domain.PermissionAsk},
 		{"ask edit", domain.ModeAsk, "edit", domain.MutationFile, true, domain.PermissionAsk},
 		{"ask shell", domain.ModeAsk, "shell", domain.MutationProcess, true, domain.PermissionAsk},
 		{"auto read inside", domain.ModeAuto, "read", domain.MutationReadOnly, true, domain.PermissionAllow},
+		{"auto skill inside", domain.ModeAuto, "skill", domain.MutationReadOnly, true, domain.PermissionAllow},
 		{"auto edit inside", domain.ModeAuto, "edit", domain.MutationFile, true, domain.PermissionAllow},
 		{"auto edit outside", domain.ModeAuto, "edit", domain.MutationFile, false, domain.PermissionAsk},
 		{"auto shell unacknowledged", domain.ModeAuto, "shell", domain.MutationProcess, true, domain.PermissionAsk},
@@ -365,7 +453,7 @@ func TestPermissionMatrix(t *testing.T) {
 
 func prepared(name, scope string, inside bool) domain.PreparedToolRequest {
 	mutation := domain.MutationProcess
-	if name == "read" || name == "search" {
+	if name == "read" || name == "search" || name == "skill" {
 		mutation = domain.MutationReadOnly
 	} else if name == "edit" {
 		mutation = domain.MutationFile

@@ -23,12 +23,13 @@ func acceptFoundationArchitecture(t *testing.T) {
 	fset := token.NewFileSet()
 
 	journalCallAllowlist := map[string]bool{
-		filepath.Join("internal", "orchestrator", "service.go"): true,
+		filepath.Join("internal", "orchestrator"): true,
 	}
 	storageImplementationAllowlist := map[string]bool{
 		filepath.Join("internal", "session", "jsonl"): true,
 	}
 	dispatchCallAllowlist := map[string]bool{
+		filepath.Join("internal", "orchestrator", "compaction.go"):         true,
 		filepath.Join("internal", "orchestrator", "service.go"):            true,
 		filepath.Join("internal", "provider", "openaicompat", "router.go"): true,
 		filepath.Join("internal", "tooling", "service.go"):                 true,
@@ -49,6 +50,13 @@ func acceptFoundationArchitecture(t *testing.T) {
 		file, err := parser.ParseFile(fset, path, nil, parser.AllErrors)
 		if err != nil {
 			return err
+		}
+		if !underAllowedDirectory(rel, map[string]bool{filepath.Join("internal", "testsupport"): true}) {
+			for _, imported := range file.Imports {
+				if strings.Contains(strings.Trim(imported.Path.Value, `"`), "/internal/testsupport/") {
+					t.Errorf("[%s] production source imports test support at %s:%d", traceArchitecture, rel, fset.Position(imported.Pos()).Line)
+				}
+			}
 		}
 		for _, declaration := range file.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
@@ -85,7 +93,7 @@ func acceptFoundationArchitecture(t *testing.T) {
 			switch selector.Sel.Name {
 			case "AppendBatch":
 				appendCalls++
-				if !journalCallAllowlist[rel] {
+				if !underAllowedDirectory(rel, journalCallAllowlist) {
 					t.Errorf("[%s] turn-journal AppendBatch call outside orchestrator at %s:%d", traceArchitecture, rel, fset.Position(call.Pos()).Line)
 				}
 			case "EncodeProposed":
@@ -123,6 +131,10 @@ func acceptFoundationArchitecture(t *testing.T) {
 	runFoundationGoTest(t, traceArchitecture, "./internal/app", `^TestRuntimeCompositionUsesOnlyOrchestratedRunner$`)
 	runFoundationGoTest(t, traceArchitecture, "./internal/orchestrator", `^Test(DurableOrderingMutationPreviewCheckpointRevalidationExecutionAndContinuation|RunControlConsequentialEventCommitsInsideDispatchCallback|OperationLaneSerializesTurnsAndControlsAcrossSessions)$`)
 	t.Logf("trace=%s parser_append_calls=%d parser_storage_calls=%d parser_dispatch_calls=%d status=pass", traceArchitecture, appendCalls, storageCalls, dispatchCalls)
+}
+
+func TestFoundationArchitectureBoundaries(t *testing.T) {
+	acceptFoundationArchitecture(t)
 }
 
 func assertProductionDependenciesExcludeTestSupport(t *testing.T, root string) {

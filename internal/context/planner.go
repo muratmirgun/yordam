@@ -1,12 +1,15 @@
 package context
 
 import (
+	"bytes"
 	stdcontext "context"
 	"encoding/json"
 	"fmt"
 
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
 	"github.com/muratmirgun/yordam/internal/protocol"
+	"github.com/muratmirgun/yordam/internal/tooling"
+	subagenttool "github.com/muratmirgun/yordam/internal/tools/subagent"
 )
 
 const (
@@ -34,10 +37,36 @@ type Request struct {
 
 type boundedPlanner struct {
 	toolExposureRevision string
+	summaries            SummaryResolver
 }
 
-func NewPlanner(toolExposureRevision string) Planner {
-	return &boundedPlanner{toolExposureRevision: toolExposureRevision}
+func NewPlanner(toolExposureRevision string, summaries SummaryResolver) Planner {
+	return &boundedPlanner{toolExposureRevision: toolExposureRevision, summaries: summaries}
+}
+
+// NewPlannerForExposure binds a context plan to a validated immutable tool
+// exposure rather than a caller-provided revision string.
+func NewPlannerForExposure(exposure protocol.ToolExposure, summaries SummaryResolver) (Planner, error) {
+	if err := exposure.Validate(); err != nil {
+		return nil, fmt.Errorf("tool exposure: %w", err)
+	}
+	return NewPlanner(exposure.CatalogRevision, summaries), nil
+}
+
+// NewChildPlanner refuses the exact canonical orchestration descriptor. This
+// uses the trusted identity/digest binding, not an alias string, so a child can
+// never be handed the real subagent schema through a renamed alias.
+func NewChildPlanner(parent, child protocol.ToolExposure, summaries SummaryResolver) (Planner, error) {
+	if err := tooling.ValidateDerivedExposure(parent, child); err != nil {
+		return nil, fmt.Errorf("child tool exposure: %w", err)
+	}
+	expected := subagenttool.BuiltinDescriptor()
+	for _, binding := range child.Aliases {
+		if binding.Identity == expected.Body.Identity && binding.SourceRevision == expected.Body.SourceRevision && binding.DescriptorDigest == expected.DescriptorDigest {
+			return nil, fmt.Errorf("child tool exposure includes orchestrated subagent")
+		}
+	}
+	return NewPlanner(child.CatalogRevision, summaries), nil
 }
 
 func (p *boundedPlanner) Plan(ctx stdcontext.Context, request Request) (protocol.ContextPlan, error) {
@@ -61,7 +90,7 @@ func (p *boundedPlanner) Plan(ctx stdcontext.Context, request Request) (protocol
 	}
 
 	sources := protocol.DeepCopy(request.SystemInstructions)
-	eventSources, compacted, compactionRevision, err := adaptEvents(request.Events)
+	eventSources, compacted, compactionRevision, err := adaptEvents(ctx, request.Session, p.summaries, request.Events)
 	if err != nil {
 		return protocol.ContextPlan{}, err
 	}
@@ -124,20 +153,29 @@ type legacyCompactionPayload struct {
 	Summary    string `json:"summary"`
 }
 
-func adaptEvents(events []protocol.EventRecord) ([]protocol.ContentSource, []protocol.ExcludedContentSource, string, error) {
-	compactionIndex := -1
-	through := uint64(0)
-	compactionRevision := defaultCompactionRevision
-	var summary string
+func adaptEvents(ctx stdcontext.Context, session protocol.SessionID, summaries SummaryResolver, events []protocol.EventRecord) ([]protocol.ContentSource, []protocol.ExcludedContentSource, string, error) {
+	type compaction struct {
+		index         int
+		from          uint64
+		through       uint64
+		fromCursor    protocol.CommittedCursor
+		throughCursor protocol.CommittedCursor
+		revision      string
+		summary       string
+		evidence      protocol.EvidenceID
+		legacy        bool
+	}
+	candidates := make([]compaction, 0)
 	for index, event := range events {
 		if event.Envelope.Kind != protocol.EventContextCompacted {
 			continue
 		}
 		if event.Legacy == nil {
-			if decoded, ok := contextCompaction(event); ok && decoded.Revision != "" {
-				compactionIndex, through, summary = -1, 0, ""
-				compactionRevision = decoded.Revision
+			decoded, ok := contextCompaction(event)
+			if !ok || !validNativeCompaction(event, session, decoded) {
+				continue
 			}
+			candidates = append(candidates, compaction{index: index, from: decoded.From.CommitSeq, through: decoded.Through.CommitSeq, fromCursor: decoded.From, throughCursor: decoded.Through, revision: decoded.Revision, evidence: decoded.SummaryEvidenceID})
 			continue
 		}
 		var payload legacyCompactionPayload
@@ -148,18 +186,36 @@ func adaptEvents(events []protocol.EventRecord) ([]protocol.ContentSource, []pro
 		if decoded, ok := contextCompaction(event); ok && decoded.Revision != "" {
 			candidateRevision = decoded.Revision
 		}
-		compactionIndex, through, summary = index, payload.ThroughSeq, payload.Summary
-		compactionRevision = candidateRevision
+		candidates = append(candidates, compaction{index: index, from: payload.FromSeq, through: payload.ThroughSeq, revision: candidateRevision, summary: payload.Summary, legacy: true})
 	}
+	for index := len(candidates) - 1; index >= 0; index-- {
+		selected := candidates[index]
+		if selected.legacy {
+			summarySource, err := contentSource(string(events[selected.index].Envelope.EventID)+":summary", "compaction_summary", "legacy_context_compaction", []protocol.ContentBlock{{Kind: protocol.ContentText, Text: selected.summary}})
+			if err != nil {
+				return nil, nil, "", err
+			}
+			return adaptEventSuffix(events, selected.index, selected.from, selected.through, selected.revision, summarySource)
+		}
+		verified, ok := summaries.(VerifiedSummaryResolver)
+		if !ok {
+			continue
+		}
+		resolved, err := verified.ResolveVerifiedCompactionSummary(ctx, protocol.ContextCompactionReference{SessionID: session, From: selected.fromCursor, Through: selected.throughCursor, SummaryEvidenceID: selected.evidence, Revision: selected.revision})
+		if err != nil || !validSummarySource(resolved, selected.evidence) {
+			continue
+		}
+		return adaptEventSuffix(events, selected.index, selected.from, selected.through, selected.revision, resolved)
+	}
+	return adaptEventSuffix(events, -1, 0, 0, defaultCompactionRevision, protocol.ContentSource{})
+}
+
+func adaptEventSuffix(events []protocol.EventRecord, compactionIndex int, from, through uint64, compactionRevision string, summary protocol.ContentSource) ([]protocol.ContentSource, []protocol.ExcludedContentSource, string, error) {
 	sources := make([]protocol.ContentSource, 0, len(events)+1)
 	excluded := make([]protocol.ExcludedContentSource, 0)
 	for index, event := range events {
 		if index == compactionIndex {
-			source, err := contentSource(string(event.Envelope.EventID)+":summary", "compaction_summary", "legacy_context_compaction", []protocol.ContentBlock{{Kind: protocol.ContentText, Text: summary}})
-			if err != nil {
-				return nil, nil, "", err
-			}
-			sources = append(sources, source)
+			sources = append(sources, protocol.DeepCopy(summary))
 			continue
 		}
 		var blocks []protocol.ContentBlock
@@ -176,11 +232,12 @@ func adaptEvents(events []protocol.EventRecord) ([]protocol.ContentSource, []pro
 			if !ok {
 				continue
 			}
-			kind, blocks = "assistant_message", protocol.DeepCopy(assistant.Blocks)
-			for _, intent := range assistant.ToolIntents {
-				intentCopy := protocol.DeepCopy(intent)
-				blocks = append(blocks, protocol.ContentBlock{Kind: protocol.ContentToolUse, ToolUse: &intentCopy})
+			var blockErr error
+			blocks, blockErr = canonicalAssistantBlocks(assistant)
+			if blockErr != nil {
+				return nil, nil, "", fmt.Errorf("assistant event %q: %w", event.Envelope.EventID, blockErr)
 			}
+			kind = "assistant_message"
 			if len(blocks) == 0 {
 				continue
 			}
@@ -191,13 +248,69 @@ func adaptEvents(events []protocol.EventRecord) ([]protocol.ContentSource, []pro
 		if err != nil {
 			return nil, nil, "", err
 		}
-		if compactionIndex >= 0 && event.Envelope.Seq <= through {
+		if compactionIndex >= 0 && event.Envelope.Seq >= from && event.Envelope.Seq <= through {
 			excluded = append(excluded, protocol.ExcludedContentSource{ID: source.ID, Reason: ExcludedCompacted, Digest: source.Digest})
 			continue
 		}
 		sources = append(sources, source)
 	}
 	return sources, excluded, compactionRevision, nil
+}
+
+func canonicalAssistantBlocks(assistant protocol.AssistantMessageV1) ([]protocol.ContentBlock, error) {
+	type occurrence struct {
+		intent protocol.ToolUseBlock
+		modern bool
+		legacy bool
+	}
+	blocks := protocol.DeepCopy(assistant.Blocks)
+	seen := make(map[string]occurrence)
+	for _, block := range blocks {
+		if block.Kind != protocol.ContentToolUse {
+			continue
+		}
+		if block.ToolUse == nil || block.ToolUse.CallID == "" {
+			return nil, fmt.Errorf("invalid modern tool intent")
+		}
+		if _, duplicate := seen[block.ToolUse.CallID]; duplicate {
+			return nil, fmt.Errorf("duplicate modern tool intent %q", block.ToolUse.CallID)
+		}
+		seen[block.ToolUse.CallID] = occurrence{intent: protocol.DeepCopy(*block.ToolUse), modern: true}
+	}
+	for _, intent := range assistant.ToolIntents {
+		if intent.CallID == "" {
+			return nil, fmt.Errorf("invalid legacy tool intent")
+		}
+		if existing, found := seen[intent.CallID]; found {
+			if existing.legacy {
+				return nil, fmt.Errorf("duplicate legacy tool intent %q", intent.CallID)
+			}
+			if existing.intent.Alias != intent.Alias || !bytes.Equal(existing.intent.Arguments, intent.Arguments) {
+				return nil, fmt.Errorf("conflicting tool intent %q", intent.CallID)
+			}
+			existing.legacy = true
+			seen[intent.CallID] = existing
+			continue
+		}
+		intentCopy := protocol.DeepCopy(intent)
+		blocks = append(blocks, protocol.ContentBlock{Kind: protocol.ContentToolUse, ToolUse: &intentCopy})
+		seen[intent.CallID] = occurrence{intent: intentCopy, legacy: true}
+	}
+	return blocks, nil
+}
+
+func validNativeCompaction(event protocol.EventRecord, session protocol.SessionID, payload protocol.ContextCompactedV1) bool {
+	if payload.Validate() != nil || event.Envelope.JournalKind != protocol.JournalSession || event.Envelope.SessionID != session || event.Envelope.JournalID != protocol.JournalID(session) || payload.From.JournalID != event.Envelope.JournalID || payload.Through.JournalID != event.Envelope.JournalID || payload.Through.CommitSeq >= event.Envelope.Seq {
+		return false
+	}
+	return true
+}
+
+func validSummarySource(source protocol.ContentSource, evidenceID protocol.EvidenceID) bool {
+	if source.ID != string(evidenceID) || source.Kind != "compaction_summary" || source.Scope != "session" || source.Provenance != "evidence:"+string(evidenceID) || len(source.Content) != 1 || source.Content[0].Kind != protocol.ContentText || source.Validate() != nil {
+		return false
+	}
+	return len(source.Content[0].Text) <= MaxCompactionSummaryBytes
 }
 
 func contextCompaction(event protocol.EventRecord) (protocol.ContextCompactedV1, bool) {

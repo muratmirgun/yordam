@@ -125,6 +125,35 @@ func (s *Service) PlanPreviewInspection(ctx context.Context, request PlanRequest
 	return s.plan(ctx, request, "observation")
 }
 
+// PlanOrchestratedAuthorization builds a dispatch-free orchestration plan for a
+// catalog-bound OrchestratedTool. It is intentionally separate from the
+// ordinary preview seam: no resource is inspected and the returned handle is
+// never executable by the tool dispatcher. The exact canonical descriptor and
+// marker are checked before the authorization plan can be created.
+func (s *Service) PlanOrchestratedAuthorization(ctx context.Context, request PlanRequest, expectedKind string) (ActionHandle, protocol.ActionPlan, error) {
+	if expectedKind == "" {
+		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("orchestrated kind is required")
+	}
+	entry, ok := s.catalog.byAlias[request.Alias]
+	if !ok {
+		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("unknown tool alias %q", request.Alias)
+	}
+	kind, ok := s.catalog.OrchestratedKind(request.Alias, entry.descriptor)
+	if !ok || kind != expectedKind || entry.classification.Effect != "orchestration" {
+		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("tool alias %q is not exact orchestrated kind %q", request.Alias, expectedKind)
+	}
+	handle, plan, err := s.plan(ctx, request, "orchestration")
+	if err != nil {
+		return ActionHandle{}, protocol.ActionPlan{}, err
+	}
+	// The orchestrator owns execution. Remove the temporary planned action so
+	// no token can ever dispatch the marker through ordinary tool execution.
+	s.mu.Lock()
+	delete(s.actions, handle.id)
+	s.mu.Unlock()
+	return ActionHandle{}, plan, nil
+}
+
 func (s *Service) PlanMutation(_ context.Context, preview PreviewResult, request PlanRequest) (ActionHandle, protocol.ActionPlan, error) {
 	if preview.handleID == "" || preview.observationDigest.IsZero() || preview.requestDigest.IsZero() || preview.preparedDigest.IsZero() || preview.effect == "" {
 		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("preview result is invalid")
@@ -229,7 +258,7 @@ func (s *Service) plan(ctx context.Context, request PlanRequest, requiredEffect 
 		return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("tool alias %q returned nil plan", request.Alias)
 	}
 	if previewOnly {
-		if _, ok := prepared.(ports.PreviewPreparer); !ok {
+		if _, previewCapable := prepared.(ports.PreviewPreparer); !previewCapable {
 			return ActionHandle{}, protocol.ActionPlan{}, fmt.Errorf("tool alias %q has effect %q, want %q (no observation preview seam)", request.Alias, entry.classification.Effect, requiredEffect)
 		}
 	}
@@ -547,7 +576,22 @@ func actionBinding(handleID string, action *plannedAction) authorization.Dispatc
 }
 
 func executionResult(result domain.ToolResult) protocol.ExecutionResult {
-	return protocol.ExecutionResult{Outcome: protocol.ActivityOutcomeV1{Status: string(result.Status), Reason: string(result.ErrorKind)}, ToolResult: protocol.ToolResultBlock{CallID: result.CallID, Status: string(result.Status), Text: result.Content}}
+	status := string(result.Status)
+	if result.FileChange != nil && result.Status != domain.ToolSucceeded {
+		status = "uncertain"
+	}
+	execution := protocol.ExecutionResult{Outcome: protocol.ActivityOutcomeV1{Status: status, Reason: string(result.ErrorKind)}, ToolResult: protocol.ToolResultBlock{CallID: result.CallID, Status: status, Text: result.Content}, Presentation: protocol.ToolResultPresentation{Content: result.Content, DurationNanos: int64(result.Duration), Truncated: result.Truncated}}
+	if result.FileChange != nil {
+		before := result.FileChange.BeforeSHA256
+		if before == "" {
+			before = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+		}
+		execution.FileChange = &protocol.FileChangedV1{
+			CallID: result.FileChange.CallID, Subject: protocol.SubjectRef{Kind: "file", ID: result.FileChange.Path},
+			Before: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: before}, After: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: result.FileChange.AfterSHA256}, EvidenceIDs: []protocol.EvidenceID{},
+		}
+	}
+	return execution
 }
 
 func previewEvidence(action *plannedAction, content string) (protocol.EvidenceCandidate, protocol.Digest, error) {

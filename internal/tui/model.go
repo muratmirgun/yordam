@@ -5,6 +5,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/tui/components"
 )
 
@@ -16,6 +17,7 @@ const (
 	ScreenHelp         Screen = "help"
 	ScreenMode         Screen = "mode"
 	ScreenModel        Screen = "model"
+	ScreenSkills       Screen = "skills"
 )
 
 type Layout string
@@ -61,6 +63,7 @@ type Options struct {
 	CanonicalWorkspace string
 	Sessions           []domain.SessionSummary
 	Models             []domain.ModelSelection
+	Skills             app.SkillSnapshot
 }
 
 type Model struct {
@@ -89,14 +92,19 @@ type Model struct {
 	pendingDraftID     uint64
 	nextDraftID        uint64
 
-	conversation components.Conversation
-	composer     components.Composer
-	context      components.Context
-	permission   components.Permission
-	sessions     components.Sessions
-	palette      components.Palette
-	spinner      spinner.Model
-	models       []domain.ModelSelection
+	conversation    components.Conversation
+	composer        components.Composer
+	context         components.Context
+	permission      components.Permission
+	sessions        components.Sessions
+	palette         components.Palette
+	spinner         spinner.Model
+	models          []domain.ModelSelection
+	skillSnapshot   app.SkillSnapshot
+	displayedSkills app.SkillSnapshot
+	skills          components.Skills
+	childCards      components.ChildCards
+	lineage         protocol.SubagentLineageV1
 }
 
 type appEventMsg struct {
@@ -143,8 +151,11 @@ func NewModel(options Options) Model {
 		palette:            components.NewPalette(),
 		spinner:            spinner.New(spinner.WithSpinner(spinner.MiniDot)),
 		models:             append([]domain.ModelSelection(nil), options.Models...),
+		skillSnapshot:      options.Skills.Clone(),
 		nextDraftID:        1,
+		childCards:         components.NewChildCards(nil),
 	}
+	model.skills = components.NewSkills(skillScreenOptions(model.skillSnapshot, false, false))
 	for index, configured := range model.models {
 		if configured == options.Selection {
 			model.modelCursor = index

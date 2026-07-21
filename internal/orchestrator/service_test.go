@@ -14,12 +14,15 @@ import (
 
 	"github.com/muratmirgun/yordam/internal/authorization"
 	"github.com/muratmirgun/yordam/internal/canonicaljson"
+	"github.com/muratmirgun/yordam/internal/compaction"
 	contextplanner "github.com/muratmirgun/yordam/internal/context"
 	"github.com/muratmirgun/yordam/internal/eventcodec"
 	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
 	"github.com/muratmirgun/yordam/internal/provider"
 	"github.com/muratmirgun/yordam/internal/tooling"
+	toolset "github.com/muratmirgun/yordam/internal/tools"
+	edittool "github.com/muratmirgun/yordam/internal/tools/edit"
 	"github.com/muratmirgun/yordam/internal/verification"
 )
 
@@ -68,6 +71,224 @@ func TestRunTurnProviderLifecycleUsesDurableAuthorizationAndTerminalBarriers(t *
 	if !slices.Equal(got, wantPrefix) {
 		t.Fatalf("order:\n got=%v\nwant=%v", got, wantPrefix)
 	}
+}
+
+func TestCollectProviderStreamPreservesCancellationWhenProviderCloses(t *testing.T) {
+	service := &Service{}
+	for attempt := 0; attempt < 100; attempt++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		stream := make(chan protocol.ModelEvent)
+		cancel()
+		close(stream)
+		_, _, err := service.collectProviderStream(ctx, "generation", stream)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("attempt=%d error=%v want=%v", attempt, err, context.Canceled)
+		}
+	}
+}
+
+func TestAutomaticCompactionPolicyThresholds(t *testing.T) {
+	knownWindow := protocol.ValueInt64{State: protocol.ValueKnown, Value: 10_000, Provenance: "test-window"}
+	zero := protocol.ValueInt64{State: protocol.ValueKnown, Value: 0, Provenance: "test-reserve"}
+	cases := []struct {
+		name            string
+		estimated       protocol.ValueInt64
+		window          protocol.ValueInt64
+		auto            bool
+		reserve         protocol.ValueInt64
+		wantCompactions int
+		wantErr         bool
+	}{
+		{name: "threshold equality", estimated: protocol.ValueInt64{State: protocol.ValueKnown, Value: 7_952, Provenance: "test-estimate"}, window: knownWindow, auto: true, wantCompactions: 1},
+		{name: "below threshold", estimated: protocol.ValueInt64{State: protocol.ValueKnown, Value: 7_951, Provenance: "test-estimate"}, window: knownWindow, auto: true, wantCompactions: 0},
+		{name: "disabled", estimated: protocol.ValueInt64{State: protocol.ValueKnown, Value: 9_000, Provenance: "test-estimate"}, window: knownWindow, auto: false, wantCompactions: 0},
+		{name: "unknown window", estimated: protocol.ValueInt64{State: protocol.ValueKnown, Value: 9_000, Provenance: "test-estimate"}, window: protocol.ValueInt64{State: protocol.ValueUnknown}, auto: true, wantCompactions: 0},
+		{name: "invalid budget", estimated: protocol.ValueInt64{State: protocol.ValueKnown, Value: 9_000, Provenance: "test-estimate"}, window: knownWindow, auto: true, reserve: zero, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			request := validStartTurnRequest()
+			request.ExpectedHead = protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), CommitSeq: 7, TransactionID: "tx-initial"}
+			request.Runtime = validRuntimeManifest(t, "observation")
+			request.Runtime.Body.Models[0].ContextWindow = tc.window
+			request.Runtime.Body.Limits.AutoCompact = tc.auto
+			request.Runtime.Body.Limits.CompactReserveTokens = tc.reserve
+			refreshRuntimeDigest(t, &request.Runtime)
+
+			log := &recordLog{}
+			repository := newAutomaticCompactionRepository(t, log)
+			planner := &automaticCompactionPlanner{estimated: tc.estimated, window: tc.window}
+			provider := &automaticCompactionProvider{log: log}
+			service, err := NewService(Dependencies{
+				Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: &loggingLane{delegate: NewOperationLane(), log: log},
+				Repository: repository, TurnLeases: &recordingTurnLeaseManager{log: log}, Context: planner,
+				Providers: fakeProviderCatalog{log: log}, Provider: provider, Authorization: &allowingAuthorization{log: log},
+				Tools: noToolService{}, Evidence: &compactionEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = service.RunTurn(context.Background(), request)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("RunTurn accepted an invalid automatic compaction budget")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := provider.compactions.Load(); int(got) != tc.wantCompactions {
+				t.Fatalf("compaction requests=%d want=%d", got, tc.wantCompactions)
+			}
+			if tc.wantCompactions == 1 {
+				if planner.calls.Load() != 2 {
+					t.Fatalf("context plan calls=%d want rebuild after compaction", planner.calls.Load())
+				}
+				if got := provider.normalPlanDigest(); got != planner.secondDigest() {
+					t.Fatalf("normal provider context digest=%s want rebuilt=%s", got.Value, planner.secondDigest().Value)
+				}
+				if got := countPrefix(log.snapshot(), "lane.acquire("); got != 1 {
+					t.Fatalf("lane acquires=%d want only the owning turn lane", got)
+				}
+			}
+		})
+	}
+}
+
+func TestAutomaticCompactionFailuresAreTerminalAndNeverRetry(t *testing.T) {
+	cases := []struct {
+		name       string
+		mode       string
+		evidence   EvidenceRecorder
+		wantNormal int
+	}{
+		{name: "provider prepare failure", mode: "compact_prepare", evidence: &compactionEvidence{}},
+		{name: "provider request uncertain", mode: "compact_stream", evidence: &compactionEvidence{}},
+		{name: "cancellation", mode: "cancel", evidence: &compactionEvidence{}},
+		{name: "evidence failure", mode: "success", evidence: failingEvidenceRecorder{}},
+		{name: "normal context too large", mode: "normal_context_too_large", evidence: &compactionEvidence{}, wantNormal: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			request := automaticCompactionRequest(t)
+			log := &recordLog{}
+			repository := newAutomaticCompactionRepository(t, log)
+			provider := &automaticFailureProvider{mode: tc.mode, log: log}
+			service, err := NewService(Dependencies{
+				Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: &loggingLane{delegate: NewOperationLane(), log: log},
+				Repository: repository, TurnLeases: &recordingTurnLeaseManager{log: log}, Context: &automaticCompactionPlanner{estimated: request.Runtime.Body.Models[0].MaximumOutput, window: request.Runtime.Body.Models[0].ContextWindow},
+				Providers: fakeProviderCatalog{log: log}, Provider: provider, Authorization: &allowingAuthorization{log: log},
+				Tools: noToolService{}, Evidence: tc.evidence, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			if tc.mode == "cancel" {
+				ctx, provider.cancel = context.WithCancel(ctx)
+			}
+			result, err := service.RunTurn(ctx, request)
+			if err == nil {
+				t.Fatal("RunTurn unexpectedly succeeded")
+			}
+			if provider.compactPrepares.Load() != 1 || provider.normalPrepares.Load() != int64(tc.wantNormal) {
+				t.Fatalf("compact=%d normal=%d want compact=1 normal=%d", provider.compactPrepares.Load(), provider.normalPrepares.Load(), tc.wantNormal)
+			}
+			if result.CommandResult.Status == "" || !hasProposedEvent(repository.appendRequests(), protocol.EventCommandCompleted) {
+				t.Fatalf("failure was not durably terminalized: result=%+v", result)
+			}
+			if tc.mode == "normal_context_too_large" && (result.CommandResult.Error == nil || result.CommandResult.Error.Code != "context_too_large") {
+				t.Fatalf("context failure is not actionable: result=%+v", result)
+			}
+		})
+	}
+}
+
+func TestAutomaticCompactionRebuildsOnceBeforeLaterToolContinuation(t *testing.T) {
+	request := automaticCompactionRequest(t)
+	log := &recordLog{}
+	repository := newAutomaticCompactionRepository(t, log)
+	planner := &automaticCompactionPlanner{
+		estimated: request.Runtime.Body.Models[0].MaximumOutput, window: request.Runtime.Body.Models[0].ContextWindow,
+		estimates: []protocol.ValueInt64{
+			request.Runtime.Body.Models[0].MaximumOutput,
+			request.Runtime.Body.Models[0].MaximumOutput,
+			{State: protocol.ValueKnown, Value: 7_951, Provenance: "test-estimate"},
+		},
+	}
+	provider := &automaticLoopProvider{}
+	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: &loggingLane{delegate: NewOperationLane(), log: log},
+		Repository: repository, TurnLeases: &recordingTurnLeaseManager{log: log}, Context: planner,
+		Providers: fakeProviderCatalog{log: log}, Provider: provider, Authorization: &allowingAuthorization{log: log},
+		Tools: observationToolService{log: log}, Evidence: &compactionEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if provider.compactions.Load() != 1 || provider.normals.Load() != 2 {
+		t.Fatalf("compactions=%d normal attempts=%d", provider.compactions.Load(), provider.normals.Load())
+	}
+	if planner.calls.Load() != 3 {
+		t.Fatalf("context plan calls=%d want initial, rebuilt, and post-tool", planner.calls.Load())
+	}
+	if got := countPrefix(log.snapshot(), "lane.acquire("); got != 1 {
+		t.Fatalf("lane acquires=%d want one turn lane", got)
+	}
+}
+
+func TestAutomaticCompactionDeduplicatesAnUnchangedSourceDigest(t *testing.T) {
+	request := automaticCompactionRequest(t)
+	repository := newAutomaticCompactionRepository(t, &recordLog{})
+	history, err := repository.ReadRange(context.Background(), journal.ReadRangeRequest{Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(request.SessionID)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection, err := compaction.Select(history.Events, request.ExpectedHead, compaction.TriggerAutomatic, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &automaticCompactionProvider{}
+	service, err := NewService(Dependencies{Repository: repository, Lane: NewOperationLane(), Providers: fakeProviderCatalog{log: &recordLog{}}, Provider: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := newTurnState(request)
+	state.head = request.ExpectedHead
+	state.compactedSources[selection.SourceDigest] = struct{}{}
+	compacted, err := service.compactWithinTurn(context.Background(), nil, request, &state, state.head, history.Events)
+	if err != nil || compacted || provider.compactions.Load() != 0 {
+		t.Fatalf("compacted=%t requests=%d error=%v", compacted, provider.compactions.Load(), err)
+	}
+}
+
+func automaticCompactionRequest(t *testing.T) StartTurnRequest {
+	t.Helper()
+	request := validStartTurnRequest()
+	request.ExpectedHead = protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), CommitSeq: 7, TransactionID: "tx-initial"}
+	request.Runtime = validRuntimeManifest(t, "observation")
+	request.Runtime.Body.Models[0].ContextWindow = protocol.ValueInt64{State: protocol.ValueKnown, Value: 10_000, Provenance: "test-window"}
+	// MaximumOutput is otherwise unused by this test; its value is reused as a
+	// known threshold estimate by the specialized test planner.
+	request.Runtime.Body.Models[0].MaximumOutput = protocol.ValueInt64{State: protocol.ValueKnown, Value: 7_952, Provenance: "test-estimate"}
+	request.Runtime.Body.Limits.AutoCompact = true
+	refreshRuntimeDigest(t, &request.Runtime)
+	return request
+}
+
+func hasProposedEvent(requests []journal.AppendRequest, kind string) bool {
+	for _, request := range requests {
+		for _, event := range request.Events {
+			if event.Kind == kind {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestCollectProviderStreamDoesNotDuplicateFinalizedDeltaBlock(t *testing.T) {
@@ -167,6 +388,45 @@ func TestSequentialToolIntentsExecuteFIFOInProviderOrder(t *testing.T) {
 	}
 }
 
+func TestSequentialToolContinuationsRetainEveryPriorResult(t *testing.T) {
+	log := &recordLog{}
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	providerService := &threeRoundToolProvider{log: log}
+	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{},
+		Lane: NewOperationLane(), Repository: &recordingRepository{head: request.ExpectedHead}, TurnLeases: &recordingTurnLeaseManager{},
+		Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: providerService,
+		Tools: observationToolService{log: log}, Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log},
+		Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	providerService.mu.Lock()
+	requests := protocol.DeepCopy(providerService.requests)
+	providerService.mu.Unlock()
+	if len(requests) != 4 {
+		t.Fatalf("provider requests=%d want four", len(requests))
+	}
+	for requestIndex, modelRequest := range requests {
+		var resultIDs []string
+		for _, message := range modelRequest.Messages {
+			if message.Role != "tool" || len(message.Blocks) != 1 || message.Blocks[0].ToolResult == nil {
+				continue
+			}
+			resultIDs = append(resultIDs, message.Blocks[0].ToolResult.CallID)
+		}
+		want := []string{"round-call-1", "round-call-2", "round-call-3"}[:requestIndex]
+		if !slices.Equal(resultIDs, want) {
+			t.Fatalf("request %d tool results=%v want=%v", requestIndex, resultIDs, want)
+		}
+	}
+}
+
 func TestRunTurnEventsValidateFoundationRegistry(t *testing.T) {
 	log := &recordLog{}
 	request := validStartTurnRequest()
@@ -186,6 +446,83 @@ func TestRunTurnEventsValidateFoundationRegistry(t *testing.T) {
 		t.Fatal(err)
 	}
 	validateAppendRequests(t, repository.appendRequests())
+}
+
+func TestStructuredFileChangedEffectBindsCanonicalEditAndFailsClosed(t *testing.T) {
+	descriptor := edittool.BuiltinDescriptor()
+	classification := toolset.EditClassification()
+	body := protocol.ActionPlanBody{
+		CallID: "edit-call", Tool: descriptor.Body.Identity, SourceRevision: descriptor.Body.SourceRevision, DescriptorDigest: descriptor.DescriptorDigest,
+		Action: "edit", Purpose: "mutate", Resources: []protocol.ResourceTarget{{Kind: "file", CanonicalID: "/workspace/target.txt", Digest: strings.Repeat("a", 64)}},
+		ExecutionLocus: classification.ExecutionLoci[0], Effect: classification.Effect, Boundary: classification.Boundary, Reversibility: classification.Reversibility,
+		VerificationCoverage: classification.VerificationCoverage, RequestedProfile: classification.RequestedProfile, EffectiveProfile: classification.EffectiveProfile, RuntimeGenerationID: "runtime-a",
+	}
+	planDigest, err := canonicaljson.Digest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := protocol.ActionPlan{Body: body, Digest: planDigest}
+	change := protocol.FileChangedV1{
+		CallID: "edit-call", Subject: protocol.SubjectRef{Kind: "file", ID: "/workspace/target.txt"},
+		Before: repeatedDigest("a"), After: repeatedDigest("b"), EvidenceIDs: []protocol.EvidenceID{},
+	}
+	records := []protocol.EvidenceRecord{{Body: protocol.EvidenceRecordBody{ID: "evidence-b"}}, {Body: protocol.EvidenceRecordBody{ID: "evidence-a"}}}
+
+	got, err := structuredFileChangedEffect(plan, protocol.ExecutionResult{FileChange: &change}, records)
+	if err != nil || got == nil || !slices.Equal(got.EvidenceIDs, []protocol.EvidenceID{"evidence-a", "evidence-b"}) {
+		t.Fatalf("effect=%+v err=%v", got, err)
+	}
+	if got.Subject != change.Subject || got.Before != change.Before || got.After != change.After {
+		t.Fatalf("effect changed structured facts: %+v", got)
+	}
+
+	malformed := change
+	malformed.After.Value = strings.ToUpper(malformed.After.Value)
+	if _, err := structuredFileChangedEffect(plan, protocol.ExecutionResult{FileChange: &malformed}, nil); err == nil {
+		t.Fatal("uppercase digest was accepted")
+	}
+	lookalike := plan
+	lookalike.Body.Tool = protocol.ToolIdentity{Source: "mcp", Authority: "attacker", Name: "edit"}
+	if _, err := structuredFileChangedEffect(lookalike, protocol.ExecutionResult{FileChange: &change}, nil); err == nil {
+		t.Fatal("non-canonical edit synthesized a file change")
+	}
+	forgedDescriptor := plan
+	forgedDescriptor.Body.SourceRevision = "forged-v1"
+	forgedDescriptor.Body.DescriptorDigest = repeatedDigest("f")
+	forgedDescriptor.Digest, _ = canonicaljson.Digest(forgedDescriptor.Body)
+	if _, err := structuredFileChangedEffect(forgedDescriptor, protocol.ExecutionResult{FileChange: &change}, nil); err == nil {
+		t.Fatal("forged edit descriptor synthesized a file change")
+	}
+	wrongPath := change
+	wrongPath.Subject.ID = "/workspace/other.txt"
+	if _, err := structuredFileChangedEffect(plan, protocol.ExecutionResult{FileChange: &wrongPath}, nil); err == nil {
+		t.Fatal("unbound path was accepted")
+	}
+}
+
+func TestFileChangedEffectSharesTheUncertainTerminalTransactionAndIdentity(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	repository := &recordingRepository{head: request.ExpectedHead}
+	service := &Service{repository: repository, probe: NoopBarrierProbe()}
+	state := newTurnState(request)
+	state.activeActivityID, state.activeStarted, state.activeDispatched = "edit-activity", true, true
+	change := protocol.FileChangedV1{
+		CallID: "edit-call", Subject: protocol.SubjectRef{Kind: "file", ID: "/workspace/target.txt"},
+		Before: repeatedDigest("a"), After: repeatedDigest("b"), EvidenceIDs: []protocol.EvidenceID{},
+	}
+	if err := service.appendActivityEvidence(context.Background(), request, &state, "edit-activity", "edit-terminal", "uncertain", nil, &change); err != nil {
+		t.Fatal(err)
+	}
+	requests := repository.appendRequests()
+	if len(requests) != 1 || !appendHasKinds(requests[0], protocol.EventFileChanged, protocol.EventActivityUncertain) {
+		t.Fatalf("terminal append=%+v", requests)
+	}
+	for _, event := range requests[0].Events {
+		if event.SessionID != request.SessionID || event.TaskID != state.taskID || event.TurnID != state.turnID || event.ActivityID != "edit-activity" || event.RuntimeGenerationID != request.Runtime.ID {
+			t.Fatalf("effect/terminal identity mismatch: %+v", event)
+		}
+	}
 }
 
 func TestRunTurnConcurrentDuplicateExecutesProviderExactlyOnce(t *testing.T) {
@@ -646,6 +983,7 @@ type recordingRepository struct {
 	head     protocol.CommittedCursor
 	batches  [][]string
 	log      *recordLog
+	trace    func(journal.AppendRequest)
 	events   []protocol.ProposedEvent
 	requests []journal.AppendRequest
 }
@@ -666,6 +1004,7 @@ func (r *recordingRepository) ReadRange(context.Context, journal.ReadRangeReques
 		records[index] = protocol.EventRecord{Envelope: protocol.EventEnvelope{
 			JournalKind: r.head.JournalKind, JournalID: r.head.JournalID, SessionID: event.SessionID,
 			EventID: event.EventID, Time: event.Time, Kind: event.Kind, PayloadVersion: event.PayloadVersion, Payload: protocol.DeepCopy(event.Payload),
+			TaskID: event.TaskID, TurnID: event.TurnID, ActivityID: event.ActivityID, RuntimeGenerationID: event.RuntimeGenerationID,
 		}}
 	}
 	return journal.EventPage{Events: records, Head: r.head, Cursor: r.head}, nil
@@ -689,6 +1028,9 @@ func (r *recordingRepository) AppendBatch(_ context.Context, request journal.App
 	r.head = protocol.CommittedCursor{
 		JournalKind: request.Journal.Kind, JournalID: request.Journal.ID,
 		CommitSeq: r.head.CommitSeq + uint64(len(request.Events)) + 1, TransactionID: request.TransactionID,
+	}
+	if r.trace != nil {
+		r.trace(protocol.DeepCopy(request))
 	}
 	return journal.AppendResult{Status: journal.AppendCommitted, Cursor: r.head}, nil
 }
@@ -771,25 +1113,31 @@ func (l *recordLog) snapshot() []string {
 type loggingLane struct {
 	delegate OperationLane
 	log      *recordLog
+	name     string
 }
 
 func (l *loggingLane) Acquire(ctx context.Context, claim OperationClaim) (OperationLease, error) {
-	l.log.add("lane.acquire(" + string(claim.Kind) + ")")
+	prefix := ""
+	if l.name != "" {
+		prefix = l.name + "."
+	}
+	l.log.add(prefix + "lane.acquire(" + string(claim.Kind) + ")")
 	lease, err := l.delegate.Acquire(ctx, claim)
 	if err != nil {
 		return nil, err
 	}
-	return loggingOperationLease{OperationLease: lease, log: l.log}, nil
+	return loggingOperationLease{OperationLease: lease, log: l.log, prefix: prefix}, nil
 }
 
 type loggingOperationLease struct {
 	OperationLease
-	log *recordLog
+	log    *recordLog
+	prefix string
 }
 
 func (l loggingOperationLease) Release() {
 	l.OperationLease.Release()
-	l.log.add("lane.release")
+	l.log.add(l.prefix + "lane.release")
 }
 
 type fakeContextPlanner struct{ log *recordLog }
@@ -852,6 +1200,36 @@ type toolThenFinalProvider struct {
 type twoToolThenFinalProvider struct {
 	log     *recordLog
 	streams atomic.Int64
+}
+
+type threeRoundToolProvider struct {
+	log      *recordLog
+	streams  atomic.Int64
+	mu       sync.Mutex
+	requests []protocol.ModelRequest
+}
+
+func (p *threeRoundToolProvider) Prepare(_ context.Context, _ protocol.ActivityID, _ string, request protocol.ModelRequest, _ protocol.Digest) (provider.ProviderHandle, error) {
+	p.log.add("provider.prepare")
+	p.mu.Lock()
+	p.requests = append(p.requests, protocol.DeepCopy(request))
+	p.mu.Unlock()
+	return provider.ProviderHandle{}, nil
+}
+
+func (p *threeRoundToolProvider) Stream(context.Context, provider.ProviderHandle, authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	p.log.add("provider.stream")
+	round := int(p.streams.Add(1))
+	stream := make(chan protocol.ModelEvent, 2)
+	if round <= 3 {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventToolIntent, Sequence: 1, ToolIntent: &protocol.ToolUseBlock{CallID: fmt.Sprintf("round-call-%d", round), Alias: "read", Arguments: json.RawMessage(`{"path":"a.go"}`)}}
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "tool_use"}}
+	} else {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: "done"}}
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "stop"}}
+	}
+	close(stream)
+	return stream, nil
 }
 
 func (s *twoToolThenFinalProvider) Prepare(context.Context, protocol.ActivityID, string, protocol.ModelRequest, protocol.Digest) (provider.ProviderHandle, error) {
@@ -1109,4 +1487,211 @@ func validModelDescriptor(generation protocol.RuntimeGenerationID) protocol.Mode
 		Capabilities: []protocol.CapabilityFact{}, UsageCategories: []string{}, Pricing: []protocol.PricingFact{},
 		CredentialBindingRef: "credential-a", SourceRevision: "providers-a", RuntimeGenerationID: generation,
 	}
+}
+
+func refreshRuntimeDigest(t *testing.T, manifest *protocol.RuntimeGenerationManifest) {
+	t.Helper()
+	digest, err := canonicaljson.Digest(manifest.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Digest = digest
+}
+
+func countPrefix(values []string, prefix string) int {
+	count := 0
+	for _, value := range values {
+		if strings.HasPrefix(value, prefix) {
+			count++
+		}
+	}
+	return count
+}
+
+type automaticCompactionPlanner struct {
+	estimated protocol.ValueInt64
+	window    protocol.ValueInt64
+	estimates []protocol.ValueInt64
+	calls     atomic.Int64
+	mu        sync.Mutex
+	plans     []protocol.ContextPlan
+}
+
+func (p *automaticCompactionPlanner) Plan(_ context.Context, _ contextplanner.Request) (protocol.ContextPlan, error) {
+	call := p.calls.Add(1)
+	estimated := p.estimated
+	if index := int(call) - 1; index >= 0 && index < len(p.estimates) {
+		estimated = p.estimates[index]
+	}
+	content := []protocol.ContentBlock{{Kind: protocol.ContentText, Text: fmt.Sprintf("planned-%d", call)}}
+	sourceDigest, _ := canonicaljson.Digest(content)
+	body := protocol.ContextPlanBody{
+		Sources:  []protocol.ContentSource{{ID: fmt.Sprintf("plan-%d", call), Kind: "user_message", Scope: "turn", Provenance: "test", Digest: sourceDigest, Content: content}},
+		Excluded: []protocol.ExcludedContentSource{}, EstimatedInputTokens: estimated, OutputReserve: 0,
+		ContextWindow: p.window, CompactionRevision: fmt.Sprintf("revision-%d", call), ToolExposureRevision: "tools-a",
+	}
+	digest, _ := canonicaljson.Digest(body)
+	plan := protocol.ContextPlan{Body: body, Digest: digest}
+	p.mu.Lock()
+	p.plans = append(p.plans, plan)
+	p.mu.Unlock()
+	return plan, nil
+}
+
+func (p *automaticCompactionPlanner) secondDigest() protocol.Digest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.plans) < 2 {
+		return protocol.Digest{}
+	}
+	return p.plans[1].Digest
+}
+
+type automaticCompactionProvider struct {
+	log           *recordLog
+	mu            sync.Mutex
+	prepared      []bool
+	normalDigests []protocol.Digest
+	compactions   atomic.Int64
+}
+
+func (p *automaticCompactionProvider) Prepare(_ context.Context, _ protocol.ActivityID, _ string, request protocol.ModelRequest, contextDigest protocol.Digest) (provider.ProviderHandle, error) {
+	if p.log != nil {
+		p.log.add("provider.prepare")
+	}
+	compact := strings.HasPrefix(request.RequestID, "compaction-request-")
+	p.mu.Lock()
+	p.prepared = append(p.prepared, compact)
+	if !compact {
+		p.normalDigests = append(p.normalDigests, contextDigest)
+	}
+	p.mu.Unlock()
+	if compact {
+		p.compactions.Add(1)
+	}
+	return provider.ProviderHandle{}, nil
+}
+
+func (p *automaticCompactionProvider) Stream(_ context.Context, _ provider.ProviderHandle, _ authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	p.mu.Lock()
+	compact := p.prepared[0]
+	p.prepared = p.prepared[1:]
+	p.mu.Unlock()
+	stream := make(chan protocol.ModelEvent, 2)
+	if compact {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: string(validCompactionSummary)}}
+	} else {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: "done"}}
+	}
+	stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "stop"}}
+	close(stream)
+	return stream, nil
+}
+
+func (p *automaticCompactionProvider) normalPlanDigest() protocol.Digest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.normalDigests) == 0 {
+		return protocol.Digest{}
+	}
+	return p.normalDigests[len(p.normalDigests)-1]
+}
+
+type automaticLoopProvider struct {
+	mu          sync.Mutex
+	prepared    []bool
+	compactions atomic.Int64
+	normals     atomic.Int64
+}
+
+func (p *automaticLoopProvider) Prepare(_ context.Context, _ protocol.ActivityID, _ string, request protocol.ModelRequest, _ protocol.Digest) (provider.ProviderHandle, error) {
+	compact := strings.HasPrefix(request.RequestID, "compaction-request-")
+	p.mu.Lock()
+	p.prepared = append(p.prepared, compact)
+	p.mu.Unlock()
+	if compact {
+		p.compactions.Add(1)
+	} else {
+		p.normals.Add(1)
+	}
+	return provider.ProviderHandle{}, nil
+}
+
+func (p *automaticLoopProvider) Stream(_ context.Context, _ provider.ProviderHandle, _ authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	p.mu.Lock()
+	compact := p.prepared[0]
+	p.prepared = p.prepared[1:]
+	p.mu.Unlock()
+	stream := make(chan protocol.ModelEvent, 2)
+	if compact {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: string(validCompactionSummary)}}
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "stop"}}
+	} else if p.normals.Load() == 1 {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventToolIntent, Sequence: 1, ToolIntent: &protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"a.go"}`)}}
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "tool_use"}}
+	} else {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: "done"}}
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "stop"}}
+	}
+	close(stream)
+	return stream, nil
+}
+
+type automaticFailureProvider struct {
+	mode            string
+	log             *recordLog
+	cancel          context.CancelFunc
+	compactPrepares atomic.Int64
+	normalPrepares  atomic.Int64
+	mu              sync.Mutex
+	prepared        []bool
+}
+
+func (p *automaticFailureProvider) Prepare(_ context.Context, _ protocol.ActivityID, _ string, request protocol.ModelRequest, _ protocol.Digest) (provider.ProviderHandle, error) {
+	compact := strings.HasPrefix(request.RequestID, "compaction-request-")
+	if compact {
+		p.compactPrepares.Add(1)
+		if p.mode == "compact_prepare" {
+			return provider.ProviderHandle{}, errors.New("compaction provider preparation failed")
+		}
+	} else {
+		p.normalPrepares.Add(1)
+	}
+	p.mu.Lock()
+	p.prepared = append(p.prepared, compact)
+	p.mu.Unlock()
+	return provider.ProviderHandle{}, nil
+}
+
+func (p *automaticFailureProvider) Stream(_ context.Context, _ provider.ProviderHandle, _ authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	p.mu.Lock()
+	compact := p.prepared[0]
+	p.prepared = p.prepared[1:]
+	p.mu.Unlock()
+	if compact && p.mode == "compact_stream" {
+		return nil, errors.New("compaction provider request outcome is uncertain")
+	}
+	if compact && p.mode == "cancel" {
+		p.cancel()
+		return make(chan protocol.ModelEvent), nil
+	}
+	stream := make(chan protocol.ModelEvent, 2)
+	if compact {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: string(validCompactionSummary)}}
+	} else if p.mode == "normal_context_too_large" {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventError, Sequence: 1, Error: &protocol.ProviderError{Code: "context_too_large", Message: "context too large"}}
+	} else {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: "done"}}
+	}
+	if !(compact && p.mode == "cancel") && !(p.mode == "normal_context_too_large" && !compact) {
+		stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "stop"}}
+	}
+	close(stream)
+	return stream, nil
+}
+
+type failingEvidenceRecorder struct{}
+
+func (failingEvidenceRecorder) Put(context.Context, protocol.EvidenceCandidate) (protocol.EvidenceRecord, error) {
+	return protocol.EvidenceRecord{}, errors.New("evidence persistence failed")
 }

@@ -22,6 +22,23 @@ jobs:
           cache: true
       - run: ./scripts/check.sh
 
+  v030-acceptance:
+    timeout-minutes: 75
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run cumulative v0.3 acceptance
+        run: go test -tags acceptance ./internal/acceptance -run TestV030SelfHostedRuntime -count=1 -v -timeout 60m
+
   cross-build:
     runs-on: ubuntu-latest
     strategy:

@@ -17,13 +17,28 @@ var (
 	ErrTurnRecoveryRequired = errors.New("turn recovery required")
 	ErrTurnHeadConflict     = errors.New("turn lease expected-head conflict")
 	ErrTurnNotTerminal      = errors.New("turn is not terminal at supplied cursor")
+	// ErrSessionNotFound is deliberately typed so recovery can distinguish a
+	// proven absent pre-reserved child from an unavailable inspection.
+	ErrSessionNotFound = errors.New("session not found")
 )
 
 type SessionLineage struct {
-	ParentSessionID  protocol.SessionID       `json:"parent_session_id"`
-	ParentCursor     protocol.CommittedCursor `json:"parent_cursor"`
-	CheckpointDigest protocol.Digest          `json:"checkpoint_digest"`
+	Kind LineageKind `json:"kind,omitempty"`
+
+	ParentSessionID protocol.SessionID       `json:"parent_session_id"`
+	ParentCursor    protocol.CommittedCursor `json:"parent_cursor"`
+
+	CheckpointDigest    protocol.Digest              `json:"checkpoint_digest,omitempty,omitzero"`
+	DelegationAttemptID protocol.DelegationAttemptID `json:"delegation_attempt_id,omitempty"`
+	ManifestDigest      protocol.Digest              `json:"manifest_digest,omitempty,omitzero"`
 }
+
+type LineageKind string
+
+const (
+	LineageCheckpoint LineageKind = "checkpoint"
+	LineageSubagent   LineageKind = "subagent"
+)
 
 type LineageCursor struct {
 	ViewSessionID   protocol.SessionID       `json:"view_session_id"`

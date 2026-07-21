@@ -1,6 +1,9 @@
 package app
 
-import "github.com/muratmirgun/yordam/internal/domain"
+import (
+	"github.com/muratmirgun/yordam/internal/domain"
+	"github.com/muratmirgun/yordam/internal/protocol"
+)
 
 type CommandKind string
 
@@ -16,6 +19,7 @@ const (
 	CommandAcknowledgeAutoShell  CommandKind = "acknowledge_auto_shell"
 	CommandCompact               CommandKind = "compact"
 	CommandReloadConfig          CommandKind = "reload_config"
+	CommandTrustSkillCatalog     CommandKind = "trust_skill_catalog"
 	CommandNewSession            CommandKind = "new_session"
 	CommandOpenSession           CommandKind = "open_session"
 	CommandShutdown              CommandKind = "shutdown"
@@ -24,12 +28,13 @@ const (
 )
 
 type Command struct {
-	Kind      CommandKind
-	DraftID   uint64
-	Prompt    string
-	CallID    string
-	Decision  domain.PermissionDecision
-	Mode      domain.PermissionMode
-	Selection domain.ModelSelection
-	SessionID string
+	Kind       CommandKind
+	DraftID    uint64
+	Prompt     string
+	CallID     string
+	Decision   domain.PermissionDecision
+	Mode       domain.PermissionMode
+	Selection  domain.ModelSelection
+	SessionID  string
+	SkillTrust protocol.SkillTrustCommandV1
 }

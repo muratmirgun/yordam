@@ -67,6 +67,7 @@ func FoundationDescriptors() []Descriptor {
 		{protocol.EventContextPlanRecorded, func() any { return new(protocol.ContextPlanRecordedV1) }, false, "sensitive", []string{"context"}},
 		{protocol.EventContextUsageRecorded, func() any { return new(protocol.ContextUsageRecordedV1) }, false, "public", []string{"usage", "context"}},
 		{protocol.EventRuntimeGenerationActivated, func() any { return new(protocol.RuntimeGenerationActivatedV1) }, true, "sensitive", []string{"runtime"}},
+		{protocol.EventProjectSkillTrustChanged, func() any { return new(protocol.ProjectSkillTrustChangedV1) }, true, "sensitive", []string{"skills", "permissions"}},
 		{protocol.EventControlOperationPlanned, func() any { return new(protocol.ControlOperationPlannedV1) }, true, "sensitive", []string{"control"}},
 		{protocol.EventControlOperationAuthorized, func() any { return new(protocol.ControlOperationAuthorizedV1) }, true, "sensitive", []string{"control", "permissions"}},
 		{protocol.EventControlOperationStarted, func() any { return new(protocol.ControlOperationStartedV1) }, true, "sensitive", []string{"control"}},
@@ -79,6 +80,11 @@ func FoundationDescriptors() []Descriptor {
 		{protocol.EventMigrationDiagnostic, func() any { return new(protocol.DiagnosticV1) }, false, "diagnostic", []string{"diagnostics"}},
 		{protocol.EventRecoveryDiagnostic, func() any { return new(protocol.DiagnosticV1) }, false, "diagnostic", []string{"diagnostics", "recovery"}},
 		{protocol.EventTransactionCommitted, func() any { return new(protocol.TransactionCommittedV1) }, false, "public", []string{"journal"}},
+		{protocol.EventSubagentRequested, func() any { return new(protocol.SubagentRequestedV1) }, true, "sensitive", []string{"subagent", "turn"}},
+		{protocol.EventSubagentWaiting, func() any { return new(protocol.SubagentWaitingV1) }, false, "public", []string{"subagent", "turn"}},
+		{protocol.EventSubagentResultAttached, func() any { return new(protocol.SubagentResultAttachedV1) }, true, "sensitive", []string{"subagent", "turn", "evidence"}},
+		{protocol.EventSubagentManifest, func() any { return new(protocol.SubagentManifestV1) }, false, "public", []string{"subagent", "session"}},
+		{protocol.EventSubagentReceipt, func() any { return new(protocol.SubagentReceiptV1) }, false, "sensitive", []string{"subagent", "usage", "evidence"}},
 	}
 
 	descriptors := make([]Descriptor, 0, len(entries))
@@ -91,6 +97,52 @@ func FoundationDescriptors() []Descriptor {
 			ValidateStructural: validateFoundationStructural,
 			ValidateSemantic: func(payload any) error {
 				return validateFoundationSemantic(kind, payload)
+			},
+			ValidateEnvelope: func(envelope protocol.EventEnvelope, payload any) error {
+				switch kind {
+				case protocol.EventContextCompacted:
+					return validateContextCompactionEnvelope(envelope, payload)
+				case protocol.EventProjectSkillTrustChanged:
+					trust, ok := payload.(*protocol.ProjectSkillTrustChangedV1)
+					if !ok || envelope.JournalKind != protocol.JournalWorkspaceControl || envelope.JournalID != protocol.JournalID(trust.WorkspaceID) {
+						return fmt.Errorf("project skill trust requires workspace-control journal")
+					}
+				case protocol.EventSubagentRequested:
+					return validateSubagentRequestedEnvelope(envelope, payload)
+				case protocol.EventSubagentWaiting:
+					waiting, ok := payload.(*protocol.SubagentWaitingV1)
+					if !ok {
+						return fmt.Errorf("invalid subagent waiting payload")
+					}
+					return waiting.Validate()
+				case protocol.EventSubagentResultAttached:
+					attachment, ok := payload.(*protocol.SubagentResultAttachedV1)
+					if !ok {
+						return fmt.Errorf("invalid subagent attachment payload")
+					}
+					return attachment.Validate()
+				case protocol.EventSubagentManifest:
+					manifest, ok := payload.(*protocol.SubagentManifestV1)
+					if !ok {
+						return fmt.Errorf("invalid subagent manifest payload")
+					}
+					return validateSubagentChildEnvelope(envelope, *manifest)
+				case protocol.EventSubagentReceipt:
+					receipt, ok := payload.(*protocol.SubagentReceiptV1)
+					if !ok {
+						return fmt.Errorf("invalid subagent receipt payload")
+					}
+					if err := receipt.Validate(); err != nil {
+						return err
+					}
+					if err := validateSubagentChildEnvelope(envelope, receipt.Manifest); err != nil {
+						return err
+					}
+					if receipt.TerminalCursor.CommitSeq != envelope.Seq || receipt.TerminalCursor.TransactionID != envelope.TransactionID {
+						return fmt.Errorf("subagent receipt terminal cursor does not match envelope")
+					}
+				}
+				return nil
 			},
 			AuthorizationCritical: entry.auth,
 			RedactionClass:        entry.redaction,
@@ -161,9 +213,9 @@ func validateFoundationSemantic(kind string, payload any) error {
 			}
 		}
 	case *protocol.ContextCompactedV1:
-		if value.From.Validate() != nil || value.Through.Validate() != nil || value.SummaryEvidenceID == "" || value.Revision == "" || value.From.JournalKind != value.Through.JournalKind || value.From.JournalID != value.Through.JournalID || value.From.CommitSeq > value.Through.CommitSeq {
-			return fmt.Errorf("invalid context compaction range")
-		}
+		return value.Validate()
+	case *protocol.ProjectSkillTrustChangedV1:
+		return value.Validate()
 	case *protocol.FileChangePlannedV1:
 		return validateActionPlan(value.Plan)
 	case *protocol.FileChangedV1:
@@ -226,6 +278,9 @@ func validateFoundationSemantic(kind string, payload any) error {
 		if err := sortedEvidenceIDs(value.InputEvidenceIDs); err != nil {
 			return err
 		}
+		if value.CompactionTrigger != "" && value.CompactionTrigger != "manual" && value.CompactionTrigger != "automatic" {
+			return fmt.Errorf("invalid compaction trigger")
+		}
 		if value.Plan != nil {
 			return validateActionPlan(*value.Plan)
 		}
@@ -254,6 +309,14 @@ func validateFoundationSemantic(kind string, payload any) error {
 		}[kind]
 		if want != "" && value.Status != want {
 			return fmt.Errorf("activity outcome status %q does not match event %q", value.Status, kind)
+		}
+		if value.OutputBytes < 0 {
+			return fmt.Errorf("activity output bytes is invalid")
+		}
+		if value.Usage != nil {
+			if err := value.Usage.Validate(); err != nil {
+				return err
+			}
 		}
 		return sortedEvidenceIDs(value.OutputEvidenceIDs)
 	case *protocol.ProviderCapabilityDecidedV1:
@@ -369,6 +432,46 @@ func validateFoundationSemantic(kind string, payload any) error {
 		if value.TransactionID == "" || value.FirstSeq == 0 || value.LastSeq < value.FirstSeq || uint64(value.EventCount) != value.LastSeq-value.FirstSeq+1 || value.Digest.Validate() != nil {
 			return fmt.Errorf("transaction marker is invalid")
 		}
+	case *protocol.SubagentRequestedV1:
+		return value.Validate()
+	case *protocol.SubagentWaitingV1:
+		return value.Validate()
+	case *protocol.SubagentManifestV1:
+		return value.Validate()
+	case *protocol.SubagentReceiptV1:
+		return value.Validate()
+	case *protocol.SubagentResultAttachedV1:
+		return value.Validate()
+	}
+	return nil
+}
+
+func validateContextCompactionEnvelope(envelope protocol.EventEnvelope, payload any) error {
+	value, ok := payload.(*protocol.ContextCompactedV1)
+	if !ok || value == nil {
+		return fmt.Errorf("context compaction payload type %T", payload)
+	}
+	if err := value.Validate(); err != nil {
+		return err
+	}
+	reference := protocol.ContextCompactionReference{SessionID: envelope.SessionID, From: value.From, Through: value.Through, SummaryEvidenceID: value.SummaryEvidenceID, Revision: value.Revision}
+	if reference.Validate() != nil || envelope.JournalKind != protocol.JournalSession || envelope.JournalID != protocol.JournalID(envelope.SessionID) || value.Through.CommitSeq >= envelope.Seq {
+		return fmt.Errorf("context compaction is not anchored before its event")
+	}
+	return nil
+}
+
+func validateSubagentRequestedEnvelope(envelope protocol.EventEnvelope, payload any) error {
+	request, ok := payload.(*protocol.SubagentRequestedV1)
+	if !ok || request == nil || request.Validate() != nil || envelope.JournalKind != protocol.JournalSession || envelope.SessionID != request.Manifest.ParentSessionID || envelope.JournalID != protocol.JournalID(request.Manifest.ParentSessionID) || envelope.RuntimeGenerationID != request.Manifest.RuntimeGenerationID || envelope.TaskID == "" || envelope.TurnID == "" || request.Manifest.ParentCursor.CommitSeq >= envelope.Seq {
+		return fmt.Errorf("subagent request does not match parent session")
+	}
+	return nil
+}
+
+func validateSubagentChildEnvelope(envelope protocol.EventEnvelope, manifest protocol.SubagentManifestV1) error {
+	if manifest.Validate() != nil || envelope.JournalKind != protocol.JournalSession || envelope.SessionID != manifest.ChildSessionID || envelope.JournalID != protocol.JournalID(manifest.ChildSessionID) || envelope.RuntimeGenerationID != manifest.RuntimeGenerationID || envelope.TaskID != manifest.ChildTaskID || envelope.TurnID != manifest.ChildTurnID {
+		return fmt.Errorf("subagent child event does not match manifest")
 	}
 	return nil
 }
@@ -530,8 +633,36 @@ func validateManifest(manifest protocol.RuntimeGenerationManifest) error {
 	if err := protocol.ValidateBounds(manifest.Body); err != nil {
 		return err
 	}
-	if manifest.ID == "" || manifest.Body.ProviderCatalogRevision == "" || manifest.Body.ToolCatalogRevision == "" || manifest.Body.InstructionRevision == "" || manifest.Body.PolicyGeneration == "" || manifest.Body.Limits.MaxToolCalls <= 0 || manifest.Body.Limits.ShellTimeoutNanos <= 0 || manifest.Body.Limits.ApplicationQueueCapacity <= 0 {
+	if manifest.ID == "" || manifest.Body.ProviderCatalogRevision == "" || manifest.Body.ToolCatalogRevision == "" || manifest.Body.InstructionRevision == "" || manifest.Body.PolicyGeneration == "" {
 		return fmt.Errorf("runtime generation manifest is incomplete")
+	}
+	if err := manifest.Body.Limits.ValidatePersisted(); err != nil {
+		return fmt.Errorf("runtime generation manifest limits: %w", err)
+	}
+	if len(manifest.Body.Skills) > 0 && manifest.Body.SkillCatalogRevision == "" {
+		return fmt.Errorf("runtime skill catalog revision is required")
+	}
+	if len(manifest.Body.Skills) > protocol.MaxActiveSkills {
+		return fmt.Errorf("runtime skill catalog exceeds %d active skills", protocol.MaxActiveSkills)
+	}
+	previousSkill := ""
+	seenSkills := make(map[string]struct{}, len(manifest.Body.Skills))
+	for _, descriptor := range manifest.Body.Skills {
+		if err := descriptor.Validate(); err != nil {
+			return fmt.Errorf("skill descriptor: %w", err)
+		}
+		if descriptor.State != protocol.SkillStateActive || descriptor.Identity.RuntimeGenerationID != manifest.ID {
+			return fmt.Errorf("runtime skill descriptor is not active for this generation")
+		}
+		if _, duplicate := seenSkills[descriptor.Identity.Name]; duplicate {
+			return fmt.Errorf("duplicate runtime skill descriptor")
+		}
+		sortKey := string(descriptor.Identity.Source) + "\x00" + descriptor.Identity.Name + "\x00" + descriptor.Identity.ContentDigest.Algorithm + "\x00" + descriptor.Identity.ContentDigest.Value
+		if previousSkill != "" && sortKey <= previousSkill {
+			return fmt.Errorf("runtime skill descriptors must be sorted")
+		}
+		previousSkill = sortKey
+		seenSkills[descriptor.Identity.Name] = struct{}{}
 	}
 	seenModels := make(map[string]struct{}, len(manifest.Body.Models))
 	for _, descriptor := range manifest.Body.Models {
@@ -743,6 +874,7 @@ func validateAuthorizationJournal(envelope protocol.EventEnvelope, sessionID pro
 func controlOnlyKind(kind string) bool {
 	switch kind {
 	case protocol.EventRuntimeGenerationActivated,
+		protocol.EventProjectSkillTrustChanged,
 		protocol.EventControlOperationPlanned,
 		protocol.EventControlOperationAuthorized,
 		protocol.EventControlOperationStarted,
@@ -772,6 +904,9 @@ func sessionOnlyKind(kind string) bool {
 		protocol.EventEvidenceRecorded, protocol.EventEvidenceLinked,
 		protocol.EventCheckpointPlanned, protocol.EventCheckpointReady, protocol.EventCheckpointFailed,
 		protocol.EventVerificationReceiptRecorded, protocol.EventContextPlanRecorded, protocol.EventContextUsageRecorded:
+		return true
+	case protocol.EventSubagentRequested, protocol.EventSubagentWaiting, protocol.EventSubagentResultAttached,
+		protocol.EventSubagentManifest, protocol.EventSubagentReceipt:
 		return true
 	default:
 		return false

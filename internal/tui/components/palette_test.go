@@ -17,6 +17,7 @@ func TestPaletteContainsExactSlashCommandTable(t *testing.T) {
 		{name: "/sessions", screen: "sessions"},
 		{name: "/mode", screen: "mode"},
 		{name: "/model", screen: "model"},
+		{name: "/skills", screen: "skills"},
 		{name: "/reload", command: app.CommandReloadConfig},
 		{name: "/compact", command: app.CommandCompact},
 		{name: "/help", screen: "help"},
