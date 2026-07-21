@@ -4,7 +4,7 @@
 - Worktree: `/Users/murat/oss/tui-yordam-v0.1/.worktrees/codex-v0.3-compaction`
 - Starting commit: `79cabb9`
 - Workflow: fresh implementer per task, task-scoped spec/quality review, final whole-branch review
-- Status: Self-hosting/release Task 3 ready for implementation
+- Status: Self-hosting/release Task 3 complete; Task 4 ready for implementation
 - Preflight conflicts: none; approved order is compaction, skills, sequential subagent, self-hosting/release
 
 ## Completed Tasks
@@ -36,6 +36,7 @@
 - Sequential Subagent Task 9: complete (`b5ccd77..074fa5a`; real Bootstrap+JSONL parent/child E2E, lane/approval/restart/secret acceptance matrix, dispatch-free canonical orchestration authorization, typed transient lifecycle adaptation, structured durable edit effects, exact scope/security docs, and immutable Darwin/arm64 evidence; final clean affected/full/full-race/vet/diff gates passed on tested source `6fb8bf8`; Linux was not claimed).
 - Self-hosting/release Task 1: complete (`074fa5a..9f1cc18`; exact clean-commit no-hardlink clone/build harness, isolated HOME/config/data/log/tmp PTY launch, repository Go-development skill, and strict fail-closed ten-phase local SSE provider; tagged acceptance, ptyfixture/repolint, vet, and diff gates passed).
 - Self-hosting/release Task 2: complete (`9f1cc18..18517f0`; real PTY project-skill trust, one sequential child, exact README edit, child focused check, parent full repository verification, manual compaction, post-compaction continuation, graceful shutdown, and `--continue` recovery; interactive approval lane/cursor integration, cumulative tool results, workspace-bound evidence, and race-free terminal emulation were hardened from real failures; exact normal and race self-host acceptance, affected-package tests, vet, and diff gates passed on Darwin/arm64).
+- Self-hosting/release Task 3: complete (named 13-case trust/hostile-skill/compaction/cancellation/crash/commit-unknown/retrust release matrix with exact top-level inventory guards; real process death and durable JSONL recovery are paired with the owning subagent reconciliation boundaries; no production defect was exposed; focused normal/race matrix, full tests, vet, and diff gates passed on Darwin/arm64).
 
 ## Carried Dependencies
 
