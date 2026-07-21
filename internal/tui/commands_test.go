@@ -614,7 +614,11 @@ func TestRealModelBoundsSelectedChildCardWithHugeHistoryAndCardList(t *testing.T
 			ChildSessionID: protocol.SessionID(fmt.Sprintf("123e4567-e89b-12d3-a456-%012d", index)), Task: long,
 			State: protocol.SubagentStageSucceeded, Attempt: index%protocol.MaxSubagentAttemptsPerTurn + 1,
 			StartedAt: time.Unix(1, 0).UTC(), Deadline: time.Unix(3, 0).UTC(), ElapsedNanos: int64(time.Second), ToolCalls: 1, MaxToolCalls: 4,
-			ReceiptSummary: long, ChangedFiles: []string{"a-" + long, "b-" + long, "c-" + long}, CommandsAndTests: []string{"a-" + long, "b-" + long, "c-" + long},
+		}
+		if index%2 == 0 {
+			card.ReceiptSummary = long
+			card.ChangedFiles = []string{"a-" + long, "b-" + long, "c-" + long}
+			card.CommandsAndTests = []string{"a-" + long, "b-" + long, "c-" + long}
 		}
 		raw, err := json.Marshal(card)
 		if err != nil {
@@ -623,12 +627,20 @@ func TestRealModelBoundsSelectedChildCardWithHugeHistoryAndCardList(t *testing.T
 		views[index] = protocol.ProjectionView{ID: string(card.AttemptID), Kind: "subagent", Status: string(card.State), State: protocol.ValueKnown, Data: raw}
 	}
 	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventState, Durable: &protocol.DurableProjection{Subagents: views}})
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTurnCompleted})
 	for range 12 {
 		model = tui.PressForTest(model, "alt+]")
 	}
 	for _, width := range []int{40, 120} {
 		model = tui.UpdateForTest(model, tea.WindowSizeMsg{Width: width, Height: 24})
-		rendered := model.View().Content
+		view := model.View()
+		rendered := view.Content
+		if lines := strings.Count(strings.TrimSuffix(rendered, "\n"), "\n") + 1; lines > 24 {
+			t.Fatalf("width %d terminal overflow: lines=%d height=24\n%s", width, lines, rendered)
+		}
+		if view.Cursor == nil || view.Cursor.Position.Y < 0 || view.Cursor.Position.Y >= 24 {
+			t.Fatalf("width %d composer cursor is not visible: %+v", width, view.Cursor)
+		}
 		start := strings.Index(rendered, "card 13/20")
 		endMarker := "Alt+[/Alt+] cards | Alt+Enter open"
 		end := strings.Index(rendered[start:], endMarker)
@@ -646,6 +658,12 @@ func TestRealModelBoundsSelectedChildCardWithHugeHistoryAndCardList(t *testing.T
 				t.Fatalf("width %d card line width=%d: %q", width, lipgloss.Width(line), line)
 			}
 		}
+		model = tui.PressForTest(model, "alt+]")
+		transition := model.View()
+		if lines := strings.Count(strings.TrimSuffix(transition.Content, "\n"), "\n") + 1; lines > 24 || transition.Cursor == nil || transition.Cursor.Position.Y >= 24 || !strings.Contains(transition.Content, "card 14/20") {
+			t.Fatalf("width %d card-height transition overflow/cursor loss: cursor=%+v\n%s", width, transition.Cursor, transition.Content)
+		}
+		model = tui.PressForTest(model, "alt+[")
 	}
 }
 

@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -108,6 +109,83 @@ func TestSubscriptionUpdatesPreserveCapturedRelatedSessionCursors(t *testing.T) 
 	item.Event.Cursor.RelatedSessions[0].CommitSeq++
 	if snapshot.Cursor.RelatedSessions[0].CommitSeq == item.Event.Cursor.RelatedSessions[0].CommitSeq {
 		t.Fatal("subscription event related cursors alias snapshot cursor")
+	}
+}
+
+func TestMaximumServerDerivedRelatedWindowDeliversValidEventCursor(t *testing.T) {
+	base := newBrokerSource()
+	source := &maximumRelatedBrokerSource{brokerSource: base}
+	broker := mustBroker(t, source, nil)
+	snapshot, subscription, err := broker.SnapshotAndSubscribe(t.Context(), snapshotRequest(8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Cursor.RelatedSessions) != protocol.MaxCollectionMembers {
+		t.Fatalf("related cursors=%d", len(snapshot.Cursor.RelatedSessions))
+	}
+	events, cursor := source.commit(source.session, "parent-at-max-related-window", time.Unix(8, 0).UTC())
+	if err := broker.PublishCommitted(t.Context(), source.session, cursor, events); err != nil {
+		t.Fatal(err)
+	}
+	item, err := subscription.Next(t.Context())
+	if err != nil || item.Event == nil || item.Terminal != nil || len(item.Event.Cursor.RelatedSessions) != protocol.MaxCollectionMembers {
+		t.Fatalf("item=%+v err=%v", item, err)
+	}
+}
+
+type maximumRelatedBrokerSource struct{ *brokerSource }
+
+func (s *maximumRelatedBrokerSource) RelatedSessionHeads(context.Context, protocol.CommittedCursor) ([]protocol.CommittedCursor, error) {
+	result := make([]protocol.CommittedCursor, protocol.MaxCollectionMembers)
+	for index := range result {
+		ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(fmt.Sprintf("child-%05d", index))}
+		result[index] = committedCursor(ref, 1, "head")
+	}
+	return result, nil
+}
+
+func TestSubscribeNeverEchoesClientSuppliedRelatedSessionCursors(t *testing.T) {
+	source := newBrokerSource()
+	broker := mustBroker(t, source, nil)
+	foreign := committedCursor(protocol.JournalRef{Kind: protocol.JournalSession, ID: "nonexistent-child"}, 9999, "client-future")
+	subscription, err := broker.Subscribe(t.Context(), protocol.SubscriptionRequest{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: "session-1",
+		After:    protocol.ApplicationCursor{WorkspaceControl: source.initialWorkspace, SelectedSession: ptrCursor(source.initialSession), RelatedSessions: []protocol.CommittedCursor{foreign}, Stream: protocol.StreamCursor{Epoch: broker.Epoch()}},
+		Consumer: "adversarial-client", QueueCapacity: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.PublishTransient(protocol.ApplicationEvent{Correlation: protocol.EventCorrelation{JournalKind: protocol.JournalSession, JournalID: "session-1", SessionID: "session-1"}, Kind: app.ApplicationEventNotice, PayloadVersion: 1, Payload: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	item, err := subscription.Next(t.Context())
+	if err != nil || item.Event == nil {
+		t.Fatalf("item=%+v err=%v", item, err)
+	}
+	if len(item.Event.Cursor.RelatedSessions) != 0 {
+		t.Fatalf("outgoing cursor echoed client provenance: %+v", item.Event.Cursor.RelatedSessions)
+	}
+}
+
+func TestSubscribeEpochGapNeverEchoesClientSuppliedRelatedSessionCursors(t *testing.T) {
+	source := newBrokerSource()
+	broker := mustBroker(t, source, nil)
+	foreign := committedCursor(protocol.JournalRef{Kind: protocol.JournalSession, ID: "nonexistent-child"}, 9999, "client-future")
+	subscription, err := broker.Subscribe(t.Context(), protocol.SubscriptionRequest{
+		ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: "session-1",
+		After:    protocol.ApplicationCursor{WorkspaceControl: source.initialWorkspace, SelectedSession: ptrCursor(source.initialSession), RelatedSessions: []protocol.CommittedCursor{foreign}, Stream: protocol.StreamCursor{Epoch: "stale-client-epoch"}},
+		Consumer: "adversarial-client", QueueCapacity: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := subscription.Next(t.Context())
+	if err != nil || item.Terminal == nil {
+		t.Fatalf("item=%+v err=%v", item, err)
+	}
+	if len(item.Terminal.ResumeAfter.RelatedSessions) != 0 {
+		t.Fatalf("terminal echoed client provenance: %+v", item.Terminal.ResumeAfter.RelatedSessions)
 	}
 }
 

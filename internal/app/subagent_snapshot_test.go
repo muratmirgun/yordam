@@ -93,6 +93,19 @@ func TestProjectSubagentCardsIgnoresNilDecodedLifecycleRecords(t *testing.T) {
 	}
 }
 
+func TestProjectSubagentCardsIgnoresCrossJournalParentRequest(t *testing.T) {
+	manifest := protocol.SubagentManifestV1{AttemptID: "attempt", ParentSessionID: "parent", ParentCursor: subagentTestCursor("parent", 1), ChildSessionID: "child", ChildTaskID: "child-task", ChildTurnID: "child-turn", RuntimeGenerationID: "generation", SkillCatalogRevision: "skills", MaxToolCalls: 1, Deadline: time.Unix(20, 0).UTC()}
+	record := subagentSnapshotRecord(protocol.EventSubagentRequested, "parent", 2, time.Unix(10, 0).UTC(), &protocol.SubagentRequestedV1{Call: protocol.SubagentCallV1{Task: "task"}, Manifest: manifest})
+	record.Envelope.SessionID, record.Envelope.JournalID = "other", "other"
+	parent := journal.Inspection{Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: "parent"}, Events: []protocol.EventRecord{record}}
+	cards, err := projectSubagentCards(parent, func(protocol.SessionID) (journal.Inspection, error) {
+		return journal.Inspection{}, journal.ErrSessionNotFound
+	}, time.Unix(11, 0).UTC(), secret.New())
+	if err != nil || len(cards) != 0 {
+		t.Fatalf("cross-journal request cards=%+v err=%v", cards, err)
+	}
+}
+
 func TestProjectSubagentCardsNumbersAttemptsPerParentTurn(t *testing.T) {
 	parent := journal.Inspection{Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: "parent"}}
 	seq := uint64(2)
@@ -158,6 +171,55 @@ func TestProjectSubagentCardsFailsClosedAbovePerTurnLimit(t *testing.T) {
 	}, time.Unix(50, 0).UTC(), secret.New()); err == nil {
 		t.Fatal("fifth attempt in one parent turn was silently hidden")
 	}
+}
+
+func TestProjectSubagentCardsUsesDeterministicRecentLifetimeWindow(t *testing.T) {
+	parent := journal.Inspection{Journal: protocol.JournalRef{Kind: protocol.JournalSession, ID: "parent"}}
+	for index := 0; index <= protocol.MaxCollectionMembers; index++ {
+		attemptID := protocol.DelegationAttemptID(fmt.Sprintf("attempt-%05d", index))
+		manifest := protocol.SubagentManifestV1{AttemptID: attemptID, ParentSessionID: "parent", ParentCursor: subagentTestCursor("parent", uint64(index+1)), ChildSessionID: protocol.SessionID("child-" + string(attemptID)), ChildTaskID: protocol.TaskID("child-task-" + string(attemptID)), ChildTurnID: protocol.TurnID("child-turn-" + string(attemptID)), RuntimeGenerationID: "generation", SkillCatalogRevision: "skills", MaxToolCalls: 1, Deadline: time.Unix(10000, 0).UTC()}
+		record := subagentSnapshotRecord(protocol.EventSubagentRequested, "parent", uint64(index+2), time.Unix(int64(index+2), 0).UTC(), &protocol.SubagentRequestedV1{Call: protocol.SubagentCallV1{Task: "task"}, Manifest: manifest})
+		record.Envelope.TurnID = protocol.TurnID(fmt.Sprintf("parent-turn-%05d", index))
+		parent.Events = append(parent.Events, record)
+	}
+	cards, err := projectSubagentCards(parent, func(protocol.SessionID) (journal.Inspection, error) {
+		return journal.Inspection{}, journal.ErrSessionNotFound
+	}, time.Unix(9000, 0).UTC(), secret.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cards) != protocol.MaxCollectionMembers || cards[0].AttemptID != "attempt-00001" || cards[len(cards)-1].AttemptID != "attempt-04096" {
+		t.Fatalf("window len=%d first=%q last=%q", len(cards), cards[0].AttemptID, cards[len(cards)-1].AttemptID)
+	}
+	for _, card := range cards {
+		if card.Attempt != 1 || card.Validate() != nil {
+			t.Fatalf("invalid window card: %+v", card)
+		}
+	}
+	parentRef := parent.Journal
+	reader := &adversarialPrefixReader{records: map[protocol.JournalRef][]protocol.EventRecord{parentRef: parent.Events}}
+	repository := &recentWindowRepository{adversarialPrefixReader: reader}
+	parentCursor := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: parentRef.ID, CommitSeq: uint64(protocol.MaxCollectionMembers + 3), TransactionID: "transaction"}
+	heads, err := (runtimeBrokerSource{Repository: repository}).RelatedSessionHeads(t.Context(), parentCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(heads) != len(cards) || heads[0].JournalID != protocol.JournalID(cards[0].ChildSessionID) || heads[len(heads)-1].JournalID != protocol.JournalID(cards[len(cards)-1].ChildSessionID) {
+		t.Fatalf("related/card windows diverged: heads=%d cards=%d first=%q/%q last=%q/%q", len(heads), len(cards), heads[0].JournalID, cards[0].ChildSessionID, heads[len(heads)-1].JournalID, cards[len(cards)-1].ChildSessionID)
+	}
+}
+
+type recentWindowRepository struct {
+	journal.Repository
+	*adversarialPrefixReader
+}
+
+func (r *recentWindowRepository) ReadRange(ctx context.Context, request journal.ReadRangeRequest) (journal.EventPage, error) {
+	return r.adversarialPrefixReader.ReadRange(ctx, request)
+}
+
+func (r *recentWindowRepository) Head(_ context.Context, ref protocol.JournalRef) (protocol.CommittedCursor, error) {
+	return protocol.CommittedCursor{JournalKind: ref.Kind, JournalID: ref.ID, CommitSeq: 1, TransactionID: "head"}, nil
 }
 
 func TestProjectSubagentCardsRejectsReceiptForDifferentManifest(t *testing.T) {

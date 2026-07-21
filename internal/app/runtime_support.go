@@ -501,13 +501,13 @@ func (s runtimeBrokerSource) RelatedSessionHeads(ctx context.Context, parentCurs
 	if err != nil {
 		return nil, fmt.Errorf("read selected session at snapshot cursor: %w", err)
 	}
-	children := make(map[protocol.SessionID]struct{})
-	for _, record := range parent.Events {
-		request, ok := record.Decoded.(*protocol.SubagentRequestedV1)
-		if !ok || request == nil || request.Validate() != nil || request.Manifest.ParentSessionID != protocol.SessionID(parentRef.ID) || record.Envelope.JournalKind != parentRef.Kind || record.Envelope.JournalID != parentRef.ID || record.Envelope.SessionID != protocol.SessionID(parentRef.ID) {
-			continue
-		}
-		children[request.Manifest.ChildSessionID] = struct{}{}
+	attempts, err := recentSubagentAttempts(parent)
+	if err != nil {
+		return nil, fmt.Errorf("select related child window: %w", err)
+	}
+	children := make(map[protocol.SessionID]struct{}, len(attempts))
+	for _, attempt := range attempts {
+		children[attempt.request.Manifest.ChildSessionID] = struct{}{}
 	}
 	ids := make([]protocol.SessionID, 0, len(children))
 	for id := range children {
@@ -573,6 +573,9 @@ func (s runtimeBrokerSource) Project(ctx context.Context, vector SnapshotVector)
 		inspection, inspectErr := readInspectionAt(ctx, s.Repository, ref, *vector.SelectedSession)
 		if inspectErr != nil {
 			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("read selected session for subagents at snapshot cursor: %w", inspectErr)
+		}
+		if len(vector.RelatedSessions) > protocol.MaxCollectionMembers {
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("related-session snapshot vector exceeds protocol limit")
 		}
 		related := make(map[protocol.SessionID]protocol.CommittedCursor, len(vector.RelatedSessions))
 		for index, cursor := range vector.RelatedSessions {

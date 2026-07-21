@@ -491,7 +491,7 @@ func (model Model) applyDurableSubagents(durable protocol.DurableProjection) Mod
 			model.sessions.SetLineage(lineage)
 		}
 	}
-	return model
+	return model.resizeComponents()
 }
 
 func (model Model) replaceConversation(replay domain.SessionReplay) Model {
@@ -582,6 +582,11 @@ func (model Model) resizeComponents() Model {
 	}
 	model.composer.SetWidth(max(1, streamWidth))
 	conversationHeight := max(1, model.height-3-model.composer.Height())
+	if model.layout() != LayoutContextOnly {
+		if cards := model.childCards.View(max(1, streamWidth)); cards != "" {
+			conversationHeight = max(1, conversationHeight-renderedLineCount(cards)-2)
+		}
+	}
 	if model.turnProgress != progressIdle {
 		conversationHeight = max(1, conversationHeight-1)
 	}

@@ -58,10 +58,10 @@ func (model Model) handleKey(key string) Model {
 			return model
 		case "alt+[":
 			model.childCards.Move(-1)
-			return model
+			return model.resizeComponents()
 		case "alt+]":
 			model.childCards.Move(1)
-			return model
+			return model.resizeComponents()
 		}
 	}
 	if model.screen != ScreenConversation {

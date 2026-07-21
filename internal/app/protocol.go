@@ -205,6 +205,9 @@ func ValidateApplicationCursor(cursor protocol.ApplicationCursor, selected proto
 }
 
 func validateRelatedSessionCursors(related []protocol.CommittedCursor, selected *protocol.CommittedCursor) error {
+	if len(related) > protocol.MaxCollectionMembers {
+		return fmt.Errorf("related-session cursor exceeds protocol collection limit")
+	}
 	for index, cursor := range related {
 		if cursor.Validate() != nil || cursor.JournalKind != protocol.JournalSession || selected == nil || cursor.JournalID == selected.JournalID || index > 0 && related[index-1].JournalID >= cursor.JournalID {
 			return fmt.Errorf("related-session cursor is invalid")

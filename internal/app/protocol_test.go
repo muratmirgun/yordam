@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -112,6 +113,19 @@ func TestApplicationCursorValidatesSortedUniqueRelatedSessionProvenance(t *testi
 				t.Fatal("invalid related-session provenance accepted")
 			}
 		})
+	}
+}
+
+func TestApplicationCursorRejectsOversizedRelatedSessionProvenance(t *testing.T) {
+	workspace := committedCursor(protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "workspace-1"}, 1, "workspace")
+	parent := committedCursor(protocol.JournalRef{Kind: protocol.JournalSession, ID: "parent"}, 2, "parent")
+	related := make([]protocol.CommittedCursor, protocol.MaxCollectionMembers+1)
+	for index := range related {
+		related[index] = committedCursor(protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(fmt.Sprintf("child-%05d", index))}, 1, "head")
+	}
+	cursor := protocol.ApplicationCursor{WorkspaceControl: workspace, SelectedSession: &parent, RelatedSessions: related, Stream: protocol.StreamCursor{Epoch: "epoch"}}
+	if err := app.ValidateApplicationCursor(cursor, "parent"); err == nil {
+		t.Fatal("oversized related-session provenance accepted")
 	}
 }
 

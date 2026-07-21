@@ -157,6 +157,10 @@ func (b *Broker) snapshotLocked(ctx context.Context, selected protocol.SessionID
 			if relatedErr != nil {
 				return protocol.ApplicationSnapshot{}, relatedErr
 			}
+			if len(related) > protocol.MaxCollectionMembers {
+				return protocol.ApplicationSnapshot{}, fmt.Errorf("related-session cursor vector exceeds protocol limit")
+			}
+			related = protocol.DeepCopy(related)
 			sort.Slice(related, func(i, j int) bool { return related[i].JournalID < related[j].JournalID })
 			for index, cursor := range related {
 				if cursor.Validate() != nil || cursor.JournalKind != protocol.JournalSession || cursor.JournalID == head.JournalID || index > 0 && related[index-1].JournalID == cursor.JournalID {
@@ -188,13 +192,13 @@ func (b *Broker) Subscribe(ctx context.Context, request protocol.SubscriptionReq
 		return nil, err
 	}
 	subscription := b.newSubscriptionLocked(request.Consumer, request.SelectedSessionID, request.QueueCapacity, protocol.DeepCopy(request.After))
-	if subscription.cursor.SelectedSession == nil || subscription.cursor.SelectedSession.JournalID != protocol.JournalID(request.SelectedSessionID) {
-		subscription.cursor.RelatedSessions = nil
-	}
+	// Related-session cursors are server-authored snapshot provenance, not
+	// reconnect input. Never echo a client-supplied vector into event cursors.
+	subscription.cursor.RelatedSessions = nil
 	if request.After.Stream.Epoch != b.epoch {
 		terminal := protocol.SubscriptionTerminal{
 			Code: "transient.gap", Message: "transient process epoch changed",
-			ResumeAfter: protocol.DeepCopy(request.After), RequiresSnapshot: true,
+			ResumeAfter: protocol.DeepCopy(subscription.cursor), RequiresSnapshot: true,
 		}
 		terminal.ResumeAfter.Stream = protocol.StreamCursor{Epoch: b.epoch, Seq: b.streamSeq}
 		subscription.queueTerminalLocked(terminal)

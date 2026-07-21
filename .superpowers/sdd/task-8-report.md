@@ -103,3 +103,35 @@ go test ./... -count=1  PASS
 go vet ./...  PASS
 git diff --check  PASS
 ```
+
+## Second review-fix addendum
+
+- `Subscribe` now treats related-session cursors as snapshot-only,
+  server-authored provenance. Client-supplied related cursors are validated as
+  input but cleared before catch-up, transient, durable, slow-consumer, or
+  epoch-gap output can be authored. Adversarial nonexistent/future child
+  cursors are never echoed in an outgoing application cursor.
+- One shared full-history validator selects the most recent
+  `MaxCollectionMembers` distinct attempts after enforcing exact duplicates and
+  the per-parent-turn limit across the entire prefix. Related child heads and
+  chronological child cards consume that same selected attempt set; lineage
+  children therefore use the same bounded window. Related vectors over the
+  protocol limit fail closed in broker, projection, and application-cursor
+  validation. A 4,096-related-cursor subscription still emits a valid durable
+  event rather than `invalid_event`.
+- Conversation viewport sizing now reserves the selected child card's rendered
+  height plus its separator budget. Durable card replacement, terminal resize,
+  window resize, and card navigation all recalculate the viewport. A real
+  40x24 model with 1,000 history lines, 20 cards, long values, and transitions
+  between tall and short cards stays within 24 rendered lines and keeps the
+  composer cursor visible.
+
+Second review-fix verification:
+
+```text
+go test ./internal/app ./internal/protocol ./internal/tui/... ./internal/subagent ./internal/session/jsonl -count=1  PASS
+go test -race ./internal/app ./internal/tui/... ./internal/subagent -run 'Test.*(Subagent|Child|Snapshot|ApplicationCursor|Related|Lifetime|Window|Subscribe|Terminal|Lineage|Attempt)' -count=1  PASS
+go test ./... -count=1  PASS
+go vet ./...  PASS
+git diff --check  PASS
+```

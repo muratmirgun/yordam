@@ -16,6 +16,13 @@ import (
 
 type childInspection func(protocol.SessionID) (journal.Inspection, error)
 
+type subagentCardAttempt struct {
+	request protocol.SubagentRequestedV1
+	at      time.Time
+	state   protocol.SubagentStage
+	ordinal int
+}
+
 type journalRangeReader interface {
 	ReadRange(context.Context, journal.ReadRangeRequest) (journal.EventPage, error)
 }
@@ -74,53 +81,19 @@ func readInspectionAt(ctx context.Context, reader journalRangeReader, ref protoc
 }
 
 func projectSubagentCards(parent journal.Inspection, inspectChild childInspection, now time.Time, redactor secret.Redacting) ([]protocol.SubagentCardV1, error) {
-	type pending struct {
-		request protocol.SubagentRequestedV1
-		at      time.Time
-		state   protocol.SubagentStage
-		ordinal int
+	selected, err := recentSubagentAttempts(parent)
+	if err != nil {
+		return nil, err
 	}
-	order := make([]protocol.DelegationAttemptID, 0)
-	attempts := make(map[protocol.DelegationAttemptID]pending)
-	attemptsByTurn := make(map[protocol.TurnID]int)
-	for _, record := range parent.Events {
-		switch value := record.Decoded.(type) {
-		case *protocol.SubagentRequestedV1:
-			if value == nil || value.Validate() != nil || value.Manifest.ParentSessionID != protocol.SessionID(parent.Journal.ID) {
-				continue
-			}
-			if existing, exists := attempts[value.Manifest.AttemptID]; exists {
-				if existing.request != *value {
-					return nil, fmt.Errorf("conflicting duplicate subagent attempt %q", value.Manifest.AttemptID)
-				}
-				continue
-			}
-			attemptsByTurn[record.Envelope.TurnID]++
-			if attemptsByTurn[record.Envelope.TurnID] > protocol.MaxSubagentAttemptsPerTurn {
-				return nil, fmt.Errorf("subagent attempts exceed per-turn limit")
-			}
-			order = append(order, value.Manifest.AttemptID)
-			attempts[value.Manifest.AttemptID] = pending{request: protocol.DeepCopy(*value), at: record.Envelope.Time, state: protocol.SubagentStageRequested, ordinal: attemptsByTurn[record.Envelope.TurnID]}
-		case *protocol.SubagentWaitingV1:
-			if value == nil {
-				continue
-			}
-			attempt, ok := attempts[value.AttemptID]
-			if ok && attempt.request.Manifest.ChildSessionID == value.ChildSessionID {
-				attempt.state = protocol.SubagentStageWaiting
-				attempts[value.AttemptID] = attempt
-			}
-		}
-	}
-	cards := make([]protocol.SubagentCardV1, 0, len(order))
-	for _, attemptID := range order {
-		attempt := attempts[attemptID]
+	cards := make([]protocol.SubagentCardV1, 0, len(selected))
+	for _, attempt := range selected {
+		attemptID := attempt.request.Manifest.AttemptID
 		manifest := attempt.request.Manifest
 		card := protocol.SubagentCardV1{AttemptID: attemptID, ParentSessionID: manifest.ParentSessionID, ChildSessionID: manifest.ChildSessionID, Task: publicSubagentText(redactor, attempt.request.Call.Task, protocol.MaxSubagentTaskBytes), State: attempt.state, Attempt: attempt.ordinal, StartedAt: attempt.at, Deadline: manifest.Deadline, MaxToolCalls: manifest.MaxToolCalls, ChangedFiles: []string{}, CommandsAndTests: []string{}}
 		end := now
-		child, err := inspectChild(manifest.ChildSessionID)
-		if err != nil {
-			if errors.Is(err, journal.ErrSessionNotFound) {
+		child, childErr := inspectChild(manifest.ChildSessionID)
+		if childErr != nil {
+			if errors.Is(childErr, journal.ErrSessionNotFound) {
 				card.ElapsedNanos = max(0, end.Sub(card.StartedAt).Nanoseconds())
 				if validateErr := card.Validate(); validateErr != nil {
 					return nil, validateErr
@@ -128,7 +101,7 @@ func projectSubagentCards(parent journal.Inspection, inspectChild childInspectio
 				cards = append(cards, card)
 				continue
 			}
-			return nil, err
+			return nil, childErr
 		}
 		for _, record := range child.Events {
 			switch value := record.Decoded.(type) {
@@ -162,6 +135,51 @@ func projectSubagentCards(parent journal.Inspection, inspectChild childInspectio
 		cards = append(cards, card)
 	}
 	return cards, nil
+}
+
+func recentSubagentAttempts(parent journal.Inspection) ([]subagentCardAttempt, error) {
+	order := make([]protocol.DelegationAttemptID, 0)
+	attempts := make(map[protocol.DelegationAttemptID]subagentCardAttempt)
+	attemptsByTurn := make(map[protocol.TurnID]int)
+	for _, record := range parent.Events {
+		switch value := record.Decoded.(type) {
+		case *protocol.SubagentRequestedV1:
+			if value == nil || value.Validate() != nil || value.Manifest.ParentSessionID != protocol.SessionID(parent.Journal.ID) ||
+				record.Envelope.JournalKind != protocol.JournalSession || record.Envelope.JournalID != parent.Journal.ID || record.Envelope.SessionID != value.Manifest.ParentSessionID ||
+				record.Envelope.TaskID == "" || record.Envelope.TurnID == "" || record.Envelope.RuntimeGenerationID != value.Manifest.RuntimeGenerationID {
+				continue
+			}
+			if existing, exists := attempts[value.Manifest.AttemptID]; exists {
+				if existing.request != *value {
+					return nil, fmt.Errorf("conflicting duplicate subagent attempt %q", value.Manifest.AttemptID)
+				}
+				continue
+			}
+			attemptsByTurn[record.Envelope.TurnID]++
+			if attemptsByTurn[record.Envelope.TurnID] > protocol.MaxSubagentAttemptsPerTurn {
+				return nil, fmt.Errorf("subagent attempts exceed per-turn limit")
+			}
+			order = append(order, value.Manifest.AttemptID)
+			attempts[value.Manifest.AttemptID] = subagentCardAttempt{request: protocol.DeepCopy(*value), at: record.Envelope.Time, state: protocol.SubagentStageRequested, ordinal: attemptsByTurn[record.Envelope.TurnID]}
+		case *protocol.SubagentWaitingV1:
+			if value == nil {
+				continue
+			}
+			attempt, ok := attempts[value.AttemptID]
+			if ok && attempt.request.Manifest.ChildSessionID == value.ChildSessionID {
+				attempt.state = protocol.SubagentStageWaiting
+				attempts[value.AttemptID] = attempt
+			}
+		}
+	}
+	if len(order) > protocol.MaxCollectionMembers {
+		order = order[len(order)-protocol.MaxCollectionMembers:]
+	}
+	selected := make([]subagentCardAttempt, 0, len(order))
+	for _, attemptID := range order {
+		selected = append(selected, protocol.DeepCopy(attempts[attemptID]))
+	}
+	return selected, nil
 }
 
 func childRecordMatchesManifest(record protocol.EventRecord, manifest protocol.SubagentManifestV1) bool {
