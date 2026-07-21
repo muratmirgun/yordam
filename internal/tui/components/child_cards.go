@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
@@ -58,41 +59,51 @@ func (c *ChildCards) ApplyStage(stage protocol.SubagentStageV1) {
 }
 
 func (c ChildCards) View(width int) string {
-	blocks := make([]string, 0, len(c.cards))
-	for index, card := range c.cards {
-		marker := "  "
-		if index == c.cursor {
-			marker = "> "
-		}
-		budget := time.Duration(card.ElapsedNanos).Round(time.Millisecond).String() + "/" + card.Deadline.Sub(card.StartedAt).Round(time.Millisecond).String()
-		heading := fmt.Sprintf("%sCHILD %s [%s]", marker, card.AttemptID, card.State)
-		if width >= 72 {
-			heading += fmt.Sprintf(" | %s | session: %s | attempt %d | %s | tools %d/%d", card.Task, card.ChildSessionID, card.Attempt, budget, card.ToolCalls, card.MaxToolCalls)
-			blocks = append(blocks, strings.Join(append([]string{heading}, childDetails(card)...), "\n"))
-			continue
-		}
-		lines := []string{heading, "task: " + card.Task, "session: " + string(card.ChildSessionID), fmt.Sprintf("attempt %d | %s | tools %d/%d", card.Attempt, budget, card.ToolCalls, card.MaxToolCalls)}
-		blocks = append(blocks, strings.Join(append(lines, childDetails(card)...), "\n"))
-	}
-	if len(blocks) == 0 {
+	if len(c.cards) == 0 {
 		return ""
 	}
-	return strings.Join(blocks, "\n\n") + "\nopen: Alt+Enter"
+	width = max(width, 1)
+	index := min(max(c.cursor, 0), len(c.cards)-1)
+	card := c.cards[index]
+	budget := time.Duration(card.ElapsedNanos).Round(time.Millisecond).String() + "/" + card.Deadline.Sub(card.StartedAt).Round(time.Millisecond).String()
+	lines := []string{
+		fmt.Sprintf("card %d/%d", index+1, len(c.cards)),
+		fmt.Sprintf("CHILD %s [%s]", card.AttemptID, card.State),
+		"session: " + string(card.ChildSessionID),
+		fmt.Sprintf("attempt %d | %s | tools %d/%d", card.Attempt, budget, card.ToolCalls, card.MaxToolCalls),
+		"task: " + card.Task,
+	}
+	lines = append(lines, childDetails(card)...)
+	lines = append(lines, "Alt+[/Alt+] cards | Alt+Enter open")
+	for lineIndex := range lines {
+		lines[lineIndex] = truncateChildLine(lines[lineIndex], width)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func childDetails(card protocol.SubagentCardV1) []string {
-	lines := make([]string, 0, 5)
+	lines := make([]string, 0, 6)
 	if card.ReceiptSummary != "" {
 		lines = append(lines, "summary: "+card.ReceiptSummary)
 	}
-	if len(card.ChangedFiles) != 0 {
-		lines = append(lines, "changed: "+strings.Join(card.ChangedFiles, ", "))
+	for index, value := range card.ChangedFiles {
+		if index == 2 {
+			break
+		}
+		lines = append(lines, "changed: "+value)
 	}
-	if len(card.CommandsAndTests) != 0 {
-		lines = append(lines, "tests: "+strings.Join(card.CommandsAndTests, ", "))
+	for index, value := range card.CommandsAndTests {
+		if index == 2 {
+			break
+		}
+		lines = append(lines, "tests: "+value)
 	}
 	if card.Warning != "" {
 		lines = append(lines, "WARNING: "+card.Warning)
 	}
 	return lines
+}
+
+func truncateChildLine(value string, width int) string {
+	return ansi.Truncate(value, width, "…")
 }

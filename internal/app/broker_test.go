@@ -53,6 +53,92 @@ func TestSnapshotAndSubscribeHasNoCommitGap(t *testing.T) {
 	}
 }
 
+func TestSnapshotCapturesRelatedHeadsBeforeProjectionAndReplaysExactVector(t *testing.T) {
+	base := newBrokerSource()
+	child := protocol.JournalRef{Kind: protocol.JournalSession, ID: "child-1"}
+	base.ensure(child)
+	source := &adversarialRelatedBrokerSource{brokerSource: base, child: child}
+	broker := mustBroker(t, source, nil)
+
+	first, err := broker.Snapshot(t.Context(), snapshotRequest(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Cursor.SelectedSession == nil || first.Cursor.SelectedSession.CommitSeq != base.initialSession.CommitSeq || len(first.Cursor.RelatedSessions) != 1 || first.Cursor.RelatedSessions[0].CommitSeq != 1 {
+		t.Fatalf("first cursor=%+v", first.Cursor)
+	}
+	var projected app.SnapshotVector
+	if err := json.Unmarshal(first.Durable.Workspace.Data, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if projected.SelectedSession == nil || *projected.SelectedSession != *first.Cursor.SelectedSession || len(projected.RelatedSessions) != 1 || projected.RelatedSessions[0] != first.Cursor.RelatedSessions[0] {
+		t.Fatalf("projection vector=%+v cursor=%+v", projected, first.Cursor)
+	}
+
+	second, err := broker.Snapshot(t.Context(), snapshotRequest(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Cursor.SelectedSession == nil || second.Cursor.SelectedSession.CommitSeq <= first.Cursor.SelectedSession.CommitSeq || len(second.Cursor.RelatedSessions) != 1 || second.Cursor.RelatedSessions[0].CommitSeq <= first.Cursor.RelatedSessions[0].CommitSeq {
+		t.Fatalf("second cursor=%+v first=%+v", second.Cursor, first.Cursor)
+	}
+}
+
+func TestSubscriptionUpdatesPreserveCapturedRelatedSessionCursors(t *testing.T) {
+	base := newBrokerSource()
+	child := protocol.JournalRef{Kind: protocol.JournalSession, ID: "child-1"}
+	base.ensure(child)
+	source := &stableRelatedBrokerSource{brokerSource: base, child: child}
+	broker := mustBroker(t, source, nil)
+	snapshot, subscription, err := broker.SnapshotAndSubscribe(t.Context(), snapshotRequest(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Cursor.RelatedSessions) != 1 {
+		t.Fatalf("snapshot cursor=%+v", snapshot.Cursor)
+	}
+	events, cursor := source.commit(source.session, "parent-after-related-snapshot", time.Unix(7, 0).UTC())
+	if err := broker.PublishCommitted(t.Context(), source.session, cursor, events); err != nil {
+		t.Fatal(err)
+	}
+	item, err := subscription.Next(t.Context())
+	if err != nil || item.Event == nil || len(item.Event.Cursor.RelatedSessions) != 1 || item.Event.Cursor.RelatedSessions[0] != snapshot.Cursor.RelatedSessions[0] {
+		t.Fatalf("item=%+v err=%v snapshot=%+v", item, err, snapshot.Cursor)
+	}
+	item.Event.Cursor.RelatedSessions[0].CommitSeq++
+	if snapshot.Cursor.RelatedSessions[0].CommitSeq == item.Event.Cursor.RelatedSessions[0].CommitSeq {
+		t.Fatal("subscription event related cursors alias snapshot cursor")
+	}
+}
+
+type stableRelatedBrokerSource struct {
+	*brokerSource
+	child protocol.JournalRef
+}
+
+func (s *stableRelatedBrokerSource) RelatedSessionHeads(context.Context, protocol.CommittedCursor) ([]protocol.CommittedCursor, error) {
+	head, err := s.Head(context.Background(), s.child)
+	return []protocol.CommittedCursor{head}, err
+}
+
+type adversarialRelatedBrokerSource struct {
+	*brokerSource
+	child protocol.JournalRef
+	once  sync.Once
+}
+
+func (s *adversarialRelatedBrokerSource) RelatedSessionHeads(context.Context, protocol.CommittedCursor) ([]protocol.CommittedCursor, error) {
+	head, err := s.Head(context.Background(), s.child)
+	if err != nil {
+		return nil, err
+	}
+	s.once.Do(func() {
+		s.commit(s.session, "parent-request-after-vector", time.Unix(5, 0).UTC())
+		s.commit(s.child, "child-receipt-after-vector", time.Unix(6, 0).UTC())
+	})
+	return []protocol.CommittedCursor{head}, nil
+}
+
 func TestSubscriptionCatchUpMergesByTimestampThenEventID(t *testing.T) {
 	source := newBrokerSource()
 	source.commit(source.session, "z-session", time.Unix(2, 0).UTC())

@@ -495,6 +495,42 @@ func (s runtimeBrokerSource) ReadRange(ctx context.Context, request journal.Read
 	return s.Repository.ReadRange(ctx, request)
 }
 
+func (s runtimeBrokerSource) RelatedSessionHeads(ctx context.Context, parentCursor protocol.CommittedCursor) ([]protocol.CommittedCursor, error) {
+	parentRef := protocol.JournalRef{Kind: protocol.JournalSession, ID: parentCursor.JournalID}
+	parent, err := readInspectionAt(ctx, s.Repository, parentRef, parentCursor)
+	if err != nil {
+		return nil, fmt.Errorf("read selected session at snapshot cursor: %w", err)
+	}
+	children := make(map[protocol.SessionID]struct{})
+	for _, record := range parent.Events {
+		request, ok := record.Decoded.(*protocol.SubagentRequestedV1)
+		if !ok || request == nil || request.Validate() != nil || request.Manifest.ParentSessionID != protocol.SessionID(parentRef.ID) || record.Envelope.JournalKind != parentRef.Kind || record.Envelope.JournalID != parentRef.ID || record.Envelope.SessionID != protocol.SessionID(parentRef.ID) {
+			continue
+		}
+		children[request.Manifest.ChildSessionID] = struct{}{}
+	}
+	ids := make([]protocol.SessionID, 0, len(children))
+	for id := range children {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	result := make([]protocol.CommittedCursor, 0, len(ids))
+	for _, id := range ids {
+		head, headErr := s.Repository.Head(ctx, protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(id)})
+		if errors.Is(headErr, journal.ErrSessionNotFound) {
+			continue
+		}
+		if headErr != nil {
+			return nil, fmt.Errorf("read related child head %q: %w", id, headErr)
+		}
+		if head.Validate() != nil || head.JournalKind != protocol.JournalSession || head.JournalID != protocol.JournalID(id) {
+			return nil, fmt.Errorf("related child head %q is invalid", id)
+		}
+		result = append(result, head)
+	}
+	return result, nil
+}
+
 func (s runtimeBrokerSource) Project(ctx context.Context, vector SnapshotVector) (protocol.DurableProjection, protocol.RuntimeProjection, error) {
 	workspaceRef := s.Workspace
 	workspaceAuthorization, err := projection.New[authorization.Projection](s.Repository, authorization.Projector{}, nil).At(ctx, workspaceRef, vector.WorkspaceControl)
@@ -534,12 +570,23 @@ func (s runtimeBrokerSource) Project(ctx context.Context, vector SnapshotVector)
 	}
 	if vector.SelectedSession != nil {
 		ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: vector.SelectedSession.JournalID}
-		inspection, inspectErr := s.Repository.Inspect(ctx, ref)
+		inspection, inspectErr := readInspectionAt(ctx, s.Repository, ref, *vector.SelectedSession)
 		if inspectErr != nil {
-			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("inspect selected session for subagents: %w", inspectErr)
+			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("read selected session for subagents at snapshot cursor: %w", inspectErr)
+		}
+		related := make(map[protocol.SessionID]protocol.CommittedCursor, len(vector.RelatedSessions))
+		for index, cursor := range vector.RelatedSessions {
+			if cursor.Validate() != nil || cursor.JournalKind != protocol.JournalSession || cursor.JournalID == ref.ID || index > 0 && vector.RelatedSessions[index-1].JournalID >= cursor.JournalID {
+				return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("related-session snapshot vector is invalid")
+			}
+			related[protocol.SessionID(cursor.JournalID)] = cursor
 		}
 		cards, cardsErr := projectSubagentCards(inspection, func(childID protocol.SessionID) (journal.Inspection, error) {
-			return s.Repository.Inspect(ctx, protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(childID)})
+			cursor, ok := related[childID]
+			if !ok {
+				return journal.Inspection{}, journal.ErrSessionNotFound
+			}
+			return readInspectionAt(ctx, s.Repository, protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(childID)}, cursor)
 		}, time.Now().UTC(), s.Redactor)
 		if cardsErr != nil {
 			return protocol.DurableProjection{}, protocol.RuntimeProjection{}, fmt.Errorf("project subagent cards: %w", cardsErr)

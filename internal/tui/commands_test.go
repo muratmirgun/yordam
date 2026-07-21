@@ -3,11 +3,15 @@ package tui_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
+	lipgloss "charm.land/lipgloss/v2"
+	"github.com/muratmirgun/yordam/internal/agent"
 	"github.com/muratmirgun/yordam/internal/app"
 	"github.com/muratmirgun/yordam/internal/domain"
 	"github.com/muratmirgun/yordam/internal/protocol"
@@ -596,6 +600,52 @@ func TestDurableSubagentSnapshotRendersCardAndNavigatesChildAndParent(t *testing
 	restarted = tui.PressForTest(restarted, "alt+enter")
 	if got := tui.CommandsForTest(restartedCommands); len(got) != 1 || got[0].SessionID != "child" {
 		t.Fatalf("restart child navigation=%+v", got)
+	}
+}
+
+func TestRealModelBoundsSelectedChildCardWithHugeHistoryAndCardList(t *testing.T) {
+	model := tui.NewModel(tui.OptionsForTest())
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventTextDelta, Runtime: agent.RuntimeEvent{Text: strings.Repeat("huge history line\n", 1000)}})
+	long := strings.Repeat("long-task-value-", 120)
+	views := make([]protocol.ProjectionView, 20)
+	for index := range views {
+		card := protocol.SubagentCardV1{
+			AttemptID: protocol.DelegationAttemptID(fmt.Sprintf("attempt-%02d", index+1)), ParentSessionID: "parent",
+			ChildSessionID: protocol.SessionID(fmt.Sprintf("123e4567-e89b-12d3-a456-%012d", index)), Task: long,
+			State: protocol.SubagentStageSucceeded, Attempt: index%protocol.MaxSubagentAttemptsPerTurn + 1,
+			StartedAt: time.Unix(1, 0).UTC(), Deadline: time.Unix(3, 0).UTC(), ElapsedNanos: int64(time.Second), ToolCalls: 1, MaxToolCalls: 4,
+			ReceiptSummary: long, ChangedFiles: []string{"a-" + long, "b-" + long, "c-" + long}, CommandsAndTests: []string{"a-" + long, "b-" + long, "c-" + long},
+		}
+		raw, err := json.Marshal(card)
+		if err != nil {
+			t.Fatal(err)
+		}
+		views[index] = protocol.ProjectionView{ID: string(card.AttemptID), Kind: "subagent", Status: string(card.State), State: protocol.ValueKnown, Data: raw}
+	}
+	model = tui.ApplyAppEventForTest(model, app.Event{Kind: app.EventState, Durable: &protocol.DurableProjection{Subagents: views}})
+	for range 12 {
+		model = tui.PressForTest(model, "alt+]")
+	}
+	for _, width := range []int{40, 120} {
+		model = tui.UpdateForTest(model, tea.WindowSizeMsg{Width: width, Height: 24})
+		rendered := model.View().Content
+		start := strings.Index(rendered, "card 13/20")
+		endMarker := "Alt+[/Alt+] cards | Alt+Enter open"
+		end := strings.Index(rendered[start:], endMarker)
+		if start < 0 || end < 0 {
+			t.Fatalf("width %d selected card missing:\n%s", width, rendered)
+		}
+		end += start + len(endMarker)
+		cardView := rendered[start:end]
+		lines := strings.Split(cardView, "\n")
+		if len(lines) > 12 || strings.Contains(cardView, "attempt-12") || strings.Contains(cardView, "attempt-14") {
+			t.Fatalf("width %d unbounded/non-selected card view (%d lines):\n%s", width, len(lines), cardView)
+		}
+		for _, line := range lines {
+			if lipgloss.Width(line) > width {
+				t.Fatalf("width %d card line width=%d: %q", width, lipgloss.Width(line), line)
+			}
+		}
 	}
 }
 

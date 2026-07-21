@@ -12,9 +12,10 @@ type StreamCursor struct {
 }
 
 type ApplicationCursor struct {
-	WorkspaceControl CommittedCursor  `json:"workspace_control"`
-	SelectedSession  *CommittedCursor `json:"selected_session,omitempty"`
-	Stream           StreamCursor     `json:"stream"`
+	WorkspaceControl CommittedCursor   `json:"workspace_control"`
+	SelectedSession  *CommittedCursor  `json:"selected_session,omitempty"`
+	RelatedSessions  []CommittedCursor `json:"related_sessions,omitempty"`
+	Stream           StreamCursor      `json:"stream"`
 }
 
 type CommandExpectation struct {

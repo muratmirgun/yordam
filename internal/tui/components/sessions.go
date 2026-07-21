@@ -22,9 +22,7 @@ func NewSessions(items []domain.SessionSummary) Sessions {
 }
 
 func (s *Sessions) SetLineage(lineage protocol.SubagentLineageV1) {
-	if s.relations == nil {
-		s.relations = make(map[string]string)
-	}
+	s.relations = make(map[string]string)
 	if lineage.ParentSessionID != "" {
 		s.relations[string(lineage.SessionID)] = "child of " + string(lineage.ParentSessionID)
 		s.relations[string(lineage.ParentSessionID)] = "parent of " + string(lineage.SessionID)

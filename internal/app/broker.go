@@ -16,8 +16,13 @@ import (
 const ConsumerFakeHeadless = "fake_headless"
 
 type SnapshotVector struct {
-	WorkspaceControl protocol.CommittedCursor  `json:"workspace_control"`
-	SelectedSession  *protocol.CommittedCursor `json:"selected_session,omitempty"`
+	WorkspaceControl protocol.CommittedCursor   `json:"workspace_control"`
+	SelectedSession  *protocol.CommittedCursor  `json:"selected_session,omitempty"`
+	RelatedSessions  []protocol.CommittedCursor `json:"related_sessions,omitempty"`
+}
+
+type relatedSessionHeadSource interface {
+	RelatedSessionHeads(context.Context, protocol.CommittedCursor) ([]protocol.CommittedCursor, error)
 }
 
 type BrokerSource interface {
@@ -147,6 +152,19 @@ func (b *Broker) snapshotLocked(ctx context.Context, selected protocol.SessionID
 			return protocol.ApplicationSnapshot{}, err
 		}
 		vector.SelectedSession = &head
+		if relatedSource, ok := b.source.(relatedSessionHeadSource); ok {
+			related, relatedErr := relatedSource.RelatedSessionHeads(ctx, head)
+			if relatedErr != nil {
+				return protocol.ApplicationSnapshot{}, relatedErr
+			}
+			sort.Slice(related, func(i, j int) bool { return related[i].JournalID < related[j].JournalID })
+			for index, cursor := range related {
+				if cursor.Validate() != nil || cursor.JournalKind != protocol.JournalSession || cursor.JournalID == head.JournalID || index > 0 && related[index-1].JournalID == cursor.JournalID {
+					return protocol.ApplicationSnapshot{}, fmt.Errorf("related-session cursor vector is invalid")
+				}
+			}
+			vector.RelatedSessions = protocol.DeepCopy(related)
+		}
 	}
 	durable, runtime, err := b.source.Project(ctx, vector)
 	if err != nil {
@@ -156,7 +174,8 @@ func (b *Broker) snapshotLocked(ctx context.Context, selected protocol.SessionID
 		ProtocolVersion: protocol.ApplicationProtocolVersion,
 		Cursor: protocol.ApplicationCursor{
 			WorkspaceControl: workspaceHead, SelectedSession: protocol.DeepCopy(vector.SelectedSession),
-			Stream: protocol.StreamCursor{Epoch: b.epoch, Seq: b.streamSeq},
+			RelatedSessions: protocol.DeepCopy(vector.RelatedSessions),
+			Stream:          protocol.StreamCursor{Epoch: b.epoch, Seq: b.streamSeq},
 		},
 		Durable: protocol.DeepCopy(durable), Runtime: protocol.DeepCopy(runtime),
 	}, nil
@@ -169,6 +188,9 @@ func (b *Broker) Subscribe(ctx context.Context, request protocol.SubscriptionReq
 		return nil, err
 	}
 	subscription := b.newSubscriptionLocked(request.Consumer, request.SelectedSessionID, request.QueueCapacity, protocol.DeepCopy(request.After))
+	if subscription.cursor.SelectedSession == nil || subscription.cursor.SelectedSession.JournalID != protocol.JournalID(request.SelectedSessionID) {
+		subscription.cursor.RelatedSessions = nil
+	}
 	if request.After.Stream.Epoch != b.epoch {
 		terminal := protocol.SubscriptionTerminal{
 			Code: "transient.gap", Message: "transient process epoch changed",
@@ -450,6 +472,12 @@ func (b *Broker) validateSubscriptionRequest(request protocol.SubscriptionReques
 	}
 	if request.SelectedSessionID == "" && request.After.SelectedSession != nil {
 		return requestError(codeInvalidCommand, "subscription without selection carries a session cursor", nil)
+	}
+	if request.After.SelectedSession != nil && (request.After.SelectedSession.Validate() != nil || request.After.SelectedSession.JournalKind != protocol.JournalSession) {
+		return requestError(codeInvalidCommand, "invalid selected-session cursor", nil)
+	}
+	if err := validateRelatedSessionCursors(request.After.RelatedSessions, request.After.SelectedSession); err != nil {
+		return requestError(codeInvalidCommand, "invalid related-session cursor", err)
 	}
 	_, err := b.capacity(request.QueueCapacity)
 	return err

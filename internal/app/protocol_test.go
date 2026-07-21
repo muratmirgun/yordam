@@ -88,6 +88,33 @@ func TestApplicationCursorValidationRejectsIncompleteOrMismatchedVectors(t *test
 	}
 }
 
+func TestApplicationCursorValidatesSortedUniqueRelatedSessionProvenance(t *testing.T) {
+	workspace := committedCursor(protocol.JournalRef{Kind: protocol.JournalWorkspaceControl, ID: "workspace-1"}, 1, "workspace")
+	parent := committedCursor(protocol.JournalRef{Kind: protocol.JournalSession, ID: "parent"}, 2, "parent")
+	childA := committedCursor(protocol.JournalRef{Kind: protocol.JournalSession, ID: "child-a"}, 3, "child-a")
+	childB := committedCursor(protocol.JournalRef{Kind: protocol.JournalSession, ID: "child-b"}, 4, "child-b")
+	valid := protocol.ApplicationCursor{WorkspaceControl: workspace, SelectedSession: &parent, RelatedSessions: []protocol.CommittedCursor{childA, childB}, Stream: protocol.StreamCursor{Epoch: "epoch-1"}}
+	if err := app.ValidateApplicationCursor(valid, "parent"); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*protocol.ApplicationCursor){
+		"unsorted": func(cursor *protocol.ApplicationCursor) {
+			cursor.RelatedSessions[0], cursor.RelatedSessions[1] = cursor.RelatedSessions[1], cursor.RelatedSessions[0]
+		},
+		"duplicate": func(cursor *protocol.ApplicationCursor) { cursor.RelatedSessions[1] = cursor.RelatedSessions[0] },
+		"selected":  func(cursor *protocol.ApplicationCursor) { cursor.RelatedSessions[0] = parent },
+		"workspace": func(cursor *protocol.ApplicationCursor) { cursor.RelatedSessions[0] = workspace },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := protocol.DeepCopy(valid)
+			mutate(&changed)
+			if err := app.ValidateApplicationCursor(changed, "parent"); err == nil {
+				t.Fatal("invalid related-session provenance accepted")
+			}
+		})
+	}
+}
+
 func TestCommandIdempotencyReplaysDurableResultAndConflictsOnChangedPrincipal(t *testing.T) {
 	ref := protocol.JournalRef{Kind: protocol.JournalSession, ID: "session-1"}
 	head := committedCursor(ref, 1, "initial")

@@ -50,6 +50,18 @@ func TestSessionPickerProjectsDurableParentChildLineageLabels(t *testing.T) {
 	}
 }
 
+func TestSessionsSetLineageReplacesStaleRelations(t *testing.T) {
+	picker := components.NewSessions(nil)
+	picker.SetLineage(protocol.SubagentLineageV1{SessionID: "parent-a", Children: []protocol.SessionID{"child-a"}})
+	picker.SetLineage(protocol.SubagentLineageV1{SessionID: "parent-b", Children: []protocol.SessionID{"child-b"}})
+	if got := picker.Relation("child-a"); got != "" {
+		t.Fatalf("stale relation=%q", got)
+	}
+	if got := picker.Relation("child-b"); got != "child of parent-b" {
+		t.Fatalf("current relation=%q", got)
+	}
+}
+
 func TestSessionPickerUpsertsAndResorts(t *testing.T) {
 	picker := components.NewSessions([]domain.SessionSummary{{ID: "old", Title: "Old", UpdatedAt: time.Unix(1, 0)}})
 	picker.Upsert(domain.SessionSummary{ID: "new", Title: "New", UpdatedAt: time.Unix(3, 0)})

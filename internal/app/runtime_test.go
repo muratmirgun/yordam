@@ -279,6 +279,150 @@ func TestRuntimeBrokerProjectsFrozenMetadataOnlySkillCatalog(t *testing.T) {
 	}
 }
 
+func TestRuntimeBrokerSnapshotExcludesParentAndChildCommitsAfterVectorCapture(t *testing.T) {
+	builder := newRuntimeBuilderForTest(t, nil)
+	workspaceRef, err := builder.store.EnsureWorkspaceControl(t.Context(), builder.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspacePayload, err := canonicaljson.Marshal(protocol.ControlOperationTerminalV1{ControlOperationID: "seed", Status: "interrupted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, appendErr := builder.store.AppendBatch(t.Context(), journal.AppendRequest{Journal: workspaceRef, TransactionID: "snapshot-workspace-seed", Events: []protocol.ProposedEvent{{EventID: "snapshot-workspace-seed", Time: time.Unix(1, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventControlOperationInterrupted, Payload: workspacePayload}}}); appendErr != nil || result.Status != journal.AppendCommitted {
+		t.Fatalf("seed workspace result=%+v err=%v", result, appendErr)
+	}
+	parentID := protocol.SessionID(builder.activeSession.get())
+	parentRef := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(parentID)}
+	parentHead, err := builder.store.Head(t.Context(), parentRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childID, err := builder.store.ReserveSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := protocol.SubagentManifestV1{AttemptID: "snapshot-attempt-1", ParentSessionID: parentID, ParentCursor: parentHead, ChildSessionID: childID, ChildTaskID: "snapshot-child-task-1", ChildTurnID: "snapshot-child-turn-1", RuntimeGenerationID: "snapshot-generation", SkillCatalogRevision: "snapshot-skills", MaxToolCalls: 4, Deadline: time.Unix(100, 0).UTC()}
+	request := protocol.SubagentRequestedV1{Call: protocol.SubagentCallV1{Task: "first snapshot task"}, Manifest: manifest}
+	requestPayload, err := canonicaljson.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstParent, err := appendSnapshotFixtureEvent(t.Context(), builder.store, parentRef, parentHead, "snapshot-parent-request-1", protocol.ProposedEvent{EventID: "snapshot-parent-request-1", Time: time.Unix(10, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentRequested, SessionID: parentID, TaskID: "snapshot-parent-task", TurnID: "snapshot-parent-turn", RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: requestPayload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestDigest, err := canonicaljson.Digest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := builder.store.CreateWithIdentity(t.Context(), childID, builder.workspace, domain.ModeAsk, domain.ModelSelection{}, &journal.SessionLineage{Kind: journal.LineageSubagent, ParentSessionID: parentID, ParentCursor: manifest.ParentCursor, DelegationAttemptID: manifest.AttemptID, ManifestDigest: manifestDigest}); err != nil {
+		t.Fatal(err)
+	}
+	childRef := protocol.JournalRef{Kind: protocol.JournalSession, ID: protocol.JournalID(childID)}
+	childHead, err := builder.store.Head(t.Context(), childRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPayload, err := canonicaljson.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstChild, err := appendSnapshotFixtureEvent(t.Context(), builder.store, childRef, childHead, "snapshot-child-manifest-1", protocol.ProposedEvent{EventID: "snapshot-child-manifest-1", Time: time.Unix(11, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentManifest, SessionID: childID, TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID, RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: manifestPayload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingChildID, err := builder.store.ReserveSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseSource := runtimeBrokerSource{Repository: builder.store, Sessions: builder.store, Workspace: workspaceRef, Generation: "snapshot-generation", Redactor: secret.New()}
+	source := &postCaptureRuntimeSource{runtimeBrokerSource: baseSource}
+	source.late = func() error {
+		secondManifest := manifest
+		secondManifest.AttemptID, secondManifest.ChildSessionID, secondManifest.ChildTaskID, secondManifest.ChildTurnID = "snapshot-attempt-2", missingChildID, "snapshot-child-task-2", "snapshot-child-turn-2"
+		secondManifest.ParentCursor = firstParent
+		secondPayload, marshalErr := canonicaljson.Marshal(protocol.SubagentRequestedV1{Call: protocol.SubagentCallV1{Task: "second snapshot task"}, Manifest: secondManifest})
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if _, appendErr := appendSnapshotFixtureEvent(t.Context(), builder.store, parentRef, firstParent, "snapshot-parent-request-2", protocol.ProposedEvent{EventID: "snapshot-parent-request-2", Time: time.Unix(12, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentRequested, SessionID: parentID, TaskID: "snapshot-parent-task", TurnID: "snapshot-parent-turn", RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: secondPayload}); appendErr != nil {
+			return appendErr
+		}
+		receiptCursor := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: childRef.ID, CommitSeq: firstChild.CommitSeq + 1, TransactionID: "snapshot-child-receipt-1"}
+		receipt := protocol.SubagentReceiptV1{Status: "succeeded", Summary: "late snapshot receipt", Manifest: manifest, TerminalCursor: receiptCursor, ChangedFiles: []string{}, CommandsAndTests: []string{}, Usage: unknownSubagentUsage(), EvidenceIDs: []protocol.EvidenceID{}, UnknownEffects: []protocol.ActivityID{}}
+		receiptPayload, marshalErr := canonicaljson.Marshal(receipt)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		_, appendErr := appendSnapshotFixtureEvent(t.Context(), builder.store, childRef, firstChild, "snapshot-child-receipt-1", protocol.ProposedEvent{EventID: "snapshot-child-receipt-1", Time: time.Unix(13, 0).UTC(), PayloadVersion: 1, Kind: protocol.EventSubagentReceipt, SessionID: childID, TaskID: manifest.ChildTaskID, TurnID: manifest.ChildTurnID, RuntimeGenerationID: manifest.RuntimeGenerationID, Payload: receiptPayload})
+		return appendErr
+	}
+	broker, err := NewBroker(BrokerOptions{Source: source, Epoch: "snapshot-epoch", DefaultQueueCapacity: 4, MaxQueueCapacity: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := broker.Snapshot(t.Context(), protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: parentID, Consumer: "snapshot-adversary", QueueCapacity: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCards := decodeSnapshotSubagentCards(t, first.Durable)
+	if len(firstCards) != 1 || firstCards[0].State != protocol.SubagentStageRunning || firstCards[0].ReceiptSummary != "" || first.Cursor.SelectedSession == nil || *first.Cursor.SelectedSession != firstParent || len(first.Cursor.RelatedSessions) != 1 || first.Cursor.RelatedSessions[0] != firstChild {
+		t.Fatalf("first snapshot cards=%+v cursor=%+v", firstCards, first.Cursor)
+	}
+	second, err := broker.Snapshot(t.Context(), protocol.SnapshotRequest{ProtocolVersion: protocol.ApplicationProtocolVersion, SelectedSessionID: parentID, Consumer: "snapshot-adversary", QueueCapacity: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCards := decodeSnapshotSubagentCards(t, second.Durable)
+	if len(secondCards) != 2 || secondCards[0].State != protocol.SubagentStageSucceeded || secondCards[0].ReceiptSummary != "late snapshot receipt" || second.Cursor.SelectedSession == nil || second.Cursor.SelectedSession.CommitSeq <= first.Cursor.SelectedSession.CommitSeq || len(second.Cursor.RelatedSessions) != 1 || second.Cursor.RelatedSessions[0].CommitSeq <= first.Cursor.RelatedSessions[0].CommitSeq {
+		t.Fatalf("second snapshot cards=%+v cursor=%+v", secondCards, second.Cursor)
+	}
+}
+
+type postCaptureRuntimeSource struct {
+	runtimeBrokerSource
+	once atomic.Bool
+	late func() error
+}
+
+func (s *postCaptureRuntimeSource) RelatedSessionHeads(ctx context.Context, parent protocol.CommittedCursor) ([]protocol.CommittedCursor, error) {
+	result, err := s.runtimeBrokerSource.RelatedSessionHeads(ctx, parent)
+	if err == nil && s.once.CompareAndSwap(false, true) && s.late != nil {
+		err = s.late()
+	}
+	return result, err
+}
+
+func appendSnapshotFixtureEvent(ctx context.Context, store *jsonl.Store, ref protocol.JournalRef, expected protocol.CommittedCursor, transactionID protocol.TransactionID, event protocol.ProposedEvent) (protocol.CommittedCursor, error) {
+	request := journal.AppendRequest{Journal: ref, ExpectedHead: expected, TransactionID: transactionID, Events: []protocol.ProposedEvent{event}}
+	if strings.HasPrefix(string(expected.TransactionID), "legacy:") {
+		request.Compatibility = &journal.CompatibilityDeclaration{ReaderVersion: protocol.EnvelopeVersion, WriterVersion: protocol.EnvelopeVersion, LegacyHead: expected}
+	}
+	result, err := store.AppendBatch(ctx, request)
+	if err != nil {
+		return protocol.CommittedCursor{}, err
+	}
+	if result.Status != journal.AppendCommitted {
+		return protocol.CommittedCursor{}, fmt.Errorf("snapshot fixture append status %q", result.Status)
+	}
+	return result.Cursor, nil
+}
+
+func decodeSnapshotSubagentCards(t *testing.T, durable protocol.DurableProjection) []protocol.SubagentCardV1 {
+	t.Helper()
+	result := make([]protocol.SubagentCardV1, 0, len(durable.Subagents))
+	for _, view := range durable.Subagents {
+		var card protocol.SubagentCardV1
+		if err := json.Unmarshal(view.Data, &card); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, card)
+	}
+	return result
+}
+
 func TestSkillInstructionsExposeOnlyFrozenUntrustedMetadata(t *testing.T) {
 	builder := newRuntimeBuilderForTest(t, nil)
 	content := []byte("---\nname: go-testing\ndescription: Test Go.\n---\nbody-sentinel-never-system\n")

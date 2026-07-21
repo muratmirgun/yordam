@@ -193,13 +193,22 @@ func ValidateApplicationCursor(cursor protocol.ApplicationCursor, selected proto
 		return fmt.Errorf("stream cursor epoch is required")
 	}
 	if selected == "" {
-		if cursor.SelectedSession != nil {
+		if cursor.SelectedSession != nil || len(cursor.RelatedSessions) != 0 {
 			return fmt.Errorf("unselected cursor carries a session component")
 		}
 		return nil
 	}
 	if cursor.SelectedSession == nil || cursor.SelectedSession.Validate() != nil || cursor.SelectedSession.JournalKind != protocol.JournalSession || cursor.SelectedSession.JournalID != protocol.JournalID(selected) {
 		return fmt.Errorf("selected-session cursor is invalid")
+	}
+	return validateRelatedSessionCursors(cursor.RelatedSessions, cursor.SelectedSession)
+}
+
+func validateRelatedSessionCursors(related []protocol.CommittedCursor, selected *protocol.CommittedCursor) error {
+	for index, cursor := range related {
+		if cursor.Validate() != nil || cursor.JournalKind != protocol.JournalSession || selected == nil || cursor.JournalID == selected.JournalID || index > 0 && related[index-1].JournalID >= cursor.JournalID {
+			return fmt.Errorf("related-session cursor is invalid")
+		}
 	}
 	return nil
 }

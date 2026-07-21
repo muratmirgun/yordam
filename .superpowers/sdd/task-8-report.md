@@ -64,3 +64,42 @@ Residual: elapsed time is frozen at the snapshot boundary (or the durable
 receipt time for terminal cards); it does not animate between stage/snapshot
 refreshes. This keeps reconnect rendering deterministic and avoids a second
 transient timer authority.
+
+## Review-fix addendum
+
+- Delegation ordinals are now derived per durable parent turn rather than per
+  session. Exact duplicate requests retain their original ordinal, more than
+  four distinct requests in one turn fail closed, and later turns restart at
+  ordinal one. The existing subagent projector remains the durable protocol
+  authority for the per-turn maximum.
+- Snapshot provenance now includes a sorted, unique, deep-copied list of exact
+  related-child committed cursors. The broker captures the selected parent
+  head, derives child identities from that exact prefix, captures every present
+  child head, and only then projects. Parent and child card inputs are read with
+  paged `ReadRange` calls that stop at the requested committed transaction;
+  card projection never calls latest-head `Inspect`.
+- A real JSONL/runtime-source adversarial fixture commits a second parent
+  request and a child receipt after vector capture. The first snapshot excludes
+  both commits and reports the captured parent/child cursors; the following
+  snapshot includes both. Subscription cursor advancement preserves and
+  deep-copies the captured related-child provenance.
+- Receipts now populate public cards only when the full manifest and the child
+  journal/session/task/turn/runtime envelope identity match the request. A
+  mismatched receipt cannot surface its summary, changed files, commands, or
+  tests.
+- Child rendering now shows one selected card with an index/total indicator,
+  real navigation controls, at most two changed-file and two command/test rows,
+  at most twelve card lines, and display-width truncation on every line. A real
+  TUI model fixture covers 1,000 history lines, 20 cards, long task/evidence
+  values, and narrow/wide windows. Session lineage replacement clears stale
+  relation labels.
+
+Review-fix verification:
+
+```text
+go test ./internal/app ./internal/protocol ./internal/tui/... ./internal/subagent ./internal/session/jsonl -count=1  PASS
+go test -race ./internal/app ./internal/tui/... ./internal/subagent -run 'Test.*(Subagent|Child|Snapshot|ApplicationCursor|Session.*Lineage|Related|InspectionAt|Attempt)' -count=1  PASS
+go test ./... -count=1  PASS
+go vet ./...  PASS
+git diff --check  PASS
+```
