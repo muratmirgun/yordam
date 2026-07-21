@@ -213,48 +213,167 @@ func adaptEvents(ctx stdcontext.Context, session protocol.SessionID, summaries S
 func adaptEventSuffix(events []protocol.EventRecord, compactionIndex int, from, through uint64, compactionRevision string, summary protocol.ContentSource) ([]protocol.ContentSource, []protocol.ExcludedContentSource, string, error) {
 	sources := make([]protocol.ContentSource, 0, len(events)+1)
 	excluded := make([]protocol.ExcludedContentSource, 0)
+	appendSource := func(source protocol.ContentSource, event protocol.EventRecord) {
+		if compactionIndex >= 0 && event.Envelope.Seq >= from && event.Envelope.Seq <= through {
+			excluded = append(excluded, protocol.ExcludedContentSource{ID: source.ID, Reason: ExcludedCompacted, Digest: source.Digest})
+			return
+		}
+		sources = append(sources, source)
+	}
+	terminals := terminalTurns(events)
+	var pending *pendingExchange
+	flushPending := func() error {
+		if pending == nil {
+			return nil
+		}
+		if len(pending.remaining) == 0 {
+			pending = nil
+			return nil
+		}
+		if _, terminal := terminals[pending.assistant.turnID]; !terminal {
+			for _, callID := range pending.ordered {
+				if _, unresolved := pending.remaining[callID]; unresolved {
+					return fmt.Errorf("assistant event %q has unresolved tool call %q", pending.assistant.eventID, callID)
+				}
+			}
+		}
+		for _, callID := range pending.ordered {
+			if _, unresolved := pending.remaining[callID]; !unresolved {
+				continue
+			}
+			result := protocol.ToolResultBlock{CallID: callID, Status: "uncertain", Text: "historical tool result unavailable"}
+			source, err := resultSource(string(pending.assistant.eventID)+":legacy-tool-result:"+callID, "legacy_tool_result", result)
+			if err != nil {
+				return err
+			}
+			appendSource(source, protocol.EventRecord{Envelope: protocol.EventEnvelope{Seq: 0}})
+		}
+		pending = nil
+		return nil
+	}
 	for index, event := range events {
 		if index == compactionIndex {
 			sources = append(sources, protocol.DeepCopy(summary))
 			continue
 		}
-		var blocks []protocol.ContentBlock
-		kind := ""
 		switch event.Envelope.Kind {
 		case protocol.EventUserMessage:
+			if err := flushPending(); err != nil {
+				return nil, nil, "", err
+			}
 			content, ok := userMessageContent(event)
 			if !ok || content == "" {
 				continue
 			}
-			kind, blocks = "user_message", []protocol.ContentBlock{{Kind: protocol.ContentText, Text: content}}
+			source, err := contentSource(string(event.Envelope.EventID), "user_message", "event_v2", []protocol.ContentBlock{{Kind: protocol.ContentText, Text: content}})
+			if err != nil {
+				return nil, nil, "", err
+			}
+			appendSource(source, event)
 		case protocol.EventAssistantMessage:
+			if err := flushPending(); err != nil {
+				return nil, nil, "", err
+			}
 			assistant, ok := assistantMessage(event)
 			if !ok {
 				continue
 			}
-			var blockErr error
-			blocks, blockErr = canonicalAssistantBlocks(assistant)
-			if blockErr != nil {
-				return nil, nil, "", fmt.Errorf("assistant event %q: %w", event.Envelope.EventID, blockErr)
+			blocks, err := canonicalAssistantBlocks(assistant)
+			if err != nil {
+				return nil, nil, "", fmt.Errorf("assistant event %q: %w", event.Envelope.EventID, err)
 			}
-			kind = "assistant_message"
 			if len(blocks) == 0 {
 				continue
 			}
-		default:
-			continue
+			source, err := contentSource(string(event.Envelope.EventID), "assistant_message", "event_v2", blocks)
+			if err != nil {
+				return nil, nil, "", err
+			}
+			appendSource(source, event)
+			ordered := toolCallIDs(blocks)
+			if len(ordered) != 0 {
+				remaining := make(map[string]struct{}, len(ordered))
+				for _, callID := range ordered {
+					remaining[callID] = struct{}{}
+				}
+				pending = &pendingExchange{assistant: transcriptEntry{source: source, eventID: event.Envelope.EventID, turnID: event.Envelope.TurnID}, ordered: ordered, remaining: remaining}
+			}
+		case protocol.EventToolMessage:
+			message, ok := toolMessage(event)
+			if !ok || message.Validate() != nil {
+				return nil, nil, "", fmt.Errorf("tool message event %q is invalid", event.Envelope.EventID)
+			}
+			for resultIndex, result := range message.Results {
+				if pending == nil {
+					return nil, nil, "", fmt.Errorf("tool result %q from source event %q is late", result.CallID, event.Envelope.EventID)
+				}
+				if _, expected := pending.remaining[result.CallID]; !expected {
+					if containsToolCall(pending.ordered, result.CallID) {
+						return nil, nil, "", fmt.Errorf("tool result %q from source event %q is duplicate", result.CallID, event.Envelope.EventID)
+					}
+					return nil, nil, "", fmt.Errorf("tool result %q from source event %q is unknown", result.CallID, event.Envelope.EventID)
+				}
+				id := string(event.Envelope.EventID)
+				if len(message.Results) > 1 {
+					id = fmt.Sprintf("%s:%d", id, resultIndex)
+				}
+				source, err := resultSource(id, "event_v2", result)
+				if err != nil {
+					return nil, nil, "", err
+				}
+				appendSource(source, event)
+				delete(pending.remaining, result.CallID)
+			}
 		}
-		source, err := contentSource(string(event.Envelope.EventID), kind, "event_v2", blocks)
-		if err != nil {
-			return nil, nil, "", err
-		}
-		if compactionIndex >= 0 && event.Envelope.Seq >= from && event.Envelope.Seq <= through {
-			excluded = append(excluded, protocol.ExcludedContentSource{ID: source.ID, Reason: ExcludedCompacted, Digest: source.Digest})
-			continue
-		}
-		sources = append(sources, source)
+	}
+	if err := flushPending(); err != nil {
+		return nil, nil, "", err
 	}
 	return sources, excluded, compactionRevision, nil
+}
+
+type transcriptEntry struct {
+	source  protocol.ContentSource
+	eventID protocol.EventID
+	turnID  protocol.TurnID
+}
+
+type pendingExchange struct {
+	assistant transcriptEntry
+	ordered   []string
+	remaining map[string]struct{}
+}
+
+func terminalTurns(events []protocol.EventRecord) map[protocol.TurnID]struct{} {
+	terminal := make(map[protocol.TurnID]struct{})
+	for _, event := range events {
+		switch event.Envelope.Kind {
+		case protocol.EventTurnCompleted, protocol.EventTurnFailed, protocol.EventTurnInterrupted:
+			if event.Envelope.TurnID != "" {
+				terminal[event.Envelope.TurnID] = struct{}{}
+			}
+		}
+	}
+	return terminal
+}
+
+func toolCallIDs(blocks []protocol.ContentBlock) []string {
+	ordered := make([]string, 0)
+	for _, block := range blocks {
+		if block.Kind == protocol.ContentToolUse && block.ToolUse != nil {
+			ordered = append(ordered, block.ToolUse.CallID)
+		}
+	}
+	return ordered
+}
+
+func containsToolCall(callIDs []string, callID string) bool {
+	for _, candidate := range callIDs {
+		if candidate == callID {
+			return true
+		}
+	}
+	return false
 }
 
 func canonicalAssistantBlocks(assistant protocol.AssistantMessageV1) ([]protocol.ContentBlock, error) {
@@ -356,6 +475,26 @@ func assistantMessage(event protocol.EventRecord) (protocol.AssistantMessageV1, 
 		}
 		return decoded, true
 	}
+}
+
+func toolMessage(event protocol.EventRecord) (protocol.ToolMessageV1, bool) {
+	switch payload := event.Decoded.(type) {
+	case *protocol.ToolMessageV1:
+		return protocol.DeepCopy(*payload), true
+	case protocol.ToolMessageV1:
+		return protocol.DeepCopy(payload), true
+	default:
+		var decoded protocol.ToolMessageV1
+		if json.Unmarshal(event.Envelope.Payload, &decoded) != nil {
+			return protocol.ToolMessageV1{}, false
+		}
+		return decoded, true
+	}
+}
+
+func resultSource(id, provenance string, result protocol.ToolResultBlock) (protocol.ContentSource, error) {
+	resultCopy := protocol.DeepCopy(result)
+	return contentSource(id, "tool_message", provenance, []protocol.ContentBlock{{Kind: protocol.ContentToolResult, ToolResult: &resultCopy}})
 }
 
 func contentSource(id, kind, provenance string, blocks []protocol.ContentBlock) (protocol.ContentSource, error) {

@@ -87,6 +87,46 @@ func TestCollectProviderStreamPreservesCancellationWhenProviderCloses(t *testing
 	}
 }
 
+func TestContextMessagesMapsDurableToolSourcesToToolRole(t *testing.T) {
+	tool := protocol.ToolResultBlock{CallID: "call-a", Status: "succeeded", Text: "contents"}
+	messages := contextMessages(protocol.ContextPlan{Body: protocol.ContextPlanBody{Sources: []protocol.ContentSource{
+		{ID: "assistant-event", Kind: "assistant_message", Content: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &protocol.ToolUseBlock{CallID: tool.CallID, Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}}}},
+		{ID: "tool-event", Kind: "tool_message", Content: []protocol.ContentBlock{{Kind: protocol.ContentToolResult, ToolResult: &tool}}},
+	}}})
+	if len(messages) != 2 || messages[0].Role != "assistant" || messages[0].Blocks[0].ToolUse == nil || messages[0].Blocks[0].ToolUse.CallID != tool.CallID || messages[1].Role != "tool" || messages[1].Blocks[0].ToolResult == nil || messages[1].Blocks[0].ToolResult.CallID != tool.CallID {
+		t.Fatalf("messages=%#v", messages)
+	}
+}
+
+func TestRunTurnProviderPrepareReceivesProjectedAssistantAndToolMessages(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	tool := protocol.ToolResultBlock{CallID: "call-a", Status: "succeeded", Text: "contents"}
+	planner := staticContextPlanner{plan: contextPlanForMessages(t, []protocol.ContentSource{
+		{ID: "assistant-event", Kind: "assistant_message", Scope: "session", Provenance: "event_v2", Content: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &protocol.ToolUseBlock{CallID: tool.CallID, Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}}}},
+		{ID: "tool-event", Kind: "tool_message", Scope: "session", Provenance: "event_v2", Content: []protocol.ContentBlock{{Kind: protocol.ContentToolResult, ToolResult: &tool}}},
+	})}
+	providerService := &capturingProviderService{}
+	service, err := NewService(Dependencies{
+		Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(),
+		Repository: &recordingRepository{head: request.ExpectedHead}, TurnLeases: &recordingTurnLeaseManager{}, Context: planner,
+		Providers: fakeProviderCatalog{log: &recordLog{}}, Provider: providerService, Tools: noToolService{},
+		Authorization: &allowingAuthorization{log: &recordLog{}}, Evidence: noEvidenceRecorder{}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	providerService.mu.Lock()
+	requests := protocol.DeepCopy(providerService.requests)
+	providerService.mu.Unlock()
+	if len(requests) != 1 || len(requests[0].Messages) != 2 || requests[0].Messages[0].Role != "assistant" || requests[0].Messages[0].Blocks[0].ToolUse == nil || requests[0].Messages[0].Blocks[0].ToolUse.CallID != tool.CallID || requests[0].Messages[1].Role != "tool" || requests[0].Messages[1].Blocks[0].ToolResult == nil || requests[0].Messages[1].Blocks[0].ToolResult.CallID != tool.CallID {
+		t.Fatalf("prepare requests=%#v", requests)
+	}
+}
+
 func TestAutomaticCompactionPolicyThresholds(t *testing.T) {
 	knownWindow := protocol.ValueInt64{State: protocol.ValueKnown, Value: 10_000, Provenance: "test-window"}
 	zero := protocol.ValueInt64{State: protocol.ValueKnown, Value: 0, Provenance: "test-reserve"}
@@ -1156,6 +1196,32 @@ func (p fakeContextPlanner) Plan(_ context.Context, request contextplanner.Reque
 	return protocol.ContextPlan{Body: body, Digest: digest}, nil
 }
 
+type staticContextPlanner struct{ plan protocol.ContextPlan }
+
+func (p staticContextPlanner) Plan(context.Context, contextplanner.Request) (protocol.ContextPlan, error) {
+	return protocol.DeepCopy(p.plan), nil
+}
+
+func contextPlanForMessages(t *testing.T, sources []protocol.ContentSource) protocol.ContextPlan {
+	t.Helper()
+	for index := range sources {
+		digest, err := canonicaljson.Digest(sources[index].Content)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sources[index].Digest = digest
+	}
+	body := protocol.ContextPlanBody{
+		Sources: sources, Excluded: []protocol.ExcludedContentSource{}, EstimatedInputTokens: protocol.ValueInt64{State: protocol.ValueUnknown},
+		ContextWindow: protocol.ValueInt64{State: protocol.ValueUnknown}, CompactionRevision: "none", ToolExposureRevision: "tools-a",
+	}
+	digest, err := canonicaljson.Digest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return protocol.ContextPlan{Body: body, Digest: digest}
+}
+
 type fakeProviderCatalog struct{ log *recordLog }
 
 func (c fakeProviderCatalog) Resolve(protocol.ProviderID, protocol.ModelID) (protocol.ModelDescriptor, bool) {
@@ -1170,6 +1236,26 @@ func (c fakeProviderCatalog) Negotiate(_ protocol.ProviderID, _ protocol.ModelID
 }
 
 type fakeProviderService struct{ log *recordLog }
+
+type capturingProviderService struct {
+	mu       sync.Mutex
+	requests []protocol.ModelRequest
+}
+
+func (p *capturingProviderService) Prepare(_ context.Context, _ protocol.ActivityID, _ string, request protocol.ModelRequest, _ protocol.Digest) (provider.ProviderHandle, error) {
+	p.mu.Lock()
+	p.requests = append(p.requests, protocol.DeepCopy(request))
+	p.mu.Unlock()
+	return provider.ProviderHandle{}, nil
+}
+
+func (p *capturingProviderService) Stream(context.Context, provider.ProviderHandle, authorization.CommittedToken) (<-chan protocol.ModelEvent, error) {
+	stream := make(chan protocol.ModelEvent, 2)
+	stream <- protocol.ModelEvent{Kind: protocol.ModelEventContentBlock, Sequence: 1, Block: &protocol.ContentBlock{Kind: protocol.ContentText, Text: "done"}}
+	stream <- protocol.ModelEvent{Kind: protocol.ModelEventTerminal, Sequence: 2, Terminal: &protocol.ModelTerminal{Reason: "stop"}}
+	close(stream)
+	return stream, nil
+}
 
 type countingProviderService struct {
 	delegate fakeProviderService

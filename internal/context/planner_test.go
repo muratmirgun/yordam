@@ -129,12 +129,12 @@ func TestContextPlanDoesNotDuplicateDualEncodedToolIntents(t *testing.T) {
 	})
 	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
 		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
-		Events: []protocol.EventRecord{event}, Model: contextModel(1024), OutputReserve: 64,
+		Events: []protocol.EventRecord{event, contextEvent("tool-result", 3, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: intent.CallID, Status: "succeeded", Text: "ok"}}})}, Model: contextModel(1024), OutputReserve: 64,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.Body.Sources) != 1 || len(plan.Body.Sources[0].Content) != 1 || plan.Body.Sources[0].Content[0].Kind != protocol.ContentToolUse || plan.Body.Sources[0].Content[0].ToolUse == nil || plan.Body.Sources[0].Content[0].ToolUse.CallID != intent.CallID {
+	if len(plan.Body.Sources) != 2 || len(plan.Body.Sources[0].Content) != 1 || plan.Body.Sources[0].Content[0].Kind != protocol.ContentToolUse || plan.Body.Sources[0].Content[0].ToolUse == nil || plan.Body.Sources[0].Content[0].ToolUse.CallID != intent.CallID {
 		t.Fatalf("dual-encoded tool intent was not projected exactly once: %+v", plan.Body.Sources)
 	}
 }
@@ -144,12 +144,12 @@ func TestContextPlanKeepsLegacyToolIntentsOnly(t *testing.T) {
 	event := contextEvent("legacy-assistant-tool", 2, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{ToolIntents: []protocol.ToolUseBlock{intent}})
 	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextplanner.Request{
 		Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1,
-		Events: []protocol.EventRecord{event}, Model: contextModel(1024), OutputReserve: 64,
+		Events: []protocol.EventRecord{event, contextEvent("tool-result", 3, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: intent.CallID, Status: "succeeded", Text: "ok"}}})}, Model: contextModel(1024), OutputReserve: 64,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.Body.Sources) != 1 || len(plan.Body.Sources[0].Content) != 1 || plan.Body.Sources[0].Content[0].ToolUse == nil || plan.Body.Sources[0].Content[0].ToolUse.CallID != intent.CallID || plan.Body.Sources[0].Content[0].ToolUse.Alias != intent.Alias || string(plan.Body.Sources[0].Content[0].ToolUse.Arguments) != string(intent.Arguments) {
+	if len(plan.Body.Sources) != 2 || len(plan.Body.Sources[0].Content) != 1 || plan.Body.Sources[0].Content[0].ToolUse == nil || plan.Body.Sources[0].Content[0].ToolUse.CallID != intent.CallID || plan.Body.Sources[0].Content[0].ToolUse.Alias != intent.Alias || string(plan.Body.Sources[0].Content[0].ToolUse.Arguments) != string(intent.Arguments) {
 		t.Fatalf("legacy tool intent was not preserved exactly once: %+v", plan.Body.Sources)
 	}
 }
@@ -182,6 +182,137 @@ func TestContextPlanDecodesEventPayloadWhenProjectionIsUnavailable(t *testing.T)
 	if len(plan.Body.Sources) != 1 || plan.Body.Sources[0].Content[0].Text != "from raw" {
 		t.Fatalf("sources=%#v", plan.Body.Sources)
 	}
+}
+
+func TestContextPlanProjectsCanonicalToolResultsAfterAssistantToolUse(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	result := protocol.ToolResultBlock{CallID: intent.CallID, Status: "succeeded", Text: "contents"}
+	events := []protocol.EventRecord{
+		contextEvent("assistant-tool", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+		contextEvent("tool-result", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result}}),
+	}
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextRequest(events))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Body.Sources) != 2 || plan.Body.Sources[0].Kind != "assistant_message" || plan.Body.Sources[1].Kind != "tool_message" {
+		t.Fatalf("sources=%#v", plan.Body.Sources)
+	}
+	if plan.Body.Sources[0].Content[0].ToolUse == nil || plan.Body.Sources[0].Content[0].ToolUse.CallID != intent.CallID || plan.Body.Sources[1].Content[0].ToolResult == nil || plan.Body.Sources[1].Content[0].ToolResult.CallID != intent.CallID {
+		t.Fatalf("sources=%#v", plan.Body.Sources)
+	}
+}
+
+func TestContextPlanSynthesizesMissingResultForTerminalHistoricalTurn(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "historical-call", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	events := []protocol.EventRecord{
+		contextTurnEvent("assistant-event", 1, protocol.EventAssistantMessage, "turn-a", &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+		contextTurnEvent("turn-terminal", 2, protocol.EventTurnCompleted, "turn-a", &protocol.TurnTerminalV1{Status: "completed", Reason: "done"}),
+	}
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextRequest(events))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Body.Sources) != 2 {
+		t.Fatalf("sources=%#v", plan.Body.Sources)
+	}
+	tool := plan.Body.Sources[1]
+	if tool.ID != "assistant-event:legacy-tool-result:historical-call" || tool.Kind != "tool_message" || tool.Provenance != "legacy_tool_result" || len(tool.Content) != 1 || tool.Content[0].ToolResult == nil || tool.Content[0].ToolResult.CallID != intent.CallID || tool.Content[0].ToolResult.Status != "uncertain" || tool.Content[0].ToolResult.Text != "historical tool result unavailable" {
+		t.Fatalf("tool source=%#v", tool)
+	}
+}
+
+func TestContextPlanRejectsMissingResultForNonTerminalTurn(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "unresolved-call", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	events := []protocol.EventRecord{
+		contextTurnEvent("assistant-event", 1, protocol.EventAssistantMessage, "turn-a", &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+	}
+	_, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextRequest(events))
+	if err == nil || !strings.Contains(err.Error(), intent.CallID) || !strings.Contains(err.Error(), "unresolved tool call") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestContextPlanRejectsMalformedToolResultExchanges(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	result := protocol.ToolResultBlock{CallID: intent.CallID, Status: "succeeded", Text: "contents"}
+	unknown := protocol.ToolResultBlock{CallID: "unknown-call", Status: "succeeded", Text: "contents"}
+	cases := []struct {
+		name    string
+		events  []protocol.EventRecord
+		callID  string
+		eventID string
+	}{
+		{name: "duplicate", callID: intent.CallID, eventID: "second-result", events: []protocol.EventRecord{
+			contextEvent("assistant-event", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+			contextEvent("first-result", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result}}),
+			contextEvent("second-result", 3, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result}}),
+		}},
+		{name: "unknown", callID: unknown.CallID, eventID: "unknown-result", events: []protocol.EventRecord{
+			contextEvent("assistant-event", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+			contextEvent("unknown-result", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{unknown}}),
+		}},
+		{name: "late", callID: result.CallID, eventID: "late-result", events: []protocol.EventRecord{
+			contextEvent("assistant-event", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+			contextEvent("result", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result}}),
+			contextEvent("user-event", 3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "next"}),
+			contextEvent("late-result", 4, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result}}),
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextRequest(tc.events))
+			if err == nil || !strings.Contains(err.Error(), tc.callID) || !strings.Contains(err.Error(), tc.eventID) {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestContextPlanOrdersTwoToolResultsByPayloadOrder(t *testing.T) {
+	first := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"a.go"}`)}
+	second := protocol.ToolUseBlock{CallID: "call-b", Alias: "read", Arguments: json.RawMessage(`{"path":"b.go"}`)}
+	events := []protocol.EventRecord{
+		contextEvent("assistant-event", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &first}, {Kind: protocol.ContentToolUse, ToolUse: &second}}}),
+		contextEvent("result-event", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: second.CallID, Status: "succeeded", Text: "b"}, {CallID: first.CallID, Status: "succeeded", Text: "a"}}}),
+	}
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextRequest(events))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Body.Sources) != 3 || plan.Body.Sources[1].ID != "result-event:0" || plan.Body.Sources[1].Content[0].ToolResult.CallID != second.CallID || plan.Body.Sources[2].ID != "result-event:1" || plan.Body.Sources[2].Content[0].ToolResult.CallID != first.CallID {
+		t.Fatalf("sources=%#v", plan.Body.Sources)
+	}
+}
+
+func TestContextPlanDecodesToolMessagesFromEveryProjectionForm(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	message := protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: intent.CallID, Status: "succeeded", Text: "contents"}}}
+	raw, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		event protocol.EventRecord
+	}{
+		{name: "pointer", event: contextEvent("tool-result", 2, protocol.EventToolMessage, &message)},
+		{name: "value", event: contextEvent("tool-result", 2, protocol.EventToolMessage, message)},
+		{name: "raw", event: protocol.EventRecord{Envelope: protocol.EventEnvelope{EventID: "tool-result", Seq: 2, Kind: protocol.EventToolMessage, Payload: raw}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assistant := contextEvent("assistant-event", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}})
+			plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextRequest([]protocol.EventRecord{assistant, tc.event}))
+			if err != nil || len(plan.Body.Sources) != 2 || plan.Body.Sources[1].Content[0].ToolResult == nil || plan.Body.Sources[1].Content[0].ToolResult.CallID != intent.CallID {
+				t.Fatalf("plan=%#v error=%v", plan, err)
+			}
+		})
+	}
+}
+
+func contextRequest(events []protocol.EventRecord) contextplanner.Request {
+	return contextplanner.Request{Session: "session", TaskID: "task", OutcomeContractID: "contract", OutcomeContractVersion: 1, Events: events, Model: contextModel(1024), OutputReserve: 64}
 }
 
 func TestContextPlanFailsClosedForMalformedNativeCompaction(t *testing.T) {
@@ -232,6 +363,12 @@ func TestContextPlanIgnoresMalformedLaterLegacyCompaction(t *testing.T) {
 
 func contextEvent(id string, sequence uint64, kind string, decoded any) protocol.EventRecord {
 	return protocol.EventRecord{Envelope: protocol.EventEnvelope{EventID: protocol.EventID(id), Seq: sequence, Kind: kind}, Decoded: decoded}
+}
+
+func contextTurnEvent(id string, sequence uint64, kind string, turnID protocol.TurnID, decoded any) protocol.EventRecord {
+	event := contextEvent(id, sequence, kind, decoded)
+	event.Envelope.TurnID = turnID
+	return event
 }
 
 func TestContextPlanExcludesSourcesBeyondKnownBudget(t *testing.T) {

@@ -1438,10 +1438,13 @@ func contextMessages(plan protocol.ContextPlan) []protocol.ModelMessage {
 	messages := make([]protocol.ModelMessage, 0, len(plan.Body.Sources))
 	for _, source := range plan.Body.Sources {
 		role := "system"
-		if source.Kind == "user_message" {
+		switch source.Kind {
+		case "user_message":
 			role = "user"
-		} else if source.Kind == "assistant_message" {
+		case "assistant_message":
 			role = "assistant"
+		case "tool_message":
+			role = "tool"
 		}
 		messages = append(messages, protocol.ModelMessage{Role: role, Blocks: protocol.DeepCopy(source.Content)})
 	}
