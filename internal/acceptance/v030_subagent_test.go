@@ -23,6 +23,12 @@ import (
 	"github.com/muratmirgun/yordam/internal/tui/components"
 )
 
+// This is a test-harness watchdog, not the child execution deadline. Full
+// repository race instrumentation can delay the app goroutine for more than
+// the compaction fixture's 45-second operation budget; the child itself still
+// uses the independently bounded manifest deadline configured below.
+const v030SubagentEventDeadline = 2 * time.Minute
+
 // TestV030Subagent is the release-facing acceptance matrix for the sequential
 // child runtime. Every entry names a production-path test exactly; runV030GoTest
 // first checks the package inventory so a renamed, deleted, or accidentally
@@ -220,7 +226,10 @@ func assertV030SubagentEndToEnd(t *testing.T) {
 			BaseURL: server.URL + "/v1", APIKeyEnv: "V030_SUBAGENT_KEY", Models: []string{"fixture-model"}, DefaultModel: "fixture-model",
 		}},
 		MaxToolCalls: 16, ShellTimeoutSeconds: 5,
-		Subagents: config.SubagentConfig{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 4, TimeoutSeconds: 30},
+		// Timeout behavior is covered by the focused matrix. This E2E budget is
+		// intentionally larger because race instrumentation can consume more
+		// than 30 seconds before a three-request child finishes.
+		Subagents: config.SubagentConfig{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 4, TimeoutSeconds: 90},
 	}
 	if err := config.SaveGlobal(configPath, cfg); err != nil {
 		t.Fatal(err)
@@ -313,7 +322,7 @@ func assertV030SubagentEndToEnd(t *testing.T) {
 func runV030SubagentTurn(t *testing.T, application *app.App, parentSessionID, prompt string) (string, int) {
 	t.Helper()
 	application.Commands() <- app.Command{Kind: app.CommandStartTurn, Prompt: prompt}
-	deadline := time.NewTimer(v030FixtureOperationDeadline)
+	deadline := time.NewTimer(v030SubagentEventDeadline)
 	defer deadline.Stop()
 	var visible strings.Builder
 	childPrompts := 0
@@ -342,7 +351,7 @@ func runV030SubagentTurn(t *testing.T, application *app.App, parentSessionID, pr
 				return visible.String(), childPrompts
 			}
 		case <-deadline.C:
-			t.Fatalf("subagent turn timed out after %s", v030FixtureOperationDeadline)
+			t.Fatalf("subagent turn timed out after %s", v030SubagentEventDeadline)
 		}
 	}
 }

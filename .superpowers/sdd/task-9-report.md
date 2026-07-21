@@ -53,6 +53,22 @@ The exact-source full/race/vet/diff release evidence is intentionally recorded
 only after the source commit and clean gate. It will be added to the release
 acceptance document in a child evidence commit.
 
+The first exact-source full race attempt found no data-race report, but the real
+E2E fixture exceeded its inherited 45-second event watchdog. A focused race run
+with a two-minute watchdog then proved the deeper bound: the fixture's
+30-second child manifest deadline interrupted the three-request success child
+under instrumentation. Timeout behavior already has focused acceptance tests,
+so the composition fixture now uses a 90-second child deadline and a separate
+two-minute harness watchdog. This test-only timing fix is committed separately;
+the complete clean gate is rerun against that final source.
+
+Focused verification of the timing fix:
+
+```text
+go test ./internal/acceptance -run '^TestV030Subagent/real_bootstrap_jsonl_edit_test_failure_restart_and_secret_boundaries$' -count=1 -v  PASS (16.60s)
+go test -race ./internal/acceptance -run '^TestV030Subagent/real_bootstrap_jsonl_edit_test_failure_restart_and_secret_boundaries$' -count=1 -v  PASS, no race report (202.16s)
+```
+
 ## Residual scope
 
 This task does not add concurrent child scheduling, worktree isolation,
