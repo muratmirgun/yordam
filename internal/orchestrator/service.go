@@ -1181,21 +1181,16 @@ func (s *Service) reconcileInteractiveApprovalJournal(ctx context.Context, reque
 	if page.Head == state.head {
 		return nil
 	}
-	if page.More || page.Cursor != page.Head || len(page.Events) != 2 || page.Head.CommitSeq != state.head.CommitSeq+2 {
-		return fmt.Errorf("interactive approval changed the turn journal outside the trusted-shell acknowledgement boundary: before=%d cursor=%d head=%d events=%d more=%t", state.head.CommitSeq, page.Cursor.CommitSeq, page.Head.CommitSeq, len(page.Events), page.More)
+	if page.More || page.Cursor != page.Head || len(page.Events) != 1 || page.Head.CommitSeq != state.head.CommitSeq+2 {
+		return fmt.Errorf("interactive approval journal drift b=%d c=%d h=%d n=%d more=%t", state.head.CommitSeq, page.Cursor.CommitSeq, page.Head.CommitSeq, len(page.Events), page.More)
 	}
 	event := page.Events[0].Envelope
-	marker := page.Events[1].Envelope
 	if event.Kind != protocol.EventTrustedExecutionAcknowledged || event.SessionID != request.SessionID || event.RuntimeGenerationID != request.Runtime.ID || event.Actor == nil || *event.Actor != request.Command.Actor || event.Seq != state.head.CommitSeq+1 || event.TransactionID != page.Head.TransactionID {
 		return fmt.Errorf("interactive approval journal suffix has invalid trusted-shell provenance: kind=%q session=%q generation=%q actor=%+v seq=%d transaction=%q", event.Kind, event.SessionID, event.RuntimeGenerationID, event.Actor, event.Seq, event.TransactionID)
 	}
 	var acknowledged protocol.TrustedExecutionAcknowledgedV1
 	if err := json.Unmarshal(event.Payload, &acknowledged); err != nil || !acknowledged.Enabled || acknowledged.Profile != "unsandboxed" {
 		return fmt.Errorf("interactive approval journal suffix has invalid trusted-shell payload")
-	}
-	var committed protocol.TransactionCommittedV1
-	if marker.Kind != protocol.EventTransactionCommitted || marker.SessionID != request.SessionID || marker.RuntimeGenerationID != request.Runtime.ID || marker.Actor != nil || marker.Seq != page.Head.CommitSeq || marker.TransactionID != page.Head.TransactionID || json.Unmarshal(marker.Payload, &committed) != nil || committed.TransactionID != marker.TransactionID || committed.FirstSeq != event.Seq || committed.LastSeq != event.Seq || committed.EventCount != 1 || committed.Digest.IsZero() {
-		return fmt.Errorf("interactive approval journal suffix has invalid transaction marker")
 	}
 	state.head = page.Head
 	return nil
