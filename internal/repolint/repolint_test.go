@@ -4,7 +4,35 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/muratmirgun/yordam/internal/skills"
 )
+
+func TestSelfHostingGoDevelopmentSkillIsStrictAndNonAuthoritative(t *testing.T) {
+	path := "../../.yordam/skills/go-development/SKILL.md"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, normalized, err := skills.Parse("go-development", raw)
+	if err != nil {
+		t.Fatalf("parse repository skill: %v", err)
+	}
+	if metadata.Description != "Make bounded Go changes with focused and complete verification." || string(normalized) != string(raw) {
+		t.Fatalf("repository skill metadata=%+v or normalization changed bytes", metadata)
+	}
+	content := string(raw)
+	for _, required := range []string{"Inspect", "exact bounded changes", "focused verification", "complete project verification", "Report every failure", "Never bypass or broaden permissions"} {
+		if !strings.Contains(content, required) {
+			t.Errorf("repository skill missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"api_key", "apiKey", "Bearer ", "sudo ", "chmod 777", "curl ", "http://", "https://", "/Users/", "/home/", "hook:"} {
+		if strings.Contains(content, forbidden) {
+			t.Errorf("repository skill contains forbidden authority, secret, hook, or absolute-path text %q", forbidden)
+		}
+	}
+}
 
 func TestV030CompactionDocumentation(t *testing.T) {
 	for path, required := range map[string][]string{
