@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/x/vt"
 	"github.com/muratmirgun/yordam/internal/secret"
 )
 
@@ -29,5 +30,23 @@ func TestSecretDiagnosticFormattingRedactsConfiguredSentinel(t *testing.T) {
 	}
 	if !strings.Contains(formatted, "ordinary terminal output") || !strings.Contains(formatted, "[REDACTED]") {
 		t.Fatal("secret-bearing PTY diagnostic discarded useful redacted output")
+	}
+}
+
+func TestCurrentScreenExcludesReplacedTerminalHistory(t *testing.T) {
+	session := &Session{emulator: vt.NewEmulator(12, 3)}
+	writer := lockedWriter{session: session}
+	if _, err := writer.Write([]byte("PERMISSION")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("\r\x1b[2KREADY")); err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(session.Output(), "PERMISSION") {
+		t.Fatal("raw PTY history did not retain replaced content")
+	}
+	if screen := session.CurrentScreen(); strings.Contains(screen, "PERMISSION") || !strings.Contains(screen, "READY") {
+		t.Fatalf("current screen=%q", screen)
 	}
 }

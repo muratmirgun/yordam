@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
 )
 
@@ -25,6 +26,7 @@ type Session struct {
 	diagnosticRedactor func(string) string
 	mu                 sync.Mutex
 	output             bytes.Buffer
+	emulator           *vt.Emulator
 }
 
 const scriptedSSE = "data: {\"choices\":[{\"delta\":{\"content\":\"scripted PTY response\"}}]}\n\ndata: [DONE]\n"
@@ -48,7 +50,7 @@ func start(t testing.TB, redact func(string) string, binary, workspace string, e
 	if err != nil {
 		t.Fatal(formatDiagnostic(redact, "start PTY: %v", err))
 	}
-	session := &Session{command: command, terminal: terminal, done: make(chan error, 1), diagnosticRedactor: redact}
+	session := &Session{command: command, terminal: terminal, done: make(chan error, 1), diagnosticRedactor: redact, emulator: vt.NewEmulator(120, 32)}
 	go func() {
 		_, _ = io.Copy(lockedWriter{session: session}, terminal)
 	}()
@@ -112,6 +114,37 @@ func (s *Session) OutputOffset() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.output.Len()
+}
+
+// CurrentScreen returns the normalized text currently visible in the PTY,
+// excluding content that later ANSI updates replaced or cleared.
+func (s *Session) CurrentScreen() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.emulator == nil {
+		return ""
+	}
+	return s.emulator.String()
+}
+
+func (s *Session) WaitForCurrentScreen(t testing.TB, value string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if strings.Contains(s.CurrentScreen(), value) {
+			return
+		}
+		select {
+		case err := <-s.done:
+			t.Fatal(s.formatDiagnostic("process exited before current-screen marker %q: err=%v screen=%q output=%q", value, err, s.CurrentScreen(), s.Output()))
+		case <-deadline.C:
+			t.Fatal(s.formatDiagnostic("timed out waiting for current-screen marker %q; screen=%q output=%q", value, s.CurrentScreen(), s.Output()))
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Session) WaitForAfter(t testing.TB, offset int, value string, timeout time.Duration) {
@@ -241,7 +274,14 @@ type lockedWriter struct{ session *Session }
 func (w lockedWriter) Write(value []byte) (int, error) {
 	w.session.mu.Lock()
 	defer w.session.mu.Unlock()
-	return w.session.output.Write(value)
+	written, err := w.session.output.Write(value)
+	if err != nil || w.session.emulator == nil {
+		return written, err
+	}
+	if _, emulatorErr := w.session.emulator.Write(value); emulatorErr != nil {
+		return written, emulatorErr
+	}
+	return written, nil
 }
 
 func BuildYordam(t testing.TB, directory string) string {
