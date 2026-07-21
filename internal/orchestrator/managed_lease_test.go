@@ -57,7 +57,7 @@ func (r approvalSuffixRepository) ReadRange(context.Context, journal.ReadRangeRe
 func TestInteractiveApprovalReconcilesOnlyExactTrustedShellConsequence(t *testing.T) {
 	request := validStartTurnRequest()
 	state := newTurnState(request)
-	next := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), CommitSeq: state.head.CommitSeq + 1, TransactionID: "trusted-shell-control"}
+	next := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), CommitSeq: state.head.CommitSeq + 2, TransactionID: "trusted-shell-control"}
 	actor := request.Command.Actor
 	payload, err := json.Marshal(protocol.TrustedExecutionAcknowledgedV1{Enabled: true, Profile: "unsandboxed"})
 	if err != nil {
@@ -65,10 +65,19 @@ func TestInteractiveApprovalReconcilesOnlyExactTrustedShellConsequence(t *testin
 	}
 	event := protocol.EventEnvelope{
 		SchemaVersion: protocol.EnvelopeVersion, JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID),
-		SessionID: request.SessionID, EventID: "trusted-shell-event", Seq: next.CommitSeq, Time: time.Now().UTC(), PayloadVersion: 1,
+		SessionID: request.SessionID, EventID: "trusted-shell-event", Seq: next.CommitSeq - 1, Time: time.Now().UTC(), PayloadVersion: 1,
 		Kind: protocol.EventTrustedExecutionAcknowledged, TransactionID: next.TransactionID, Actor: &actor, RuntimeGenerationID: request.Runtime.ID, Payload: payload,
 	}
-	service := &Service{repository: approvalSuffixRepository{page: journal.EventPage{Events: []protocol.EventRecord{{Envelope: event}}, Cursor: next, Head: next}}}
+	markerPayload, err := json.Marshal(protocol.TransactionCommittedV1{TransactionID: next.TransactionID, FirstSeq: event.Seq, LastSeq: event.Seq, EventCount: 1, Digest: repeatedDigest("c")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := protocol.EventEnvelope{
+		SchemaVersion: protocol.EnvelopeVersion, JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), SessionID: request.SessionID,
+		EventID: "trusted-shell-marker", Seq: next.CommitSeq, Time: time.Now().UTC(), PayloadVersion: 1, Kind: protocol.EventTransactionCommitted,
+		TransactionID: next.TransactionID, RuntimeGenerationID: request.Runtime.ID, Payload: markerPayload,
+	}
+	service := &Service{repository: approvalSuffixRepository{page: journal.EventPage{Events: []protocol.EventRecord{{Envelope: event}, {Envelope: marker}}, Cursor: next, Head: next}}}
 	if err := service.reconcileInteractiveApprovalJournal(t.Context(), request, &state); err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +87,7 @@ func TestInteractiveApprovalReconcilesOnlyExactTrustedShellConsequence(t *testin
 
 	state = newTurnState(request)
 	event.Kind = protocol.EventModeChanged
-	service.repository = approvalSuffixRepository{page: journal.EventPage{Events: []protocol.EventRecord{{Envelope: event}}, Cursor: next, Head: next}}
+	service.repository = approvalSuffixRepository{page: journal.EventPage{Events: []protocol.EventRecord{{Envelope: event}, {Envelope: marker}}, Cursor: next, Head: next}}
 	if err := service.reconcileInteractiveApprovalJournal(t.Context(), request, &state); err == nil {
 		t.Fatal("unrelated journal consequence was accepted")
 	}
