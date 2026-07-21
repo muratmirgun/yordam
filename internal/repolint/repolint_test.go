@@ -39,6 +39,20 @@ func TestV030AcceptanceCIJobContract(t *testing.T) {
 	}
 }
 
+func TestCIWorkflowDoesNotUseRunnerContextInJobEnvironment(t *testing.T) {
+	workflow := readRepositoryFile(t, ".github/workflows/ci.yml")
+	for _, name := range []string{"test", "v030-acceptance", "cross-build", "secret-hygiene"} {
+		job := workflowJob(t, workflow, name)
+		steps := strings.Index(job, "\n    steps:")
+		if steps < 0 {
+			t.Fatalf("CI job %q has no steps", name)
+		}
+		if strings.Contains(job[:steps], "${{ runner.") {
+			t.Errorf("CI job %q uses runner context before step scope", name)
+		}
+	}
+}
+
 func TestV030ReleaseCandidateWorkflowContract(t *testing.T) {
 	workflow := readRepositoryFile(t, ".github/workflows/release.yml")
 	packageJob := workflowJob(t, workflow, "package")

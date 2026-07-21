@@ -33,7 +33,7 @@ func TestCIWorkflowContainsRequiredGates(t *testing.T) {
 		"PROFILE_KEY: synthetic-profile-secret",
 		"TEST_OUTPUT_ROOT: ${{ runner.temp }}/yordam-secret-scan",
 		"go test -tags acceptance ./internal/acceptance -run 'TestV010Acceptance/secret_hygiene' -count=1 -v",
-		"TMPDIR: ${{ env.TEST_OUTPUT_ROOT }}/tmp",
+		"TMPDIR: ${{ runner.temp }}/yordam-secret-scan/tmp",
 		"rg -uuu 'synthetic-(ci|profile)-secret' \"$TEST_OUTPUT_ROOT\"",
 		"[[ $status -eq 1 ]]",
 	}
