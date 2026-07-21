@@ -197,18 +197,30 @@ func TestRecoveryControlAttemptIdentityIsDeterministicAcrossTerminalAndIncomplet
 	completed := func(id string) protocol.EventRecord {
 		return record(id, protocol.EventCommandCompleted, protocol.CommandCompletedV1{CommandID: protocol.CommandID(id), RequestDigest: protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("a", 64)}, Status: "failed", Result: json.RawMessage(`{}`)})
 	}
-	first, second := base+"-attempt-1", base+"-attempt-2"
+	first, second, third := base+"-attempt-1", base+"-attempt-2", base+"-attempt-3"
 	for _, test := range []struct {
-		name   string
-		events []protocol.EventRecord
-		want   string
+		name    string
+		events  []protocol.EventRecord
+		want    string
+		wantErr bool
 	}{
 		{name: "first", want: first},
 		{name: "accepted incomplete attempt advances", events: []protocol.EventRecord{accepted(first)}, want: second},
 		{name: "terminal advances", events: []protocol.EventRecord{accepted(first), completed(first)}, want: second},
+		{name: "later terminal attempt supersedes earlier incomplete", events: []protocol.EventRecord{accepted(first), accepted(second), completed(second)}, want: third},
+		{name: "later incomplete attempt supersedes earlier incomplete", events: []protocol.EventRecord{accepted(first), accepted(second)}, want: third},
+		{name: "missing ordinal fails closed", events: []protocol.EventRecord{accepted(first), accepted(third)}, wantErr: true},
+		{name: "duplicate acceptance fails closed", events: []protocol.EventRecord{accepted(first), accepted(first)}, wantErr: true},
+		{name: "conflicting legacy identity fails closed", events: []protocol.EventRecord{accepted(base), accepted(first)}, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := recoveryControlAttemptIdentity(test.events, base)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("identity=%q want fail-closed error", got)
+				}
+				return
+			}
 			if err != nil || got != test.want {
 				t.Fatalf("identity=%q want=%q err=%v", got, test.want, err)
 			}

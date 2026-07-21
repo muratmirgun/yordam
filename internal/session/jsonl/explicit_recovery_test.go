@@ -223,6 +223,40 @@ func TestExplicitRecoveryPersistsCompleteRequestBeforeFirstPhysicalAction(t *tes
 	}
 }
 
+func TestExplicitRecoveryResumesPersistedPhysicalTailWithFreshRuntimeGeneration(t *testing.T) {
+	fixture := copyFixture(t, "v1-truncated-final")
+	setup := openFixtureStore(fixture)
+	_, request := recoveryRequestForFixture(t, setup, "operation-runtime-restart", "txn-runtime-restart")
+	request.RuntimeGenerationID = "runtime-generation-before-crash"
+	faultErr := errors.New("crash after manifest persistence")
+	faulting := New(fixture.root, Options{
+		Encoder: fixturePassthroughEncoder{},
+		Fault: func(point FaultPoint) error {
+			if point == FaultQuarantineWrite {
+				return faultErr
+			}
+			return nil
+		},
+	})
+	if _, err := faulting.RecoverSession(context.Background(), request); !errors.Is(err, faultErr) {
+		t.Fatalf("first recovery err=%v want injected crash", err)
+	}
+
+	restartedRequest := request
+	restartedRequest.RuntimeGenerationID = "runtime-generation-after-restart"
+	result, err := openFixtureStore(fixture).RecoverSession(context.Background(), restartedRequest)
+	if err != nil || (result.Status != "recovered" && result.Status != "already_recovered") {
+		t.Fatalf("fresh-runtime resume result=%+v err=%v", result, err)
+	}
+	inspection, err := openFixtureStore(fixture).InspectSession(context.Background(), fixtureSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.Journal.Writable || countEventKind(inspection.Journal.Events, protocol.EventRecoveryDiagnostic) != 1 {
+		t.Fatalf("resumed inspection=%+v", inspection)
+	}
+}
+
 func TestExplicitRecoveryConflictsDoNotMutate(t *testing.T) {
 	for _, mutate := range []struct {
 		name string
@@ -255,28 +289,42 @@ func TestExplicitRecoveryConflictsDoNotMutate(t *testing.T) {
 }
 
 func TestExplicitRecoveryRejectsChangedRequestForPersistedOperation(t *testing.T) {
-	fixture := copyFixture(t, "v1-truncated-final")
-	setup := openFixtureStore(fixture)
-	_, request := recoveryRequestForFixture(t, setup, "operation-stable", "txn-stable")
-	faultErr := errors.New("pause after request persistence")
-	store := New(fixture.root, Options{Encoder: fixturePassthroughEncoder{}, Fault: func(point FaultPoint) error {
-		if point == FaultQuarantineWrite {
-			return faultErr
-		}
-		return nil
-	}})
-	if _, err := store.RecoverSession(context.Background(), request); !errors.Is(err, faultErr) {
-		t.Fatal(err)
-	}
-	changed := request
-	changed.TransactionID = "txn-replacement-not-allowed"
-	before := snapshotTree(t, fixture.root)
-	result, err := openFixtureStore(fixture).RecoverSession(context.Background(), changed)
-	if err != nil || result.Status != "conflict" {
-		t.Fatalf("changed request result=%+v err=%v", result, err)
-	}
-	if after := snapshotTree(t, fixture.root); !reflect.DeepEqual(after, before) {
-		t.Fatal("changed operation request mutated storage")
+	for _, test := range []struct {
+		name   string
+		mutate func(*journal.RecoveryRequest)
+	}{
+		{name: "transaction", mutate: func(request *journal.RecoveryRequest) { request.TransactionID = "txn-replacement-not-allowed" }},
+		{name: "expected head", mutate: func(request *journal.RecoveryRequest) { request.ExpectedHead.CommitSeq++ }},
+		{name: "observed tail", mutate: func(request *journal.RecoveryRequest) {
+			request.ObservedTailDigest = protocol.Digest{Algorithm: protocol.DigestSHA256, Value: strings.Repeat("0", sha256.Size*2)}
+		}},
+		{name: "clean prefix", mutate: func(request *journal.RecoveryRequest) { request.CleanPrefix = true }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := copyFixture(t, "v1-truncated-final")
+			setup := openFixtureStore(fixture)
+			_, request := recoveryRequestForFixture(t, setup, "operation-stable", "txn-stable")
+			faultErr := errors.New("pause after request persistence")
+			store := New(fixture.root, Options{Encoder: fixturePassthroughEncoder{}, Fault: func(point FaultPoint) error {
+				if point == FaultQuarantineWrite {
+					return faultErr
+				}
+				return nil
+			}})
+			if _, err := store.RecoverSession(context.Background(), request); !errors.Is(err, faultErr) {
+				t.Fatal(err)
+			}
+			changed := request
+			test.mutate(&changed)
+			before := snapshotTree(t, fixture.root)
+			result, err := openFixtureStore(fixture).RecoverSession(context.Background(), changed)
+			if err != nil || result.Status != "conflict" {
+				t.Fatalf("changed request result=%+v err=%v", result, err)
+			}
+			if after := snapshotTree(t, fixture.root); !reflect.DeepEqual(after, before) {
+				t.Fatal("changed operation request mutated storage")
+			}
+		})
 	}
 }
 

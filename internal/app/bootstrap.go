@@ -425,8 +425,11 @@ func recoveryControlAttemptIdentity(events []protocol.EventRecord, storageIdenti
 				continue
 			}
 			state := attempts[value]
-			if state.accepted && state.identity != string(commandID) {
-				return "", fmt.Errorf("recovery control attempt ordinal %d has conflicting identities", value)
+			if state.accepted {
+				if state.identity != string(commandID) {
+					return "", fmt.Errorf("recovery control attempt ordinal %d has conflicting identities", value)
+				}
+				return "", fmt.Errorf("recovery control attempt ordinal %d has duplicate acceptance", value)
 			}
 			state.identity, state.accepted = string(commandID), true
 			attempts[value] = state
@@ -462,7 +465,7 @@ func recoveryControlAttemptIdentity(events []protocol.EventRecord, storageIdenti
 	}
 	for value := 1; value <= max; value++ {
 		state, ok := attempts[value]
-		if !ok || !state.accepted || (value < max && !state.terminal) {
+		if !ok || !state.accepted {
 			return "", fmt.Errorf("recovery control attempt history is non-contiguous at ordinal %d", value)
 		}
 	}
