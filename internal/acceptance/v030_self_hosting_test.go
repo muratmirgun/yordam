@@ -67,13 +67,12 @@ func TestV030SelfHosting(t *testing.T) {
 	session.WaitForAfter(t, turnOffset, "CHILD", 20*time.Second)
 	session.WaitForAfter(t, turnOffset, "Child session:", 30*time.Second)
 	session.WaitForAfter(t, turnOffset, "y: allow once | s: allow session | n/Esc: deny", 30*time.Second)
-	session.WaitForQuiet(t, 100*time.Millisecond, 5*time.Second)
-	parentPermissionOffset := session.OutputOffset()
+	session.ResetOutput()
 	session.Write(t, "y")
-	waitForSelfHostAuthorization(t, checkout.DataDir, "parent-complete-test", 30*time.Second)
-	session.WaitForAfter(t, parentPermissionOffset, "PERMISSION", 30*time.Second)
+	waitForSelfHostAuthorization(t, checkout.DataDir, "parent-complete-test", "go test ./...", 30*time.Second)
+	session.WaitForOrderedAfter(t, 0, []string{"AUTO SHELL WARNING", "PERMISSION", "y: allow once | s: allow session | n/Esc: deny"}, 30*time.Second)
 	session.Write(t, "y")
-	session.WaitForAfter(t, turnOffset, "self-hosting change and complete verification succeeded", 420*time.Second)
+	session.WaitFor(t, "self-hosting change and complete verification succeeded", 420*time.Second)
 	session.WaitForQuiet(t, 300*time.Millisecond, 10*time.Second)
 
 	prefixes := captureSelfHostJournalPrefixes(t, checkout.DataDir)
@@ -104,11 +103,11 @@ func TestV030SelfHosting(t *testing.T) {
 	}
 }
 
-func waitForSelfHostAuthorization(t *testing.T, dataDir, callID string, timeout time.Duration) {
+func waitForSelfHostAuthorization(t *testing.T, dataDir, callID, command string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		found, err := selfHostAuthorizationRequested(dataDir, callID)
+		found, err := selfHostAuthorizationRequested(dataDir, callID, command)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -122,7 +121,7 @@ func waitForSelfHostAuthorization(t *testing.T, dataDir, callID string, timeout 
 	}
 }
 
-func selfHostAuthorizationRequested(dataDir, callID string) (bool, error) {
+func selfHostAuthorizationRequested(dataDir, callID, command string) (bool, error) {
 	found := false
 	err := filepath.WalkDir(filepath.Join(dataDir, "workspaces"), func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -141,7 +140,7 @@ func selfHostAuthorizationRequested(dataDir, callID string) (bool, error) {
 				continue
 			}
 			var requested protocol.AuthorizationRequestedV1
-			if json.Unmarshal(envelope.Payload, &requested) == nil && requested.Request.CallID == callID {
+			if json.Unmarshal(envelope.Payload, &requested) == nil && requested.Request.CallID == callID && selfHostAuthorizationHasCommand(requested.Request, command) {
 				found = true
 				break
 			}
@@ -149,6 +148,17 @@ func selfHostAuthorizationRequested(dataDir, callID string) (bool, error) {
 		return nil
 	})
 	return found, err
+}
+
+func selfHostAuthorizationHasCommand(request protocol.AuthorizationRequest, command string) bool {
+	for _, resource := range request.Resources {
+		for _, attribute := range resource.Attributes {
+			if attribute.Name == "command" && attribute.Value == command {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func selfHostSuccessSteps(readmeSHA string) []providerStep {
