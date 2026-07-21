@@ -94,6 +94,10 @@ func TestV030SelfHosting(t *testing.T) {
 
 	session.Write(t, "\x0f")
 	session.WaitForCurrentScreen(t, "Ask Yordam", 10*time.Second)
+	postCompactOffset := session.OutputOffset()
+	session.Write(t, "confirm compacted session remains usable\r")
+	session.WaitForAfter(t, postCompactOffset, "post-compaction continuation succeeded", 30*time.Second)
+	session.WaitForQuiet(t, 300*time.Millisecond, 10*time.Second)
 	session.Write(t, "/quit\r")
 	session.WaitForExit(t, 10*time.Second)
 	session.AssertRestored(t)
@@ -103,6 +107,7 @@ func TestV030SelfHosting(t *testing.T) {
 	result := inspectSelfHostedRun(t, checkout, provider, original)
 	restarted := checkout.start(t, provider.URL, "--continue")
 	restarted.WaitFor(t, "self-hosting change and complete verification succeeded", 15*time.Second)
+	restarted.WaitFor(t, "post-compaction continuation succeeded", 15*time.Second)
 	restarted.WaitFor(t, "CHILD", 15*time.Second)
 	restarted.WaitFor(t, string(result.child.Session.ID), 15*time.Second)
 	restarted.Write(t, "\x0f")
@@ -276,6 +281,7 @@ func selfHostSuccessSteps(readmeSHA string) []providerStep {
 		{Role: "parent", RequiredTools: parentTools, RequiredText: []string{"delegate-readme", "child changed README.md", "terminal_cursor"}, SSE: providerToolCallSSE("parent-complete-test", "shell", `{"command":"go test ./...","cwd":"."}`)},
 		{Role: "parent", RequiredTools: parentTools, RequiredText: []string{"parent-complete-test"}, SSE: providerTextSSE("self-hosting change and complete verification succeeded")},
 		{Role: "compaction", RequiredText: []string{"Return only canonical JSON", "normalized_sources"}, SSE: providerTextSSE(`{"goal":"self-host","constraints":["one bounded README heading replacement"],"decisions":["one sequential child"],"files":["README.md"],"commands_and_tests":["git diff --check -- README.md","go test ./..."],"unresolved":[],"children":["child changed README.md and focused check passed"],"skills":["go-development"],"unknown_effects":[]}`)},
+		{Role: "parent", RequiredTools: parentTools, RequiredText: []string{"confirm compacted session remains usable", "one sequential child"}, SSE: providerTextSSE("post-compaction continuation succeeded")},
 	}
 }
 
@@ -513,14 +519,14 @@ func assertSelfHostProviderTrace(t *testing.T, provider *scriptedProvider, attac
 	provider.mu.Lock()
 	requests := append([]capturedProviderRequest(nil), provider.Requests...)
 	provider.mu.Unlock()
-	if len(requests) != 10 {
-		t.Fatalf("provider requests=%d want exact script of 10", len(requests))
+	if len(requests) != 11 {
+		t.Fatalf("provider requests=%d want exact script of 11", len(requests))
 	}
 	counts := map[string]int{}
 	for _, request := range requests {
 		counts[request.Role]++
 	}
-	if counts["parent"] != 4 || counts["child"] != 5 || counts["compaction"] != 1 {
+	if counts["parent"] != 5 || counts["child"] != 5 || counts["compaction"] != 1 {
 		t.Fatalf("provider role counts=%v", counts)
 	}
 	if !strings.Contains(requests[7].Body, string(attachment.ReceiptEvidenceID)) || !strings.Contains(requests[7].Body, attachment.ReceiptDigest.Value) {
