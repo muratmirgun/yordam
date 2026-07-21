@@ -88,9 +88,12 @@ func TestV030SelfHosting(t *testing.T) {
 	// The TUI rewrites the stage suffix in place, so only the first frame repeats
 	// the full label in the raw PTY byte stream. Assert the ordered visible suffixes.
 	session.WaitForOrderedAfter(t, compactOffset, []string{"Compacting context: preparing", "summarizing...", "persist"}, 30*time.Second)
-	session.WaitForAfter(t, compactOffset, "Latest compacted:", 30*time.Second)
 	session.WaitForQuiet(t, 300*time.Millisecond, 10*time.Second)
+	session.Write(t, "\x0f") // Ctrl+O opens the context panel where durable range/revision are rendered.
+	session.WaitForCurrentScreen(t, "Latest compacted:", 30*time.Second)
 
+	session.Write(t, "\x0f")
+	session.WaitForCurrentScreen(t, "Ask Yordam", 10*time.Second)
 	session.Write(t, "/quit\r")
 	session.WaitForExit(t, 10*time.Second)
 	session.AssertRestored(t)
@@ -101,8 +104,11 @@ func TestV030SelfHosting(t *testing.T) {
 	restarted := checkout.start(t, provider.URL, "--continue")
 	restarted.WaitFor(t, "self-hosting change and complete verification succeeded", 15*time.Second)
 	restarted.WaitFor(t, "CHILD", 15*time.Second)
-	restarted.WaitFor(t, "Latest compacted:", 15*time.Second)
 	restarted.WaitFor(t, string(result.child.Session.ID), 15*time.Second)
+	restarted.Write(t, "\x0f")
+	restarted.WaitForCurrentScreen(t, "Latest compacted:", 15*time.Second)
+	restarted.Write(t, "\x0f")
+	restarted.WaitForCurrentScreen(t, "Ask Yordam", 10*time.Second)
 	restarted.Write(t, "/quit\r")
 	restarted.WaitForExit(t, 10*time.Second)
 	restarted.AssertRestored(t)
