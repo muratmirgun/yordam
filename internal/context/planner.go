@@ -230,7 +230,8 @@ func adaptEventSuffix(events []protocol.EventRecord, compactionIndex int, from, 
 			pending = nil
 			return nil
 		}
-		if _, terminal := terminals[pending.assistant.turnID]; !terminal {
+		terminalSeq, terminal := terminals[pending.assistant.turnID]
+		if !terminal || terminalSeq <= pending.assistant.seq {
 			for _, callID := range pending.ordered {
 				if _, unresolved := pending.remaining[callID]; unresolved {
 					return fmt.Errorf("assistant event %q has unresolved tool call %q", pending.assistant.eventID, callID)
@@ -296,12 +297,15 @@ func adaptEventSuffix(events []protocol.EventRecord, compactionIndex int, from, 
 				for _, callID := range ordered {
 					remaining[callID] = struct{}{}
 				}
-				pending = &pendingExchange{assistant: transcriptEntry{source: source, eventID: event.Envelope.EventID, turnID: event.Envelope.TurnID}, ordered: ordered, remaining: remaining}
+				pending = &pendingExchange{assistant: transcriptEntry{source: source, eventID: event.Envelope.EventID, turnID: event.Envelope.TurnID, seq: event.Envelope.Seq}, ordered: ordered, remaining: remaining}
 			}
 		case protocol.EventToolMessage:
 			message, ok := toolMessage(event)
-			if !ok || message.Validate() != nil {
+			if !ok {
 				return nil, nil, "", fmt.Errorf("tool message event %q is invalid", event.Envelope.EventID)
+			}
+			if err := message.Validate(); err != nil {
+				return nil, nil, "", fmt.Errorf("tool message event %q: %w", event.Envelope.EventID, err)
 			}
 			for resultIndex, result := range message.Results {
 				if pending == nil {
@@ -336,6 +340,7 @@ type transcriptEntry struct {
 	source  protocol.ContentSource
 	eventID protocol.EventID
 	turnID  protocol.TurnID
+	seq     uint64
 }
 
 type pendingExchange struct {
@@ -344,13 +349,13 @@ type pendingExchange struct {
 	remaining map[string]struct{}
 }
 
-func terminalTurns(events []protocol.EventRecord) map[protocol.TurnID]struct{} {
-	terminal := make(map[protocol.TurnID]struct{})
+func terminalTurns(events []protocol.EventRecord) map[protocol.TurnID]uint64 {
+	terminal := make(map[protocol.TurnID]uint64)
 	for _, event := range events {
 		switch event.Envelope.Kind {
 		case protocol.EventTurnCompleted, protocol.EventTurnFailed, protocol.EventTurnInterrupted:
-			if event.Envelope.TurnID != "" {
-				terminal[event.Envelope.TurnID] = struct{}{}
+			if event.Envelope.TurnID != "" && event.Envelope.Seq > terminal[event.Envelope.TurnID] {
+				terminal[event.Envelope.TurnID] = event.Envelope.Seq
 			}
 		}
 	}

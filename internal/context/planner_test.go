@@ -222,6 +222,18 @@ func TestContextPlanSynthesizesMissingResultForTerminalHistoricalTurn(t *testing
 	}
 }
 
+func TestContextPlanRejectsHistoricalResultWhenTerminalPrecedesAssistant(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "historical-call", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	events := []protocol.EventRecord{
+		contextTurnEvent("turn-terminal", 1, protocol.EventTurnCompleted, "turn-a", &protocol.TurnTerminalV1{Status: "completed", Reason: "done"}),
+		contextTurnEvent("assistant-event", 2, protocol.EventAssistantMessage, "turn-a", &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+	}
+	_, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), contextRequest(events))
+	if err == nil || !strings.Contains(err.Error(), intent.CallID) || !strings.Contains(err.Error(), "unresolved tool call") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestContextPlanRejectsMissingResultForNonTerminalTurn(t *testing.T) {
 	intent := protocol.ToolUseBlock{CallID: "unresolved-call", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
 	events := []protocol.EventRecord{
@@ -247,6 +259,10 @@ func TestContextPlanRejectsMalformedToolResultExchanges(t *testing.T) {
 			contextEvent("assistant-event", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
 			contextEvent("first-result", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result}}),
 			contextEvent("second-result", 3, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result}}),
+		}},
+		{name: "same payload duplicate", callID: intent.CallID, eventID: "duplicate-result", events: []protocol.EventRecord{
+			contextEvent("assistant-event", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+			contextEvent("duplicate-result", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{result, result}}),
 		}},
 		{name: "unknown", callID: unknown.CallID, eventID: "unknown-result", events: []protocol.EventRecord{
 			contextEvent("assistant-event", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
