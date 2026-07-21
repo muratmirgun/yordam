@@ -240,9 +240,10 @@ func validateProviderMessages(messages []providerWireMessage) ([]string, []strin
 			if message.ToolCallID != "" {
 				return nil, nil, fmt.Errorf("assistant message %d carries tool result ID", index)
 			}
-			for _, call := range message.ToolCalls {
-				if call.ID == "" || call.Type != "function" || call.Function.Name == "" || !json.Valid([]byte(call.Function.Arguments)) || pending[call.ID] {
-					return nil, nil, fmt.Errorf("assistant message %d has invalid or duplicate tool call", index)
+			for callIndex, call := range message.ToolCalls {
+				argumentsValid := json.Valid([]byte(call.Function.Arguments))
+				if call.ID == "" || call.Type != "function" || call.Function.Name == "" || !argumentsValid || pending[call.ID] {
+					return nil, nil, fmt.Errorf("tool dup=%t msg=%d item=%d total=%d id=%q", pending[call.ID], index, callIndex, len(message.ToolCalls), call.ID)
 				}
 				pending[call.ID] = true
 				callIDs = append(callIDs, call.ID)
