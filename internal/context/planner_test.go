@@ -222,6 +222,57 @@ func TestContextPlanSynthesizesMissingResultForTerminalHistoricalTurn(t *testing
 	}
 }
 
+func TestContextPlanHistoricalCompatibilityExchangeFullyCompactedYieldsSummaryOnly(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "historical-call", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	resolver := &fakeSummaryResolver{sources: map[protocol.EvidenceID]protocol.ContentSource{
+		"summary": summarySource(t, "summary", "historical exchange summary"),
+	}}
+	events := []protocol.EventRecord{
+		contextTurnEvent("assistant-event", 1, protocol.EventAssistantMessage, "turn-a", &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+		contextTurnEvent("turn-terminal", 2, protocol.EventTurnCompleted, "turn-a", &protocol.TurnTerminalV1{Status: "completed", Reason: "historical"}),
+		nativeCompactionEvent("compact", 3, "session", 1, 2, "summary", "native-r1"),
+	}
+
+	plan, err := contextplanner.NewPlanner("tools-r1", resolver).Plan(stdcontext.Background(), contextRequest(events))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Body.Sources) != 1 || plan.Body.Sources[0].ID != "summary" || plan.Body.Sources[0].Kind != "compaction_summary" {
+		t.Fatalf("sources=%#v", plan.Body.Sources)
+	}
+	if len(plan.Body.Excluded) != 2 || plan.Body.Excluded[0].ID != "assistant-event" || plan.Body.Excluded[1].ID != "assistant-event:legacy-tool-result:historical-call" {
+		t.Fatalf("excluded=%#v", plan.Body.Excluded)
+	}
+}
+
+func TestContextPlanHistoricalCompatibilityExchangeStaysAdjacentBeforeSummary(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "historical-call", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	resolver := &fakeSummaryResolver{sources: map[protocol.EvidenceID]protocol.ContentSource{
+		"summary": summarySource(t, "summary", "older history summary"),
+	}}
+	events := []protocol.EventRecord{
+		contextEvent("old-user", 1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old"}),
+		contextTurnEvent("assistant-event", 2, protocol.EventAssistantMessage, "turn-a", &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+		nativeCompactionEvent("compact", 3, "session", 1, 1, "summary", "native-r1"),
+		contextTurnEvent("turn-terminal", 4, protocol.EventTurnCompleted, "turn-a", &protocol.TurnTerminalV1{Status: "completed", Reason: "historical"}),
+	}
+
+	plan, err := contextplanner.NewPlanner("tools-r1", resolver).Plan(stdcontext.Background(), contextRequest(events))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Body.Sources) != 3 || plan.Body.Sources[0].ID != "assistant-event" || plan.Body.Sources[1].ID != "assistant-event:legacy-tool-result:historical-call" || plan.Body.Sources[2].ID != "summary" {
+		t.Fatalf("sources=%#v", plan.Body.Sources)
+	}
+	assistant, result := plan.Body.Sources[0], plan.Body.Sources[1]
+	if assistant.Kind != "assistant_message" || result.Kind != "tool_message" || assistant.Content[0].ToolUse == nil || result.Content[0].ToolResult == nil || assistant.Content[0].ToolUse.CallID != result.Content[0].ToolResult.CallID {
+		t.Fatalf("provider transcript order is invalid: assistant=%#v result=%#v", assistant, result)
+	}
+	if len(plan.Body.Excluded) != 1 || plan.Body.Excluded[0].ID != "old-user" {
+		t.Fatalf("excluded=%#v", plan.Body.Excluded)
+	}
+}
+
 func TestContextPlanRejectsHistoricalResultWhenTerminalPrecedesAssistant(t *testing.T) {
 	intent := protocol.ToolUseBlock{CallID: "historical-call", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
 	events := []protocol.EventRecord{

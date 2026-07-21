@@ -307,13 +307,16 @@ func adaptEventSuffix(events []protocol.EventRecord, compactionIndex int, from, 
 			if err != nil {
 				return err
 			}
-			appendSource(source, protocol.EventRecord{Envelope: protocol.EventEnvelope{Seq: 0}})
+			appendSource(source, protocol.EventRecord{Envelope: protocol.EventEnvelope{Seq: pending.assistant.seq}})
 		}
 		pending = nil
 		return nil
 	}
 	for index, event := range events {
 		if index == compactionIndex {
+			if err := flushPending(); err != nil {
+				return nil, nil, "", err
+			}
 			sources = append(sources, protocol.DeepCopy(summary))
 			continue
 		}
