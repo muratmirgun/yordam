@@ -72,7 +72,13 @@ func TestV030SelfHosting(t *testing.T) {
 	session.WaitForCurrentScreen(t, "AUTO SHELL WARNING", 30*time.Second)
 	session.WaitForCurrentScreen(t, "PERMISSION", 30*time.Second)
 	session.WaitForCurrentScreen(t, "y: allow once | s: allow session | n/Esc: deny", 30*time.Second)
+	if screen := session.CurrentScreen(); strings.Contains(screen, "Child session:") || strings.Contains(screen, "Parent session:") || strings.Contains(screen, "Delegation attempt:") {
+		t.Fatalf("parent permission screen retained child lineage:\n%s", screen)
+	}
 	session.Write(t, "y")
+	if err := waitForSelfHostAuthorizationConsumed(checkout.DataDir, "parent-complete-test", 5*time.Second); err != nil {
+		t.Fatalf("parent permission input was not consumed: %v\ncurrent screen:\n%s\nraw PTY:\n%q", err, session.CurrentScreen(), session.Output())
+	}
 	session.WaitForAfter(t, turnOffset, "self-hosting change and complete verification succeeded", 420*time.Second)
 	session.WaitForQuiet(t, 300*time.Millisecond, 10*time.Second)
 
@@ -160,6 +166,52 @@ func selfHostAuthorizationHasCommand(request protocol.AuthorizationRequest, comm
 		}
 	}
 	return false
+}
+
+func waitForSelfHostAuthorizationConsumed(dataDir, callID string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		found, err := selfHostAuthorizationConsumed(dataDir, callID)
+		if err != nil {
+			return err
+		}
+		if found {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for canonical authorization decision consumption %q", callID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func selfHostAuthorizationConsumed(dataDir, callID string) (bool, error) {
+	found := false
+	err := filepath.WalkDir(filepath.Join(dataDir, "workspaces"), func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if found || entry.IsDir() || entry.Name() != "events.jsonl" {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, line := range bytes.Split(raw, []byte{'\n'}) {
+			var envelope protocol.EventEnvelope
+			if json.Unmarshal(line, &envelope) != nil || envelope.Kind != protocol.EventAuthorizationDecisionConsumed {
+				continue
+			}
+			var consumed protocol.AuthorizationDecisionConsumedV1
+			if json.Unmarshal(envelope.Payload, &consumed) == nil && consumed.CallID == callID {
+				found = true
+				break
+			}
+		}
+		return nil
+	})
+	return found, err
 }
 
 func selfHostSuccessSteps(readmeSHA string) []providerStep {
