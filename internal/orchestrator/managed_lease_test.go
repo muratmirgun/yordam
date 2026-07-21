@@ -2,10 +2,12 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
+	"github.com/muratmirgun/yordam/internal/journal"
 	"github.com/muratmirgun/yordam/internal/protocol"
 )
 
@@ -40,6 +42,45 @@ func TestInteractiveApprovalYieldsTurnLaneForDurableControl(t *testing.T) {
 	}
 	if turn.Claim() != (OperationClaim{Kind: OperationTurn, SessionID: "parent"}) {
 		t.Fatalf("turn claim was not reacquired: %+v", turn.Claim())
+	}
+}
+
+type approvalSuffixRepository struct {
+	inertRepository
+	page journal.EventPage
+}
+
+func (r approvalSuffixRepository) ReadRange(context.Context, journal.ReadRangeRequest) (journal.EventPage, error) {
+	return r.page, nil
+}
+
+func TestInteractiveApprovalReconcilesOnlyExactTrustedShellConsequence(t *testing.T) {
+	request := validStartTurnRequest()
+	state := newTurnState(request)
+	next := protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID), CommitSeq: state.head.CommitSeq + 1, TransactionID: "trusted-shell-control"}
+	actor := request.Command.Actor
+	payload, err := json.Marshal(protocol.TrustedExecutionAcknowledgedV1{Enabled: true, Profile: "unsandboxed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := protocol.EventEnvelope{
+		SchemaVersion: protocol.EnvelopeVersion, JournalKind: protocol.JournalSession, JournalID: protocol.JournalID(request.SessionID),
+		SessionID: request.SessionID, EventID: "trusted-shell-event", Seq: next.CommitSeq, Time: time.Now().UTC(), PayloadVersion: 1,
+		Kind: protocol.EventTrustedExecutionAcknowledged, TransactionID: next.TransactionID, Actor: &actor, RuntimeGenerationID: request.Runtime.ID, Payload: payload,
+	}
+	service := &Service{repository: approvalSuffixRepository{page: journal.EventPage{Events: []protocol.EventRecord{{Envelope: event}}, Cursor: next, Head: next}}}
+	if err := service.reconcileInteractiveApprovalJournal(t.Context(), request, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.head != next {
+		t.Fatalf("reconciled head=%+v want=%+v", state.head, next)
+	}
+
+	state = newTurnState(request)
+	event.Kind = protocol.EventModeChanged
+	service.repository = approvalSuffixRepository{page: journal.EventPage{Events: []protocol.EventRecord{{Envelope: event}}, Cursor: next, Head: next}}
+	if err := service.reconcileInteractiveApprovalJournal(t.Context(), request, &state); err == nil {
+		t.Fatal("unrelated journal consequence was accepted")
 	}
 }
 

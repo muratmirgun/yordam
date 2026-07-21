@@ -1063,6 +1063,9 @@ func (s *Service) authorizeActivity(ctx context.Context, lease managedOperationL
 		if approveErr != nil {
 			return authorization.CommittedToken{}, approveErr
 		}
+		if err := s.reconcileInteractiveApprovalJournal(ctx, request, state); err != nil {
+			return authorization.CommittedToken{}, err
+		}
 		decision, err = s.deps.Authorization.ResolveInteractive(ctx, authorizationRequest, decision, response)
 		if err != nil {
 			return authorization.CommittedToken{}, err
@@ -1168,6 +1171,29 @@ func (s *Service) awaitInteractiveApproval(ctx context.Context, lease managedOpe
 		return approveErr
 	})
 	return response, err
+}
+
+func (s *Service) reconcileInteractiveApprovalJournal(ctx context.Context, request StartTurnRequest, state *turnState) error {
+	page, err := s.repository.ReadRange(ctx, journal.ReadRangeRequest{Journal: state.ref, After: state.head, Limit: 2})
+	if err != nil {
+		return fmt.Errorf("read interactive approval journal suffix: %w", err)
+	}
+	if page.Head == state.head {
+		return nil
+	}
+	if page.More || page.Cursor != page.Head || len(page.Events) != 1 || page.Head.CommitSeq != state.head.CommitSeq+1 {
+		return fmt.Errorf("interactive approval changed the turn journal outside the trusted-shell acknowledgement boundary")
+	}
+	event := page.Events[0].Envelope
+	if event.Kind != protocol.EventTrustedExecutionAcknowledged || event.SessionID != request.SessionID || event.RuntimeGenerationID != request.Runtime.ID || event.Actor == nil || *event.Actor != request.Command.Actor || event.Seq != page.Head.CommitSeq || event.TransactionID != page.Head.TransactionID {
+		return fmt.Errorf("interactive approval journal suffix has invalid trusted-shell provenance")
+	}
+	var acknowledged protocol.TrustedExecutionAcknowledgedV1
+	if err := json.Unmarshal(event.Payload, &acknowledged); err != nil || !acknowledged.Enabled || acknowledged.Profile != "unsandboxed" {
+		return fmt.Errorf("interactive approval journal suffix has invalid trusted-shell payload")
+	}
+	state.head = page.Head
+	return nil
 }
 
 func (s *Service) completeTurn(ctx context.Context, request StartTurnRequest, state *turnState, assistant protocol.AssistantMessageV1, terminal protocol.ProviderAttemptTerminalV1) (RunResult, error) {
