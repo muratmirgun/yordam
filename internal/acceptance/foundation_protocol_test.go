@@ -9,6 +9,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -39,6 +42,38 @@ const (
 	traceSkills      = "Yordam v0.3 Skills; Acceptance 8"
 	traceSubagents   = "Yordam v0.3 Sequential Subagent; Acceptance 9"
 )
+
+func assertV020NestsV010(t *testing.T) {
+	t.Helper()
+	root := foundationRepositoryRoot(t)
+	path := filepath.Join(root, "internal", "acceptance", "v020_foundation_test.go")
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("parse v0.2 cumulative inventory: %v", err)
+	}
+	calls := 0
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "TestV020Foundation" || function.Body == nil {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			identifier, ok := call.Fun.(*ast.Ident)
+			if ok && identifier.Name == "TestV010Acceptance" {
+				calls++
+			}
+			return true
+		})
+	}
+	if calls != 1 {
+		t.Fatalf("v0.2 cumulative inventory nests v0.1 calls=%d want=1", calls)
+	}
+}
 
 func acceptFoundationMigration(t *testing.T) {
 	t.Logf("trace=%s", traceMigration)

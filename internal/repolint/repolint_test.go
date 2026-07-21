@@ -1,12 +1,73 @@
 package repolint_test
 
 import (
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/muratmirgun/yordam/internal/skills"
 )
+
+func TestCheckScriptKeepsV030AcceptanceOptIn(t *testing.T) {
+	raw, err := os.ReadFile("../../scripts/check.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	const acceptance = `if [[ "${YORDAM_ACCEPTANCE:-0}" == "1" ]]; then
+  go test -tags acceptance ./internal/acceptance -run '^TestV030SelfHostedRuntime$' -count=1 -v
+fi`
+	if strings.Count(text, acceptance) != 1 {
+		t.Fatalf("check script must contain one exact opt-in v0.3 acceptance branch")
+	}
+	if strings.Index(text, acceptance) < strings.Index(text, "git diff --check") {
+		t.Fatal("optional acceptance must extend, not replace, the fast default gate")
+	}
+}
+
+func TestProductionCapabilityPackagesContainNoExecutableSkillOrHookLoader(t *testing.T) {
+	root := repositoryRoot(t)
+	for _, directory := range []string{
+		filepath.Join("internal", "skills"),
+		filepath.Join("internal", "subagent"),
+		filepath.Join("internal", "app"),
+		filepath.Join("internal", "tui"),
+	} {
+		err := filepath.WalkDir(filepath.Join(root, directory), func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			for _, forbidden := range []string{`"os/exec"`, `"plugin"`, "exec.Command(", "syscall.Exec(", "LoadHook(", "RunHook("} {
+				if strings.Contains(string(raw), forbidden) {
+					relative, _ := filepath.Rel(root, path)
+					t.Errorf("production capability package contains executable skill/hook loader %q in %s", forbidden, filepath.ToSlash(relative))
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	skill := filepath.Join(root, ".yordam", "skills", "go-development", "SKILL.md")
+	info, err := os.Stat(skill)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o111 != 0 {
+		t.Fatalf("repository skill is executable: mode=%#o", info.Mode().Perm())
+	}
+}
 
 func TestSelfHostingGoDevelopmentSkillIsStrictAndNonAuthoritative(t *testing.T) {
 	path := "../../.yordam/skills/go-development/SKILL.md"
