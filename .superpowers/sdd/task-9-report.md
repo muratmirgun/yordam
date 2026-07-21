@@ -75,3 +75,21 @@ This task does not add concurrent child scheduling, worktree isolation,
 cross-host execution, free-form child messaging, or per-child provider/model
 selection. A receipt proves only evidence projected from one child attempt; it
 does not verify the parent goal.
+
+## Final exact-source release gate
+
+Exact tested source:
+`6fb8bf83d55413246e112a76433fd93443421e9b`
+
+```text
+go test ./internal/subagent ./internal/orchestrator ./internal/app ./internal/tui/... ./internal/acceptance -count=1  PASS (109.77s)
+go test ./... -count=1  PASS (123.12s)
+go test -race ./... -count=1  PASS, no race report (568.47s)
+go vet ./...  PASS (0.88s)
+git diff --check  PASS (0.01s)
+```
+
+Host: `go version go1.26.4 darwin/arm64`; `Darwin 27.0.0 arm64`.
+Fixture SHA-256:
+`3025639c84e32fa887dfaebc69a26be7ec10209fc41b168d3d6ff1178c444ad6`.
+Linux was not run locally and is not claimed.
