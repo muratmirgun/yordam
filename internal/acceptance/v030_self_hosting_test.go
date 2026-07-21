@@ -66,8 +66,10 @@ func TestV030SelfHosting(t *testing.T) {
 	session.WaitForAfter(t, turnOffset, "skill go-development [project", 20*time.Second)
 	session.WaitForAfter(t, turnOffset, "CHILD", 20*time.Second)
 	session.WaitForAfter(t, turnOffset, "Child session:", 30*time.Second)
+	parentPermissionOffset := session.OutputOffset()
 	session.Write(t, "y")
-	session.WaitForAfter(t, turnOffset, "AUTO SHELL WARNING", 120*time.Second)
+	waitForSelfHostAuthorization(t, checkout.DataDir, "parent-complete-test", 30*time.Second)
+	session.WaitForAfter(t, parentPermissionOffset, "PERMISSION", 30*time.Second)
 	session.Write(t, "y")
 	session.WaitForAfter(t, turnOffset, "self-hosting change and complete verification succeeded", 420*time.Second)
 	session.WaitForQuiet(t, 300*time.Millisecond, 10*time.Second)
@@ -98,6 +100,53 @@ func TestV030SelfHosting(t *testing.T) {
 	if len(provider.Requests) != len(steps) {
 		t.Fatalf("restart retried provider effects: requests=%d want=%d", len(provider.Requests), len(steps))
 	}
+}
+
+func waitForSelfHostAuthorization(t *testing.T, dataDir, callID string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		found, err := selfHostAuthorizationRequested(dataDir, callID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for canonical authorization request %q", callID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func selfHostAuthorizationRequested(dataDir, callID string) (bool, error) {
+	found := false
+	err := filepath.WalkDir(filepath.Join(dataDir, "workspaces"), func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if found || entry.IsDir() || entry.Name() != "events.jsonl" {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, line := range bytes.Split(raw, []byte{'\n'}) {
+			var envelope protocol.EventEnvelope
+			if json.Unmarshal(line, &envelope) != nil || envelope.Kind != protocol.EventAuthorizationRequested {
+				continue
+			}
+			var requested protocol.AuthorizationRequestedV1
+			if json.Unmarshal(envelope.Payload, &requested) == nil && requested.Request.CallID == callID {
+				found = true
+				break
+			}
+		}
+		return nil
+	})
+	return found, err
 }
 
 func selfHostSuccessSteps(readmeSHA string) []providerStep {
