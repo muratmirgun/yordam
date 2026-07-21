@@ -209,6 +209,80 @@ func TestRunTurnSubagentHappyPathCommitsParentHandoffAndAttachment(t *testing.T)
 	}
 }
 
+func TestSubagentAttachmentFailurePreservesAtomicResultInvariant(t *testing.T) {
+	tests := []struct {
+		name             string
+		configure        func(*recordingRepository) (journal.Repository, ApplicationEventPublisher)
+		wantTerminals    int
+		wantToolMessages int
+	}{
+		{
+			name: "append failure",
+			configure: func(repository *recordingRepository) (journal.Repository, ApplicationEventPublisher) {
+				return &subagentAttachmentFailingRepository{recordingRepository: repository}, nil
+			},
+		},
+		{
+			name: "publication failure after commit", wantTerminals: 1, wantToolMessages: 1,
+			configure: func(repository *recordingRepository) (journal.Repository, ApplicationEventPublisher) {
+				return &publishingRecordingRepository{recordingRepository: repository}, subagentAttachmentFailingPublisher{}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := validStartTurnRequest()
+			request.Runtime = validRuntimeManifest(t, "observation")
+			request.Runtime.Body.SkillCatalogRevision = "skills-a"
+			request.Runtime.Body.Limits.Subagents = protocol.SubagentLimits{Enabled: true, MaxPerTurn: 4, MaxToolCalls: 1, TimeoutNanos: int64(time.Second)}
+			request.Runtime.Body.Limits.MaxToolCalls = 5
+			request.Runtime.Body.Tools = append(request.Runtime.Body.Tools, subagenttool.BuiltinDescriptor())
+			refreshRuntimeDigest(t, &request.Runtime)
+
+			base := &recordingRepository{head: request.ExpectedHead}
+			repository, publisher := test.configure(base)
+			manifest := protocol.SubagentManifestV1{AttemptID: "attempt", ParentSessionID: request.SessionID, ParentCursor: request.ExpectedHead, ChildSessionID: "child", ChildTaskID: "child-task", ChildTurnID: "child-turn", RuntimeGenerationID: request.Runtime.ID, SkillCatalogRevision: "skills-a", MaxToolCalls: 1, Deadline: testSubagentDeadline()}
+			receipt := childReceipt(manifest, "succeeded", "child done", protocol.CommittedCursor{JournalKind: protocol.JournalSession, JournalID: "child", CommitSeq: 2, TransactionID: "child-terminal"}, unknownUsage(), nil, nil)
+			children := &subagentTestChildren{receipt: receipt, workspace: domain.Workspace{ID: "workspace", CanonicalPath: "/workspace"}}
+			service, err := NewService(Dependencies{
+				Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository, Publisher: publisher,
+				TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: &recordLog{}}, Providers: fakeProviderCatalog{log: &recordLog{}}, Provider: &subagentTestProvider{log: &recordLog{}},
+				Tools: subagentPlanService{}, Authorization: &allowingAuthorization{log: &recordLog{}}, Evidence: recordingEvidence{log: &recordLog{}}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+				ChildSessions: children, ParentSessions: subagentParentInspector{children}, Children: subagentTestCoordinator{children: children, log: &recordLog{}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.RunTurn(context.Background(), request); err == nil {
+				t.Fatal("subagent attachment failure unexpectedly succeeded")
+			}
+
+			activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "subagent", "delegate"))
+			if got := activityTerminalCount(base.appendRequests(), activityID); got != test.wantTerminals {
+				t.Fatalf("subagent terminal count=%d want=%d batches=%v", got, test.wantTerminals, base.batchKinds())
+			}
+			if got := activityToolMessageCount(base.appendRequests(), activityID); got != test.wantToolMessages {
+				t.Fatalf("subagent tool messages=%d want=%d batches=%v", got, test.wantToolMessages, base.batchKinds())
+			}
+			for _, appendRequest := range base.appendRequests() {
+				terminal := false
+				for _, event := range appendRequest.Events {
+					if event.ActivityID == activityID {
+						switch event.Kind {
+						case protocol.EventActivitySucceeded, protocol.EventActivityFailed, protocol.EventActivityDenied,
+							protocol.EventActivityCancelled, protocol.EventActivityInterruptedNoEffect, protocol.EventActivityUncertain:
+							terminal = true
+						}
+					}
+				}
+				if terminal && !appendHasKinds(appendRequest, protocol.EventToolMessage) {
+					t.Fatalf("subagent committed a resultless terminal transaction: %+v", appendRequest)
+				}
+			}
+		})
+	}
+}
+
 // subagentActivityRecords turns the exact persisted parent candidates into the
 // stateful records consumed by the activity projector.  Filtering is deliberate:
 // the projector ignores all other foundation events, while this regression
@@ -459,6 +533,59 @@ func appendHasKinds(request journal.AppendRequest, kinds ...string) bool {
 		}
 	}
 	return true
+}
+
+type subagentAttachmentFailingRepository struct{ *recordingRepository }
+
+func (r *subagentAttachmentFailingRepository) AppendBatch(ctx context.Context, request journal.AppendRequest) (journal.AppendResult, error) {
+	if appendHasKinds(request, protocol.EventSubagentResultAttached) {
+		return journal.AppendResult{}, errors.New("subagent attachment append failed")
+	}
+	return r.recordingRepository.AppendBatch(ctx, request)
+}
+
+type publishingRecordingRepository struct{ *recordingRepository }
+
+func (r *publishingRecordingRepository) AppendBatch(ctx context.Context, request journal.AppendRequest) (journal.AppendResult, error) {
+	result, err := r.recordingRepository.AppendBatch(ctx, request)
+	if err != nil || result.Status != journal.AppendCommitted {
+		return result, err
+	}
+	result.Events = make([]protocol.EventEnvelope, len(request.Events))
+	for index, event := range request.Events {
+		result.Events[index] = protocol.EventEnvelope{
+			SchemaVersion: protocol.EnvelopeVersion, PayloadVersion: event.PayloadVersion,
+			JournalKind: request.Journal.Kind, JournalID: request.Journal.ID, EventID: event.EventID,
+			SessionID: event.SessionID, Seq: request.ExpectedHead.CommitSeq + uint64(index) + 1, Time: event.Time, Kind: event.Kind,
+			TaskID: event.TaskID, TurnID: event.TurnID, ActivityID: event.ActivityID, ParentActivityID: event.ParentActivityID,
+			CausationEventID: event.CausationEventID, Actor: event.Actor, RuntimeGenerationID: event.RuntimeGenerationID,
+			TransactionID: request.TransactionID, Payload: protocol.DeepCopy(event.Payload),
+		}
+	}
+	return result, nil
+}
+
+type subagentAttachmentFailingPublisher struct{}
+
+func (subagentAttachmentFailingPublisher) PublishCommitted(_ context.Context, _ protocol.JournalRef, _ protocol.CommittedCursor, events []protocol.EventEnvelope) error {
+	for _, event := range events {
+		if event.Kind == protocol.EventSubagentResultAttached {
+			return errors.New("subagent attachment publication failed")
+		}
+	}
+	return nil
+}
+
+func activityToolMessageCount(requests []journal.AppendRequest, activityID protocol.ActivityID) int {
+	count := 0
+	for _, request := range requests {
+		for _, event := range request.Events {
+			if event.ActivityID == activityID && event.Kind == protocol.EventToolMessage {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func subagentPlannedActivityID(t *testing.T, repo *recordingRepository) protocol.ActivityID {

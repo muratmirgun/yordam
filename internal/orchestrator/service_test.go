@@ -703,6 +703,110 @@ func TestToolResultAppendBarrierBlocksProviderContinuation(t *testing.T) {
 	if prepareCount != 1 || provider.streams.Load() != 1 {
 		t.Fatalf("provider crossed failed result barrier: prepares=%d streams=%d", prepareCount, provider.streams.Load())
 	}
+	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "tool", "call-a"))
+	if got := activityTerminalCount(base.appendRequests(), activityID); got != 0 {
+		t.Fatalf("failed atomic result append committed %d resultless tool terminals: %v", got, base.batchKinds())
+	}
+	if countKind(flattenAppendKinds(base.appendRequests()), protocol.EventTurnFailed) != 1 {
+		t.Fatalf("turn failure was not committed while tool activity stayed recoverable: %v", base.batchKinds())
+	}
+}
+
+func TestToolResultSanitizationFailureLeavesActivityForRecovery(t *testing.T) {
+	request := validStartTurnRequest()
+	request.Runtime = validRuntimeManifest(t, "observation")
+	repository := &recordingRepository{head: request.ExpectedHead}
+	log := &recordLog{}
+	service, err := NewService(Dependencies{
+		Admission: rejectingToolResultAdmission{passthroughAdmission: passthroughAdmission{}}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository,
+		TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &toolThenFinalProvider{log: log},
+		Tools: unsanitizableObservationToolService{observationToolService{log: log}}, Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log}, Recovery: noRecoveryRecorder{}, Verification: verification.NewService(time.Now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunTurn(context.Background(), request); err == nil {
+		t.Fatal("tool-result sanitization failure unexpectedly succeeded")
+	}
+	activityID := protocol.ActivityID(stableID("activity", string(request.Command.CommandID), "tool", "call-a"))
+	if got := activityTerminalCount(repository.appendRequests(), activityID); got != 0 {
+		t.Fatalf("sanitization failure committed %d resultless tool terminals: %v", got, repository.batchKinds())
+	}
+	if _, _, ok := terminalToolResult(repository.appendRequests(), protocol.EventActivitySucceeded, "call-a"); ok {
+		t.Fatalf("sanitization failure persisted rejected result: %v", repository.batchKinds())
+	}
+	if countKind(flattenAppendKinds(repository.appendRequests()), protocol.EventTurnFailed) != 1 {
+		t.Fatalf("turn failure was not committed while tool activity stayed recoverable: %v", repository.batchKinds())
+	}
+}
+
+func TestToolResultBindsHostileToolOutputToIntentAndTerminalStatus(t *testing.T) {
+	tests := []struct {
+		name     string
+		effect   string
+		tools    func(*recordLog) ToolService
+		recovery func(*recordLog) RecoveryRecorder
+	}{
+		{
+			name: "observation", effect: "observation",
+			tools: func(log *recordLog) ToolService {
+				return hostileObservationToolService{observationToolService{log: log}}
+			},
+			recovery: func(*recordLog) RecoveryRecorder { return noRecoveryRecorder{} },
+		},
+		{
+			name: "mutation", effect: "mutation",
+			tools:    func(log *recordLog) ToolService { return hostileMutationToolService{mutationToolService{log: log}} },
+			recovery: func(log *recordLog) RecoveryRecorder { return recordingRecovery{log: log} },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := validStartTurnRequest()
+			request.Runtime = validRuntimeManifest(t, test.effect)
+			repository := &recordingRepository{head: request.ExpectedHead}
+			log := &recordLog{}
+			service, err := NewService(Dependencies{
+				Admission: passthroughAdmission{}, Instructions: emptyInstructionService{}, Lane: NewOperationLane(), Repository: repository,
+				TurnLeases: &recordingTurnLeaseManager{}, Context: fakeContextPlanner{log: log}, Providers: fakeProviderCatalog{log: log}, Provider: &toolThenFinalProvider{log: log},
+				Tools: test.tools(log), Authorization: &allowingAuthorization{log: log}, Evidence: recordingEvidence{log: log}, Recovery: test.recovery(log), Verification: verification.NewService(time.Now),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.RunTurn(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			_, result, ok := terminalToolResult(repository.appendRequests(), protocol.EventActivitySucceeded, "call-a")
+			if !ok || result.CallID != "call-a" || result.Status != "succeeded" {
+				t.Fatalf("durable result was not rebound to intent/outcome: %+v present=%v batches=%v", result, ok, repository.batchKinds())
+			}
+			for _, appendRequest := range repository.appendRequests() {
+				for _, event := range appendRequest.Events {
+					if event.Kind == protocol.EventToolMessage && strings.Contains(string(event.Payload), "attacker-call") {
+						t.Fatalf("hostile call ID reached durable transcript: %s", event.Payload)
+					}
+				}
+			}
+		})
+	}
+}
+
+func activityTerminalCount(requests []journal.AppendRequest, activityID protocol.ActivityID) int {
+	count := 0
+	for _, request := range requests {
+		for _, event := range request.Events {
+			if event.ActivityID != activityID {
+				continue
+			}
+			switch event.Kind {
+			case protocol.EventActivitySucceeded, protocol.EventActivityFailed, protocol.EventActivityDenied,
+				protocol.EventActivityCancelled, protocol.EventActivityInterruptedNoEffect, protocol.EventActivityUncertain:
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func terminalToolResult(requests []journal.AppendRequest, terminalKind, callID string) (journal.AppendRequest, protocol.ToolResultBlock, bool) {
@@ -1297,6 +1401,15 @@ func (r *toolTerminalFailingRepository) AppendBatch(ctx context.Context, request
 	return r.recordingRepository.AppendBatch(ctx, request)
 }
 
+type rejectingToolResultAdmission struct{ passthroughAdmission }
+
+func (a rejectingToolResultAdmission) SanitizeText(ctx context.Context, generation protocol.RuntimeGenerationID, value string) (string, error) {
+	if value == "reject-tool-result" {
+		return "", errors.New("tool result rejected by admission")
+	}
+	return a.passthroughAdmission.SanitizeText(ctx, generation, value)
+}
+
 func (r *recordingRepository) Inspect(context.Context, protocol.JournalRef) (journal.Inspection, error) {
 	return journal.Inspection{Head: r.head, Writable: true}, nil
 }
@@ -1691,6 +1804,24 @@ func (s evidencedObservationToolService) Execute(_ context.Context, _ tooling.Ac
 			{ID: "evidence-a", Kind: "tool_output", MediaType: "text/plain", Actor: protocol.ActorRef{ID: "read", Kind: protocol.ActorTool}, Subject: protocol.SubjectRef{Kind: "file", ID: "a.go"}, Content: []byte("a"), Limit: 1024},
 		},
 	}, nil
+}
+
+type unsanitizableObservationToolService struct{ observationToolService }
+
+func (unsanitizableObservationToolService) Execute(context.Context, tooling.ActionHandle, authorization.CommittedToken) (protocol.ExecutionResult, error) {
+	return protocol.ExecutionResult{Outcome: protocol.ActivityOutcomeV1{Status: "succeeded"}, ToolResult: protocol.ToolResultBlock{CallID: "call-a", Status: "succeeded", Text: "reject-tool-result"}}, nil
+}
+
+type hostileObservationToolService struct{ observationToolService }
+
+func (hostileObservationToolService) Execute(context.Context, tooling.ActionHandle, authorization.CommittedToken) (protocol.ExecutionResult, error) {
+	return protocol.ExecutionResult{Outcome: protocol.ActivityOutcomeV1{Status: "succeeded"}, ToolResult: protocol.ToolResultBlock{CallID: "attacker-call", Status: "failed", Text: "hostile observation"}}, nil
+}
+
+type hostileMutationToolService struct{ mutationToolService }
+
+func (hostileMutationToolService) Execute(context.Context, tooling.ActionHandle, authorization.CommittedToken) (protocol.ExecutionResult, error) {
+	return protocol.ExecutionResult{Outcome: protocol.ActivityOutcomeV1{Status: "succeeded"}, ToolResult: protocol.ToolResultBlock{CallID: "attacker-call", Status: "failed", Text: "hostile mutation"}}, nil
 }
 
 type driftingObservationToolService struct{ observationToolService }

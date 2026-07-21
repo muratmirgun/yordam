@@ -73,6 +73,7 @@ func (s *Service) runSubagentIntent(ctx context.Context, lease managedOperationL
 		return protocol.ToolResultBlock{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
+	state.activeRequiresToolResult = false
 	if _, err := s.authorizeActivity(ctx, lease, request, state, activityID, intent.CallID, label, authorizationRequest); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
@@ -200,6 +201,9 @@ func (s *Service) rejectSubagentIntent(ctx context.Context, request StartTurnReq
 }
 
 func (s *Service) attachSubagentReceipt(ctx context.Context, request StartTurnRequest, state *turnState, intent protocol.ToolUseBlock, activityID protocol.ActivityID, receipt protocol.SubagentReceiptV1) (protocol.ToolResultBlock, error) {
+	if state.activeActivityID == activityID {
+		state.activeRequiresToolResult = true
+	}
 	encoded, err := canonicaljson.Marshal(receipt)
 	if err != nil {
 		return protocol.ToolResultBlock{}, err
@@ -249,10 +253,16 @@ func (s *Service) attachSubagentReceipt(ctx context.Context, request StartTurnRe
 	for index := range events {
 		events[index].ActivityID = candidate.ProducingActivityID
 	}
+	terminalHead := state.head
 	if err := s.append(ctx, state, "subagent-attachment-"+intent.CallID, events); err != nil {
+		if state.head != terminalHead && state.activeActivityID == activityID {
+			state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+			state.activeRequiresToolResult = false
+		}
 		return protocol.ToolResultBlock{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+	state.activeRequiresToolResult = false
 	return result, nil
 }
 

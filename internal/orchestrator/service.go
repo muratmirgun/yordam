@@ -324,10 +324,12 @@ func (s *Service) runProviderActivity(ctx context.Context, lease managedOperatio
 	if err := s.append(ctx, state, label+"-planned", events); err != nil {
 		if state.head != plannedHead {
 			state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
+			state.activeRequiresToolResult = false
 		}
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
+	state.activeRequiresToolResult = false
 	token, err := s.authorizeActivity(ctx, lease, request, state, activityID, callID, label, authorizationRequest)
 	if err != nil {
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
@@ -373,10 +375,12 @@ func (s *Service) runProviderActivity(ctx context.Context, lease managedOperatio
 	if err := s.append(ctx, state, label+"-terminal", events); err != nil {
 		if state.head != terminalHead {
 			state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+			state.activeRequiresToolResult = false
 		}
 		return protocol.AssistantMessageV1{}, protocol.ProviderAttemptTerminalV1{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+	state.activeRequiresToolResult = false
 	return message, terminal, nil
 }
 
@@ -454,10 +458,12 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 		if err := s.append(ctx, state, previewLabel+"-planned", events); err != nil {
 			if state.head != plannedHead {
 				state.activeActivityID, state.activeStarted, state.activeDispatched = previewActivityID, false, false
+				state.activeRequiresToolResult = false
 			}
 			return protocol.ToolResultBlock{}, err
 		}
 		state.activeActivityID, state.activeStarted, state.activeDispatched = previewActivityID, false, false
+		state.activeRequiresToolResult = false
 		barrierState := state.barrierState()
 		barrierState.ActivityID, barrierState.PlanDigest = previewActivityID, previewPlan.Digest
 		if err := s.cross(ctx, BarrierActionPlanCommitted, barrierState); err != nil {
@@ -512,10 +518,12 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 		if err := s.append(ctx, state, mutationLabel+"-planned", events); err != nil {
 			if state.head != plannedHead {
 				state.activeActivityID, state.activeStarted, state.activeDispatched = mutationActivityID, false, false
+				state.activeRequiresToolResult = false
 			}
 			return protocol.ToolResultBlock{}, err
 		}
 		state.activeActivityID, state.activeStarted, state.activeDispatched = mutationActivityID, false, false
+		state.activeRequiresToolResult = false
 		checkpoint, err := s.prepareCheckpoint(ctx, request, state, mutationActivityID, mutationLabel, preview, mutationPlan, previewRecords)
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
@@ -538,6 +546,7 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 			var toolResult *protocol.ToolResultBlock
 			if round == 2 {
 				status = "failed"
+				state.activeRequiresToolResult = true
 				result, sanitizeErr := s.sanitizeToolResult(ctx, request.Runtime.ID, protocol.ToolResultBlock{CallID: intent.CallID, Status: "failed", Text: "resource drift did not stabilize"})
 				if sanitizeErr != nil {
 					return protocol.ToolResultBlock{}, sanitizeErr
@@ -580,6 +589,7 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 		state.activeDispatched = true
 		execution, executeErr := s.deps.Tools.Execute(ctx, mutationHandle, token)
 		if executeErr != nil {
+			state.activeRequiresToolResult = true
 			status := "uncertain"
 			if s.deps.EffectProbe != nil {
 				if noEffect, probeErr := s.deps.EffectProbe.ProvesNoEffect(ctx, mutationActivityID); probeErr == nil && noEffect {
@@ -598,6 +608,10 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 		if err := s.probe.After(ctx, BarrierEffectDispatch, barrierState); err != nil {
 			return protocol.ToolResultBlock{}, err
 		}
+		state.activeRequiresToolResult = true
+		status := normalizeActivityStatus(execution.Outcome.Status)
+		execution.ToolResult.CallID = intent.CallID
+		execution.ToolResult.Status = status
 		records, err := s.recordEvidence(ctx, request, mutationActivityID, mutationPlan, execution.Evidence)
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
@@ -605,10 +619,6 @@ func (s *Service) runToolIntent(ctx context.Context, lease managedOperationLease
 		fileChange, err := structuredFileChangedEffect(mutationPlan, execution, records)
 		if err != nil {
 			return protocol.ToolResultBlock{}, err
-		}
-		status := execution.Outcome.Status
-		if status == "" {
-			status = "failed"
 		}
 		execution.ToolResult.EvidenceIDs = evidenceIDs(records)
 		result, err := s.sanitizeToolResult(ctx, request.Runtime.ID, execution.ToolResult)
@@ -660,10 +670,12 @@ func (s *Service) runObservationIntent(ctx context.Context, lease managedOperati
 	if err := s.append(ctx, state, label+"-planned", events); err != nil {
 		if state.head != plannedHead {
 			state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
+			state.activeRequiresToolResult = false
 		}
 		return protocol.ToolResultBlock{}, err
 	}
 	state.activeActivityID, state.activeStarted, state.activeDispatched = activityID, false, false
+	state.activeRequiresToolResult = false
 	barrierState := state.barrierState()
 	barrierState.ActivityID, barrierState.PlanDigest = activityID, plan.Digest
 	if err := s.cross(ctx, BarrierActionPlanCommitted, barrierState); err != nil {
@@ -682,6 +694,7 @@ func (s *Service) runObservationIntent(ctx context.Context, lease managedOperati
 	state.activeDispatched = true
 	execution, err := s.deps.Tools.Execute(ctx, handle, token)
 	if err != nil {
+		state.activeRequiresToolResult = true
 		result, sanitizeErr := s.sanitizeToolResult(context.WithoutCancel(ctx), request.Runtime.ID, protocol.ToolResultBlock{CallID: intent.CallID, Status: "uncertain", Text: err.Error()})
 		if sanitizeErr != nil {
 			return protocol.ToolResultBlock{}, errors.Join(err, sanitizeErr)
@@ -694,6 +707,10 @@ func (s *Service) runObservationIntent(ctx context.Context, lease managedOperati
 	if err := s.probe.After(ctx, BarrierEffectDispatch, barrierState); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
+	state.activeRequiresToolResult = true
+	status := normalizeActivityStatus(execution.Outcome.Status)
+	execution.ToolResult.CallID = intent.CallID
+	execution.ToolResult.Status = status
 	if err := s.publishToolPresentation(ctx, request, state, activityID, plan, execution); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
@@ -706,7 +723,7 @@ func (s *Service) runObservationIntent(ctx context.Context, lease managedOperati
 	if err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
-	if err := s.appendActivityEvidence(ctx, request, state, activityID, label+"-terminal", execution.Outcome.Status, &result, records); err != nil {
+	if err := s.appendActivityEvidence(ctx, request, state, activityID, label+"-terminal", status, &result, records); err != nil {
 		return protocol.ToolResultBlock{}, err
 	}
 	return result, nil
@@ -842,14 +859,12 @@ func (s *Service) recordEvidence(ctx context.Context, request StartTurnRequest, 
 }
 
 func (s *Service) appendActivityEvidence(ctx context.Context, request StartTurnRequest, state *turnState, activityID protocol.ActivityID, label, status string, toolResult *protocol.ToolResultBlock, records []protocol.EvidenceRecord, fileChanges ...*protocol.FileChangedV1) error {
+	status = normalizeActivityStatus(status)
 	kind := map[string]string{
 		"succeeded": protocol.EventActivitySucceeded, "failed": protocol.EventActivityFailed,
 		"denied": protocol.EventActivityDenied, "cancelled": protocol.EventActivityCancelled,
 		"interrupted_no_effect": protocol.EventActivityInterruptedNoEffect, "uncertain": protocol.EventActivityUncertain,
 	}[status]
-	if kind == "" {
-		kind, status = protocol.EventActivityFailed, "failed"
-	}
 	values := make([]struct {
 		kind    string
 		payload any
@@ -893,15 +908,26 @@ func (s *Service) appendActivityEvidence(ctx context.Context, request StartTurnR
 	if err := s.append(ctx, state, label, events); err != nil {
 		if state.head != terminalHead && state.activeActivityID == activityID {
 			state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+			state.activeRequiresToolResult = false
 		}
 		return err
 	}
 	if state.activeActivityID == activityID {
 		state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+		state.activeRequiresToolResult = false
 	}
 	barrierState := state.barrierState()
 	barrierState.ActivityID = activityID
 	return s.cross(ctx, BarrierActionTerminalCommitted, barrierState)
+}
+
+func normalizeActivityStatus(status string) string {
+	switch status {
+	case "succeeded", "failed", "denied", "cancelled", "interrupted_no_effect", "uncertain":
+		return status
+	default:
+		return "failed"
+	}
 }
 
 func structuredFileChangedEffect(plan protocol.ActionPlan, execution protocol.ExecutionResult, records []protocol.EvidenceRecord) (*protocol.FileChangedV1, error) {
@@ -1065,11 +1091,13 @@ func (s *Service) abandonDriftRound(ctx context.Context, request StartTurnReques
 	if err := s.append(ctx, state, label+"-drift-terminal", events); err != nil {
 		if state.head != terminalHead && state.activeActivityID == activityID {
 			state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+			state.activeRequiresToolResult = false
 		}
 		return err
 	}
 	if state.activeActivityID == activityID {
 		state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+		state.activeRequiresToolResult = false
 	}
 	return nil
 }
@@ -1107,6 +1135,9 @@ func (s *Service) authorizeActivity(ctx context.Context, lease managedOperationL
 			{protocol.EventAuthorizationDecided, protocol.AuthorizationDecidedV1{Decision: decision}},
 		}
 		if authorizationRequest.Source.Source != "provider" {
+			if state.activeActivityID == activityID {
+				state.activeRequiresToolResult = true
+			}
 			result, sanitizeErr := s.sanitizeToolResult(ctx, request.Runtime.ID, protocol.ToolResultBlock{CallID: callID, Status: "denied", Text: decision.Reason})
 			if sanitizeErr != nil {
 				return authorization.CommittedToken{}, sanitizeErr
@@ -1128,11 +1159,13 @@ func (s *Service) authorizeActivity(ctx context.Context, lease managedOperationL
 		if appendErr := s.append(ctx, state, label+"-decision", events); appendErr != nil {
 			if state.head != decisionHead {
 				state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+				state.activeRequiresToolResult = false
 				return authorization.CommittedToken{}, errors.Join(denied, appendErr)
 			}
 			return authorization.CommittedToken{}, appendErr
 		}
 		state.activeActivityID, state.activeStarted, state.activeDispatched = "", false, false
+		state.activeRequiresToolResult = false
 		return authorization.CommittedToken{}, denied
 	}
 	decisionEventID := eventID(state.command.CommandID, label+"-decision", 0, protocol.EventAuthorizationDecided)
@@ -1362,7 +1395,8 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 		activityStatus = "cancelled"
 	}
 	eventCount := 3
-	if state.activeActivityID != "" {
+	terminalizeActiveActivity := state.activeActivityID != "" && !state.activeRequiresToolResult
+	if terminalizeActiveActivity {
 		eventCount++
 	}
 	if request.child != nil {
@@ -1392,7 +1426,7 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 		return RunResult{}, err
 	}
 	events := make([]protocol.ProposedEvent, 0, eventCount)
-	if state.activeActivityID != "" {
+	if terminalizeActiveActivity {
 		activityKind := map[string]string{
 			"failed": protocol.EventActivityFailed, "denied": protocol.EventActivityDenied,
 			"cancelled": protocol.EventActivityCancelled, "uncertain": protocol.EventActivityUncertain,
@@ -1467,7 +1501,7 @@ func (s *Service) terminalizeTurnFailure(ctx context.Context, request StartTurnR
 	if state.head != finalCursor {
 		return RunResult{}, fmt.Errorf("failure terminal cursor prediction mismatch")
 	}
-	state.activeActivityID, state.activeStarted, state.activeDispatched, state.terminal = "", false, false, true
+	state.activeActivityID, state.activeStarted, state.activeDispatched, state.activeRequiresToolResult, state.terminal = "", false, false, false, true
 	return RunResult{TaskID: state.taskID, TurnID: state.turnID, Cursor: state.head, Status: commandStatus, CommandResult: commandResult}, nil
 }
 
@@ -1859,10 +1893,13 @@ type turnState struct {
 	activeActivityID  protocol.ActivityID
 	activeStarted     bool
 	activeDispatched  bool
-	compactedSources  map[protocol.Digest]struct{}
-	subagentAttempts  int
-	subagentDepth     int
-	activeSubagent    bool
+	// Once terminal result assembly begins, generic turn-failure cleanup must
+	// leave this activity unresolved rather than commit a resultless terminal.
+	activeRequiresToolResult bool
+	compactedSources         map[protocol.Digest]struct{}
+	subagentAttempts         int
+	subagentDepth            int
+	activeSubagent           bool
 }
 
 type authorizationDeniedError struct{ reason string }

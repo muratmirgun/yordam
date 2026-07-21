@@ -625,7 +625,7 @@ func (s *Service) reconcileWaitingSubagents(ctx context.Context, lease managedOp
 		if err := s.verifyParentHead(ctx, &turnState{ref: request.Storage.Journal, head: parentHead}); err != nil {
 			return parentHead, changed, false, err
 		}
-		recoveryTurn := turnState{ref: request.Storage.Journal, head: parentHead, command: CommandMetadata{CommandID: projection.OriginalCommandID, RequestDigest: projection.OriginalRequestDigest}, taskID: attempt.ParentTaskID, turnID: attempt.ParentTurnID, activeActivityID: attempt.ActivityID}
+		recoveryTurn := turnState{ref: request.Storage.Journal, head: parentHead, command: CommandMetadata{CommandID: projection.OriginalCommandID, RequestDigest: projection.OriginalRequestDigest}, taskID: attempt.ParentTaskID, turnID: attempt.ParentTurnID, activeActivityID: attempt.ActivityID, activeRequiresToolResult: true}
 		if recoveryTurn.command.CommandID == "" || recoveryTurn.activeActivityID == "" {
 			continue
 		}
