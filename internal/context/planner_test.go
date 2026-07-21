@@ -402,6 +402,59 @@ func TestContextPlanExcludesSourcesBeyondKnownBudget(t *testing.T) {
 	}
 }
 
+func TestContextPlanBudgetExcludesWholeToolExchange(t *testing.T) {
+	intent := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	events := []protocol.EventRecord{
+		contextEvent("assistant-tool", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+		contextEvent("tool-result", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: intent.CallID, Status: "succeeded", Text: strings.Repeat("result", 128)}}}),
+	}
+	request := contextRequest(events)
+	request.Model = contextModel(64)
+	request.OutputReserve = 0
+
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Body.Sources) != 0 {
+		t.Fatalf("partial tool exchange included: %#v", plan.Body.Sources)
+	}
+	if len(plan.Body.Excluded) != 2 || plan.Body.Excluded[0].ID != "assistant-tool" || plan.Body.Excluded[1].ID != "tool-result" {
+		t.Fatalf("excluded=%#v", plan.Body.Excluded)
+	}
+	for _, excluded := range plan.Body.Excluded {
+		if excluded.Reason != contextplanner.ExcludedBudget {
+			t.Fatalf("excluded=%#v", plan.Body.Excluded)
+		}
+	}
+}
+
+func TestContextPlanBudgetIncludesWholeToolExchangeInSourceOrder(t *testing.T) {
+	first := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"a.go"}`)}
+	second := protocol.ToolUseBlock{CallID: "call-b", Alias: "read", Arguments: json.RawMessage(`{"path":"b.go"}`)}
+	events := []protocol.EventRecord{
+		contextEvent("assistant-tool", 1, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &first}, {Kind: protocol.ContentToolUse, ToolUse: &second}}}),
+		contextEvent("tool-results", 2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: second.CallID, Status: "succeeded", Text: "second"}, {CallID: first.CallID, Status: "succeeded", Text: "first"}}}),
+	}
+	request := contextRequest(events)
+	request.Model = contextModel(1024)
+	request.OutputReserve = 0
+
+	plan, err := contextplanner.NewPlanner("tools-r1", nil).Plan(stdcontext.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Body.Excluded) != 0 || len(plan.Body.Sources) != 3 {
+		t.Fatalf("plan=%#v", plan)
+	}
+	if plan.Body.Sources[0].ID != "assistant-tool" || plan.Body.Sources[1].ID != "tool-results:0" || plan.Body.Sources[2].ID != "tool-results:1" {
+		t.Fatalf("sources=%#v", plan.Body.Sources)
+	}
+	if plan.Body.Sources[1].Content[0].ToolResult.CallID != second.CallID || plan.Body.Sources[2].Content[0].ToolResult.CallID != first.CallID {
+		t.Fatalf("sources=%#v", plan.Body.Sources)
+	}
+}
+
 func contextModel(window int64) protocol.ModelDescriptor {
 	return protocol.ModelDescriptor{
 		ProviderID: "openai", ModelID: "model", AdapterKind: "openai_compatible", DisplayName: "Model",

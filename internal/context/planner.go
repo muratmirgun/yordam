@@ -126,13 +126,20 @@ func (p *boundedPlanner) Plan(ctx stdcontext.Context, request Request) (protocol
 			return protocol.ContextPlan{}, fmt.Errorf("duplicate content source %q", source.ID)
 		}
 		seen[source.ID] = struct{}{}
-		tokens := estimateTokens(source.Content)
-		if bounded && used+tokens > available {
-			excluded = append(excluded, protocol.ExcludedContentSource{ID: source.ID, Reason: ExcludedBudget, Digest: source.Digest})
+	}
+	groups, err := groupContextSources(sources)
+	if err != nil {
+		return protocol.ContextPlan{}, err
+	}
+	for _, group := range groups {
+		if bounded && used+group.tokens > available {
+			for _, source := range group.sources {
+				excluded = append(excluded, protocol.ExcludedContentSource{ID: source.ID, Reason: ExcludedBudget, Digest: source.Digest})
+			}
 			continue
 		}
-		included = append(included, protocol.DeepCopy(source))
-		used += tokens
+		included = append(included, protocol.DeepCopy(group.sources)...)
+		used += group.tokens
 	}
 	body := protocol.ContextPlanBody{
 		Sources: included, Excluded: excluded,
@@ -145,6 +152,56 @@ func (p *boundedPlanner) Plan(ctx stdcontext.Context, request Request) (protocol
 		return protocol.ContextPlan{}, err
 	}
 	return protocol.ContextPlan{Body: protocol.DeepCopy(body), Digest: digest}, nil
+}
+
+type sourceGroup struct {
+	sources []protocol.ContentSource
+	tokens  int64
+}
+
+func groupContextSources(sources []protocol.ContentSource) ([]sourceGroup, error) {
+	groups := make([]sourceGroup, 0, len(sources))
+	for index := 0; index < len(sources); index++ {
+		source := sources[index]
+		group := sourceGroup{sources: []protocol.ContentSource{source}, tokens: estimateTokens(source.Content)}
+		callIDs := toolCallIDs(source.Content)
+		if source.Kind != "assistant_message" || len(callIDs) == 0 {
+			groups = append(groups, group)
+			continue
+		}
+
+		remaining := make(map[string]struct{}, len(callIDs))
+		for _, callID := range callIDs {
+			if _, duplicate := remaining[callID]; duplicate {
+				return nil, fmt.Errorf("assistant source %q has duplicate tool call %q", source.ID, callID)
+			}
+			remaining[callID] = struct{}{}
+		}
+		for len(remaining) > 0 {
+			index++
+			if index >= len(sources) {
+				return nil, fmt.Errorf("assistant source %q has unresolved tool results", source.ID)
+			}
+			resultSource := sources[index]
+			if resultSource.Kind != "tool_message" {
+				return nil, fmt.Errorf("assistant source %q is not followed by all tool results", source.ID)
+			}
+			for _, block := range resultSource.Content {
+				if block.Kind != protocol.ContentToolResult || block.ToolResult == nil {
+					return nil, fmt.Errorf("tool source %q has invalid result content", resultSource.ID)
+				}
+				callID := block.ToolResult.CallID
+				if _, expected := remaining[callID]; !expected {
+					return nil, fmt.Errorf("tool source %q has unexpected result %q", resultSource.ID, callID)
+				}
+				delete(remaining, callID)
+			}
+			group.sources = append(group.sources, resultSource)
+			group.tokens += estimateTokens(resultSource.Content)
+		}
+		groups = append(groups, group)
+	}
+	return groups, nil
 }
 
 type legacyCompactionPayload struct {

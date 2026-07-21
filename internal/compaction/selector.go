@@ -1,6 +1,7 @@
 package compaction
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -53,6 +54,7 @@ func Select(events []protocol.EventRecord, head protocol.CommittedCursor, trigge
 		start = priorThrough + 1
 	}
 	cutoff := len(committed) - recentSuffixEvents - 1
+	cutoff = exchangeSafeCutoff(committed, cutoff)
 	if start > cutoff {
 		return Selection{}, ErrNothingToCompact
 	}
@@ -70,6 +72,93 @@ func Select(events []protocol.EventRecord, head protocol.CommittedCursor, trigge
 	}
 	selection.RetainedEventIDs = retainedIDs(committed, cutoff)
 	return cloneSelection(selection), nil
+}
+
+type toolExchangeRange struct {
+	assistant int
+	result    int
+}
+
+func exchangeSafeCutoff(events []protocol.EventRecord, cutoff int) int {
+	ranges := toolExchangeRanges(events)
+	for {
+		adjusted := cutoff
+		for _, exchange := range ranges {
+			if exchange.assistant <= adjusted && adjusted < exchange.result {
+				adjusted = exchange.assistant - 1
+			}
+		}
+		if adjusted == cutoff {
+			return cutoff
+		}
+		cutoff = adjusted
+	}
+}
+
+func toolExchangeRanges(events []protocol.EventRecord) []toolExchangeRange {
+	type pendingExchange struct {
+		assistant int
+		remaining map[string]struct{}
+	}
+	var pending *pendingExchange
+	ranges := make([]toolExchangeRange, 0)
+	for index, record := range events {
+		if message, ok := assistantMessage(record); ok {
+			callIDs := assistantToolCallIDs(message)
+			if len(callIDs) > 0 {
+				remaining := make(map[string]struct{}, len(callIDs))
+				for _, callID := range callIDs {
+					remaining[callID] = struct{}{}
+				}
+				pending = &pendingExchange{assistant: index, remaining: remaining}
+			}
+			continue
+		}
+		if record.Envelope.Kind != protocol.EventToolMessage || pending == nil {
+			continue
+		}
+		message, ok := toolMessage(record)
+		if !ok {
+			continue
+		}
+		for _, result := range message.Results {
+			delete(pending.remaining, result.CallID)
+		}
+		if len(pending.remaining) == 0 {
+			ranges = append(ranges, toolExchangeRange{assistant: pending.assistant, result: index})
+			pending = nil
+		}
+	}
+	return ranges
+}
+
+func assistantToolCallIDs(message *protocol.AssistantMessageV1) []string {
+	if message == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	callIDs := make([]string, 0, len(message.Blocks)+len(message.ToolIntents))
+	for _, block := range message.Blocks {
+		if block.Kind != protocol.ContentToolUse || block.ToolUse == nil || block.ToolUse.CallID == "" {
+			continue
+		}
+		if _, duplicate := seen[block.ToolUse.CallID]; duplicate {
+			continue
+		}
+		seen[block.ToolUse.CallID] = struct{}{}
+		callIDs = append(callIDs, block.ToolUse.CallID)
+	}
+	for _, intent := range message.ToolIntents {
+		if intent.CallID == "" {
+			continue
+		}
+		if _, duplicate := seen[intent.CallID]; duplicate {
+			continue
+		}
+		seen[intent.CallID] = struct{}{}
+		callIDs = append(callIDs, intent.CallID)
+	}
+	return callIDs
 }
 
 func boundedSelection(events []protocol.EventRecord, sources []protocol.ContentSource, start, cutoff int, trigger Trigger, limit int) (Selection, error) {
@@ -434,6 +523,20 @@ func normalizedEventText(record protocol.EventRecord) (string, error) {
 	if message, ok := userMessage(record); ok {
 		return boundEventText(prefix + message), nil
 	}
+	if record.Envelope.Kind == protocol.EventToolMessage {
+		message, ok := toolMessage(record)
+		if !ok {
+			return "", fmt.Errorf("tool message event %q is invalid", record.Envelope.EventID)
+		}
+		if err := message.Validate(); err != nil {
+			return "", fmt.Errorf("tool message event %q: %w", record.Envelope.EventID, err)
+		}
+		parts := make([]string, 0, len(message.Results))
+		for _, result := range message.Results {
+			parts = append(parts, fmt.Sprintf("tool_result call_id=%s status=%s evidence_ids=%s", result.CallID, result.Status, strings.Join(evidenceStrings(result.EvidenceIDs), ",")))
+		}
+		return boundEventText(prefix + strings.Join(parts, "\n")), nil
+	}
 	payload := record.Envelope.Payload
 	if len(payload) == 0 {
 		var err error
@@ -459,6 +562,21 @@ func assistantMessage(record protocol.EventRecord) (*protocol.AssistantMessageV1
 		return &value, true
 	default:
 		return nil, false
+	}
+}
+
+func toolMessage(record protocol.EventRecord) (*protocol.ToolMessageV1, bool) {
+	switch value := record.Decoded.(type) {
+	case *protocol.ToolMessageV1:
+		return value, value != nil
+	case protocol.ToolMessageV1:
+		return &value, true
+	default:
+		var decoded protocol.ToolMessageV1
+		if len(record.Envelope.Payload) == 0 || json.Unmarshal(record.Envelope.Payload, &decoded) != nil {
+			return nil, false
+		}
+		return &decoded, true
 	}
 }
 

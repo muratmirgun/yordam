@@ -70,6 +70,86 @@ func TestSelectRejectsNoSafeCommittedRange(t *testing.T) {
 	}
 }
 
+func TestSelectKeepsToolExchangeAcrossDefaultBoundary(t *testing.T) {
+	t.Parallel()
+	intent := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	events := []protocol.EventRecord{
+		selectionEvent(1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old one"}),
+		selectionEvent(2, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old two"}),
+		selectionEvent(3, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &intent}}}),
+		selectionEvent(4, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: intent.CallID, Status: "succeeded", Text: "private result"}}}),
+		selectionEvent(5, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+		selectionEvent(6, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentText, Text: "recent two"}}}),
+		selectionEvent(7, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent three"}),
+	}
+
+	selection, err := compaction.Select(events, selectionCursor(7), compaction.TriggerManual, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.Through != selectionCursor(2) {
+		t.Fatalf("tool exchange was split at cutoff: through=%+v", selection.Through)
+	}
+	if !containsID(selection.RetainedEventIDs, "event-3") || !containsID(selection.RetainedEventIDs, "event-4") {
+		t.Fatalf("retained=%v", selection.RetainedEventIDs)
+	}
+}
+
+func TestSelectKeepsMultiResultToolExchangeAcrossBoundary(t *testing.T) {
+	t.Parallel()
+	first := protocol.ToolUseBlock{CallID: "call-a", Alias: "read", Arguments: json.RawMessage(`{"path":"a.go"}`)}
+	second := protocol.ToolUseBlock{CallID: "call-b", Alias: "read", Arguments: json.RawMessage(`{"path":"b.go"}`)}
+	events := []protocol.EventRecord{
+		selectionEvent(1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old one"}),
+		selectionEvent(2, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old two"}),
+		selectionEvent(3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old three"}),
+		selectionEvent(4, protocol.EventAssistantMessage, &protocol.AssistantMessageV1{Blocks: []protocol.ContentBlock{{Kind: protocol.ContentToolUse, ToolUse: &first}, {Kind: protocol.ContentToolUse, ToolUse: &second}}}),
+		selectionEvent(5, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: first.CallID, Status: "succeeded", Text: "first"}}}),
+		selectionEvent(6, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: second.CallID, Status: "failed", Text: "second"}}}),
+		selectionEvent(7, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+		selectionEvent(8, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
+	}
+
+	selection, err := compaction.Select(events, selectionCursor(8), compaction.TriggerManual, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.Through != selectionCursor(3) {
+		t.Fatalf("multi-result tool exchange was split at cutoff: through=%+v", selection.Through)
+	}
+	for _, id := range []protocol.EventID{"event-4", "event-5", "event-6"} {
+		if !containsID(selection.RetainedEventIDs, id) {
+			t.Fatalf("retained=%v missing=%s", selection.RetainedEventIDs, id)
+		}
+	}
+}
+
+func TestSelectNormalizesToolResultWithoutBodies(t *testing.T) {
+	t.Parallel()
+	events := []protocol.EventRecord{
+		selectionEvent(1, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "old"}),
+		selectionEvent(2, protocol.EventToolMessage, &protocol.ToolMessageV1{Results: []protocol.ToolResultBlock{{CallID: "call-a", Status: "succeeded", Text: "secret body", JSON: json.RawMessage(`{"secret":true}`), EvidenceIDs: []protocol.EvidenceID{"evidence-a"}}}}),
+		selectionEvent(3, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent one"}),
+		selectionEvent(4, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent two"}),
+		selectionEvent(5, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent three"}),
+		selectionEvent(6, protocol.EventUserMessage, &protocol.UserMessageV1{Content: "recent four"}),
+	}
+
+	selection, err := compaction.Select(events, selectionCursor(6), compaction.TriggerManual, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := sourcesText(selection.Sources)
+	if strings.Contains(joined, "secret body") || strings.Contains(joined, `"secret":true`) {
+		t.Fatalf("normalized sources leaked tool result body: %q", joined)
+	}
+	for _, want := range []string{"call_id=call-a", "status=succeeded", "evidence_ids=evidence-a"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("normalized sources=%q missing=%q", joined, want)
+		}
+	}
+}
+
 func TestSelectRejectsEventsOutsideCommittedHead(t *testing.T) {
 	t.Parallel()
 	events := []protocol.EventRecord{
