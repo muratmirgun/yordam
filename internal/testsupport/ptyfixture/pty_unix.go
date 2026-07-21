@@ -50,7 +50,7 @@ func start(t testing.TB, redact func(string) string, binary, workspace string, e
 	if err != nil {
 		t.Fatal(formatDiagnostic(redact, "start PTY: %v", err))
 	}
-	session := &Session{command: command, terminal: terminal, done: make(chan error, 1), diagnosticRedactor: redact, emulator: vt.NewEmulator(120, 32)}
+	session := &Session{command: command, terminal: terminal, done: make(chan error, 1), diagnosticRedactor: redact, emulator: newPTYEmulator(120, 32)}
 	go func() {
 		_, _ = io.Copy(lockedWriter{session: session}, terminal)
 	}()
@@ -61,8 +61,17 @@ func start(t testing.TB, redact func(string) string, binary, workspace string, e
 			_ = command.Process.Kill()
 			<-session.done
 		}
+		_ = session.emulator.Close()
 	})
 	return session
+}
+
+func newPTYEmulator(width, height int) *vt.Emulator {
+	emulator := vt.NewEmulator(width, height)
+	go func() {
+		_, _ = io.Copy(io.Discard, emulator)
+	}()
+	return emulator
 }
 
 func (s *Session) Write(t testing.TB, value string) {

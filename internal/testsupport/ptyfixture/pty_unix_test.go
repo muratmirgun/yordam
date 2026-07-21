@@ -7,8 +7,8 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/charmbracelet/x/vt"
 	"github.com/muratmirgun/yordam/internal/secret"
 )
 
@@ -34,7 +34,8 @@ func TestSecretDiagnosticFormattingRedactsConfiguredSentinel(t *testing.T) {
 }
 
 func TestCurrentScreenExcludesReplacedTerminalHistory(t *testing.T) {
-	session := &Session{emulator: vt.NewEmulator(12, 3)}
+	session := &Session{emulator: newPTYEmulator(12, 3)}
+	t.Cleanup(func() { _ = session.emulator.Close() })
 	writer := lockedWriter{session: session}
 	if _, err := writer.Write([]byte("PERMISSION")); err != nil {
 		t.Fatal(err)
@@ -48,5 +49,24 @@ func TestCurrentScreenExcludesReplacedTerminalHistory(t *testing.T) {
 	}
 	if screen := session.CurrentScreen(); strings.Contains(screen, "PERMISSION") || !strings.Contains(screen, "READY") {
 		t.Fatalf("current screen=%q", screen)
+	}
+}
+
+func TestCurrentScreenEmulatorDoesNotBlockOnTerminalQueries(t *testing.T) {
+	session := &Session{emulator: newPTYEmulator(12, 3)}
+	t.Cleanup(func() { _ = session.emulator.Close() })
+	done := make(chan error, 1)
+	go func() {
+		_, err := (lockedWriter{session: session}).Write([]byte("\x1b[c"))
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal query blocked PTY output capture")
 	}
 }
