@@ -12,9 +12,11 @@ type RuntimeLimits struct {
 	MaxToolCalls             int            `json:"max_tool_calls"`
 	ShellTimeoutNanos        int64          `json:"shell_timeout_nanos"`
 	ApplicationQueueCapacity int            `json:"application_queue_capacity"`
-	AutoCompact              bool           `json:"auto_compact"`
-	CompactReserveTokens     ValueInt64     `json:"compact_reserve_tokens"`
+	AutoCompact              bool           `json:"auto_compact,omitempty"`
+	CompactReserveTokens     ValueInt64     `json:"compact_reserve_tokens,omitempty"`
 	Subagents                SubagentLimits `json:"subagents,omitempty"`
+	autoCompactAbsent        bool
+	compactReserveAbsent     bool
 	subagentsPresent         bool
 }
 
@@ -67,13 +69,18 @@ func (limits RuntimeLimits) MarshalJSON() ([]byte, error) {
 		MaxToolCalls             int             `json:"max_tool_calls"`
 		ShellTimeoutNanos        int64           `json:"shell_timeout_nanos"`
 		ApplicationQueueCapacity int             `json:"application_queue_capacity"`
-		AutoCompact              bool            `json:"auto_compact"`
-		CompactReserveTokens     ValueInt64      `json:"compact_reserve_tokens"`
+		AutoCompact              *bool           `json:"auto_compact,omitempty"`
+		CompactReserveTokens     *ValueInt64     `json:"compact_reserve_tokens,omitempty"`
 		Subagents                *SubagentLimits `json:"subagents,omitempty"`
 	}
 	encoded := wire{
 		MaxToolCalls: limits.MaxToolCalls, ShellTimeoutNanos: limits.ShellTimeoutNanos, ApplicationQueueCapacity: limits.ApplicationQueueCapacity,
-		AutoCompact: limits.AutoCompact, CompactReserveTokens: limits.CompactReserveTokens,
+	}
+	if !limits.autoCompactAbsent {
+		encoded.AutoCompact = &limits.AutoCompact
+	}
+	if !limits.compactReserveAbsent {
+		encoded.CompactReserveTokens = &limits.CompactReserveTokens
 	}
 	if limits.subagentsPresent || limits.Subagents != (SubagentLimits{}) {
 		encoded.Subagents = &limits.Subagents
@@ -86,8 +93,8 @@ func (limits *RuntimeLimits) UnmarshalJSON(data []byte) error {
 		MaxToolCalls             int             `json:"max_tool_calls"`
 		ShellTimeoutNanos        int64           `json:"shell_timeout_nanos"`
 		ApplicationQueueCapacity int             `json:"application_queue_capacity"`
-		AutoCompact              bool            `json:"auto_compact"`
-		CompactReserveTokens     ValueInt64      `json:"compact_reserve_tokens"`
+		AutoCompact              *bool           `json:"auto_compact"`
+		CompactReserveTokens     *ValueInt64     `json:"compact_reserve_tokens"`
 		Subagents                json.RawMessage `json:"subagents"`
 	}
 	var decoded wire
@@ -96,7 +103,13 @@ func (limits *RuntimeLimits) UnmarshalJSON(data []byte) error {
 	}
 	*limits = RuntimeLimits{
 		MaxToolCalls: decoded.MaxToolCalls, ShellTimeoutNanos: decoded.ShellTimeoutNanos, ApplicationQueueCapacity: decoded.ApplicationQueueCapacity,
-		AutoCompact: decoded.AutoCompact, CompactReserveTokens: decoded.CompactReserveTokens,
+		autoCompactAbsent: decoded.AutoCompact == nil, compactReserveAbsent: decoded.CompactReserveTokens == nil,
+	}
+	if decoded.AutoCompact != nil {
+		limits.AutoCompact = *decoded.AutoCompact
+	}
+	if decoded.CompactReserveTokens != nil {
+		limits.CompactReserveTokens = *decoded.CompactReserveTokens
 	}
 	if len(decoded.Subagents) == 0 {
 		return nil

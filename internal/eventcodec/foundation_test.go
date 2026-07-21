@@ -298,13 +298,11 @@ func TestFoundationRegistryRejectsInvalidSubagentRuntimeLimits(t *testing.T) {
 	}
 }
 
-func TestFoundationRegistryPreservesLegacyRuntimeManifestWithoutSubagents(t *testing.T) {
+func TestFoundationRegistryPreservesLegacyRuntimeManifestWithoutCompactionOrSubagents(t *testing.T) {
 	type legacyRuntimeLimits struct {
-		MaxToolCalls             int                 `json:"max_tool_calls"`
-		ShellTimeoutNanos        int64               `json:"shell_timeout_nanos"`
-		ApplicationQueueCapacity int                 `json:"application_queue_capacity"`
-		AutoCompact              bool                `json:"auto_compact"`
-		CompactReserveTokens     protocol.ValueInt64 `json:"compact_reserve_tokens"`
+		MaxToolCalls             int   `json:"max_tool_calls"`
+		ShellTimeoutNanos        int64 `json:"shell_timeout_nanos"`
+		ApplicationQueueCapacity int   `json:"application_queue_capacity"`
 	}
 	type legacyRuntimeBody struct {
 		ProviderCatalogRevision string                     `json:"provider_catalog_revision"`
@@ -319,7 +317,7 @@ func TestFoundationRegistryPreservesLegacyRuntimeManifestWithoutSubagents(t *tes
 	legacy := legacyRuntimeBody{
 		ProviderCatalogRevision: "providers", Models: []protocol.ModelDescriptor{}, ToolCatalogRevision: "tools", Tools: []protocol.ToolDescriptor{},
 		InstructionRevision: "instructions", PolicyGeneration: "policy", ExecutionProfiles: []string{"restricted"},
-		Limits: legacyRuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1, CompactReserveTokens: protocol.ValueInt64{State: protocol.ValueUnknown}},
+		Limits: legacyRuntimeLimits{MaxToolCalls: 1, ShellTimeoutNanos: 1, ApplicationQueueCapacity: 1},
 	}
 	legacyJSON, err := canonicaljson.Marshal(legacy)
 	if err != nil {
